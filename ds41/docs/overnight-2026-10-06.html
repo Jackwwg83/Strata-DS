@@ -1,0 +1,112 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<title>夜间工作汇总</title>
+<link rel="icon" href="data:,">
+<style>
+:root{--bg:#fbfbf9;--fg:#1d1d1b;--mut:#6b6b66;--line:#e2e1dc;--card:#fff;--acc:#2f5d8a;--ok:#2e7d4f;--warn:#9a5b00;--bad:#a33;--chip:#eef2f6}
+@media (prefers-color-scheme:dark){:root:not([data-theme=light]){--bg:#161615;--fg:#e9e8e3;--mut:#9b9a94;--line:#33332f;--card:#1f1f1d;--acc:#8db7e0;--ok:#7cc79a;--warn:#e0b060;--bad:#e88;--chip:#26303a}}
+:root[data-theme=dark]{--bg:#161615;--fg:#e9e8e3;--mut:#9b9a94;--line:#33332f;--card:#1f1f1d;--acc:#8db7e0;--ok:#7cc79a;--warn:#e0b060;--bad:#e88;--chip:#26303a}
+body{margin:0;background:var(--bg);color:var(--fg);font:15px/1.7 -apple-system,BlinkMacSystemFont,"Segoe UI","PingFang SC","Hiragino Sans GB","Microsoft YaHei","Noto Sans CJK SC",sans-serif}
+main{max-width:1080px;margin:0 auto;padding:24px 16px 72px}
+h1{font-size:26px;margin:0 0 4px}
+h2{font-size:19px;margin:36px 0 10px;color:var(--acc);border-bottom:1px solid var(--line);padding-bottom:4px}
+h3{font-size:15.5px;margin:20px 0 6px}
+p{margin:8px 0}
+.sub,.note{color:var(--mut);font-size:13px}
+.card{background:var(--card);border:1px solid var(--line);border-radius:10px;padding:14px 18px;margin:12px 0}
+.tw{overflow-x:auto;margin:10px 0;border:1px solid var(--line);border-radius:8px;background:var(--card)}
+table{border-collapse:collapse;width:100%;font-size:13.5px;font-variant-numeric:tabular-nums}
+th,td{padding:7px 10px;border-bottom:1px solid var(--line);text-align:left;vertical-align:top}
+th{font-weight:600;background:color-mix(in srgb,var(--acc) 8%,transparent);white-space:nowrap}
+tr:last-child td{border-bottom:0}
+code{font-family:ui-monospace,SFMono-Regular,Menlo,Consolas,monospace;font-size:12.5px;background:var(--chip);padding:1px 4px;border-radius:4px;word-break:break-all}
+.ok{color:var(--ok)}.warn{color:var(--warn)}.bad{color:var(--bad)}
+ol li,ul li{margin:4px 0}
+</style>
+</head>
+<body>
+<main>
+<h1>夜间工作汇总（2026-10-05 22:00 → 10-06 早上）</h1>
+<p class="sub">测试机：Vast 54324174（RTX 4090 + i9-14900K，容器内存上限 64 GiB），$0.92/h，仍在运行。所有数字都有日志：<code>ds41/bench/results/2026-10-06-m4/</code>，合并记录在 <code>feature/ds41</code> 的提交说明里。</p>
+
+<div class="card">
+<h3 style="margin-top:4px">一页结论</h3>
+<ol>
+<li><b>dots 的 GPU kernel 基本都做到位了。</b>今晚合并了 6 个版本：K3-25、K5-14、K7-06、K8-02→K8-07、K10-03。每个都审过代码，都通过了新加的 CUDA graph 检查。解码一步里的 GPU kernel 已经<b>没有任何 host 同步</b>。</li>
+<li><b>M4（3bpw + 内存/SSD 分层）的代码写完并提交了，数值正确</b>（开不开内存层，输出逐字节相同）。但实测有两个发现，和方案的预期不一样：
+  <ul>
+  <li>按 profile 静态选的内存层，在这台 64 GB 机器上<b>没有帮助，甚至更慢</b>。它挤掉了页缓存，而页缓存按「最近用过」保留专家，反而更能跟上当前文本。所以默认改成不开（和上游一样，需要时再手动打开）。</li>
+  <li>在这台 Intel 机器上，<b>真正的瓶颈是 CPU 专家 kernel 的 AVX2 路径</b>：每个专家约 0.6 ms，只有 7950X（AVX-512）的一半速度。其次才是 SSD。</li>
+  </ul></li>
+<li><b>速度现状（这台机器）：</b>每 token 约 0.3–0.5 秒，即 2–3 tok/s。这是「64 GB 内存 + 无 AVX-512 的 CPU + 3bpw 190 GB 专家」的组合，离目标很远，原因已经定位清楚。</li>
+<li><b>针对瓶颈，新开了任务 K11：CPU 专家 kernel 的 AVX2 优化</b>，交给 dots，列为第一优先级。</li>
+<li><b>需要你决定 3 件事</b>，见最后一节。</li>
+</ol>
+</div>
+
+<h2>1. 今晚做了什么</h2>
+<div class="tw"><table>
+<tr><th>事项</th><th>结果</th></tr>
+<tr><td>新测试机</td><td>i9-14900K + 4090；模型下载约 2 小时（390 GiB），打包 12 分钟，专家文件和旧机器逐字节相同；K10 golden 和旧机器一致</td></tr>
+<tr><td>和 dots 的沟通机制</td><td>GitHub issue <b>#8</b>（协调）+ <code>ds41/tasks/PRIORITIES.md</code>（优先级和合并状态）。一夜回答了 dots 4 个问题，合并 6 次，另下发 2 次指令（K11 新任务、K8-12 加屏障）</td></tr>
+<tr><td>CUDA graph 检查（规则 7）</td><td>加进了 K1c/K3/K5/K7/K8/K10 的验收测试：捕获到 graph 后回放，回放前先把输出填成垃圾值，回放结果必须和直接执行一致。runner 改为统一用主分支的测试文件，旧分支也逃不掉检查。<span class="ok">它确实抓到了问题：K7、K8 的旧基线都没通过。</span></td></tr>
+<tr><td>测试队列</td><td>修了两个慢点：测试机从 GitHub 下载极慢（改用本地 llama.cpp 源码，配置时间从几十分钟降到 2 秒）；停机期间推送的 23 个分支已补测</td></tr>
+</table></div>
+
+<h3>合并的 kernel（新机器、新测试下的成绩）</h3>
+<div class="tw"><table>
+<tr><th>任务</th><th>合并版本</th><th>成绩</th><th>之前</th><th>说明</th></tr>
+<tr><td>K3 注意力</td><td>K3-25</td><td>42.3 µs（m=1：27.7）</td><td>K3-11：49.9</td><td>每批 128 个 key 的行地址只算一次</td></tr>
+<tr><td>K5 indexer</td><td>K5-14</td><td>117.9 µs</td><td>K5-11：125.2</td><td>每个 warp 用私有直方图</td></tr>
+<tr><td>K7 hc 混合</td><td>K7-06</td><td>14.1 µs（m=1：12.3）</td><td>基线 69.8，且过不了 graph 检查</td><td>快约 5 倍</td></tr>
+<tr><td>K8 router</td><td>K8-02 → K8-07</td><td>19.8 µs（m=1：16.4）</td><td>基线要 host 同步</td><td>去掉了引擎里最后一处 host 同步</td></tr>
+<tr><td>K10 GPU 专家</td><td>K10-03</td><td>179 µs（m=1：95）</td><td>Codex 版：244</td><td>快 27%，结果和 FP16 golden 逐位相同</td></tr>
+</table></div>
+<p class="note">待定：K8-12（快 4.6%）用了跨 CTA 的原子计数器做同步，我要求 dots 按 CUDA 官方写法加上 <code>__threadfence()</code> 后再合并：路由一旦静默出错，代价太大。</p>
+
+<h2>2. M4 实测（3bpw，64 GiB 容器，i9-14900K）</h2>
+<h3>数值</h3>
+<p class="ok">开不开内存层，200 步的逐 token dump 逐字节相同（code_py_0，nll 1.063326）。专家放在哪一层，都不改变任何输出。</p>
+<h3>内存层预算（每组都从冷启动开始）</h3>
+<div class="tw"><table>
+<tr><th>内存层</th><th>文档 ms/token</th><th>聊天 ms/token</th><th>内存层接住的访问</th><th>读 SSD 的访问</th></tr>
+<tr><td>0（只靠页缓存）</td><td><b>294.6</b></td><td>419.0</td><td>0</td><td>9.4% / 20.6%</td></tr>
+<tr><td>16 GiB</td><td>323.1</td><td><b>396.6</b></td><td>6–7%</td><td>10.5% / 19.6%</td></tr>
+<tr><td>32 GiB</td><td>319.6</td><td>471.3</td><td>12–13%</td><td>11.1% / 19.7%</td></tr>
+<tr><td>48 GiB</td><td>337.9</td><td>516.4</td><td>17–21%</td><td>11.1% / 18.6%</td></tr>
+</table></div>
+<p>读 SSD 的比例几乎不随预算变化。显存已经放了最热的专家，profile 排在后面的那批和当前文本对不太上，而页缓存会跟着文本走。另外，自动预算（64 GiB 里拿出 60 GiB）实测是 552 ms，比不开（357 ms）慢得多。</p>
+<h3>时间花在哪</h3>
+<ul>
+<li>CPU 专家约占一步的 90%。专家在内存里时，每个约 0.6 ms（22 GB/s）；7950X 用 AVX-512 是 44 GB/s。<b>这台 i9 没有 AVX-512，大部分 Intel 家用 CPU 也没有。</b></li>
+<li>线程数：8 线程（等于大核数）337 ms，16 线程 375 ms，28 线程 360 ms。混合架构上，线程数应该等于大核数。</li>
+<li>Lookahead 预取：预测命中约 48%，但对速度的影响在噪声范围内（约 3%）。说明瓶颈不在读盘的方式上。</li>
+<li>GPU kernel 合计约 19 ms/token，在这台机器上不是瓶颈，所以 dots 的 GPU 提速在端到端里看不出来。</li>
+</ul>
+<h3>端到端（合并后的全部 kernel，8 线程，内存层 0）</h3>
+<p>code_py_0 文档 329 ms/token，zh_0 文档 591 ms，聊天生成 526 ms（显存命中 50–66%）。<span class="warn">这一轮和测试队列同时在跑，编译在抢 CPU，比上面那几轮慢一些。</span>生成的文本是通顺的中文续写。</p>
+
+<h2>3. 各部分状态</h2>
+<div class="tw"><table>
+<tr><th>组件</th><th>代码</th><th>已部署（测试机）</th><th>真实数据验证</th></tr>
+<tr><td>doorbell CPU/GPU 协作、显存缓存 + 自适应换入（M2）</td><td class="ok">✓</td><td class="ok">✓</td><td class="ok">✓ 5 篇文档的 nll 和 FP16 参照一致</td></tr>
+<tr><td>GPU kernel：K3/K5/K7/K8/K10</td><td class="ok">✓</td><td class="ok">✓</td><td class="ok">✓ 验收测试 + 端到端生成</td></tr>
+<tr><td>M4 内存层 / engram O_DIRECT / Lookahead / 分层统计</td><td class="ok">✓</td><td class="ok">✓</td><td class="ok">✓ 64 GiB 容器实测；<span class="warn">128 GB 机器还没测</span></td></tr>
+<tr><td>CUDA graph 捕获整步解码</td><td class="bad">✗</td><td>—</td><td>—（kernel 都已具备条件，引擎这一步还没做）</td></tr>
+<tr><td>K11 CPU kernel AVX2 优化</td><td class="warn">任务已发布，dots 刚开始</td><td>—</td><td>基线：5,987 µs</td></tr>
+</table></div>
+
+<h2>4. 需要你决定</h2>
+<div class="card">
+<ol>
+<li><b>测试机还开不开？</b>从昨晚 21:25 开到早上 8 点约 10.5 小时，约 $10，加流量约 $1。dots 还在用它跑 K11、K10、K8，我建议白天继续开，晚上没人用时关掉。</li>
+<li><b>「128 GB」的实测需要另一台机器。</b>这台容器只分到 64 GB。要测真实目标，得找一台容器内存 ≥ 128 GB、最好带 AVX-512（7950X 一类）的机器。Vast 上这类机器很少，今晚没租到。要不要我定期去找？</li>
+<li><b>3bpw 还是 SAGE 1.59？</b>实测说明，3bpw 的 190 GB 专家放在 64–128 GB 的机器上，很大一部分要靠 SSD 和 CPU 硬扛。SAGE 1.59 的专家只有 101 GB，128 GB 机器能整体装下，没有 SSD 层；CPU 每个专家要读的字节也只有约一半。我建议下一步同时把 SAGE 打包跑起来，需要 K10 支持更多码率，可以交给 Codex 或 dots。</li>
+</ol>
+</div>
+</main>
+</body>
+</html>
