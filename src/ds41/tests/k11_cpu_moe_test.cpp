@@ -8,7 +8,7 @@
 // Env: K11_PACK (default /workspace/pack-3bpw), K11_GOLDEN (default /workspace/ci/golden/k10), K11_THREADS,
 //      K11_WEIGHTS: ram (default, the only scored mode) | mmap-warm | mmap-ptecold | mmap-cold | all. The mmap modes
 //      read the experts through the test's own shared mapping of experts.bin, as the engine's file tier does:
-//      mmap-warm: every page cached (checked with mincore before each timed forward);
+//      mmap-warm: every page cached (checked with mincore before each timed forward; all pages, no tolerance);
 //      mmap-ptecold: a fresh mapping at the same address (MAP_FIXED) before each timed forward, every page cached;
 //      mmap-cold: a fresh mapping and POSIX_FADV_DONTNEED before each timed forward, no page cached (mincore).
 //      A mode whose state cannot be established is reported INVALID and not timed. Every forward is checked.
@@ -143,8 +143,8 @@ int main() {
             std::vector<at::Half> w(wf.size());
             for (size_t i = 0; i < wf.size(); ++i) w[i] = to_half(wf[i]);
             std::vector<float> out((size_t) m * H);
+            auto poison = [&] { std::fill(out.begin(), out.end(), std::nanf("")); };   // a forward that writes nothing fails
             auto run = [&] {
-                std::fill(out.begin(), out.end(), std::nanf(""));   // a forward that writes nothing fails the check
                 exl3_moe_cpu_forward_raw(layer, (const at::Half*) x.data(), sel.data(), w.data(), out.data(), m, K,
                                          threads);
             };
@@ -161,20 +161,23 @@ int main() {
                 check(err <= kMaxErr, tag + " m=" + s + " " + when + ": relative L2 above the limit");
                 return err;
             };
+            poison();
             run();
             const double err = verify("first forward");
             std::printf("[%s] m=%d rel_l2 vs FP16 golden = %.5f\n", tag.c_str(), m, err);
             if (tag == "ram") metric(("err_m" + s).c_str(), err);
             if (m != 4) {
                 std::vector<double> t;
-                for (int r = 0; r < 3; ++r) { run(); verify("warm-up"); }
+                for (int r = 0; r < 3; ++r) { poison(); run(); verify("warm-up"); }
                 for (int r = 0; r < reps && st.valid; ++r) {
                     if (!condition(st)) { st.valid = false; break; }
+                    poison();
                     const double rb0 = read_bytes_mb();
                     const double a = now_us();
                     run();
                     t.push_back(now_us() - a);
-                    st.read_mb.push_back(read_bytes_mb() - rb0);
+                    const double rb1 = read_bytes_mb();
+                    st.read_mb.push_back(rb0 < 0 || rb1 < 0 ? std::nan("") : rb1 - rb0);   // NaN: no I/O evidence
                     verify("timed");
                 }
                 if (!st.valid) {
@@ -226,9 +229,16 @@ int main() {
         if (map == MAP_FAILED) { std::printf("RESULT fail mmap-failed\n"); return 1; }
         const int64_t flayer =
             make_layer([&](size_t i) { return (const uint8_t*) map + pack.expert(le[i].first, le[i].second).offset; });
-        // a fresh mapping at the same address: every page-table entry of the old one is gone, the descriptors stay valid
+        // a fresh mapping at the same address: every page-table entry of the old one is gone, the descriptors stay valid.
+        // A failed MAP_FIXED may already have removed the old mapping: then the range is no longer ours, and the
+        // remaining file modes are abandoned without touching it again (no forward, no munmap).
+        bool map_lost = false;
         auto remap = [&] {
-            return mmap(map, file_bytes, PROT_READ, MAP_SHARED | MAP_FIXED, fd, 0) == (void*) map;
+            if (map_lost) return false;
+            if (mmap(map, file_bytes, PROT_READ, MAP_SHARED | MAP_FIXED, fd, 0) == (void*) map) return true;
+            map_lost = true;
+            std::printf("  MAP_FIXED failed: the mapping is abandoned, the remaining file modes are not run\n");
+            return false;
         };
         // the 32 experts' page ranges, as (address in the mapping, length, file offset)
         auto each_range = [&](auto fn) {
@@ -255,7 +265,7 @@ int main() {
         auto warm_ok = [&](Stats& st) {   // the page cache must hold every page
             const double r = resident();
             st.max_bad = std::max(st.max_bad, r < 0 ? 1.0 : 1.0 - r);
-            return r >= 0.999;
+            return r == 1.0;
         };
         auto drop = [&] {
             return remap() && each_range([&](uint8_t*, size_t n, off_t off) {
@@ -274,24 +284,33 @@ int main() {
         };
         for (const std::string mode : {"mmap-warm", "mmap-ptecold", "mmap-cold"}) {
             if (modes != "all" && modes != mode) continue;
+            if (map_lost) {
+                std::printf("  [%s] INVALID: not run, the mapping was lost\n", mode.c_str());
+                continue;
+            }
             double f1 = 0, f8 = 0;
             Stats st;
             if (mode == "mmap-warm") measure(flayer, mode, warm_ok, 21, f1, f8, st);
             else if (mode == "mmap-ptecold")
                 measure(flayer, mode, [&](Stats& x) { return remap() && warm_ok(x); }, 21, f1, f8, st);
             else measure(flayer, mode, cold_ok, 9, f1, f8, st);
+            bool io_known = !st.read_mb.empty();
+            for (double v : st.read_mb) io_known = io_known && !std::isnan(v);
             std::sort(st.read_mb.begin(), st.read_mb.end());
-            const double rmb = st.read_mb.empty() ? -1 : st.read_mb[st.read_mb.size() / 2];
-            std::printf("  [%s] %s; worst %s %.4f; median storage read per timed forward %.1f MB\n", mode.c_str(),
-                        st.valid ? "valid" : "INVALID", mode == "mmap-cold" ? "resident fraction" : "missing fraction",
-                        st.max_bad, rmb);
+            const double rmb = io_known ? st.read_mb[st.read_mb.size() / 2] : std::nan("");
+            char io[64];
+            if (io_known) std::snprintf(io, sizeof io, "%.1f MB", rmb);
+            else std::snprintf(io, sizeof io, "unavailable");
+            std::printf("  [%s] %s; worst %s %.4f; median storage read per timed forward (m=1 and m=8 together) %s\n",
+                        mode.c_str(), st.valid ? "valid" : "INVALID",
+                        mode == "mmap-cold" ? "resident fraction" : "missing fraction", st.max_bad, io);
             if (!st.valid) continue;
             metric(("us_m1_" + mode).c_str(), f1);
             metric(("us_m8_" + mode).c_str(), f8);
-            metric(("read_mb_" + mode).c_str(), rmb);
+            if (io_known) metric(("read_mb_" + mode).c_str(), rmb);
         }
         exl3_moe_cpu_free_layer(flayer);
-        munmap(map, file_bytes);
+        if (!map_lost) munmap(map, file_bytes);
         close(fd);
 #else
         std::printf("K11_WEIGHTS=%s: file modes need Linux; skipped\n", modes.c_str());
