@@ -35,7 +35,7 @@ ol li,ul li{margin:4px 0}
 <div class="card">
 <h3 style="margin-top:4px">一页结论</h3>
 <ol>
-<li><b>dots 的 GPU kernel 基本都做到位了。</b>今晚合并了 6 个版本：K3-25、K5-14、K7-06、K8-02→K8-07、K10-03。每个都审过代码，都通过了新加的 CUDA graph 检查。解码一步里的 GPU kernel 已经<b>没有任何 host 同步</b>。</li>
+<li><b>dots 的 GPU kernel 基本都做到位了。</b>今晚合并了 9 个版本：K3-25、K5-14、K7-06、K8-02→K8-07、K10-03→K10-08、K11-01、K11-02。每个都审过代码，都通过了新加的 CUDA graph 检查。解码一步里的 GPU kernel 已经<b>没有任何 host 同步</b>。</li>
 <li><b>M4（3bpw + 内存/SSD 分层）的代码写完并提交了，数值正确</b>（开不开内存层，输出逐字节相同）。但实测有两个发现，和方案的预期不一样：
   <ul>
   <li>按 profile 静态选的内存层，在这台 64 GB 机器上<b>没有帮助，甚至更慢</b>。它挤掉了页缓存，而页缓存按「最近用过」保留专家，反而更能跟上当前文本。所以默认改成不开（和上游一样，需要时再手动打开）。</li>
@@ -63,9 +63,10 @@ ol li,ul li{margin:4px 0}
 <tr><td>K5 indexer</td><td>K5-14</td><td>117.9 µs</td><td>K5-11：125.2</td><td>每个 warp 用私有直方图</td></tr>
 <tr><td>K7 hc 混合</td><td>K7-06</td><td>14.1 µs（m=1：12.3）</td><td>基线 69.8，且过不了 graph 检查</td><td>快约 5 倍</td></tr>
 <tr><td>K8 router</td><td>K8-02 → K8-07</td><td>19.8 µs（m=1：16.4）</td><td>基线要 host 同步</td><td>去掉了引擎里最后一处 host 同步</td></tr>
-<tr><td>K10 GPU 专家</td><td>K10-03</td><td>179 µs（m=1：95）</td><td>Codex 版：244</td><td>快 27%，结果和 FP16 golden 逐位相同</td></tr>
+<tr><td>K10 GPU 专家</td><td>K10-03 → K10-08</td><td>170.7 µs（m=1：90.4）</td><td>Codex 版：244</td><td>快 30%，结果和 FP16 golden 逐位相同</td></tr>
+<tr><td><b>K11 CPU 专家（新任务）</b></td><td>K11-01、K11-02</td><td>5,264 µs（AVX-VNNI）</td><td>原 kernel：5,987</td><td>新增 AVX-VNNI 路径（12 代及以后的 Intel），快 12%；纯 AVX2 的 CPU 也快 4–6%；误差和原 kernel 完全一样</td></tr>
 </table></div>
-<p class="note">待定：K8-12（快 4.6%）用了跨 CTA 的原子计数器做同步，我要求 dots 按 CUDA 官方写法加上 <code>__threadfence()</code> 后再合并：路由一旦静默出错，代价太大。</p>
+<p class="note">K8-12 没有合并：它加了屏障后只快 3%，折合每 token 约 26 µs，而一步要 300 ms 以上，不值得为此引入跨 CTA 原子同步。K8 已关闭，K3/K5/K7 也停止优化，dots 现在全力做 K11。</p>
 
 <h2>2. M4 实测（3bpw，64 GiB 容器，i9-14900K）</h2>
 <h3>数值</h3>
