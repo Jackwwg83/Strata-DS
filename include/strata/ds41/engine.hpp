@@ -33,6 +33,10 @@ struct EngineOptions {
     int adapt_every = 4;                    ///< adaptive tier: steps between swaps (0 = static residency)
     float adapt_decay = 0.7f;
     int adapt_swaps = 96;
+    /// with a profile: RAM tier size in GiB; 0 = none (the default, as upstream: setup opts in), -1 = available RAM
+    /// less 4 GB. Measured in a 64 GiB container (2026-10-06): a static RAM tier starves the file cache, which
+    /// follows the text better; 0 was fastest for documents, 16 GiB for chat generation.
+    double ram_budget_gib = 0;
 };
 
 class Engine {
@@ -57,6 +61,10 @@ public:
         double gpu_ms = 0, cpu_experts_ms = 0, engram_ms = 0, total_ms = 0;
         int expert_hits = 0, expert_total = 0;
         int vram_swaps = 0;   ///< adaptive swaps committed before this step
+        /// the CPU's experts by tier: from the RAM copy, from the mapped file, and of those, the ones with pages
+        /// missing from RAM when computed (read from the SSD)
+        int ram_experts = 0, file_experts = 0, ssd_experts = 0;
+        int warmed = 0, warmed_useful = 0;   ///< lookahead: file-tier experts warmed, and of those, used next layer
     };
     /// VRAM expert slots in use (0: no tier)
     int vram_expert_slots() const;

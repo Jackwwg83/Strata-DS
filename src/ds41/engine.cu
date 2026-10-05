@@ -10,6 +10,9 @@
 
 #include "strata/ds41/config.hpp"
 #include "strata/ds41/doorbell.hpp"
+#include "strata/ds41/engram_rows.hpp"
+#include "strata/ds41/host_experts.hpp"
+#include "strata/ds41/lookahead.hpp"
 #include "strata/ds41/fp8_gemv.hpp"
 #include "strata/ds41/kernels/k3_sparse_attn.hpp"
 #include "strata/ds41/kernels/k5_indexer.hpp"
@@ -23,6 +26,7 @@
 #include <cuda_fp16.h>
 #include <cuda_runtime.h>
 #include <fcntl.h>
+#include <sys/mman.h>
 #include <unistd.h>
 
 #include <algorithm>
@@ -122,7 +126,9 @@ struct Engine::Impl {
     float* rope_yarn = nullptr;
 
     // engram: rows of both engram layers for the current step, read before the step's GPU work
-    std::vector<int> eng_fd;
+    std::unique_ptr<EngramRows> eng_rows;   // O_DIRECT reads (upstream DirectFile): the rows bypass the file cache
+    int n_eng = 0;                     // engram tables
+    std::vector<std::vector<int64_t>> eng_ids;   // [table][kEngRows] the rows of the current step
     std::vector<int32_t> history;      // compressed token ids fed so far
     static constexpr int kEngRows = 24;
     uint8_t* eng_host = nullptr;       // pinned: per engram layer, kEngRows*256 weight bytes then kEngRows*8 scales
@@ -138,6 +144,11 @@ struct Engine::Impl {
     std::atomic<int64_t> worker_us{0}; // CPU expert time of the current step
     std::atomic<int> worker_misses{0}; // routed experts the CPU computed in the current step
     std::unique_ptr<VramExperts> vram;  // the VRAM tier (null: none)
+    std::unique_ptr<HostExperts> host;  // the RAM tier (null: none); the rest is read from the mapped file
+    std::atomic<int> worker_ram{0}, worker_file{0}, worker_ssd{0};   // CPU experts of the step by tier
+    std::vector<unsigned char> mincore_buf;
+    std::unique_ptr<RouterLookahead> lookahead;   // warms the next layer's file-tier experts (DS41_LOOKAHEAD=0: off)
+    bool fetch_now = true;             // ask for a layer's missing file pages before computing (DS41_FETCH_NOW=0: off)
     int32_t* gpu_sel = nullptr;        // [6] this layer's resident slots (-1: CPU)
     int32_t* routes_dev = nullptr;     // [40][6]
     float* weights_dev = nullptr;      // [40][6]
@@ -174,6 +185,10 @@ struct Engine::Impl {
         }
         cv.notify_all();
         if (worker.joinable()) worker.join();
+        // the lookahead calls into both tiers, and the VRAM tier's copy thread writes into RAM slots: stop them first
+        lookahead.reset();
+        vram.reset();
+        host.reset();
         if (eng_host) cudaFreeHost(eng_host);
     }
 
@@ -257,13 +272,15 @@ struct Engine::Impl {
         rope_yarn = dalloc<float>(yarn.size());
         ck(cudaMemcpy(rope_plain, plain.data(), plain.size() * 4, cudaMemcpyHostToDevice), "rope");
         ck(cudaMemcpy(rope_yarn, yarn.data(), yarn.size() * 4, cudaMemcpyHostToDevice), "rope");
-        // engram files
-        for (const auto& t : pack.engram_tables()) {
-            const int fd = open(t.path.c_str(), O_RDONLY);
-            if (fd < 0) throw std::runtime_error("cannot open engram table " + t.path);
-            eng_fd.push_back(fd);
+        // engram tables
+        {
+            std::vector<EngramRows::Table> tabs;
+            for (const auto& t : pack.engram_tables()) tabs.push_back({t.path, t.weight_offset, t.scale_offset});
+            n_eng = (int) tabs.size();
+            if (n_eng) eng_rows = std::make_unique<EngramRows>(tabs, kEngRows);
+            eng_ids.assign(n_eng, std::vector<int64_t>(kEngRows, 0));
         }
-        const size_t eng_bytes = eng_fd.size() * kEngRows * (256 + 8);
+        const size_t eng_bytes = (size_t) n_eng * kEngRows * (256 + 8);
         ck(cudaHostAlloc((void**) &eng_host, std::max<size_t>(eng_bytes, 1), cudaHostAllocDefault), "engram pinned");
         eng_dev = dalloc<uint8_t>(std::max<size_t>(eng_bytes, 1));
         // scratch
@@ -325,6 +342,37 @@ struct Engine::Impl {
             std::fprintf(stderr, "ds41: %d VRAM expert slots (%.2f GiB)\n", vram->slots(),
                          vram->slots() * (double) vram->slot_bytes() / (1ull << 30));
         }
+        // the RAM tier after it: the hottest experts the VRAM tier does not hold (upstream's resident budget)
+        if (!opt.expert_profile.empty() && opt.ram_budget_gib != 0) {
+            const size_t budget = opt.ram_budget_gib < 0 ? auto_ram_budget(4ull << 30)
+                                                         : (size_t) (opt.ram_budget_gib * (double) (1ull << 30));
+            std::vector<int64_t> handles;
+            for (const auto& y : L) handles.push_back(y.moe_handle);
+            const double t0 = now_ms();
+            host = std::make_unique<HostExperts>(
+                pack, read_expert_profile(opt.expert_profile, kLayers, kExperts),
+                vram ? vram->res_host() : std::vector<int32_t>((size_t) kLayers * kExperts, -1), budget, handles, 8);
+            if (vram) vram->set_host(host.get());
+            std::fprintf(stderr, "ds41: RAM tier %d experts (%.1f GiB, %s), filled in %.1f s\n", host->slots(),
+                         host->slots() * (double) host->slot_bytes() / (1ull << 30),
+                         host->locked() ? "locked" : "not locked", (now_ms() - t0) / 1000.0);
+        }
+        // the router lookahead: every expert outside the VRAM and RAM tiers is read from the file (upstream turns it
+        // on with a RAM budget; here the file tier exists whenever the experts do not all fit in RAM)
+        if (const char* f = std::getenv("DS41_FETCH_NOW")) fetch_now = f[0] != '0';
+        const char* la_env = std::getenv("DS41_LOOKAHEAD");
+        if (!(la_env && la_env[0] == '0')) {
+            std::vector<std::vector<uint16_t>> rw(kLayers, std::vector<uint16_t>((size_t) kExperts * kDim));
+            std::vector<std::vector<float>> rb(kLayers, std::vector<float>(kExperts));
+            for (int l = 0; l < kLayers; ++l) {
+                ck(cudaMemcpy(rw[l].data(), L[l].gate_w, rw[l].size() * 2, cudaMemcpyDeviceToHost), "router weights");
+                ck(cudaMemcpy(rb[l].data(), L[l].gate_bias, rb[l].size() * 4, cudaMemcpyDeviceToHost), "router bias");
+            }
+            // The VRAM and RAM tables change only between steps; a prediction racing that change warms one expert
+            // more or less, never changes what is computed.
+            lookahead = std::make_unique<RouterLookahead>(std::move(rw), std::move(rb), kExperts, kDim, kTopK,
+                                                          [this](int l, int e) { return warm_file_expert(l, e); });
+        }
         worker = std::thread([this] { worker_loop(); });
         if (const char* p = std::getenv("DS41_DEBUG")) dbg = std::fopen(p, "wb");
     }
@@ -374,15 +422,31 @@ struct Engine::Impl {
             }
             for (int l = 0; l < kLayers; ++l) {
                 if (!db->wait_published(l + 1, stop)) return;
-                const double t0 = now_ms();
+                if (lookahead) lookahead->post(l, db->x());   // predict layer l+1 while this layer computes
                 c10::Half wh[kTopK];
                 for (int i = 0; i < kTopK; ++i) {
                     const __half hv = __float2half_rn(db->w()[i]);
                     wh[i] = c10::Half(__half_as_ushort(hv), c10::Half::from_bits());
                 }
-                int misses = 0;
-                for (int i = 0; i < kTopK; ++i) misses += db->ids()[i] >= 0;
+                int misses = 0, n_file = 0;
+                int32_t file_ids[kTopK];
+                for (int i = 0; i < kTopK; ++i) {
+                    const int32_t e = db->ids()[i];
+                    if (e < 0) continue;
+                    ++misses;
+                    if (host && host->slot_of(l, e) >= 0) { ++worker_ram; continue; }
+                    ++worker_file;
+                    file_ids[n_file++] = e;
+                    if (file_pages_missing(l, e)) {
+                        ++worker_ssd;
+                        // upstream fetches a layer's missing experts in one batch before computing: ask for the whole
+                        // range now, so the reads run in parallel instead of page fault by page fault
+                        if (fetch_now) warm_file_expert(l, e);
+                    }
+                }
+                if (lookahead) lookahead->observe(l, file_ids, n_file);
                 worker_misses += misses;
+                const double t0 = now_ms();
                 exl3_moe_cpu_forward_raw(L[l].moe_handle, (const at::Half*) db->x(), db->ids(), wh, db->y(), 1, kTopK,
                                          cpu_threads);
                 worker_us += (int64_t) ((now_ms() - t0) * 1000.0);
@@ -391,14 +455,37 @@ struct Engine::Impl {
         }
     }
 
+    /// Lookahead callback: ask the OS for the pages of (layer, expert) when it is in neither the VRAM nor the RAM tier.
+    bool warm_file_expert(int l, int e) {
+        if (vram && vram->res_host()[(size_t) l * kExperts + e] >= 0) return false;
+        if (host && host->slot_of(l, e) >= 0) return false;
+        const ExpertSlot& x = pack.expert(l, e);
+        const uintptr_t a = (uintptr_t) (pack.expert_base() + x.offset) & ~(uintptr_t) 4095;
+        madvise((void*) a, (uintptr_t) (pack.expert_base() + x.offset + x.bytes) - a, MADV_WILLNEED);
+        return true;
+    }
+
+    /// True when some page of (layer, expert) in the mapped file is not in RAM: computing it reads the SSD.
+    bool file_pages_missing(int l, int e) {
+        const ExpertSlot& x = pack.expert(l, e);
+        const uintptr_t a = (uintptr_t) (pack.expert_base() + x.offset) & ~(uintptr_t) 4095;
+        const size_t len = (uintptr_t) (pack.expert_base() + x.offset + x.bytes) - a;
+        mincore_buf.resize((len + 4095) / 4096);
+        if (mincore((void*) a, len, mincore_buf.data()) != 0) return false;
+        for (unsigned char c : mincore_buf)
+            if (!(c & 1)) return true;
+        return false;
+    }
+
     // ------------------------------------------------------------------------------------- engram
-    /// Hash the n-grams ending at pos for engram layer li and read its rows into the pinned buffer (host only).
-    void engram_read(int l, int li, int pos) {
+    /// Hash the n-grams ending at pos for engram layer li: its table rows go to eng_ids[li] (host only).
+    void engram_ids(int l, int li, int pos) {
         const auto& hs = pack.engram_hash();
         const int n = hs.max_ngram, nh = hs.n_heads, cols = (n - 1) * nh;
         std::vector<int64_t> toks(n);
         for (int s = 0; s < n; ++s) toks[s] = pos - s >= 0 ? history[pos - s] : hs.pad;
-        std::vector<int64_t> ids(cols);
+        if (cols > kEngRows) throw std::runtime_error("engram: more n-gram heads than the row buffer holds");
+        int64_t* ids = eng_ids[li].data();
         const auto& m = hs.multipliers[li];
         int64_t rolling = toks[0] * m[0];
         for (int i = 1; i < n; ++i) {
@@ -408,16 +495,24 @@ struct Engine::Impl {
                 ids[c] = rolling % hs.primes[li][c] + hs.offsets[li][c];
             }
         }
-        const auto& t = pack.engram_tables()[li];
-        if (t.layer != l) throw std::runtime_error("engram table order does not match engram_hash.txt");
-        if (cols > kEngRows) throw std::runtime_error("engram: more n-gram heads than the row buffer holds");
-        uint8_t* w = eng_host + (size_t) li * kEngRows * (256 + 8);
-        uint8_t* s = w + kEngRows * 256;
-        for (int c = 0; c < cols; ++c) {
-            if (pread(eng_fd[li], w + c * 256, 256, (off_t) (t.weight_offset + (uint64_t) ids[c] * 256)) != 256 ||
-                pread(eng_fd[li], s + c * 8, 8, (off_t) (t.scale_offset + (uint64_t) ids[c] * 8)) != 8)
-                throw std::runtime_error("engram row read failed");
+        if (pack.engram_tables()[li].layer != l)
+            throw std::runtime_error("engram table order does not match engram_hash.txt");
+    }
+
+    /// The rows of every engram table for this step, into the pinned buffer, all reads in flight together.
+    void engram_read_all() {
+        if (!n_eng) return;
+        const auto& hs = pack.engram_hash();
+        const int cols = (hs.max_ngram - 1) * hs.n_heads;
+        std::vector<const int64_t*> ids;
+        std::vector<uint8_t*> w, s;
+        for (int li = 0; li < n_eng; ++li) {
+            uint8_t* base = eng_host + (size_t) li * kEngRows * (256 + 8);
+            ids.push_back(eng_ids[li].data());
+            w.push_back(base);
+            s.push_back(base + kEngRows * 256);
         }
+        eng_rows->read(ids, cols, w, s);
     }
 
     /// Engram.forward for layer l (engram layer li) from the rows engram_read put on the device.
@@ -548,13 +643,15 @@ struct Engine::Impl {
             const double t0 = now_ms();
             int li = 0;
             for (int l = 0; l < kLayers; ++l)
-                if (is_engram_layer(l)) engram_read(l, li++, pos);
+                if (is_engram_layer(l)) engram_ids(l, li++, pos);
+            engram_read_all();
             tm.engram_ms = now_ms() - t0;
         }
         if (vram) tm.vram_swaps = vram->between_steps();   // the device is idle: the last step ended in a sync
         db->reset();
         worker_us = 0;
         worker_misses = 0;
+        worker_ram = worker_file = worker_ssd = 0;
         {
             std::lock_guard<std::mutex> lk(mu);
             ++go;
@@ -565,8 +662,8 @@ struct Engine::Impl {
             dump->routes.assign(kLayers, {});
             dump->weights.assign(kLayers, {});
         }
-        if (!eng_fd.empty())
-            ck(cudaMemcpyAsync(eng_dev, eng_host, eng_fd.size() * kEngRows * (256 + 8), cudaMemcpyHostToDevice, 0),
+        if (n_eng)
+            ck(cudaMemcpyAsync(eng_dev, eng_host, (size_t) n_eng * kEngRows * (256 + 8), cudaMemcpyHostToDevice, 0),
                "engram rows");
         ops::window_index(pos, idx_dev);
         ops::embed(embed, token, h);
@@ -626,6 +723,14 @@ struct Engine::Impl {
         tm.cpu_experts_ms = worker_us.load() / 1000.0;
         tm.expert_total = kLayers * kTopK;
         tm.expert_hits = tm.expert_total - worker_misses.load();
+        tm.ram_experts = worker_ram.load();
+        tm.file_experts = worker_file.load();
+        tm.ssd_experts = worker_ssd.load();
+        if (lookahead) {
+            const auto st = lookahead->take_stats();
+            tm.warmed = (int) st.warmed;
+            tm.warmed_useful = (int) st.useful;
+        }
         tm.gpu_ms = tm.total_ms - tm.engram_ms;
         return best;
     }

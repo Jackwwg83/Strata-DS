@@ -1,7 +1,8 @@
 // src/ds41/ds41_generate.cpp - run the M1 engine on token ids: greedy generation, timings, optional dump.
 //
 //   ds41_generate --pack DIR --ids 0,128000,... [--gen 32] [--threads 8] [--dump steps.bin] [--force-ids FILE]
-//                 [--expert-profile ds41/data/expert-profile.bin [--vram-slots N] [--adapt-every 4] [--adapt-swaps 96]]
+//                 [--expert-profile ds41/data/expert-profile.bin [--vram-slots N] [--adapt-every 4] [--adapt-swaps 96]
+//                  [--ram-budget-gib N (0 none: default, -1 available RAM less 4 GB)]]
 //
 // --force-ids feeds a fixed token sequence (from the oracle) instead of the engine's own predictions, so a
 // per-layer comparison stays aligned even after the first differing token. Tokenization stays in Python.
@@ -43,6 +44,7 @@ int main(int argc, char** argv) {
         else if (a == "--vram-slots") opt.vram_expert_slots = std::stoll(next());
         else if (a == "--adapt-every") opt.adapt_every = std::stoi(next());
         else if (a == "--adapt-swaps") opt.adapt_swaps = std::stoi(next());
+        else if (a == "--ram-budget-gib") opt.ram_budget_gib = std::stod(next());
         else if (a == "--dump") dump_path = next();
         else if (a == "--force-ids") force_path = next();
         else { std::fprintf(stderr, "unknown argument %s\n", a.c_str()); return 2; }
@@ -65,7 +67,7 @@ int main(int argc, char** argv) {
         int next = -1;
         std::vector<int> out;
         double decode_ms = 0, nll_sum = 0, cpu_ms = 0;
-        long long hits = 0, routed = 0;
+        long long hits = 0, routed = 0, ram = 0, file = 0, ssd = 0, warmed = 0, useful = 0;
         int decode_steps = 0, nll_n = 0;
         for (int pos = 0; pos < total; ++pos) {
             const int tok = !forced.empty() ? forced[pos] : pos < (int) prompt.size() ? prompt[pos] : next;
@@ -81,13 +83,19 @@ int main(int argc, char** argv) {
             }
             if (pos >= (int) prompt.size() - 1) { decode_ms += t.total_ms; cpu_ms += t.cpu_experts_ms; ++decode_steps; }
             hits += t.expert_hits;
+            ram += t.ram_experts;
+            file += t.file_experts;
+            ssd += t.ssd_experts;
+            warmed += t.warmed;
+            useful += t.warmed_useful;
             routed += t.expert_total;
             if (pos >= (int) prompt.size() - 1 && forced.empty()) out.push_back(next);
             std::fprintf(stderr,
                          "pos %d tok %d -> %d  total %.1f ms (engram reads %.1f, layers %.1f, of which cpu experts %.1f)"
-                         "  vram hits %d/%d swaps %d\n",
+                         "  vram hits %d/%d swaps %d  cpu: ram %d file %d (ssd %d)  warmed %d useful %d\n",
                          pos, tok, next, t.total_ms, t.engram_ms, t.gpu_ms, t.cpu_experts_ms, t.expert_hits,
-                         t.expert_total, t.vram_swaps);
+                         t.expert_total, t.vram_swaps, t.ram_experts, t.file_experts, t.ssd_experts, t.warmed,
+                         t.warmed_useful);
             if (dump) {
                 const int32_t hdr[2] = {tok, next};
                 std::fwrite(hdr, 4, 2, dump);
@@ -108,6 +116,10 @@ int main(int argc, char** argv) {
                     decode_steps ? cpu_ms / decode_steps : 0.0);
         std::printf("vram_expert_slots %d hit_rate %.4f\n", engine.vram_expert_slots(),
                     routed ? (double) hits / routed : 0.0);
+        std::printf("tiers_share vram %.4f ram %.4f file %.4f ssd %.4f\n", routed ? (double) hits / routed : 0.0,
+                    routed ? (double) ram / routed : 0.0, routed ? (double) file / routed : 0.0,
+                    routed ? (double) ssd / routed : 0.0);
+        std::printf("lookahead warmed %lld useful %lld (%.3f)\n", warmed, useful, warmed ? (double) useful / warmed : 0.0);
     } catch (const std::exception& ex) {
         std::fprintf(stderr, "error: %s\n", ex.what());
         return 1;

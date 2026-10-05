@@ -213,6 +213,7 @@ uint64_t Pack::upload_dense() {
         check_cuda(cudaMemcpy((char*) arena_ + off, host, n, cudaMemcpyHostToDevice), "upload dense");
     }
     cudaFreeHost(host);
+    posix_fadvise(fd, 0, 0, POSIX_FADV_DONTNEED);   // its 11 GB stay out of the file cache the experts need
     close(fd);
     for (auto& kv : dense_) {
         if (kv.second.file_offset + kv.second.bytes > total) fail("tensor past end of dense.bin: " + kv.first);
