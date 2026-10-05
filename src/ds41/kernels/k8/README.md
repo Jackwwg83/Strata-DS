@@ -1,104 +1,138 @@
-# K8-07: warp-only selector ablation
+# K8-12: one-launch decode, unchanged two-stage m2..8
 
-The public header and fixed acceptance test are unchanged. Only the K8 source and
-its permitted support directory are modified. This branch starts from feature
-`f75130394c5b56f0a72f20d04b2a06165a543c17` and transplants K8-02 control
-`87b6d90888a995bf17edc039f90e0c8da4b552b6`.
+This bounded experiment starts at feature commit
+`3ee92cd12e59289735849f39df7357ee02d5e9fd`
+and preserves the merged K8-07 numerical implementation at
+`b45ddd889c37a5bb27811396b64883eb67b2935f`. Only K8 CI-FILES change; the
+interface, fixed acceptance test and task specification stay unchanged.
 
-Compared with that exact control, runtime source changes are limited to the
-`select_top6` body and its launch-thread constant (128 to 32). GEMV, scoring,
-`math.hpp`, reduction helpers, dispatch, supplied-stream handling and the 24 KiB
-scratch layout/lifetime are unchanged. The optional graph test is unchanged;
-the CPU selector model and these notes are updated for the ablation.
+The new path is only m=1. Ninety-six 128-thread CTAs each produce four expert
+scores, exactly as K8-07 does. Each CTA publishes one completion ticket. The last
+CTA's first warp performs the original deterministic double-precision top-six
+selection. No CTA spins or waits for another CTA to become resident. m=2..8 keep
+K8-07's existing score kernel, selector kernel, launch geometry and stream usage.
 
-## Algorithm and lifetime
+## Workspace and ordering contract
 
-- Decode uses one warp per expert, four experts per CTA.
-- For m=2..8, one CTA owns an expert. All its threads stage that expert's BF16 row
-  into 20 KiB of shared FP32 storage once. Each token warp reuses the row.
-  Every BF16 weight has exactly one global-load owner, independent of m.
-- Each warp produces the reference-ordered FP32 logit and its unbiased nonlinear
-  score. Computing scores in this grid spreads nonlinear work across the device.
-- The selector launches m independent 32-thread CTAs for every m=1..8: exactly
-  one full warp per token, so separate token CTAs can be scheduled independently.
-  Each lane holds 12 candidates at IDs `lane + 32*j` in registers.
-- Six deterministic warp argmax rounds select the winners. Each round broadcasts
-  the original ID and the owner's unbiased double score using warp shuffles.
-  Lane 0 writes the ID and adds the score in selected order; output lane i retains
-  score i for normalization. All 32 lanes participate in every shuffle.
-- Selection uses no shared memory or CTA barriers. The control required two CTA
-  barriers per round plus one final barrier, 13 executed barriers per token.
-- Both launches use the supplied stream. There are no host copies or device/stream
-  synchronizations in the implementation.
-- Scratch is a K8-only, 24 KiB score array per device, allocated on its first eager
-  call for all eight tokens and retained for process lifetime. A mutex protects
-  device registration. The engine's guarantee that K8 calls on a device do not
-  overlap makes reuse safe; other tasks never share this storage.
+One K8-private `Workspace` allocation per CUDA device contains all eight tokens'
+384 double scores (24,576 bytes), an aligned unsigned completion counter and
+padding: 24,584 bytes total. It is allocated once on the first legal eager call,
+even if that call is m>1. An asynchronous memset on the supplied stream initializes
+only the counter; score elements are fully overwritten before use. Every shape
+then retains and reuses the same pointer for the process lifetime. There is no
+shared arena with any other task.
 
-## Numerical reasoning
+The engine guarantees nonoverlapping, ordered K8 calls and graph replays on each
+device, including across streams. The first eager call completes before a replay
+using this arena. Different task kernels may overlap because their state is
+separate. Host locking protects the per-device registry, not GPU execution.
 
-`ops.cu::bf16_gemv_k` assigns dimension `lane + 32*j` to each lane, accumulates
-160 terms in ascending j using FP32 FMA, then reduces offsets 16,8,4,2,1. Both
-router paths retain that sequence exactly. BF16-to-FP32 shared staging is exact;
-it does not quantize the values or split/reassociate the sum.
+After the first eager call, lookup does not allocate, free, copy to/from the host,
+initialize memory, query capture status, or synchronize with the host. First-call
+capture is rejected clearly because the task contract requires eager warmup.
+All kernels and initialization use the supplied stream. m=2..8 never access the
+counter. Capturing or discarding a graph does not execute the recorded work and
+therefore does not change the counter.
 
-K8.md and the fixed interface specify FP32 logits followed by sqrt(softplus),
-selection on score+bias, and normalization from unbiased selected scores. They
-do not require an additional FP32 rounding after the nonlinear step. The fixed
-acceptance test explicitly uses double for nonlinear scores, comparisons and
-normalization. `math.hpp` follows that expression and the `z > 20` branch exactly.
-The original baseline uses floats there; retaining its intermediate rounding
-would create artificial ties for some near-tie inputs and differ from the fixed
-oracle. No epsilon-based tie rule is added.
+## Publication and reuse proof
 
-For ordered numeric scores, `better` selects higher score and then lower ID, a
-strict total order on distinct expert IDs. Each local and warp reduction
-therefore returns the same maximum regardless of grouping. The winner is removed
-by both setting its score to negative infinity and its ID to 384, so it cannot be
-selected again, even when valid scores are negative infinity. Exactly one thread
-owns its unbiased score, including zero. Repeating this six times is equivalent
-to the fixed oracle's partial sort. The denominator is summed in selected order.
+The protocol follows K7-05's reviewed device-scope acquire/release design, not its
+collapse computation. `Completion` is
+`cuda::atomic_ref<unsigned, cuda::thread_scope_device>` with explicitly required
+alignment. No legacy unsuffixed atomic/fence/volatile approximation is used.
 
-## Validation completed without a GPU
+1. Each CTA's four warp leaders write their disjoint scores, then all 128 threads
+   join the first CTA barrier. All four writes happen-before the CTA leader's
+   completion operation.
+2. The leader performs one `fetch_add(1, memory_order_acq_rel)`. Integer RMWs form
+   a modification order. Each RMW acquires the immediately preceding published
+   history and releases it together with its own CTA's four scores. Inductively,
+   the final ticket (95) acquires every expert score, independent of CTA order.
+3. The second CTA barrier distributes the acquired history and shared winner
+   flag. Nonwinning CTAs return uniformly and never access the arena again. The
+   winner's entire warp 0 loads the 384 scores and executes the unchanged
+   deterministic selector. All 32 lanes participate in each shuffle.
+4. All winner threads join the third CTA barrier after selection. Every score
+   read and every output write happens-before the leader's release store of zero.
+   All other CTAs already issued their sole counter operation. Ordered next calls
+   or graph replays begin with zero; there is no per-call memset or reset launch.
 
-- CUDA 12.8 C++17 compile: sm_86, sm_89 and sm_120 passed
-- All three architectures: selection uses 80 registers/thread, zero shared
-  memory, zero barriers and no stack/spill loads/stores; the full implementation
-  uses at most 20,480 shared bytes, below the 99 KiB task limit
-- sm_89 scoring resource counts remain unchanged: tile kernels 30 registers,
-  decode 27. The control selector used 37 registers/thread and 104 shared bytes
-  with 128 threads; the new selector uses 32 threads and 80 registers/thread
-- `host_semantics.cpp`: 2,503 routing comparisons against an independent partial
-  sort; 13,824 bit-exact FP32 logits across all m=1..8; maximum relative weight
-  difference 0 in the CPU model
-- Explicit cases include equal scores, a near-tie erased by FP32 score+bias,
-  softplus threshold neighbors, large positive values, strongly negative values,
-  zero scores after underflow, negative bias and repeated ties, every owner
-  lane/register, six successive winners owned by one lane, negative-infinity
-  comparison ties, maximal finite biases and 1,024 permutation cases
-- CPU weights match the independent oracle bit-for-bit; no relaxed tolerance
-  masks a normalization-order difference
-- Exact control audit verifies that code outside the selector and its thread
-  constant is byte-identical, including all GEMV/scoring and scratch logic
+This is regular device-scope C++ acquire/release message passing, with CTA
+barriers connecting the participating non-atomic writers/readers to the atomic
+leader. Ordinary global score loads are ordered; volatile is unnecessary. The
+CUDA 12.8 PTX emitted here uses `atom.add.acq_rel.gpu.u32` and
+`st.release.gpu.b32`, with three executed CTA barriers on the winning path.
 
-Run the portable semantic model from the repository root:
+A rejected launch that executes no work leaves the counter unchanged. Recovery
+from a partially executed kernel/device fault is not supported: failure before
+the final reset can poison the counter. The engine must not continue reusing this
+arena after such a device execution failure. Normal sequential calls and complete
+graph replays are the supported lifecycle; overlap is expressly unsupported.
 
+## Exact arithmetic preservation
+
+Every expert keeps the original lane ownership (`lane + 32*j`), 160 ascending
+FP32 `__fmaf_rn` operations, and FP32 additions at shuffle offsets 16,8,4,2,1.
+There is no split-K, reassociation, input quantization change or FP32 shortcut.
+`math.hpp` is unchanged: convert the FP32 logit to double, use the original
+`z > 20` softplus branch, then double sqrt. Selection adds double-converted bias,
+compares doubles, resolves exact ties toward the lower original expert ID, and
+removes winners using both negative infinity and the sentinel ID.
+
+The fused warp helper is an exact copy of the K8-07 selector body with token fixed
+to zero. The separate global selector remains byte-identical for m2..8. Original
+unbiased scores are broadcast from their owner lanes. Lane zero adds them in
+selected order. Weight normalization retains the original double expression and
+final float conversion. Completion order never enters the ranking or sum.
+
+## Checks and limits
+
+Portable checks from the repository root:
+
+    python3 src/ds41/kernels/k8/check_last_cta.py
     g++ -std=c++17 -O3 -march=native src/ds41/kernels/k8/host_semantics.cpp -o /tmp/k8_semantics
     /tmp/k8_semantics
 
-`graph_validation.cu` is an additional GPU regression test, separate from the
-fixed acceptance test. Its build command is at the top of that file. It checks
-all m values on a non-default stream, warms up at m=1 before larger captures,
-checks the graph has two nodes, changes inputs over 24 replays, and checks exact
-ties and near-ties. It was compile-checked only.
+The first checks exact source equivalence to K8-07; device-scope ordered protocol
+and workspace invariants; all 5,913 completion permutations for grids of size
+1..7; each of 96 possible final CTAs; 1,024 randomized mixed-shape calls across
+three independent device arenas; and negative examples for missing publication,
+missing producer barriers and partial-failure reuse. It models happens-before
+relationships; it does not execute the device weak-memory implementation.
 
-The selector trades more candidates/registers per lane for removal of cross-warp
-reductions and barriers. The m=1 path now has one selector warp instead of four,
-so reduced inter-warp latency hiding and longer serial candidate scans could
-outweigh the synchronization savings. Only GPU measurement can resolve this.
-No block-size specialization or narrowed math is used for any m.
+The inherited numerical model passes 2,503 routing cases, including 13,824
+bit-exact FP32 logits for every m=1..8, threshold neighbors, exact/near ties,
+underflow, extreme bias, all winner owner lanes/registers and 1,024 permutations.
+The CPU-model weight difference is zero. This proves the modeled ordering and
+arithmetic, not GPU libm behavior or a latency improvement.
 
-CPU checks establish the algorithm and rounding-order model, not actual device
-execution. GPU correctness, CPU/CUDA libm parity at extremely close scores,
-graph capture/replay, sanitizer results, and latency remain unverified until a
-GPU is available. No speedup claim is made from compile-only validation.
+CUDA 12.8 C++17 compile checks pass on sm_86, sm_89 and sm_120, including the
+fixed acceptance and optional graph test translation units. Both tests link on
+sm_89. The optional executable exits 77 (no CUDA device), so it has not passed a
+GPU run. All m2..8 kernel bodies have identical normalized PTX and byte-identical
+cubin text sections to K8-07 on all three targets. The fused kernel
+uses 93 registers per thread on each architecture, one shared byte and no
+stack/spill loads or stores. All task kernels use at most 20,480 shared bytes,
+below 99 KiB. The old decode producer used 27/28 registers and its separate
+selector used 80; fusion can reduce occupancy across all four producer warps.
+Ninety-six serialized integer atomics, three winner-path CTA barriers, increased
+register footprint and the single-warp tail can cost more than one saved launch.
+Only an exact-head GPU measurement can decide this experiment.
+
+`graph_validation.cu` is an optional test, not the fixed acceptance test. Its
+build command is in the file. In fresh processes, run `k8_graph_validation 1`
+through `k8_graph_validation 8` to cover every first-eager shape. It checks:
+
+- One captured kernel node for m1, two for every m2..8
+- Discarding a captured m1 graph without executing it
+- All legal shapes with 24 changing-input replays
+- 4,096 additional m1 replays over two event-ordered non-default streams, with
+  poisoned outputs and a checked output snapshot from every replay
+- Changing inputs every 128 replays and m2..8 eager calls between batches
+- Captured exact ties and FP32-collapsed near-ties at both m1 and m8
+
+The fixed queue's K8 graph test covers m8 only. Its pass must never be described
+as validation of the new fused m1 capture path. The optional test must actually
+run to establish m1 graph-replay evidence. GPU correctness, m1 graph runtime,
+compute-sanitizer and latency are pending; no speedup is claimed from these CPU
+or compile checks.
