@@ -56,3 +56,11 @@ build-vision-cuda12.bat
 
 /.ccache/
 /.rocm-win/
+
+# Strata-DS (DeepSeek V4.1 port)
+SCRATCHPAD.md
+.DS_Store
+.playwright-mcp/
+# measured evidence under ds41/ is kept: logs are re-included; raw routing traces (*.npz) stay local
+!ds41/**/logs/
+!ds41/**/*.log
