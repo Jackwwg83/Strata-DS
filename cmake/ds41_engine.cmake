@@ -4,6 +4,7 @@
 add_library(strata_ds41_engine STATIC
   src/ds41/pack.cpp
   src/ds41/ops.cu
+  src/ds41/doorbell.cu
   src/ds41/engine.cu
   third_party/exllamav3_moe/moe_mul1.cpp)
 target_include_directories(strata_ds41_engine PUBLIC
@@ -18,3 +19,10 @@ target_link_libraries(strata_ds41_engine PUBLIC strata_ds41 CUDA::cudart Threads
 
 add_executable(ds41_generate src/ds41/ds41_generate.cpp)
 target_link_libraries(ds41_generate PRIVATE strata_ds41_engine)
+
+if(STRATA_BUILD_TESTS)
+  add_executable(doorbell_test src/ds41/tests/doorbell_test.cu)
+  target_link_libraries(doorbell_test PRIVATE strata_ds41_engine)
+  add_test(NAME doorbell_test COMMAND doorbell_test)
+  set_tests_properties(doorbell_test PROPERTIES SKIP_RETURN_CODE 77 TIMEOUT 300)
+endif()
