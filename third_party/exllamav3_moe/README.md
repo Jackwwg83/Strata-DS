@@ -15,3 +15,9 @@ wholly inside one packed word omit the redundant funnel-shift half. Other
 bitrates, activation quantization, and AVX-512 dispatch remain on vendor code.
 Supplemental synthetic tests are under `tests/`; acceptance and target-machine
 performance still use the fixed K11 test. See `ds41/tasks/K11.dots-K11-02.md`.
+
+
+After integration with the merged K11-01 control, AVX-VNNI remains the preferred
+non-AVX-512 tier when supported. K11-02 specializes only its plain-AVX2 fallback;
+`EXL3_MOE_CPU_MAX_ISA=avx2` can isolate that path for testing. The AVX-VNNI
+implementation and detection remain the merged K11-01 code.

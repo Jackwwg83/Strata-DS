@@ -13,6 +13,10 @@
 #include <cstring>
 #include <fstream>
 #include <immintrin.h>
+// Strata-DS: CPUID for the optional VEX-256 AVX-VNNI tier.
+#if defined(__GNUC__) && defined(__linux__) && __GNUC__ >= 11
+#include <cpuid.h>
+#endif
 #include <chrono>
 #include <limits>
 #include <cstdio>
@@ -225,7 +229,8 @@ inline float decode_mul1_scalar(uint16_t state)
 // Declared early: the transforms below select on it. Vbmi = Vnni + AVX512-VBMI (Zen4+, Ice
 // Lake+); kept as a separate tier because Cascade/Cooper Lake have VNNI without VBMI. Bw =
 // AVX-512F/BW/VL without VNNI (Skylake-SP/X): the dword kernel with the AVX2-style accumulate.
-enum class Isa { Scalar, Avx2, Bw, Vnni, Vbmi };
+// Strata-DS: AVX-VNNI does not require AVX-512; keep it below the original BW tier.
+enum class Isa { Scalar, Avx2, AvxVnni, Bw, Vnni, Vbmi };
 extern const Isa g_isa;
 
 // -------------------------------------------------------------------------------------------
@@ -493,7 +498,7 @@ void prepare_rows
         // int8 quantization, one scale per GEMV row; two rows for a token that goes wide
         int32_t* splat = p.splat32 + static_cast<size_t>(slot) * k;
         // dup is only read by the AVX2/BW maddubs kernels; skip the stores on the VNNI/VBMI tiers
-        int32_t* splat_dup = (p.splat_dup && (g_isa == Isa::Avx2 || g_isa == Isa::Bw))
+        int32_t* splat_dup = (p.splat_dup && (g_isa == Isa::Avx2 || g_isa == Isa::AvxVnni || g_isa == Isa::Bw))
             ? p.splat_dup + static_cast<size_t>(slot) * k : nullptr;
         p.slot[r] = static_cast<uint8_t>(slot);
         p.wide[r] = 0;
@@ -1602,7 +1607,10 @@ void avx2_tiles(const MoeCpuMatrix& mat, const PreparedIn& in, float* tout, int 
     }
 }
 
-// Strata-DS K11-02 patch: a K3-only row-count-specialized AVX2 implementation.
+// Strata-DS: separate, exact 3-bit AVX-VNNI kernel. Vendor kernels above are unchanged.
+#include "strata_avxvnni.h"
+
+// Strata-DS K11-02 patch: a K3-only row-count-specialized plain AVX2 implementation.
 #include "strata_avx2_k3_rows.h"
 
 // -------------------------------------------------------------------------------------------
@@ -1658,7 +1666,7 @@ Isa detect_isa()
             hw = Isa::Bw;
     }
     else if (__builtin_cpu_supports("avx2") && __builtin_cpu_supports("fma"))
-        hw = Isa::Avx2;
+        hw = strata_has_avx_vnni() ? Isa::AvxVnni : Isa::Avx2; // Strata-DS
     else
         hw = Isa::Scalar;
 #else
@@ -1693,7 +1701,7 @@ Isa detect_isa()
     }
 #endif
 
-    // EXL3_MOE_CPU_MAX_ISA=scalar|avx2|bw|vnni|vbmi: cap detection at a lower tier for testing
+    // EXL3_MOE_CPU_MAX_ISA=scalar|avx2|avxvnni|bw|vnni|vbmi: cap detection at a lower tier for testing
     // (e.g. exercising the AVX2 path on AVX512-VNNI hardware, or the dword scheme on VBMI
     // hardware). Never upgrades past what the CPU actually supports; an unrecognized value is
     // ignored.
@@ -1704,6 +1712,8 @@ Isa detect_isa()
         Isa cap;
         if (s == "scalar") cap = Isa::Scalar;
         else if (s == "avx2") cap = Isa::Avx2;
+        // Strata-DS: older AVX-512 CPUs need not support VEX AVX-VNNI.
+        else if (s == "avxvnni") cap = strata_has_avx_vnni() ? Isa::AvxVnni : Isa::Avx2;
         else if (s == "bw" || s == "avx512bw") cap = Isa::Bw;
         else if (s == "vnni" || s == "avx512") cap = Isa::Vnni;
         else if (s == "vbmi") cap = Isa::Vbmi;
@@ -1895,6 +1905,10 @@ void run_tiles(const MoeCpuMatrix& mat, const PreparedIn& in, float* tout, int m
             }
             return;
         }
+        // Strata-DS: other rates use the unchanged AVX2 kernel and duplicated input.
+        case Isa::AvxVnni:
+            if (strata_run_avx_vnni(mat, in, tout, m, tn0, tn1)) return;
+            [[fallthrough]];
         case Isa::Avx2:
         {
             if (mat.hb)
