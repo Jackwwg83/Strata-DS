@@ -47,14 +47,46 @@ __global__ void quantize(const uint16_t* __restrict__ x, int64_t blocks,
     }
 }
 
-// SPLIT warps cooperate on ROWS output rows. Small N gets more independent K slices;
-// adjacent output rows reuse each float4 activation load and have independent accumulators.
-// Every weight vector is loaded and decoded once for all M activation rows.
+// Keep a packed chunk in registers while the next chunk is fetched. Streaming
+// weights bypass L1, leaving that cache for activations reused by neighboring rows.
+template<bool WIDE>
+__device__ __forceinline__ uint4 load_packed(const uint8_t* p) {
+    if constexpr (WIDE) {
+        return __ldcg(reinterpret_cast<const uint4*>(p));
+    } else {
+        uint32_t words[4] = {};
+        #pragma unroll
+        for (int j = 0; j < 16; ++j) words[j / 4] |= uint32_t(p[j]) << ((j % 4) * 8);
+        return make_uint4(words[0], words[1], words[2], words[3]);
+    }
+}
+
+template<int ROWS, bool WIDE>
+__device__ __forceinline__ float fetch_chunk(const uint8_t* w, const uint8_t* scales,
+                                            int64_t row, int64_t tile, int64_t k, int64_t n,
+                                            int lane, uint4 (&packed)[ROWS]) {
+    const int64_t col = tile + lane * 16;
+    #pragma unroll
+    for (int r = 0; r < ROWS; ++r) {
+        packed[r] = make_uint4(0, 0, 0, 0);
+        if (col < k && row + r < n) packed[r] = load_packed<WIDE>(w + (row + r) * k + col);
+    }
+    // Each adjacent pair of 16-byte lane vectors shares one 32-column scale.
+    // All lanes execute this broadcast, including lanes beyond the final K tile.
+    float sw = 0.0f;
+    if ((lane & 1) == 0 && col < k && row < n)
+        sw = detail::decode_e8m0(scales[(row / 32) * (k / 32) + col / 32]);
+    return __shfl_sync(0xffffffffu, sw, lane & ~1);
+}
+
+// SPLIT and ROWS keep the fixed header's lane ownership. Prefetch only packed
+// bytes; decode one four-byte word at a time and reuse it across all M tokens.
 template<int M, int ROWS, int SPLIT, bool WIDE>
 __global__ void gemv(const float* __restrict__ x, const uint8_t* __restrict__ w,
                      const uint8_t* __restrict__ scales, uint16_t* __restrict__ y,
                      int64_t k, int64_t n) {
     constexpr int GROUPS = THREADS / (32 * SPLIT);
+    constexpr int STEP = SPLIT * 512;
     const int lane = threadIdx.x & 31;
     const int warp = threadIdx.x / 32;
     const int split = warp % SPLIT;
@@ -64,52 +96,47 @@ __global__ void gemv(const float* __restrict__ x, const uint8_t* __restrict__ w,
          base < n; base += int64_t(gridDim.x) * GROUPS * ROWS) {
         const int64_t row = base + group * ROWS;
         float acc[ROWS][M] = {};
-        for (int64_t col = int64_t(split * 32 + lane) * 16; col < k; col += SPLIT * 512) {
-            uint4 packed[ROWS];
-            // ROWS is 1 or 2 and row is a multiple of ROWS, so the group never crosses a scale row.
-            const float sw = row < n ? detail::decode_e8m0(scales[(row / 32) * (k / 32) + col / 32]) : 0;
-            #pragma unroll
-            for (int r = 0; r < ROWS; ++r) {
-                packed[r] = make_uint4(0, 0, 0, 0);
-                if (row + r < n) {
-                    const uint8_t* p = w + (row + r) * k + col;
-                    if constexpr (WIDE) {
-                        packed[r] = *reinterpret_cast<const uint4*>(p);
-                    } else {
-                        uint32_t words[4] = {};
-                        #pragma unroll
-                        for (int j = 0; j < 16; ++j) words[j / 4] |= uint32_t(p[j]) << ((j % 4) * 8);
-                        packed[r] = make_uint4(words[0], words[1], words[2], words[3]);
-                    }
-                }
-            }
-            #pragma unroll
-            for (int j = 0; j < 4; ++j) {
-                float4 weight[ROWS];
-                #pragma unroll
-                for (int r = 0; r < ROWS; ++r) {
-                    const uint32_t word = j == 0 ? packed[r].x : j == 1 ? packed[r].y :
-                                          j == 2 ? packed[r].z : packed[r].w;
-                    weight[r] = make_float4(detail::decode_e4m3(uint8_t(word)) * sw,
-                                            detail::decode_e4m3(uint8_t(word >> 8)) * sw,
-                                            detail::decode_e4m3(uint8_t(word >> 16)) * sw,
-                                            detail::decode_e4m3(uint8_t(word >> 24)) * sw);
-                }
-                #pragma unroll
-                for (int t = 0; t < M; ++t) {
-                    const float* p = x + int64_t(t) * k + col + j * 4;
-                    float4 a;
-                    if constexpr (WIDE) a = *reinterpret_cast<const float4*>(p);
-                    else a = make_float4(p[0], p[1], p[2], p[3]);
+        uint4 packed[ROWS];
+        float sw = fetch_chunk<ROWS, WIDE>(w, scales, row, int64_t(split) * 512, k, n, lane, packed);
+        // A warp-uniform tile loop keeps scale broadcasts valid at K tails.
+        for (int64_t tile = int64_t(split) * 512; tile < k; tile += STEP) {
+            uint4 next[ROWS];
+            const float next_sw = fetch_chunk<ROWS, WIDE>(w, scales, row, tile + STEP, k, n, lane, next);
+            const int64_t col = tile + lane * 16;
+            if (col < k) {
+                // Keep only this word's four decoded values live per row. Full
+                // unrolling grows M=8 register pressure and reduces occupancy.
+                #pragma unroll 1
+                for (int j = 0; j < 4; ++j) {
+                    float4 weight[ROWS];
                     #pragma unroll
                     for (int r = 0; r < ROWS; ++r) {
-                        acc[r][t] = fmaf(a.x, weight[r].x, acc[r][t]);
-                        acc[r][t] = fmaf(a.y, weight[r].y, acc[r][t]);
-                        acc[r][t] = fmaf(a.z, weight[r].z, acc[r][t]);
-                        acc[r][t] = fmaf(a.w, weight[r].w, acc[r][t]);
+                        const uint32_t word = j == 0 ? packed[r].x : j == 1 ? packed[r].y :
+                                              j == 2 ? packed[r].z : packed[r].w;
+                        weight[r] = make_float4(detail::decode_e4m3(uint8_t(word)) * sw,
+                                                detail::decode_e4m3(uint8_t(word >> 8)) * sw,
+                                                detail::decode_e4m3(uint8_t(word >> 16)) * sw,
+                                                detail::decode_e4m3(uint8_t(word >> 24)) * sw);
+                    }
+                    #pragma unroll
+                    for (int t = 0; t < M; ++t) {
+                        const float* p = x + int64_t(t) * k + col + j * 4;
+                        float4 a;
+                        if constexpr (WIDE) a = *reinterpret_cast<const float4*>(p);
+                        else a = make_float4(p[0], p[1], p[2], p[3]);
+                        #pragma unroll
+                        for (int r = 0; r < ROWS; ++r) {
+                            acc[r][t] = fmaf(a.x, weight[r].x, acc[r][t]);
+                            acc[r][t] = fmaf(a.y, weight[r].y, acc[r][t]);
+                            acc[r][t] = fmaf(a.z, weight[r].z, acc[r][t]);
+                            acc[r][t] = fmaf(a.w, weight[r].w, acc[r][t]);
+                        }
                     }
                 }
             }
+            #pragma unroll
+            for (int r = 0; r < ROWS; ++r) packed[r] = next[r];
+            sw = next_sw;
         }
         #pragma unroll
         for (int r = 0; r < ROWS; ++r) {
