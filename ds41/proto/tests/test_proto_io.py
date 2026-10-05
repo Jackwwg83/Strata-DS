@@ -125,3 +125,27 @@ def test_expert_store_slots_stay_on_cpu_when_default_device_changes(tmp_path):
         torch.set_default_device("cpu")
     slot = store.free.get()
     assert slot.device.type == "cpu"
+
+
+def test_cpu_experts_output_stays_on_cpu_when_default_device_changes(monkeypatch):
+    """Regression: build_model sets the default device to cuda; the CPU kernel needs CPU buffers."""
+    seen = {}
+
+    class FakeExt:
+        @staticmethod
+        def exl3_moe_cpu_forward(handle, x, sel, w, out, threads):
+            seen["devices"] = {t.device.type for t in (x, sel, w, out)}
+
+    import types
+    fake_mod = types.SimpleNamespace(exllamav3_ext=FakeExt)
+    monkeypatch.setitem(sys.modules, "exllamav3", types.SimpleNamespace(ext=fake_mod))
+    monkeypatch.setitem(sys.modules, "exllamav3.ext", fake_mod)
+    ce = P.CpuExperts(ckpt=None)
+    ce.handles[0] = 0
+    torch.set_default_device("meta")
+    try:
+        x = torch.zeros(1, 8, dtype=torch.float16, device="cpu")
+        ce.forward(0, x, torch.zeros(1, 6, dtype=torch.int64, device="cpu"), torch.zeros(1, 6, device="cpu"))
+    finally:
+        torch.set_default_device("cpu")
+    assert seen["devices"] == {"cpu"}

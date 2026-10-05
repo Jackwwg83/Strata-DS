@@ -204,7 +204,7 @@ class CpuExperts:
 
     def forward(self, layer, x_half, indices, weights):
         from exllamav3.ext import exllamav3_ext as ext
-        out = torch.empty(x_half.shape[0], x_half.shape[1], dtype=torch.float32)
+        out = torch.empty(x_half.shape[0], x_half.shape[1], dtype=torch.float32, device="cpu")
         ext.exl3_moe_cpu_forward(self.handle(layer), x_half.cpu(), indices.cpu().to(torch.int64),
                                  weights.cpu().to(torch.float16), out, self.threads)
         return out
