@@ -13,6 +13,7 @@ implementations of the same task may compete; the fastest one that passes wins a
 | [K7](K7.md) | hyper-connection mix + collapse | `include/strata/ds41/kernels/k7_hc.hpp` | `score_us` |
 | [K10](K10.md) | routed experts on the GPU from EXL3 weights (vendor exllamav3) | `include/strata/ds41/kernels/k10_exl3_moe.hpp` | `score_us` |
 | [K8](K8.md) | MoE router on the GPU | `include/strata/ds41/kernels/k8_router.hpp` | `score_us` |
+| [K11](K11.md) | CPU EXL3 expert kernel (AVX2 first), vendored exllamav3 | `third_party/exllamav3_moe/moe_mul1.h` | `score_us` |
 
 ## Rules for every task
 
