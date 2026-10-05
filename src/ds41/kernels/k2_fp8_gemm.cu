@@ -1,6 +1,6 @@
-// Task K2: 64x256 BF16 MMA tile with a register-prefetched, single shared stage.
-// Thirty-two FP32 accumulators per lane reduce pressure. A fragments are reused
-// across eight B fragments, and the epilogue writes directly from registers.
+// Task K2: register-prefetched BF16 MMA with a single shared operand stage.
+// Large grids retain 64x256 tiles; small grids use 16x64 or 32x64 tiles to
+// distribute work across more SMs without splitting K or changing its order.
 #include "strata/ds41/kernels/k2_fp8_gemm.hpp"
 
 #include <cuda_fp8.h>
@@ -13,8 +13,15 @@ constexpr int kTileM = 64;
 constexpr int kTileN = 256;
 constexpr int kTileK = 32;
 constexpr int kStride = kTileK + 8;
-constexpr int kWarps = 16;
-constexpr int kThreads = kWarps * 32;
+// Every thread loads sixteen packed B bytes. TileM also gives the per-warp
+// output width: each warp owns 16xTileM values, with TileN/TileM warp columns.
+template <int TileM, int TileN> struct Tile {
+    static constexpr int threads = TileN * 2;
+    static constexpr int warp_columns = TileN / TileM;
+    static constexpr int n_fragments = TileM / 8;
+    static_assert(TileM % 16 == 0 && TileN % TileM == 0, "Invalid MMA tile");
+    static_assert(threads >= TileM * 4, "A tile needs more vector loaders");
+};
 
 // Match ops::act_quant_to_f32_k, including exact power-of-two boundaries.
 __device__ __forceinline__ float round_pow2(float value) {
@@ -37,15 +44,14 @@ __global__ void quantize_activations(const bf16* x, bf16* quantized, int64_t ele
     quantized[index] = __float2bfloat16_rn(float(q) * scale);
 }
 
-struct __align__(32) Operands {
-    bf16 a[kTileM * kStride];
-    bf16 b[kTileN * kStride];
+template <int TileM, int TileN> struct __align__(32) Operands {
+    bf16 a[TileM * kStride];
+    bf16 b[TileN * kStride];
 };
-struct __align__(32) SharedStorage {
-    Operands operands;
-};
-static_assert(sizeof(SharedStorage) == 25 * 1024, "Unexpected shared-memory layout");
-static_assert(sizeof(SharedStorage) <= 99 * 1024, "K2 shared-memory limit exceeded");
+static_assert(sizeof(Operands<64, 256>) == 25 * 1024, "Unexpected shared-memory layout");
+static_assert(sizeof(Operands<32, 64>) == 7680, "Unexpected shared-memory layout");
+static_assert(sizeof(Operands<16, 64>) == 6400, "Unexpected shared-memory layout");
+static_assert(sizeof(Operands<64, 256>) <= 99 * 1024, "K2 shared-memory limit exceeded");
 
 struct RegisterStage {
     uint4 a;
@@ -54,8 +60,9 @@ struct RegisterStage {
 };
 
 // K is divisible by 32, so each 16-byte vector lies within an input row. Only
-// half of the CTA loads A; every thread loads sixteen packed weights. One scale
+// TileM*4 threads load A; every thread loads sixteen packed weights. One scale
 // load per warp suffices because its sixteen adjacent columns share a 32x32 block.
+template <int TileM>
 __device__ __forceinline__ RegisterStage prefetch(
     const bf16* activation, const uint8_t* weight, const uint8_t* scales,
     int64_t row_base, int64_t col_base, int64_t k_base,
@@ -66,7 +73,7 @@ __device__ __forceinline__ RegisterStage prefetch(
     const int a_row = threadIdx.x / 4;
     const int a_k = (threadIdx.x % 4) * 8;
     const int64_t row = row_base + a_row;
-    if (threadIdx.x < kTileM * 4 && row < M)
+    if (threadIdx.x < TileM * 4 && row < M)
         next.a = *reinterpret_cast<const uint4*>(activation + row * K + k_base + a_k);
     const int b_col = threadIdx.x / 2;
     const int b_k = (threadIdx.x % 2) * 16;
@@ -92,10 +99,11 @@ __device__ __forceinline__ void store_four(bf16* dst, unsigned packed, float sca
     pair[1] = __floats2bfloat162_rn(value.z * scale, value.w * scale);
 }
 
-__device__ __forceinline__ void publish(Operands& shared, const RegisterStage& next) {
+template <int TileM, int TileN>
+__device__ __forceinline__ void publish(Operands<TileM, TileN>& shared, const RegisterStage& next) {
     const int a_row = threadIdx.x / 4;
     const int a_k = (threadIdx.x % 4) * 8;
-    if (threadIdx.x < kTileM * 4)
+    if (threadIdx.x < TileM * 4)
         *reinterpret_cast<uint4*>(shared.a + a_row * kStride + a_k) = next.a;
     const int b_col = threadIdx.x / 2;
     const int b_k = (threadIdx.x % 2) * 16;
@@ -131,43 +139,45 @@ __device__ __forceinline__ void mma(float (&d)[4], const unsigned (&a)[4],
                    "r"(b[0]), "r"(b[1]));
 }
 
-// The 4x4 warp grid assigns a 16x64 output rectangle to each warp. Each lane
-// holds 32 accumulator floats, half as many as a 32x64 warp tile. The next tile
-// remains packed in registers while tensor cores consume the shared tile.
-__global__ __launch_bounds__(kThreads, 2) void gemm_register_stage(
+// A 64x256 tile has 32 accumulator floats per lane. Smaller tiles reduce this
+// to 8 or 16 and run 128-thread CTAs; packed register prefetch, operand reuse,
+// 32-wide quantization groups and the order of MMA operations are unchanged.
+template <int TileM, int TileN>
+__global__ __launch_bounds__(TileN * 2, 1024 / (TileN * 2)) void gemm_register_stage(
     const bf16* __restrict__ activation, const uint8_t* __restrict__ weight,
     const uint8_t* __restrict__ scales, bf16* __restrict__ output,
     int64_t M, int64_t N, int64_t K) {
-    __shared__ SharedStorage shared;
+    using Shape = Tile<TileM, TileN>;
+    __shared__ Operands<TileM, TileN> shared;
     const int warp = threadIdx.x / 32;
     const int lane = threadIdx.x % 32;
-    const int warp_m = (warp / 4) * 16;
-    const int warp_n = (warp % 4) * 64;
-    const int64_t row_base = static_cast<int64_t>(blockIdx.y) * kTileM;
-    const int64_t col_base = static_cast<int64_t>(blockIdx.x) * kTileN;
-    float accum[8][4] = {};
+    const int warp_m = (warp / Shape::warp_columns) * 16;
+    const int warp_n = (warp % Shape::warp_columns) * TileM;
+    const int64_t row_base = static_cast<int64_t>(blockIdx.y) * TileM;
+    const int64_t col_base = static_cast<int64_t>(blockIdx.x) * TileN;
+    float accum[Shape::n_fragments][4] = {};
 
     if (K > 0) {
-        const RegisterStage first = prefetch(activation, weight, scales,
+        const RegisterStage first = prefetch<TileM>(activation, weight, scales,
                                             row_base, col_base, 0, M, N, K);
-        publish(shared.operands, first);
+        publish(shared, first);
         __syncthreads();
     }
     for (int64_t k_base = 0; k_base < K; k_base += kTileK) {
         const bool have_next = k_base + kTileK < K;
         RegisterStage next;
         if (have_next)
-            next = prefetch(activation, weight, scales, row_base, col_base,
+            next = prefetch<TileM>(activation, weight, scales, row_base, col_base,
                             k_base + kTileK, M, N, K);
 #pragma unroll
         for (int k = 0; k < kTileK; k += 16) {
             unsigned a[4];
-            load_a(a, shared.operands.a + (warp_m + lane % 16) * kStride
+            load_a(a, shared.a + (warp_m + lane % 16) * kStride
                        + k + (lane / 16) * 8);
 #pragma unroll
-            for (int j = 0; j < 8; ++j) {
+            for (int j = 0; j < Shape::n_fragments; ++j) {
                 unsigned b[2];
-                load_b(b, shared.operands.b + (warp_n + j * 8 + lane % 8) * kStride
+                load_b(b, shared.b + (warp_n + j * 8 + lane % 8) * kStride
                            + k + ((lane / 8) % 2) * 8);
                 mma(accum[j], a, b);
             }
@@ -175,7 +185,7 @@ __global__ __launch_bounds__(kThreads, 2) void gemm_register_stage(
         // Every reader must finish before the single operand stage is reused.
         __syncthreads();
         if (have_next) {
-            publish(shared.operands, next);
+            publish(shared, next);
             __syncthreads();
         }
     }
@@ -183,7 +193,7 @@ __global__ __launch_bounds__(kThreads, 2) void gemm_register_stage(
     // m16n8k16 gives each lane two adjacent columns in each of two rows.
     // Direct scalar BF16 stores also cover odd N and incomplete M/N tiles.
 #pragma unroll
-    for (int j = 0; j < 8; ++j) {
+    for (int j = 0; j < Shape::n_fragments; ++j) {
 #pragma unroll
         for (int i = 0; i < 4; ++i) {
             const int64_t row = row_base + warp_m + lane / 4 + (i / 2) * 8;
@@ -205,9 +215,28 @@ void fp8_block_gemm(const bf16* x, int64_t M, int64_t K, const uint8_t* w, const
     if (elements > 0)
         quantize_activations<<<static_cast<unsigned>((elements + 255) / 256), 256, 0, stream>>>(
             x, activation, elements);
-    const dim3 grid(static_cast<unsigned>((N + kTileN - 1) / kTileN),
-                    static_cast<unsigned>((M + kTileM - 1) / kTileM));
-    gemm_register_stage<<<grid, kThreads, 0, stream>>>(activation, w, w_scale, y, M, N, K);
+    const int64_t tiles_n = (N + kTileN - 1) / kTileN;
+    const int64_t tiles_m = (M + kTileM - 1) / kTileM;
+    // Small output grids are latency/occupancy limited: the accepted M=77
+    // shape has only four 64x256 CTAs. Subdivide output, not the reduction, so
+    // no extra workspace, atomics, or FP32 partial-sum reduction is required.
+    if (tiles_m * tiles_n < 128) {
+        if (M <= 128) {
+            const dim3 grid(static_cast<unsigned>((N + 63) / 64),
+                            static_cast<unsigned>((M + 15) / 16));
+            gemm_register_stage<16, 64><<<grid, Tile<16, 64>::threads, 0, stream>>>(
+                activation, w, w_scale, y, M, N, K);
+        } else {
+            const dim3 grid(static_cast<unsigned>((N + 63) / 64),
+                            static_cast<unsigned>((M + 31) / 32));
+            gemm_register_stage<32, 64><<<grid, Tile<32, 64>::threads, 0, stream>>>(
+                activation, w, w_scale, y, M, N, K);
+        }
+    } else {
+        const dim3 grid(static_cast<unsigned>(tiles_n), static_cast<unsigned>(tiles_m));
+        gemm_register_stage<64, 256><<<grid, Tile<64, 256>::threads, 0, stream>>>(
+            activation, w, w_scale, y, M, N, K);
+    }
 }
 
 }  // namespace strata::ds41::kernels
