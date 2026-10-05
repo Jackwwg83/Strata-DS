@@ -1,6 +1,7 @@
 // K3-05: eight heads share a 32-key BF16 tensor-core tile. Each CTA streams
-// 128 output dimensions; four groups expose more decode CTAs and reduce
-// live PV registers. FP32 online softmax requires no allocation.
+// 128 output dimensions for single-query decode, or all 512 dimensions
+// when independent queries provide parallelism. FP32 online softmax is
+// allocation-free in both cases.
 // m16n8k16 uses heads as the eight columns in both QK and transposed PV;
 // the documented MMA layout permits direct per-head register rescaling.
 #include "strata/ds41/kernels/k3_sparse_attn.hpp"
@@ -21,8 +22,6 @@ constexpr int kStride = kDim + 8;
 constexpr int kProbStride = kRows + 8;
 constexpr int kWarps = 4;
 constexpr int kThreads = kWarps * 32;
-constexpr int kOutputDim = 128;
-constexpr int kOutputTiles = kOutputDim / (kWarps * 16);
 constexpr unsigned kWarpMask = 0xffffffffu;
 
 struct __align__(32) TileStorage {
@@ -87,20 +86,23 @@ __device__ __forceinline__ void gather(TileStorage& tile, const bf16* window,
     __syncthreads();
 }
 
-// One CTA owns eight heads and 128 output dimensions. Splitting each 512-term
-// QK dot into two 256-term partials uses all four warps; their sum remains
-// FP32. Four output groups repeat QK to expose 32 CTAs per query while
-// reducing live PV accumulators. No global score buffer or allocator is used.
+// One CTA owns eight heads and OutputDim output dimensions. Splitting each
+// 512-term QK dot into two 256-term partials uses all four warps; their sum
+// remains FP32. Both instantiations use exactly the same softmax and MMA
+// math. No global score buffer, allocator, or host synchronization is used.
+template <int OutputDim>
 __global__ __launch_bounds__(kThreads) void attention_online(
         const bf16* __restrict__ q, const bf16* __restrict__ window,
         const bf16* __restrict__ comp, const int32_t* __restrict__ idx,
         int n_idx, const float* __restrict__ sink, float scale,
         bf16* __restrict__ output) {
+    static_assert(OutputDim == 128 || OutputDim == 512, "supported output groups");
+    constexpr int kOutputTiles = OutputDim / (kWarps * 16);
     __shared__ TileStorage tile;
     const int lane = threadIdx.x & 31;
     const int warp = threadIdx.x >> 5;
     const int query = blockIdx.z;
-    const int output_dim = blockIdx.y * kOutputDim;
+    const int output_dim = blockIdx.y * OutputDim;
     const int head = blockIdx.x * kHeadTile;
     const int32_t* indices = idx + static_cast<size_t>(query) * n_idx;
     const bf16* queries = q + (static_cast<size_t>(query) * kHeads + head) * kDim;
@@ -232,7 +234,17 @@ void sparse_attn_decode(const bf16* q, const bf16* window, const bf16* comp,
         std::fprintf(stderr, "sparse_attn_decode: invalid n_idx %d\n", n_idx);
         std::abort();
     }
-    attention_online<<<dim3(kHeads / kHeadTile, kDim / kOutputDim, m), kThreads, 0, stream>>>(
-        q, window, comp, idx, n_idx, sink, scale, o);
+    // A single query has no inter-query parallelism: four output groups
+    // expose 32 CTAs and reduce live PV registers. Verify windows already
+    // provide independent queries, so keep complete outputs to avoid four
+    // copies of QK and KV traffic. The conservative threshold applies to all
+    // index-list sizes; both paths preserve the same per-element arithmetic.
+    if (m == 1) {
+        attention_online<128><<<dim3(kHeads / kHeadTile, kDim / 128, m), kThreads, 0, stream>>>(
+            q, window, comp, idx, n_idx, sink, scale, o);
+    } else {
+        attention_online<512><<<dim3(kHeads / kHeadTile, 1, m), kThreads, 0, stream>>>(
+            q, window, comp, idx, n_idx, sink, scale, o);
+    }
 }
 }  // namespace strata::ds41::kernels
