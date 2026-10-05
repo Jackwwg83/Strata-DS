@@ -2,6 +2,7 @@
 // No host score/index copies, full sort, tensor-core numerical approximation,
 // global atomic output positions, or device-wide synchronization.
 #include "strata/ds41/kernels/k5_indexer.hpp"
+#include "k5/scratch.hpp"
 
 #include <math_constants.h>
 #include <algorithm>
@@ -26,25 +27,8 @@ struct Counts {
     int equal;
 };
 
-void check(cudaError_t status) {
-    if (status != cudaSuccess) throw std::runtime_error(cudaGetErrorString(status));
-}
-
-// Each invocation owns its stream-ordered scratch, including overlapping calls
-// on different streams. No persistent host cache or default-stream dependency.
-class Scratch {
-public:
-    Scratch(size_t bytes, cudaStream_t stream) : stream_(stream) {
-        check(cudaMallocAsync(&ptr_, bytes, stream_));
-    }
-    ~Scratch() { if (ptr_) cudaFreeAsync(ptr_, stream_); }
-    Scratch(const Scratch&) = delete;
-    Scratch& operator=(const Scratch&) = delete;
-    void* get() const { return ptr_; }
-private:
-    void* ptr_ = nullptr;
-    cudaStream_t stream_;
-};
+using k5_detail::check;
+using k5_detail::Scratch;
 
 __device__ __forceinline__ float bf_round(float value) {
     return __bfloat162float(__float2bfloat16_rn(value));
@@ -326,6 +310,7 @@ void indexer_topk(const __nv_bfloat16* q, const __nv_bfloat16* keys, int64_t t, 
     choose_byte<false><<<1, kThreads, 0, stream>>>(hist, parts, k, 0, cutoff);
     compact(scores, t, cutoff, tiles, out_idx, offset, nullptr, 0, 0, stream);
     check(cudaGetLastError());
+    scratch.finish();
 }
 
 void candidate_blocks(const float* scores, int64_t t, int topk_blocks, int block,
@@ -359,5 +344,6 @@ void candidate_blocks(const float* scores, int64_t t, int topk_blocks, int block
     }
     compact(maxima, nb, cutoff, tiles, nullptr, 0, cand, t, block, stream);
     check(cudaGetLastError());
+    scratch.finish();
 }
 } // namespace strata::ds41::kernels

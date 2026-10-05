@@ -30,9 +30,21 @@ set to positive infinity before selection, ties use lower block indices, and
 negative-infinity blocks are excluded from the final mask. Partial blocks,
 non-default block sizes, zero selections, and selecting all blocks are handled.
 
-Scratch allocation and release are stream ordered and private to each call.
-There are no host score/index copies, explicit stream/device synchronizations,
-external libraries, or modified fixed interfaces/tests.
+Scratch is retained in a bounded, thread-local cache. Each slot belongs to one
+CUDA device and a lifetime-unique stream ID. A slot is reusable only after its
+recorded completion event succeeds; in-flight calls get separate slots. Eight
+slots, each at most 2 MiB, bound retained memory per host thread. Nearby shapes
+share 64 KiB size classes. A warm call uses no allocation/free API. The cache
+does not change CUDA memory-pool retention or any process/device setting.
+
+Graph capture, oversized requests, and cache pressure use per-call stream-
+ordered allocation/free. Capture therefore owns its allocation nodes instead
+of embedding a reusable cache pointer. Thread teardown waits on each valid
+completion event before freeing its allocation. Failed event recording prevents
+reuse; an invalid/terminated context is left to CUDA's resource teardown.
+
+There are no host score/index copies, explicit stream/device synchronizations
+in ordinary calls, external libraries, or modified fixed interfaces/tests.
 
 ## Verification
 
@@ -49,6 +61,35 @@ Checked on 2026-10-05 against `feature/ds41` base
   persistent ownership of every key
 - `git diff --check` passes
 
-These are compile/resource and algorithm-model checks. They do not establish
-GPU numerical parity, race freedom, queue CMake integration, or speed. The
-fixed GPU acceptance test and queue timings remain the required validation.
+## Iteration 1 GPU result
+
+The RTX 4090 queue passed commit `d77475a1cce001d737e4ce998a3eb2e3b781c498`
+on 2026-10-05, with zero score mismatches and complete top-k overlap in every
+case. It reported `us_t16k=668.7`, `us_t128k=839.7`, and `score_us=1508`.
+[Exact queue result](https://github.com/Jackwwg83/Strata-DS/issues/3#issuecomment-5993612540)
+
+## Iteration 2: isolate warm allocation overhead
+
+Iteration 2 changes only scratch lifetime/ownership; every GPU kernel remains
+byte-identical to that passing parent. It removes the repeated warm
+`cudaMallocAsync`/`cudaFreeAsync` calls rather than adjusting a pool's retention
+threshold. This is an allocation-overhead experiment, not a measured speedup.
+
+Checks before submission:
+
+- CUDA 12.8/C++17 compilation passes again for sm_86, sm_89, and sm_120
+- All six histogram/selection CPU model suites still pass
+- `verify_scratch.cpp` compiles with C++17 and strict warnings, and tests the
+  actual scratch header against a deterministic runtime stub: warm reuse,
+  leased/pending slots, stream/device identity, graph-capture fallback, bounded
+  memory, exception paths, and separate host-thread teardown
+- The lifecycle test also passes AddressSanitizer and UndefinedBehaviorSanitizer
+  with LeakSanitizer disabled because this executor uses ptrace; the stub also
+  asserts that every test releases all mock allocations
+- A source comparison confirms every GPU kernel is unchanged from iteration 1
+- `git diff --check` passes
+
+The lifecycle stub is not a CUDA-driver concurrency test. Iteration 2's GPU
+acceptance and timings still require the fixed queue test. Runtime API contracts:
+[events](https://docs.nvidia.com/cuda/cuda-runtime-api/group__CUDART__EVENT.html),
+[stream IDs/capture](https://docs.nvidia.com/cuda/cuda-runtime-api/group__CUDART__STREAM.html).
