@@ -1,0 +1,16 @@
+2026-10-05T11:24:25Z	task/K5/dots-K5-01	9605be598a	pass	us_t16k=105.5 us_t128k=563.1 score_us=668.6
+2026-10-05T11:28:58Z	task/K5/dots-K5-02	2a0e5182f8	pass	us_t16k=641 us_t128k=640 score_us=1281
+2026-10-05T11:34:01Z	task/K5/dots-K5-03	d77475a1cc	pass	us_t16k=668.7 us_t128k=839.7 score_us=1508
+2026-10-05T11:38:18Z	task/K5/dots-K5-01	315419dbc7	pass	us_t16k=121.8 us_t128k=379.7 score_us=501.5
+2026-10-05T11:39:48Z	task/K5/dots-K5-04	5562db7897	pass	us_t16k=93.18 us_t128k=382 score_us=475.1
+2026-10-05T11:44:40Z	task/K5/dots-K5-02	9b8d285fab	pass	us_t16k=29.7 us_t128k=66.56 score_us=96.26
+2026-10-05T11:49:54Z	task/K5/dots-K5-03	aba301fe8b	pass	us_t16k=59.58 us_t128k=231.4 score_us=291
+2026-10-05T12:20:00Z	task/K5/dots-K5-05	c7db23e4b7	pass	us_t16k=49.15 us_t128k=373.8 score_us=422.9
+2026-10-05T12:25:56Z	task/K5/dots-K5-06	04b82f1abd	pass	us_t16k=58.37 us_t128k=362.5 score_us=420.9
+2026-10-05T12:34:30Z	task/K5/dots-K5-07	466796657f	pass	us_t16k=66.53 us_t128k=243.6 score_us=310.1
+2026-10-05T12:41:03Z	task/K5/dots-K5-08	fdbb838ce2	pass	us_t16k=69.44 us_t128k=452.6 score_us=522
+2026-10-05T12:42:32Z	task/K5/dots-K5-09	fb0afb328a	pass	us_t16k=60.42 us_t128k=377.9 score_us=438.3
+2026-10-05T12:43:37Z	task/K5/dots-K5-10	0882e5898a	pass	us_t16k=57.18 us_t128k=334.8 score_us=392
+2026-10-05T12:54:11Z	task/K5/dots-K5-11	1f3dd904c5	pass	us_t16k=44.93 us_t128k=83.87 score_us=128.8
+2026-10-05T13:06:21Z	task/K5/dots-K5-12	e90f35a8d8	pass	us_t16k=71.87 us_t128k=253.1 score_us=325
+2026-10-05T13:22:57Z	task/K5/dots-K5-13	2a9205261e	pass	us_t16k=184.3 us_t128k=205 score_us=389.3
