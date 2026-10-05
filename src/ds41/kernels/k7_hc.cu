@@ -12,19 +12,24 @@ namespace strata::ds41::kernels {
 namespace {
 
 constexpr int kThreads = 256;
-constexpr int kWarps = kThreads / 32;
-constexpr int kChunk = 1024;
+constexpr int kProducerThreads = 32;
+constexpr int kDotThreads = 256;
+constexpr int kDotWarps = kDotThreads / 32;
+constexpr int kNormThreads = 1024;
+constexpr int kNormWarps = kNormThreads / 32;
 constexpr int kStreamSize = kHc * kDim;
-constexpr int kParts = kStreamSize / kChunk;
 constexpr int kReductionRows = kHcMix + 1;
 constexpr int kMaxTokens = 8;  // The fixed interface permits m in [1, 8].
 constexpr unsigned kWarpMask = 0xffffffffu;
 static_assert(kHc == 4 && kHcMix == 24);
-static_assert(kStreamSize % kChunk == 0 && kDim % kThreads == 0);
+static_assert(kDim % kThreads == 0 && kStreamSize % kNormThreads == 0);
+static_assert(kNormThreads == kHc * kDotThreads);
 
 struct Workspace {
-    float partial[kMaxTokens][kReductionRows][kParts];
+    float dots[kMaxTokens][kHcMix][kDotWarps];
+    float squares[kMaxTokens][kNormWarps];
 };
+static_assert(sizeof(Workspace) == 7168);
 
 void check_cuda(cudaError_t status, const char* operation) {
     if (status != cudaSuccess) {
@@ -62,55 +67,43 @@ __device__ __forceinline__ float warp_sum(float value) {
     return value;
 }
 
-// Each CTA owns a disjoint 1024-column tile of one FP32 weight row. Every
-// weight is loaded exactly once, then reused in registers for ALL m tokens.
-// Splitting the long dot products exposes 480 independent CTAs even for m=1.
-// Row zero also computes the norm; no float atomics or completion counters.
+// Each warp-only CTA owns one ORIGINAL reference warp of one weight row.
+// Each lane retains the complete 80-term stride-256 FMA chain. Splitting a
+// chain into contiguous tiles changes FP32 cancellation and is not equivalent.
+// Every weight is loaded once and reused for all tokens. No shared-memory
+// reduction is needed: the original shuffle tree produces each warp total.
+// The first four rows also own the original 1024 norm lanes, partitioned by
+// step mod 4, preserving their stride-1024 chains and 32 reference warp totals.
 template <int Tokens>
 __global__ void hc_partials(const __nv_bfloat16* __restrict__ x,
                             const float* __restrict__ fn, Workspace* workspace) {
-    __shared__ float warp_dots[Tokens][kWarps];
-    __shared__ float warp_squares[Tokens][kWarps];
-    const int tid = threadIdx.x;
-    const int lane = tid & 31;
-    const int warp = tid >> 5;
+    const int lane = threadIdx.x;
+    const int warp = blockIdx.x;
     const int row = blockIdx.y;
-    const int part = blockIdx.x;
+    const int original_lane = warp * 32 + lane;
     float dots[Tokens] = {};
     float squares[Tokens] = {};
-#pragma unroll
-    for (int offset = 0; offset < kChunk; offset += kThreads) {
-        const int column = part * kChunk + offset + tid;
+#pragma unroll 1
+    for (int step = 0; step < kStreamSize / kDotThreads; ++step) {
+        const int column = original_lane + step * kDotThreads;
         const float weight = fn[row * kStreamSize + column];
 #pragma unroll
         for (int token = 0; token < Tokens; ++token) {
             const float value = __bfloat162float(x[token * kStreamSize + column]);
-            dots[token] += value * weight;
-            if (row == 0) squares[token] += value * value;
+            dots[token] = fmaf(value, weight, dots[token]);
+            if (row < kHc && (step & (kHc - 1)) == row)
+                squares[token] = fmaf(value, value, squares[token]);
         }
     }
 #pragma unroll
     for (int token = 0; token < Tokens; ++token) {
         const float dot = warp_sum(dots[token]);
-        if (lane == 0) warp_dots[token][warp] = dot;
-        if (row == 0) {
+        if (lane == 0) workspace->dots[token][row][warp] = dot;
+        if (row < kHc) {
             const float square = warp_sum(squares[token]);
-            if (lane == 0) warp_squares[token][warp] = square;
+            if (lane == 0)
+                workspace->squares[token][row * kDotWarps + warp] = square;
         }
-    }
-    __syncthreads();
-
-    // One thread per token sums the eight warp totals in a fixed order.
-    if (tid < Tokens) {
-        float dot = 0.0f;
-        float square = 0.0f;
-#pragma unroll
-        for (int w = 0; w < kWarps; ++w) {
-            dot += warp_dots[tid][w];
-            if (row == 0) square += warp_squares[tid][w];
-        }
-        workspace->partial[tid][row][part] = dot;
-        if (row == 0) workspace->partial[tid][kHcMix][part] = square;
     }
 }
 
@@ -189,14 +182,19 @@ __global__ void hc_finish(const __nv_bfloat16* __restrict__ x,
     if (blockIdx.x != 0) return;  // Uniform for the CTA, before any barrier.
 
     if (tid < kReductionRows) {
+        // Start at +0 and sum warp totals in exactly ops::block_sum order.
         float sum = 0.0f;
+        if (tid == kHcMix) {
 #pragma unroll
-        for (int part = 0; part < kParts; ++part)
-            sum += workspace->partial[token][tid][part];
-        if (tid == kHcMix)
+            for (int w = 0; w < kNormWarps; ++w)
+                sum += workspace->squares[token][w];
             reciprocal_rms = rsqrtf(sum / static_cast<float>(kStreamSize) + kNormEps);
-        else
+        } else {
+#pragma unroll
+            for (int w = 0; w < kDotWarps; ++w)
+                sum += workspace->dots[token][tid][w];
             mixes[tid] = sum;
+        }
     }
     __syncthreads();
     if (tid < 32)
@@ -214,10 +212,10 @@ void hc_mixes_pre(const __nv_bfloat16* x, int m, const float* fn, const float* s
         std::abort();
     }
     Workspace* workspace = workspace_for_device();
-    const dim3 partial_grid(kParts, kHcMix);
+    const dim3 partial_grid(kDotWarps, kHcMix);
 #define K7_LAUNCH(TOKENS) \
     case TOKENS: \
-        hc_partials<TOKENS><<<partial_grid, kThreads, 0, stream>>>(x, fn, workspace); \
+        hc_partials<TOKENS><<<partial_grid, kProducerThreads, 0, stream>>>(x, fn, workspace); \
         break
     switch (m) {
         K7_LAUNCH(1);
