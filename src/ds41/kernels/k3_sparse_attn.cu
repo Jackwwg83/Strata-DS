@@ -174,57 +174,118 @@ void check_cuda(cudaError_t status, const char* operation) {
     }
 }
 
-// An owned pool keeps only this kernel's reusable scratch resident across event
-// synchronizations. The default device pool and all device-wide settings remain
-// untouched. Allocations are still private to each invocation and stream-ordered.
-class ScratchPools {
-    struct Entry {
-        int device;
-        cudaMemPool_t pool;
+// Keep a bounded set of scratch allocations rather than allocating and freeing
+// on every invocation. Event-protected slots remain safe when streams overlap,
+// when a destroyed stream's handle is recycled, and when host threads enqueue
+// simultaneously. Four slots cap retained scratch at about 32.2 MiB per device.
+class ScratchArena {
+    static constexpr int kSlots = 4;
+    static constexpr size_t kScratchBytes =
+        (size_t) 8 * kHeads * kMaxPartitions * (kHeadDim * sizeof(float) + sizeof(float2));
+    struct Slot {
+        float* data = nullptr;
+        cudaEvent_t done = nullptr;
+        cudaStream_t last_stream = nullptr;
+        bool recorded = false;
+    };
+    struct Device {
+        int id = -1;
+        cudaMemPool_t pool = nullptr;
+        cudaStream_t cleanup = nullptr;
+        unsigned next = 0;
+        Slot slots[kSlots];
     };
     std::mutex mutex_;
-    std::vector<Entry> pools_;
+    std::vector<Device> devices_;
 
-public:
-    cudaMemPool_t get(int device) {
-        std::lock_guard<std::mutex> lock(mutex_);
-        for (const Entry& entry : pools_)
-            if (entry.device == device) return entry.pool;
-
+    Device& device(int id) {
+        for (Device& entry : devices_)
+            if (entry.id == id) return entry;
+        Device entry;
+        entry.id = id;
         cudaMemPoolProps properties{};
         properties.allocType = cudaMemAllocationTypePinned;
         properties.handleTypes = cudaMemHandleTypeNone;
         properties.location.type = cudaMemLocationTypeDevice;
-        properties.location.id = device;
-        cudaMemPool_t pool = nullptr;
-        check_cuda(cudaMemPoolCreate(&pool, &properties), "create scratch pool");
-        // At most 8.04 MiB is needed by a legal individual call. A 16 MiB
-        // retention target also covers allocator page rounding; excess memory
-        // used by concurrent calls can be released at the next synchronization.
-        uint64_t retention = 16ull * 1024 * 1024;
-        check_cuda(cudaMemPoolSetAttribute(pool, cudaMemPoolAttrReleaseThreshold,
-                                          &retention), "retain scratch pages");
-        // Do not inject cross-stream dependencies merely to recycle a block.
-        int internal_dependencies = 0;
-        check_cuda(cudaMemPoolSetAttribute(pool, cudaMemPoolReuseAllowInternalDependencies,
-                                          &internal_dependencies), "scratch pool dependencies");
-        pools_.push_back({device, pool});
-        return pool;
+        properties.location.id = id;
+        check_cuda(cudaMemPoolCreate(&entry.pool, &properties), "create scratch pool");
+        check_cuda(cudaStreamCreateWithFlags(&entry.cleanup, cudaStreamNonBlocking), "create cleanup stream");
+        devices_.push_back(entry);
+        return devices_.back();
     }
 
-    ~ScratchPools() {
-        // CUDA defers pool teardown until all outstanding stream-ordered frees
-        // finish, so no stream/device synchronization is needed here either.
-        for (const Entry& entry : pools_) cudaMemPoolDestroy(entry.pool);
+public:
+    template <class Launch>
+    void run(cudaStream_t stream, size_t bytes, Launch launch) {
+        int id = 0;
+        check_cuda(cudaGetDevice(&id), "current device");
+        // The lock covers selection through the completion-event record, not GPU
+        // execution. Another host thread cannot interleave work using this slot.
+        std::lock_guard<std::mutex> lock(mutex_);
+        Device& entry = device(id);
+        cudaStreamCaptureStatus capture;
+        check_cuda(cudaStreamIsCapturing(stream, &capture), "stream capture status");
+        if (capture != cudaStreamCaptureStatusNone) {
+            // Captured allocations belong to the graph, not the reusable cache.
+            // This also permits graph replay alongside ordinary invocations.
+            float* data = nullptr;
+            check_cuda(cudaMallocFromPoolAsync(reinterpret_cast<void**>(&data), bytes,
+                                               entry.pool, stream), "allocate graph scratch");
+            launch(data);
+            check_cuda(cudaFreeAsync(data, stream), "release graph scratch");
+            return;
+        }
+        Slot* slot = nullptr;
+        for (Slot& candidate : entry.slots)
+            if (candidate.data && candidate.last_stream == stream) {
+                slot = &candidate;
+                break;
+            }
+        if (!slot)
+            for (Slot& candidate : entry.slots)
+                if (!candidate.data) {
+                    slot = &candidate;
+                    break;
+                }
+        if (!slot) slot = &entry.slots[entry.next++ % kSlots];
+        if (!slot->data) {
+            check_cuda(cudaEventCreateWithFlags(&slot->done, cudaEventDisableTiming), "create scratch event");
+            check_cuda(cudaMallocFromPoolAsync(reinterpret_cast<void**>(&slot->data),
+                                               kScratchBytes, entry.pool, stream), "allocate cached scratch");
+        }
+        if (slot->recorded) {
+            const cudaError_t status = cudaEventQuery(slot->done);
+            if (status == cudaErrorNotReady)
+                check_cuda(cudaStreamWaitEvent(stream, slot->done, 0), "wait for scratch");
+            else
+                check_cuda(status, "scratch completion");
+        }
+        launch(slot->data);
+        check_cuda(cudaEventRecord(slot->done, stream), "record scratch completion");
+        slot->recorded = true;
+        slot->last_stream = stream;
+    }
+
+    ~ScratchArena() {
+        int previous = 0;
+        if (cudaGetDevice(&previous) != cudaSuccess) return;  // Runtime already shut down.
+        for (Device& entry : devices_) {
+            if (cudaSetDevice(entry.id) != cudaSuccess) continue;
+            // The caller may already have destroyed every input stream. The
+            // arena's own cleanup stream waits for the recorded uses, then frees
+            // each allocation. CUDA defers pool destruction until frees finish.
+            for (Slot& slot : entry.slots) {
+                if (!slot.data) continue;
+                if (slot.recorded) cudaStreamWaitEvent(entry.cleanup, slot.done, 0);
+                cudaFreeAsync(slot.data, entry.cleanup);
+                cudaEventDestroy(slot.done);
+            }
+            cudaStreamDestroy(entry.cleanup);
+            cudaMemPoolDestroy(entry.pool);
+        }
+        cudaSetDevice(previous);
     }
 };
-
-cudaMemPool_t scratch_pool() {
-    static ScratchPools pools;
-    int device = 0;
-    check_cuda(cudaGetDevice(&device), "current device");
-    return pools.get(device);
-}
 
 }  // namespace
 
@@ -232,26 +293,22 @@ void sparse_attn_decode(const bf16* q, const bf16* window, const bf16* comp,
                         const int32_t* idx, int m, int n_idx, const float* sink, float scale,
                         bf16* o, cudaStream_t stream) {
     if (m <= 0) return;
-    if (n_idx < 0 || n_idx > 1024) {
-        std::fprintf(stderr, "sparse_attn_decode: invalid n_idx %d\n", n_idx);
+    if (m > 8 || n_idx < 0 || n_idx > 1024) {
+        std::fprintf(stderr, "sparse_attn_decode: invalid shape m=%d n_idx=%d\n", m, n_idx);
         std::abort();
     }
     const int partitions = n_idx > 0 ? (n_idx + kPartition - 1) / kPartition : 1;
     const size_t parts = (size_t) m * kHeads * partitions;
     const size_t numerator_bytes = parts * kHeadDim * sizeof(float);
-    float* workspace = nullptr;
-    // Stream-ordered scratch is private to this call, including simultaneous
-    // calls on different streams. Retained pool pages avoid per-call OS release.
-    check_cuda(cudaMallocFromPoolAsync(reinterpret_cast<void**>(&workspace),
-                                       numerator_bytes + parts * sizeof(float2),
-                                       scratch_pool(), stream), "allocate partials");
-    auto* stats = reinterpret_cast<float2*>(reinterpret_cast<char*>(workspace) + numerator_bytes);
-    sparse_partials<<<dim3(kHeads, partitions, m), kThreads, 0, stream>>>(
-        q, window, comp, idx, n_idx, partitions, scale, workspace, stats);
-    check_cuda(cudaGetLastError(), "partial kernel");
-    sparse_merge<<<m * kHeads, kThreads, 0, stream>>>(workspace, stats, partitions, sink, o);
-    check_cuda(cudaGetLastError(), "merge kernel");
-    check_cuda(cudaFreeAsync(workspace, stream), "release partials");
+    static ScratchArena scratch;
+    scratch.run(stream, numerator_bytes + parts * sizeof(float2), [&](float* workspace) {
+        auto* stats = reinterpret_cast<float2*>(reinterpret_cast<char*>(workspace) + numerator_bytes);
+        sparse_partials<<<dim3(kHeads, partitions, m), kThreads, 0, stream>>>(
+            q, window, comp, idx, n_idx, partitions, scale, workspace, stats);
+        check_cuda(cudaGetLastError(), "partial kernel");
+        sparse_merge<<<m * kHeads, kThreads, 0, stream>>>(workspace, stats, partitions, sink, o);
+        check_cuda(cudaGetLastError(), "merge kernel");
+    });
 }
 
 }  // namespace strata::ds41::kernels
