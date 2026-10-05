@@ -14,14 +14,16 @@
 #   CI-ISSUE: <issue number>             CI-FILES: <allowed paths, space separated, prefix match>
 # The test prints "RESULT pass|fail <key=value ...>"; the last such line is the verdict.
 #
-# Env: REPO_DIR (clone of the repo), BASE (default origin/feature/ds41), GH_TOKEN (fine-grained token: issues
-# write on this repo only), POLL (default 60).
+# Results never need a GitHub token on this (public cloud) machine: each result is written to $STATE/outbox/ as
+# "<issue number>\n<markdown comment>", and ds41/ci/relay.sh on the reviewer's machine posts and archives them.
+#
+# Env: REPO_DIR (clone of the repo), BASE (default origin/feature/ds41), POLL (default 60).
 set -u
 REPO_DIR=${REPO_DIR:-/workspace/ci/repo}
 BASE=${BASE:-origin/feature/ds41}
 POLL=${POLL:-60}
 STATE=${STATE:-/workspace/ci/state}
-mkdir -p "$STATE/results" "$STATE/logs" "$STATE/wt"
+mkdir -p "$STATE/results" "$STATE/logs" "$STATE/wt" "$STATE/outbox"
 TESTED="$STATE/tested.txt"
 touch "$TESTED"
 
@@ -77,12 +79,12 @@ test_branch() {
 record() {  # record <task> <branch> <sha> <pass|fail> <details> <issue>
     local task=$1 branch=$2 sha=$3 v=$4 details=$5 issue=$6
     printf '%s\t%s\t%s\t%s\t%s\n' "$(date -u +%FT%TZ)" "$branch" "${sha:0:10}" "$v" "$details" >> "$STATE/results/$task.tsv"
-    if [ -n "$issue" ] && [ -n "${GH_TOKEN:-}" ]; then
+    if [ -n "$issue" ]; then
         local tail_txt
         tail_txt=$(tail -40 "$STATE/logs/${task}_${sha:0:10}.log" 2>/dev/null)
-        gh issue comment "$issue" --repo "$(git -C "$REPO_DIR" remote get-url origin | sed -E 's#.*github.com[:/]##; s#\.git$##')" \
-            --body "$(printf '**%s** `%s` @ `%s`: **%s** %s\n\n<details><summary>log tail</summary>\n\n```\n%s\n```\n</details>' \
-                     "$task" "$branch" "${sha:0:10}" "$v" "$details" "$tail_txt")" >/dev/null 2>&1 || true
+        printf '%s\n**%s** `%s` @ `%s`: **%s** %s\n\n<details><summary>log tail</summary>\n\n```\n%s\n```\n</details>\n' \
+            "$issue" "$task" "$branch" "${sha:0:10}" "$v" "$details" "$tail_txt" \
+            > "$STATE/outbox/$(date -u +%Y%m%dT%H%M%S)_${task}_${sha:0:10}.md"
     fi
 }
 
