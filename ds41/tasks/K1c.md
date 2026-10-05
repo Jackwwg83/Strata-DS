@@ -3,7 +3,7 @@
 CI-TARGETS: strata_ds41 k1c_fp8_gemv_test
 CI-TEST: ./k1c_fp8_gemv_test
 CI-FILES: src/ds41/kernels/fp8_gemv.cu src/ds41/kernels/fp8_gemv/
-CI-ISSUE: TBD
+CI-ISSUE: 6
 
 ## What it computes
 

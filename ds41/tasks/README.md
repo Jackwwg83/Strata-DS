@@ -6,6 +6,7 @@ implementations of the same task may compete; the fastest one that passes wins a
 
 | Task | Kernel | Header | Ranking metric (lower is better) |
 | --- | --- | --- | --- |
+| [K1c](K1c.md) | faster FP8 GEMV for decode (all dense weights) | `include/strata/ds41/fp8_gemv.hpp` | `score_us` |
 | [K2](K2.md) | FP8 block-scaled GEMM for prefill | `include/strata/ds41/kernels/k2_fp8_gemm.hpp` | `score_us` |
 | [K3](K3.md) | sparse attention, decode and verify windows | `include/strata/ds41/kernels/k3_sparse_attn.hpp` | `score_us` |
 | [K5](K5.md) | indexer scores, candidate blocks, top-k | `include/strata/ds41/kernels/k5_indexer.hpp` | `score_us` |
