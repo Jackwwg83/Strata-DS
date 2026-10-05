@@ -16,3 +16,6 @@ if(STRATA_BUILD_TESTS)
     add_test(NAME fp8_gemv_parity COMMAND fp8_gemv_parity --selftest)
     set_tests_properties(fp8_gemv_parity PROPERTIES SKIP_RETURN_CODE 77 TIMEOUT 600)
 endif()
+
+# The M1 engine (pack loader, GPU ops, CPU experts) builds on the kernels above.
+include(${CMAKE_CURRENT_LIST_DIR}/ds41_engine.cmake)
