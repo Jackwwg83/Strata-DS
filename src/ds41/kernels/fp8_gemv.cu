@@ -48,12 +48,15 @@ __global__ void quantize(const uint16_t* __restrict__ x, int64_t blocks,
 }
 
 // SPLIT warps cooperate on ROWS output rows. Small N gets more independent K slices;
-// adjacent output rows reuse each float4 activation load and have independent accumulators.
+// Two or four adjacent output rows reuse each float4 activation load and weight-block scale.
+// Four rows amortize activation traffic on large N without adding more K slices.
+// The large-M four-row entry point bounds registers to allow four resident blocks.
 // Every weight vector is loaded and decoded once for all M activation rows.
 template<int M, int ROWS, int SPLIT, bool WIDE>
-__global__ void gemv(const float* __restrict__ x, const uint8_t* __restrict__ w,
+__device__ __forceinline__ void gemv_body(const float* __restrict__ x, const uint8_t* __restrict__ w,
                      const uint8_t* __restrict__ scales, uint16_t* __restrict__ y,
                      int64_t k, int64_t n) {
+    static_assert(ROWS == 1 || ROWS == 2 || ROWS == 4, "row groups must divide a scale block");
     constexpr int GROUPS = THREADS / (32 * SPLIT);
     const int lane = threadIdx.x & 31;
     const int warp = threadIdx.x / 32;
@@ -66,7 +69,7 @@ __global__ void gemv(const float* __restrict__ x, const uint8_t* __restrict__ w,
         float acc[ROWS][M] = {};
         for (int64_t col = int64_t(split * 32 + lane) * 16; col < k; col += SPLIT * 512) {
             uint4 packed[ROWS];
-            // ROWS is 1 or 2 and row is a multiple of ROWS, so the group never crosses a scale row.
+            // ROWS divides 32 and row is a multiple of ROWS, so all rows share this scale.
             const float sw = row < n ? detail::decode_e8m0(scales[(row / 32) * (k / 32) + col / 32]) : 0;
             #pragma unroll
             for (int r = 0; r < ROWS; ++r) {
@@ -83,7 +86,9 @@ __global__ void gemv(const float* __restrict__ x, const uint8_t* __restrict__ w,
                     }
                 }
             }
-            #pragma unroll
+            // Keep four-row decode packets short-lived; fully expanding all four
+            // packets increases registers enough to undermine the row reuse.
+            #pragma unroll (ROWS == 4 && M >= 5 ? 1 : 4)
             for (int j = 0; j < 4; ++j) {
                 float4 weight[ROWS];
                 #pragma unroll
@@ -145,6 +150,22 @@ __global__ void gemv(const float* __restrict__ x, const uint8_t* __restrict__ w,
     }
 }
 
+// Preserve the original resource policy for narrow groups and short token windows.
+template<int M, int ROWS, int SPLIT, bool WIDE>
+__global__ void gemv(const float* __restrict__ x, const uint8_t* __restrict__ w,
+                     const uint8_t* __restrict__ scales, uint16_t* __restrict__ y,
+                     int64_t k, int64_t n) {
+    gemv_body<M, ROWS, SPLIT, WIDE>(x, w, scales, y, k, n);
+}
+
+template<int M, int SPLIT>
+__global__ __launch_bounds__(THREADS, 4)
+void gemv_four(const float* __restrict__ x, const uint8_t* __restrict__ w,
+               const uint8_t* __restrict__ scales, uint16_t* __restrict__ y,
+               int64_t k, int64_t n) {
+    gemv_body<M, 4, SPLIT, true>(x, w, scales, y, k, n);
+}
+
 unsigned grid_for(int64_t rows) {
     const int64_t grid = (rows - 1) / (THREADS / 32) + 1;
     return unsigned(grid < 65535 ? grid : 65535);
@@ -156,10 +177,18 @@ void launch_layout(const float* x, const uint8_t* w, const uint8_t* scales, uint
     constexpr int ROWS_PER_BLOCK = (THREADS / 32 / SPLIT) * ROWS;
     const int64_t blocks = (n - 1) / ROWS_PER_BLOCK + 1;
     const unsigned grid = unsigned(blocks < 65535 ? blocks : 65535);
-    if (((reinterpret_cast<uintptr_t>(w) | reinterpret_cast<uintptr_t>(x)) & 15u) == 0)
-        gemv<M, ROWS, SPLIT, true><<<grid, THREADS, 0, stream>>>(x, w, scales, y, k, n);
-    else
-        gemv<M, ROWS, SPLIT, false><<<grid, THREADS, 0, stream>>>(x, w, scales, y, k, n);
+    if constexpr (ROWS == 4) {
+        // The four-row dispatch checks alignment before selecting this layout.
+        if constexpr (M >= 5)
+            gemv_four<M, SPLIT><<<grid, THREADS, 0, stream>>>(x, w, scales, y, k, n);
+        else
+            gemv<M, ROWS, SPLIT, true><<<grid, THREADS, 0, stream>>>(x, w, scales, y, k, n);
+    } else {
+        if (((reinterpret_cast<uintptr_t>(w) | reinterpret_cast<uintptr_t>(x)) & 15u) == 0)
+            gemv<M, ROWS, SPLIT, true><<<grid, THREADS, 0, stream>>>(x, w, scales, y, k, n);
+        else
+            gemv<M, ROWS, SPLIT, false><<<grid, THREADS, 0, stream>>>(x, w, scales, y, k, n);
+    }
 }
 
 template<int M, int ROWS>
@@ -175,7 +204,19 @@ void launch_split(const float* x, const uint8_t* w, const uint8_t* scales, uint1
 template<int M>
 void launch(const float* x, const uint8_t* w, const uint8_t* scales, uint16_t* y,
             int64_t k, int64_t n, cudaStream_t stream) {
-    if (detail::gemv_rows_per_group(n) == 2)
+    // Four rows retain all M token accumulators while reusing activations and scales.
+    // Keep the narrower layout for small grids, incomplete groups, and scalar loads:
+    // it exposes more independent work and limits registers in the guarded paths.
+    const bool aligned = ((reinterpret_cast<uintptr_t>(w) |
+                           reinterpret_cast<uintptr_t>(x)) & 15u) == 0;
+    if (n >= 4096 && (n & 3) == 0 && aligned) {
+        // N >= 4096 needs at most two K-split warps; avoid an unused four-way
+        // instantiation with four rows and its additional shared-memory reduction.
+        if (n <= 8192)
+            launch_layout<M, 4, 2>(x, w, scales, y, k, n, stream);
+        else
+            launch_layout<M, 4, 1>(x, w, scales, y, k, n, stream);
+    } else if (detail::gemv_rows_per_group(n) == 2)
         launch_split<M, 2>(x, w, scales, y, k, n, stream);
     else
         launch_split<M, 1>(x, w, scales, y, k, n, stream);
