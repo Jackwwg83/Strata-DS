@@ -14,6 +14,19 @@ namespace {
 
 constexpr int THREADS = 128;
 
+// For normal E4M3 and E8M0 bytes 7..246, the product is a normal FP32
+// value: exponent = (magnitude >> 3) + scale - 7, with an unchanged mantissa.
+// Keep the original arithmetic for zero, FP8 subnormals/NaNs and extreme scales.
+__device__ __forceinline__ float decode_scaled_e4m3(uint8_t q, uint32_t exponent_bias,
+                                                  bool normal_scale, float sw) {
+    const uint32_t magnitude = q & 127u;
+    if (normal_scale && magnitude - 8u < 119u) {
+        const uint32_t sign = uint32_t(q & 128u) << 24;
+        return detail::from_bits(sign | ((magnitude << 20) + exponent_bias));
+    }
+    return detail::decode_e4m3(q) * sw;
+}
+
 void check(cudaError_t e, const char* what) {
     if (e != cudaSuccess) {
         std::fprintf(stderr, "fp8_block_gemv %s: %s\n", what, cudaGetErrorString(e));
@@ -67,7 +80,10 @@ __global__ void gemv(const float* __restrict__ x, const uint8_t* __restrict__ w,
         for (int64_t col = int64_t(split * 32 + lane) * 16; col < k; col += SPLIT * 512) {
             uint4 packed[ROWS];
             // ROWS is 1 or 2 and row is a multiple of ROWS, so the group never crosses a scale row.
-            const float sw = row < n ? detail::decode_e8m0(scales[(row / 32) * (k / 32) + col / 32]) : 0;
+            const uint8_t scale = row < n ? scales[(row / 32) * (k / 32) + col / 32] : 0;
+            const float sw = row < n ? detail::decode_e8m0(scale) : 0;
+            const uint32_t exponent_bias = (uint32_t(scale) - 7u) << 23;
+            const bool normal_scale = uint32_t(scale) - 7u < 240u;
             #pragma unroll
             for (int r = 0; r < ROWS; ++r) {
                 packed[r] = make_uint4(0, 0, 0, 0);
@@ -90,10 +106,10 @@ __global__ void gemv(const float* __restrict__ x, const uint8_t* __restrict__ w,
                 for (int r = 0; r < ROWS; ++r) {
                     const uint32_t word = j == 0 ? packed[r].x : j == 1 ? packed[r].y :
                                           j == 2 ? packed[r].z : packed[r].w;
-                    weight[r] = make_float4(detail::decode_e4m3(uint8_t(word)) * sw,
-                                            detail::decode_e4m3(uint8_t(word >> 8)) * sw,
-                                            detail::decode_e4m3(uint8_t(word >> 16)) * sw,
-                                            detail::decode_e4m3(uint8_t(word >> 24)) * sw);
+                    weight[r] = make_float4(decode_scaled_e4m3(uint8_t(word), exponent_bias, normal_scale, sw),
+                                            decode_scaled_e4m3(uint8_t(word >> 8), exponent_bias, normal_scale, sw),
+                                            decode_scaled_e4m3(uint8_t(word >> 16), exponent_bias, normal_scale, sw),
+                                            decode_scaled_e4m3(uint8_t(word >> 24), exponent_bias, normal_scale, sw));
                 }
                 #pragma unroll
                 for (int t = 0; t < M; ++t) {
