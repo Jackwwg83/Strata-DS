@@ -13,14 +13,15 @@
 static float bf(float x) { uint32_t u; std::memcpy(&u,&x,4); u=(u+(0x7fff+((u>>16)&1)))&0xffff0000u; std::memcpy(&x,&u,4); return x; }
 static std::vector<float> randn(int n,int seed,bool rounded=true) { std::mt19937 g(seed);std::normal_distribution<float>d(0,1);std::vector<float>a(n);for(float&x:a){x=d(g);if(rounded)x=bf(x);}return a; }
 static void validate_layout() {
-    // Direct B-fragment loads cover every element of one 8-head query tile.
+    // Two register-Q partitions together cover one 8-head query tile.
     int queries[8][512] = {};
-    for (int lane = 0; lane < 32; ++lane)
-        for (int k = 0; k < 32; ++k)
+    for (int partition = 0; partition < 2; ++partition)
+      for (int lane = 0; lane < 32; ++lane)
+        for (int k = 0; k < 16; ++k)
             for (int reg = 0; reg < 2; ++reg)
                 for (int elem = 0; elem < 2; ++elem) {
                     const int h = lane / 4;
-                    const int d = k * 16 + (lane % 4) * 2 + reg * 8 + elem;
+                    const int d = partition * 256 + k * 16 + (lane % 4) * 2 + reg * 8 + elem;
                     assert(h < 8 && d < 512);
                     assert(++queries[h][d] == 1);
                 }
@@ -36,6 +37,17 @@ static void validate_layout() {
         for (int off : {4, 8, 16}) assert((lane ^ off) % 4 == lane % 4);
     }
     for (auto& head : scores) for (int n : head) assert(n == 1);
+    // Each individual shared-score instruction addresses all 32 banks.
+    for (int warp = 0; warp < 8; ++warp) for (int elem = 0; elem < 4; ++elem) {
+        int banks[32] = {};
+        for (int lane = 0; lane < 32; ++lane) {
+            const int head = (warp % 4) * 8 + (lane % 4) * 2 + (elem % 2);
+            const int row = lane / 4 + (elem / 2) * 8;
+            const int index = head * 20 + row;
+            assert(index < 32 * 20);
+            assert(++banks[index % 32] == 1);
+        }
+    }
     float lanes[32];
     for (int lane = 0; lane < 32; ++lane) lanes[lane] = (lane / 4 + 1) + (lane / 4 + 9);
     for (int off : {4, 8, 16}) {
@@ -59,11 +71,13 @@ static void validate_layout() {
         std::vector<int> written(m * 64 * 512);
         for (int t = 0; t < m; ++t) for (int group = 0; group < 2; ++group)
             for (int output = 0; output < 512; output += od)
-                for (int warp = 0; warp < 4; ++warp) for (int lane = 0; lane < 32; ++lane)
-                    for (int v = 0; v < od / 16; ++v)
+                for (int warp = 0; warp < 8; ++warp) for (int lane = 0; lane < 32; ++lane)
+                    for (int v = 0; v < (od / 2 + 15) / 16; ++v)
                         for (int a = 0; a < 2; ++a) for (int b = 0; b < 2; ++b) {
-                            const int h = group * 32 + warp * 8 + (lane % 4) * 2 + a;
-                            const int d = output + v * 16 + lane / 4 + b * 8;
+                            const int part = warp / 4;
+                            if (od == 16 && b != part) continue;
+                            const int h = group * 32 + (warp % 4) * 8 + (lane % 4) * 2 + a;
+                            const int d = output + (od >= 32 ? part * (od / 2) : 0) + v * 16 + lane / 4 + b * 8;
                             assert(++written[(t * 64 + h) * 512 + d] == 1);
                         }
         for (int n : written) assert(n == 1);
@@ -71,14 +85,14 @@ static void validate_layout() {
     // The producer packets cover each logical KV element, and all packets
     // have a 16-byte-aligned address despite the padded 520-element stride.
     int packets[16][64] = {};
-    for (int thread = 0; thread < 128; ++thread)
-        for (int i = thread; i < 16 * 64; i += 128) {
+    for (int thread = 0; thread < 256; ++thread)
+        for (int i = thread; i < 16 * 64; i += 256) {
             const int row = i / 64, dim = (i % 64) * 8;
             assert((row * 520 + dim) % 8 == 0);
             assert(++packets[row][dim / 8] == 1);
         }
     for (auto& row : packets) for (int n : row) assert(n == 1);
-    std::puts("PASS: register-Q/MMA/PV/shuffle/gather layouts and full m=1..8 output coverage");
+    std::puts("PASS: partitioned register-Q/MMA/PV/shuffle/gather/bank layouts and full m=1..8 output coverage");
 }
 int main() {
     validate_layout();
@@ -114,7 +128,9 @@ int main() {
                 for(int off=16;off;off>>=1)for(int lane=0;lane<off;lane++)lanes[lane]+=lanes[lane+off];
                 // Sequential FP32 accumulation is a sensitivity check for a
                 // different QK reduction order, not a promise about hardware.
-                for(int d=0;d<512;d++) sequential=std::fma(q[(t*64+h)*512+d],r[d],sequential);
+                float partial[2]={};
+                for(int d=0;d<512;d++) partial[d/256]=std::fma(q[(t*64+h)*512+d],r[d],partial[d/256]);
+                sequential=partial[0]+partial[1];
                 reference_scores[k]=lanes[0]*scale; scores[k]=sequential*scale;
                 maximum=std::max(maximum,reference_scores[k]);
             }
@@ -150,7 +166,7 @@ int main() {
             }
         }
         const double error=std::sqrt(num/std::max(den,1e-300));
-        std::printf("CPU online16/register-Q model m=%d n_idx=%d window_valid=%d mode=%d rel_l2=%.9g %s\n",cc.m,cc.n,cc.valid,cc.mode,error,error<=3e-3?"PASS":"FAIL");
+        std::printf("CPU online16/split256-register-Q model m=%d n_idx=%d window_valid=%d mode=%d rel_l2=%.9g %s\n",cc.m,cc.n,cc.valid,cc.mode,error,error<=3e-3?"PASS":"FAIL");
         pass &= error<=3e-3;
     }
     std::puts("Model covers BF16 P, FP32 denominator, sink-only denominator, tails, repeated/negative/all-empty indices; GPU parity remains untested.");

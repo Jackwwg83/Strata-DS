@@ -1,7 +1,7 @@
-// K3-08: 32 heads share each 16-key BF16 tensor-core tile. Four warps
-// retain eight query heads each in registers, avoiding a large shared-Q
-// allocation. Output-dimension groups expose independent CTAs, and two
-// small KV buffers overlap the next gather with the current QK/PV tile.
+// K3-08: 32 heads share each 16-key BF16 tensor-core tile. Two warps
+// split each eight-head QK tile into 256-channel reductions. Register-Q
+// fragments are half as large and the serial tensor-core chain is halved.
+// Output groups expose CTAs; double-buffered KV overlaps gather with MMA.
 // Online FP32 softmax rounds P to BF16 before PV. No global scratch/state.
 #include "strata/ds41/kernels/k3_sparse_attn.hpp"
 
@@ -19,15 +19,18 @@ constexpr int kHeadTile = 32;
 constexpr int kRows = 16;
 constexpr int kStride = kDim + 8;
 constexpr int kProbStride = kRows + 8;
-constexpr int kWarps = 4;
+constexpr int kPartitions = 2;
+constexpr int kScoreStride = kRows + 4;
+constexpr int kWarps = 8;
 constexpr int kThreads = 32 * kWarps;
 constexpr unsigned kWarpMask = 0xffffffffu;
 
 struct __align__(32) TileStorage {
     bf16 kv[2][kRows * kStride];
-    bf16 p[kHeadTile * kProbStride];
+    bf16 p[kPartitions * kHeadTile * kProbStride];
+    float score[kPartitions][kHeadTile * kScoreStride];
 };
-static_assert(sizeof(TileStorage) == 34816, "shared-memory layout changed");
+static_assert(sizeof(TileStorage) == 41472, "shared-memory layout changed");
 static_assert(sizeof(TileStorage) <= 48 * 1024, "no shared-memory opt-in required");
 
 __device__ __forceinline__ unsigned shared_address(const void* p) {
@@ -85,17 +88,19 @@ __device__ __forceinline__ void prefetch(bf16* dst, const bf16* window,
 // and two key/output rows separated by eight. The xor-4/8/16 reductions
 // therefore leave each head's online softmax state in its owning lanes.
 template <int OutputDim>
-__global__ __launch_bounds__(kThreads) void attention_online(
+__global__ __launch_bounds__(kThreads, 2) void attention_online(
         const bf16* __restrict__ q, const bf16* __restrict__ window,
         const bf16* __restrict__ comp, const int32_t* __restrict__ idx,
         int n_idx, const float* __restrict__ sink, float scale,
         bf16* __restrict__ output) {
     __shared__ TileStorage tile;
-    constexpr int output_tiles = OutputDim / 16;
+    constexpr int output_tiles = (OutputDim / kPartitions + 15) / 16;
     const int lane = threadIdx.x & 31;
     const int warp = threadIdx.x >> 5;
     const int query = blockIdx.z;
-    const int head = blockIdx.x * kHeadTile + warp * 8;
+    const int partition = warp / 4;
+    const int head_group = warp % 4;
+    const int head = blockIdx.x * kHeadTile + head_group * 8;
     const int output_dim = blockIdx.y * OutputDim;
     const int head0 = (lane & 3) * 2;
     const int head1 = head0 + 1;
@@ -105,11 +110,11 @@ __global__ __launch_bounds__(kThreads) void attention_online(
 
     // Directly load the documented m16n8k16 B fragment: lane/4 is the
     // column, lane%4 selects a pair in K, and register 1 advances K by 8.
-    // Every query element is loaded once per CTA, then reused for all keys.
-    unsigned query_fragment[kDim / 16][2];
+    // Each partition retains only half the query, then reuses it for all keys.
+    unsigned query_fragment[kDim / kPartitions / 16][2];
 #pragma unroll
-    for (int k = 0; k < kDim / 16; ++k) {
-        const bf16* src = queries + row * kDim + k * 16 + (lane & 3) * 2;
+    for (int k = 0; k < kDim / kPartitions / 16; ++k) {
+        const bf16* src = queries + row * kDim + partition * (kDim / kPartitions) + k * 16 + (lane & 3) * 2;
         query_fragment[k][0] = *reinterpret_cast<const unsigned*>(src);
         query_fragment[k][1] = *reinterpret_cast<const unsigned*>(src + 8);
     }
@@ -130,11 +135,24 @@ __global__ __launch_bounds__(kThreads) void attention_online(
 
         float score[4] = {};
 #pragma unroll
-        for (int k = 0; k < kDim / 16; ++k) {
+        for (int k = 0; k < kDim / kPartitions / 16; ++k) {
             unsigned keys[4];
-            load_a(keys, kv + (lane % 16) * kStride + k * 16 + (lane / 16) * 8);
+            load_a(keys, kv + (lane % 16) * kStride + partition * (kDim / kPartitions) + k * 16 + (lane / 16) * 8);
             mma(score, keys, query_fragment[k]);
         }
+        // Adjacent head pairs use a 20-float score stride: the 32 lanes
+        // hit all 32 banks instead of colliding across the eight key rows.
+        const int sh0 = (head_group * 8 + head0) * kScoreStride + row;
+        const int sh1 = (head_group * 8 + head1) * kScoreStride + row;
+        tile.score[partition][sh0] = score[0];
+        tile.score[partition][sh1] = score[1];
+        tile.score[partition][sh0 + 8] = score[2];
+        tile.score[partition][sh1 + 8] = score[3];
+        __syncthreads();
+        score[0] = tile.score[0][sh0] + tile.score[1][sh0];
+        score[1] = tile.score[0][sh1] + tile.score[1][sh1];
+        score[2] = tile.score[0][sh0 + 8] + tile.score[1][sh0 + 8];
+        score[3] = tile.score[0][sh1 + 8] + tile.score[1][sh1 + 8];
         const bool valid0 = first + row < n_idx && indices[first + row] >= 0;
         const bool valid1 = first + row + 8 < n_idx && indices[first + row + 8] >= 0;
         score[0] = valid0 ? score[0] * scale : -CUDART_INF_F;
@@ -166,7 +184,7 @@ __global__ __launch_bounds__(kThreads) void attention_online(
         sum1 = sum1 * alpha1 + add1;
 
         // P is rounded, while its contribution to the denominator stays
-        // FP32. Each warp writes and consumes only its own eight heads.
+        // FP32. Separate P storage per warp avoids cross-warp softmax barriers.
         bf16* probabilities = tile.p + warp * 8 * kProbStride;
         probabilities[head0 * kProbStride + row] = __float2bfloat16_rn(p0);
         probabilities[head1 * kProbStride + row] = __float2bfloat16_rn(p1);
@@ -182,7 +200,7 @@ __global__ __launch_bounds__(kThreads) void attention_online(
             result[v][2] *= alpha0;
             result[v][3] *= alpha1;
             unsigned values[4];
-            const int d = output_dim + v * 16;
+            const int d = output_dim + (OutputDim >= 32 ? partition * (OutputDim / kPartitions) : 0) + v * 16;
             load_a_transposed(values, kv + ((lane % 8) + (lane / 16) * 8) * kStride
                                              + d + ((lane / 8) & 1) * 8);
             mma(result[v], values, p);
@@ -202,11 +220,17 @@ __global__ __launch_bounds__(kThreads) void attention_online(
     bf16* out1 = output + (static_cast<size_t>(query) * kHeads + head + head1) * kDim;
 #pragma unroll
     for (int v = 0; v < output_tiles; ++v) {
-        const int d = output_dim + v * 16 + row;
-        out0[d] = __float2bfloat16_rn(result[v][0] / denom0);
-        out1[d] = __float2bfloat16_rn(result[v][1] / denom1);
-        out0[d + 8] = __float2bfloat16_rn(result[v][2] / denom0);
-        out1[d + 8] = __float2bfloat16_rn(result[v][3] / denom1);
+        const int d = output_dim + (OutputDim >= 32 ? partition * (OutputDim / kPartitions) : 0) + v * 16 + row;
+        // The narrowest group shares one 16-row PV tile between its two
+        // partitions. Each writes its own eight rows; no duplicate stores.
+        if (OutputDim >= 32 || partition == 0) {
+            out0[d] = __float2bfloat16_rn(result[v][0] / denom0);
+            out1[d] = __float2bfloat16_rn(result[v][1] / denom1);
+        }
+        if (OutputDim >= 32 || partition == 1) {
+            out0[d + 8] = __float2bfloat16_rn(result[v][2] / denom0);
+            out1[d + 8] = __float2bfloat16_rn(result[v][3] / denom1);
+        }
     }
 }
 }  // namespace
