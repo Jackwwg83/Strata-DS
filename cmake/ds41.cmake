@@ -19,3 +19,6 @@ endif()
 
 # The M1 engine (pack loader, GPU ops, CPU experts) builds on the kernels above.
 include(${CMAKE_CURRENT_LIST_DIR}/ds41_engine.cmake)
+
+# Open kernel tasks: replaceable implementations with fixed acceptance tests.
+include(${CMAKE_CURRENT_LIST_DIR}/ds41_tasks.cmake)
