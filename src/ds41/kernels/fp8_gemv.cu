@@ -21,7 +21,7 @@ void check(cudaError_t e, const char* what) {
     }
 }
 
-void validate(const uint16_t* x, int m, int64_t k) {
+void validate(const void* x, int m, int64_t k) {
     if (!x || m < 1 || m > 8 || k <= 0 || k % 32 != 0 ||
         uint64_t(k) > std::numeric_limits<size_t>::max() / (8 * sizeof(float)))
         throw std::invalid_argument("fp8_block_gemv: need x, 1 <= m <= 8, positive k divisible by 32");
@@ -47,50 +47,100 @@ __global__ void quantize(const uint16_t* __restrict__ x, int64_t blocks,
     }
 }
 
-// Each warp owns a row; consecutive lanes read consecutive 16-byte weight vectors.
-// Decode once and keep M accumulators so verify windows do not reread the weight matrix.
-template<int M, bool WIDE>
+// SPLIT warps cooperate on ROWS output rows. Small N gets more independent K slices;
+// adjacent output rows reuse each float4 activation load and have independent accumulators.
+// Every weight vector is loaded and decoded once for all M activation rows.
+template<int M, int ROWS, int SPLIT, bool WIDE>
 __global__ void gemv(const float* __restrict__ x, const uint8_t* __restrict__ w,
                      const uint8_t* __restrict__ scales, uint16_t* __restrict__ y,
                      int64_t k, int64_t n) {
+    constexpr int GROUPS = THREADS / (32 * SPLIT);
     const int lane = threadIdx.x & 31;
-    for (int64_t row = int64_t(blockIdx.x) * (THREADS / 32) + threadIdx.x / 32;
-         row < n; row += int64_t(gridDim.x) * (THREADS / 32)) {
-        float acc[M] = {};
-        for (int64_t col = int64_t(lane) * 16; col < k; col += 512) {
-            uint4 packed;
-            const uint8_t* p = w + row * k + col;
-            if constexpr (WIDE) {
-                packed = *reinterpret_cast<const uint4*>(p);
-            } else {
-                // The public interface does not require 16-byte alignment for a sliced byte tensor.
-                uint32_t words[4] = {};
-                #pragma unroll
-                for (int j = 0; j < 16; ++j) words[j / 4] |= uint32_t(p[j]) << ((j % 4) * 8);
-                packed = make_uint4(words[0], words[1], words[2], words[3]);
+    const int warp = threadIdx.x / 32;
+    const int split = warp % SPLIT;
+    const int group = warp / SPLIT;
+    __shared__ float partial[THREADS / 32][ROWS][M];
+    for (int64_t base = int64_t(blockIdx.x) * GROUPS * ROWS;
+         base < n; base += int64_t(gridDim.x) * GROUPS * ROWS) {
+        const int64_t row = base + group * ROWS;
+        float acc[ROWS][M] = {};
+        for (int64_t col = int64_t(split * 32 + lane) * 16; col < k; col += SPLIT * 512) {
+            uint4 packed[ROWS];
+            // ROWS is 1 or 2 and row is a multiple of ROWS, so the group never crosses a scale row.
+            const float sw = row < n ? detail::decode_e8m0(scales[(row / 32) * (k / 32) + col / 32]) : 0;
+            #pragma unroll
+            for (int r = 0; r < ROWS; ++r) {
+                packed[r] = make_uint4(0, 0, 0, 0);
+                if (row + r < n) {
+                    const uint8_t* p = w + (row + r) * k + col;
+                    if constexpr (WIDE) {
+                        packed[r] = *reinterpret_cast<const uint4*>(p);
+                    } else {
+                        uint32_t words[4] = {};
+                        #pragma unroll
+                        for (int j = 0; j < 16; ++j) words[j / 4] |= uint32_t(p[j]) << ((j % 4) * 8);
+                        packed[r] = make_uint4(words[0], words[1], words[2], words[3]);
+                    }
+                }
             }
-            const uint32_t words[4] = {packed.x, packed.y, packed.z, packed.w};
-            const float sw = detail::decode_e8m0(scales[(row / 32) * (k / 32) + col / 32]);
             #pragma unroll
             for (int j = 0; j < 4; ++j) {
-                const float w0 = detail::decode_e4m3(uint8_t(words[j])) * sw;
-                const float w1 = detail::decode_e4m3(uint8_t(words[j] >> 8)) * sw;
-                const float w2 = detail::decode_e4m3(uint8_t(words[j] >> 16)) * sw;
-                const float w3 = detail::decode_e4m3(uint8_t(words[j] >> 24)) * sw;
+                float4 weight[ROWS];
+                #pragma unroll
+                for (int r = 0; r < ROWS; ++r) {
+                    const uint32_t word = j == 0 ? packed[r].x : j == 1 ? packed[r].y :
+                                          j == 2 ? packed[r].z : packed[r].w;
+                    weight[r] = make_float4(detail::decode_e4m3(uint8_t(word)) * sw,
+                                            detail::decode_e4m3(uint8_t(word >> 8)) * sw,
+                                            detail::decode_e4m3(uint8_t(word >> 16)) * sw,
+                                            detail::decode_e4m3(uint8_t(word >> 24)) * sw);
+                }
                 #pragma unroll
                 for (int t = 0; t < M; ++t) {
-                    const float4 a = *reinterpret_cast<const float4*>(x + int64_t(t) * k + col + j * 4);
-                    acc[t] = fmaf(a.x, w0, acc[t]);
-                    acc[t] = fmaf(a.y, w1, acc[t]);
-                    acc[t] = fmaf(a.z, w2, acc[t]);
-                    acc[t] = fmaf(a.w, w3, acc[t]);
+                    const float* p = x + int64_t(t) * k + col + j * 4;
+                    float4 a;
+                    if constexpr (WIDE) a = *reinterpret_cast<const float4*>(p);
+                    else a = make_float4(p[0], p[1], p[2], p[3]);
+                    #pragma unroll
+                    for (int r = 0; r < ROWS; ++r) {
+                        acc[r][t] = fmaf(a.x, weight[r].x, acc[r][t]);
+                        acc[r][t] = fmaf(a.y, weight[r].y, acc[r][t]);
+                        acc[r][t] = fmaf(a.z, weight[r].z, acc[r][t]);
+                        acc[r][t] = fmaf(a.w, weight[r].w, acc[r][t]);
+                    }
                 }
             }
         }
         #pragma unroll
-        for (int t = 0; t < M; ++t) {
-            for (int d = 16; d; d >>= 1) acc[t] += __shfl_down_sync(0xffffffffu, acc[t], d);
-            if (lane == 0) y[int64_t(t) * n + row] = strata::kernels::bf16_from_f32(acc[t]);
+        for (int r = 0; r < ROWS; ++r) {
+            #pragma unroll
+            for (int t = 0; t < M; ++t) {
+                for (int d = 16; d; d >>= 1) acc[r][t] += __shfl_down_sync(0xffffffffu, acc[r][t], d);
+                if (lane == 0) {
+                    if constexpr (SPLIT == 1) {
+                        if (row + r < n) y[int64_t(t) * n + row + r] = strata::kernels::bf16_from_f32(acc[r][t]);
+                    } else {
+                        partial[warp][r][t] = acc[r][t];
+                    }
+                }
+            }
+        }
+        if constexpr (SPLIT > 1) {
+            __syncthreads();
+            if (split == 0 && lane == 0) {
+                #pragma unroll
+                for (int r = 0; r < ROWS; ++r) {
+                    #pragma unroll
+                    for (int t = 0; t < M; ++t) {
+                        float sum = partial[warp][r][t];
+                        #pragma unroll
+                        for (int z = 1; z < SPLIT; ++z) sum += partial[warp + z][r][t];
+                        if (row + r < n) y[int64_t(t) * n + row + r] = strata::kernels::bf16_from_f32(sum);
+                    }
+                }
+            }
+            // All warps must finish reading before a grid-stride iteration overwrites partials.
+            __syncthreads();
         }
     }
 }
@@ -100,13 +150,42 @@ unsigned grid_for(int64_t rows) {
     return unsigned(grid < 65535 ? grid : 65535);
 }
 
+template<int M, int ROWS, int SPLIT>
+void launch_layout(const float* x, const uint8_t* w, const uint8_t* scales, uint16_t* y,
+                   int64_t k, int64_t n, cudaStream_t stream) {
+    constexpr int ROWS_PER_BLOCK = (THREADS / 32 / SPLIT) * ROWS;
+    const int64_t blocks = (n - 1) / ROWS_PER_BLOCK + 1;
+    const unsigned grid = unsigned(blocks < 65535 ? blocks : 65535);
+    if (((reinterpret_cast<uintptr_t>(w) | reinterpret_cast<uintptr_t>(x)) & 15u) == 0)
+        gemv<M, ROWS, SPLIT, true><<<grid, THREADS, 0, stream>>>(x, w, scales, y, k, n);
+    else
+        gemv<M, ROWS, SPLIT, false><<<grid, THREADS, 0, stream>>>(x, w, scales, y, k, n);
+}
+
+template<int M, int ROWS>
+void launch_split(const float* x, const uint8_t* w, const uint8_t* scales, uint16_t* y,
+                  int64_t k, int64_t n, cudaStream_t stream) {
+    switch (detail::gemv_split_warps(n)) {
+        case 4: launch_layout<M, ROWS, 4>(x, w, scales, y, k, n, stream); break;
+        case 2: launch_layout<M, ROWS, 2>(x, w, scales, y, k, n, stream); break;
+        default: launch_layout<M, ROWS, 1>(x, w, scales, y, k, n, stream); break;
+    }
+}
+
 template<int M>
 void launch(const float* x, const uint8_t* w, const uint8_t* scales, uint16_t* y,
             int64_t k, int64_t n, cudaStream_t stream) {
-    if ((reinterpret_cast<uintptr_t>(w) & 15u) == 0)
-        gemv<M, true><<<grid_for(n), THREADS, 0, stream>>>(x, w, scales, y, k, n);
+    if (detail::gemv_rows_per_group(n) == 2)
+        launch_split<M, 2>(x, w, scales, y, k, n, stream);
     else
-        gemv<M, false><<<grid_for(n), THREADS, 0, stream>>>(x, w, scales, y, k, n);
+        launch_split<M, 1>(x, w, scales, y, k, n, stream);
+}
+
+void validate_output(int64_t k, const uint8_t* w, const uint8_t* scales, int64_t n, uint16_t* y) {
+    if (!w || !scales || !y || n <= 0 ||
+        n > std::numeric_limits<int64_t>::max() / k ||
+        uint64_t(n) > std::numeric_limits<size_t>::max() / (8 * sizeof(uint16_t)))
+        throw std::invalid_argument("fp8_block_gemv: invalid weight/output geometry or null pointer");
 }
 
 }  // namespace
@@ -121,32 +200,46 @@ void fp8_quantize_activation(const uint16_t* x, int m, int64_t k,
     check(cudaGetLastError(), "quantize launch");
 }
 
+void fp8_quantize_activation_f32(const uint16_t* x, int m, int64_t k,
+                                 float* x_deq, void* stream) {
+    validate(x, m, k);
+    if (!x_deq) throw std::invalid_argument("fp8_quantize_activation_f32: null output");
+    const int64_t blocks = int64_t(m) * (k / 32);
+    quantize<<<grid_for(blocks), THREADS, 0, static_cast<cudaStream_t>(stream)>>>(
+        x, blocks, x_deq, nullptr, nullptr);
+    check(cudaGetLastError(), "quantize f32 launch");
+}
+
+void fp8_block_gemv_q(const float* x_deq, int m, int64_t k,
+                      const uint8_t* w, const uint8_t* w_scale, int64_t n,
+                      uint16_t* y, void* stream) {
+    validate(x_deq, m, k);
+    validate_output(k, w, w_scale, n, y);
+    const auto s = static_cast<cudaStream_t>(stream);
+    switch (m) {
+        case 1: launch<1>(x_deq, w, w_scale, y, k, n, s); break;
+        case 2: launch<2>(x_deq, w, w_scale, y, k, n, s); break;
+        case 3: launch<3>(x_deq, w, w_scale, y, k, n, s); break;
+        case 4: launch<4>(x_deq, w, w_scale, y, k, n, s); break;
+        case 5: launch<5>(x_deq, w, w_scale, y, k, n, s); break;
+        case 6: launch<6>(x_deq, w, w_scale, y, k, n, s); break;
+        case 7: launch<7>(x_deq, w, w_scale, y, k, n, s); break;
+        case 8: launch<8>(x_deq, w, w_scale, y, k, n, s); break;
+    }
+    check(cudaGetLastError(), "gemv q launch");
+}
+
 void fp8_block_gemv(const uint16_t* x, int m, int64_t k,
                     const uint8_t* w, const uint8_t* w_scale, int64_t n,
                     uint16_t* y, void* stream) {
     validate(x, m, k);
-    if (!w || !w_scale || !y || n <= 0 ||
-        n > std::numeric_limits<int64_t>::max() / k ||
-        uint64_t(n) > std::numeric_limits<size_t>::max() / (8 * sizeof(uint16_t)))
-        throw std::invalid_argument("fp8_block_gemv: invalid weight/output geometry or null pointer");
+    validate_output(k, w, w_scale, n, y);
     const auto s = static_cast<cudaStream_t>(stream);
     float* dequant = nullptr;
     check(cudaMallocAsync(reinterpret_cast<void**>(&dequant), size_t(m) * size_t(k) * sizeof(float), s),
           "activation allocation");
-    const int64_t blocks = int64_t(m) * (k / 32);
-    quantize<<<grid_for(blocks), THREADS, 0, s>>>(x, blocks, dequant, nullptr, nullptr);
-    check(cudaGetLastError(), "quantize launch");
-    switch (m) {
-        case 1: launch<1>(dequant, w, w_scale, y, k, n, s); break;
-        case 2: launch<2>(dequant, w, w_scale, y, k, n, s); break;
-        case 3: launch<3>(dequant, w, w_scale, y, k, n, s); break;
-        case 4: launch<4>(dequant, w, w_scale, y, k, n, s); break;
-        case 5: launch<5>(dequant, w, w_scale, y, k, n, s); break;
-        case 6: launch<6>(dequant, w, w_scale, y, k, n, s); break;
-        case 7: launch<7>(dequant, w, w_scale, y, k, n, s); break;
-        case 8: launch<8>(dequant, w, w_scale, y, k, n, s); break;
-    }
-    check(cudaGetLastError(), "gemv launch");
+    fp8_quantize_activation_f32(x, m, k, dequant, stream);
+    fp8_block_gemv_q(dequant, m, k, w, w_scale, n, y, stream);
     check(cudaFreeAsync(dequant, s), "activation release");
 }
 

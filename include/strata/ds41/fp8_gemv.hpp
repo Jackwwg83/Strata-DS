@@ -8,10 +8,25 @@ namespace strata::ds41 {
 
 // Device pointers: x [m,k] BF16 bits, w [n,k] E4M3, w_scale [ceil(n/32),k/32] E8M0,
 // y [m,n] BF16 bits. 1 <= m <= 8, k > 0 divisible by 32, n > 0; buffers must not overlap.
-// Asynchronous even on the default stream. Uses CUDA's stream-ordered allocation pool.
+// Compatibility wrapper: allocates [m,k] floats from CUDA's stream-ordered pool, calls the two
+// entry points below, then frees the scratch. Asynchronous even on the default stream.
 void fp8_block_gemv(const uint16_t* x, int m, int64_t k,
                     const uint8_t* w, const uint8_t* w_scale, int64_t n,
                     uint16_t* y, void* stream);
+
+// Caller-owned device x_deq [m,k] floats: exactly decode(E4M3(x/s))*s, with K1 block-32 scales.
+// Same m/k constraints as above. x and x_deq must not overlap.
+// No allocation or synchronization, even on the default stream. Capturable on CUDA capture-capable streams.
+void fp8_quantize_activation_f32(const uint16_t* x, int m, int64_t k,
+                                 float* x_deq, void* stream);
+
+// x_deq is the output of fp8_quantize_activation_f32; reuse it across weights with the same k.
+// Same geometry and non-overlap rules as fp8_block_gemv. Only natural pointer alignment is required;
+// 16-byte-aligned x_deq and w select vector loads. The caller keeps all buffers alive until completion.
+// No allocation or synchronization, even on the default stream. Capturable on CUDA capture-capable streams.
+void fp8_block_gemv_q(const float* x_deq, int m, int64_t k,
+                      const uint8_t* w, const uint8_t* w_scale, int64_t n,
+                      uint16_t* y, void* stream);
 
 // The production quantizer, with exported xq [m,k] bytes and x_scale [m,k/32] FP32 powers of two.
 // All pointers are device pointers; asynchronous on stream. Used for bitwise parity checks.
@@ -25,6 +40,10 @@ void fp8_quantize_activation(const uint16_t* x, int m, int64_t k,
 #define STRATA_DS41_HD
 #endif
 namespace detail {
+
+// Shared dispatch policy lets the host test model the same lane ownership as the CUDA kernel.
+inline int gemv_split_warps(int64_t n) { return n <= 2048 ? 4 : (n <= 8192 ? 2 : 1); }
+inline int gemv_rows_per_group(int64_t n) { return n >= 1024 ? 2 : 1; }
 
 STRATA_DS41_HD inline uint32_t float_bits(float x) {
     uint32_t u;
