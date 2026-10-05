@@ -296,7 +296,7 @@ int main() {
             else measure(flayer, mode, cold_ok, 9, f1, f8, st);
             bool io_known = !st.read_mb.empty();
             for (double v : st.read_mb) io_known = io_known && !std::isnan(v);
-            std::sort(st.read_mb.begin(), st.read_mb.end());
+            if (io_known) std::sort(st.read_mb.begin(), st.read_mb.end());   // NaN breaks the sort's ordering contract
             const double rmb = io_known ? st.read_mb[st.read_mb.size() / 2] : std::nan("");
             char io[64];
             if (io_known) std::snprintf(io, sizeof io, "%.1f MB", rmb);
