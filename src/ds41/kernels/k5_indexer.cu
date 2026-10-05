@@ -1,8 +1,7 @@
-// K5-11: 64-key BF16 tensor-core scores and caller-storage exact radix selection.
+// K5-17: raw BF16 MMA scores, register-only epilogue, exact K5-11 selection.
 // The same pipeline is used eagerly and in CUDA graphs; no internal global scratch exists.
 #include "strata/ds41/kernels/k5_indexer.hpp"
 
-#include <mma.h>
 #include <math_constants.h>
 
 #include <algorithm>
@@ -66,16 +65,55 @@ struct Selection {
     Count remaining;  // Number of ties still needed within this prefix.
 };
 
-// Each warp computes 32 heads x 16 positions. The matrix intermediates are
-// FP32; the three BF16 conversions remain separate from tensor accumulation.
+// The operand layout is specified by PTX, rather than an opaque WMMA fragment.
+// ldmatrix.x4 rows are [h0..7,d0], [h8..15,d0], [h0..7,d8], [h8..15,d8].
+__device__ __forceinline__ void load_a(uint32_t (&a)[4], const bf16* address) {
+    const uint32_t shared = uint32_t(__cvta_generic_to_shared(address));
+    asm volatile("ldmatrix.sync.aligned.m8n8.x4.shared.b16 {%0,%1,%2,%3}, [%4];"
+                 : "=r"(a[0]), "=r"(a[1]), "=r"(a[2]), "=r"(a[3]) : "r"(shared));
+}
+// B is column-major [dimension,key], physically row-major [key,dimension].
+// The non-transposed x2 therefore supplies (d0..7,key0..7), then d8..15.
+__device__ __forceinline__ void load_b(uint32_t (&b)[2], const bf16* address) {
+    const uint32_t shared = uint32_t(__cvta_generic_to_shared(address));
+    asm volatile("ldmatrix.sync.aligned.m8n8.x2.shared.b16 {%0,%1}, [%2];"
+                 : "=r"(b[0]), "=r"(b[1]) : "r"(shared));
+}
+__device__ __forceinline__ void mma(float* c, const uint32_t (&a)[4],
+                                    const uint32_t (&b)[2]) {
+    asm volatile("mma.sync.aligned.m16n8k16.row.col.f32.bf16.bf16.f32 "
+                 "{%0,%1,%2,%3}, {%4,%5,%6,%7}, {%8,%9}, {%0,%1,%2,%3};"
+                 : "+f"(c[0]), "+f"(c[1]), "+f"(c[2]), "+f"(c[3])
+                 : "r"(a[0]), "r"(a[1]), "r"(a[2]), "r"(a[3]),
+                   "r"(b[0]), "r"(b[1]));
+}
+
+// Swap one bit of the lane address with one bit of a 16-register address.
+// Exactly eight shuffles per stage; this permutes values without arithmetic.
+// A pair (lane,r) becomes (lane XOR LaneBit, r XOR RegisterBit) iff its two
+// selected bits differ. The other two entries of each 2x2 stay in place.
+template<int LaneBit, int RegisterBit>
+__device__ __forceinline__ void transpose_bit(float (&v)[16], int lane) {
+#pragma unroll
+    for (int r = 0; r < 16; ++r) {
+        if ((r & RegisterBit) == 0) {
+            const float a = v[r], b = v[r | RegisterBit];
+            const bool high = (lane & LaneBit) != 0;
+            const float cross = __shfl_xor_sync(kFullWarp, high ? a : b, LaneBit);
+            v[r] = high ? cross : a;
+            v[r | RegisterBit] = high ? b : cross;
+        }
+    }
+}
+
+// Retain K5-11's 64-key CTA, four warps and input staging. Only MMA register
+// ownership/epilogue changes: no dot/contribution matrix is ever in shared.
 __global__ void tensor_scores(const bf16* q, const bf16* keys, int64_t n, const bf16* w,
                               const uint8_t* cand, float* scores) {
     __shared__ __align__(32) bf16 sq[32 * 128];
     __shared__ __align__(32) bf16 sk[64 * 128];
-    __shared__ __align__(32) float dots[32 * 64];
     __shared__ float weights[32];
-    const int tid = threadIdx.x;
-    const int warp = tid >> 5;
+    const int tid = threadIdx.x, lane = tid & 31, warp = tid >> 5;
     const int64_t base = int64_t(blockIdx.x) * 64;
     for (int i = tid; i < 32 * 128; i += 128) sq[i] = q[i];
     for (int i = tid; i < 64 * 128; i += 128) {
@@ -85,33 +123,57 @@ __global__ void tensor_scores(const bf16* q, const bf16* keys, int64_t n, const 
     if (tid < 32) weights[tid] = __bfloat162float(w[tid]);
     __syncthreads();
 
-    namespace wm = nvcuda::wmma;
-    wm::fragment<wm::matrix_a, 16, 16, 16, bf16, wm::row_major> a0, a1;
-    wm::fragment<wm::matrix_b, 16, 16, 16, bf16, wm::col_major> b;
-    wm::fragment<wm::accumulator, 16, 16, 16, float> c0, c1;
-    wm::fill_fragment(c0, 0.0f);
-    wm::fill_fragment(c1, 0.0f);
+    // Register r bits, high to low: [head16,key8,head8,key1].
+    // Lane bits: [head4,head2,head1,key4,key2]. Thus the PTX accumulator
+    // maps to head=16*(r>>3)+8*((r>>1)&1)+(lane>>2),
+    // key=8*((r>>2)&1)+2*(lane&3)+(r&1), within this warp's 16 keys.
+    float c[16] = {};
 #pragma unroll
     for (int d = 0; d < 128; d += 16) {
-        wm::load_matrix_sync(a0, sq + d, 128);
-        wm::load_matrix_sync(a1, sq + 16 * 128 + d, 128);
-        wm::load_matrix_sync(b, sk + warp * 16 * 128 + d, 128);
-        wm::mma_sync(c0, a0, b, c0);
-        wm::mma_sync(c1, a1, b, c1);
+        uint32_t a0[4], a1[4], b0[2], b1[2];
+        const int qa = (lane & 15) * 128 + (lane >> 4) * 8 + d;
+        const int kb = (warp * 16 + (lane & 7)) * 128 + ((lane >> 3) & 1) * 8 + d;
+        load_a(a0, sq + qa);
+        load_a(a1, sq + 16 * 128 + qa);
+        load_b(b0, sk + kb);
+        load_b(b1, sk + 8 * 128 + kb);
+        mma(c, a0, b0);
+        mma(c + 4, a0, b1);
+        mma(c + 8, a1, b0);
+        mma(c + 12, a1, b1);
     }
-    wm::store_matrix_sync(dots + warp * 16, c0, 64, wm::mem_row_major);
-    wm::store_matrix_sync(dots + 16 * 64 + warp * 16, c1, 64, wm::mem_row_major);
-    __syncthreads();
-    if (tid < 64 && base + tid < n) {
-        if (cand && !cand[base + tid]) {
-            scores[base + tid] = -CUDART_INF_F;
-        } else {
-            float total = 0.0f;
 #pragma unroll
-            for (int h = 0; h < 32; ++h)
-                total += rounded(fmaxf(rounded(dots[h * 64 + tid]), 0.0f) * weights[h]);
-            scores[base + tid] = rounded(total);
+    for (int r = 0; r < 16; ++r) {
+        const int h = 16 * (r >> 3) + 8 * ((r >> 1) & 1) + (lane >> 2);
+        c[r] = rounded(fmaxf(rounded(c[r]), 0.0f) * weights[h]);
+    }
+    // Output lane bits: [head16,key8,key1,key4,key2].
+    // Output register bits: [head4,head2,head8,head1]. Each lane now owns
+    // 16 consecutive heads of one key; lane+16 owns its following 16 heads.
+    transpose_bit<16, 8>(c, lane);
+    transpose_bit<8, 4>(c, lane);
+    transpose_bit<4, 1>(c, lane);
+
+    float total = 0.0f;
+    if (lane < 16) {
+#pragma unroll
+        for (int h = 0; h < 16; ++h) {
+            const int r = (h & 1) | ((h & 8) >> 2) | ((h & 6) << 1);
+            total = __fadd_rn(total, c[r]);
         }
+    }
+    // Transfer the h0..15 running sum, NOT a separately summed partial.
+    // All 32 lanes participate before any tail/mask/owner branch.
+    total = __shfl_sync(kFullWarp, total, lane & 15);
+    if (lane >= 16) {
+#pragma unroll
+        for (int h = 0; h < 16; ++h) {
+            const int r = (h & 1) | ((h & 8) >> 2) | ((h & 6) << 1);
+            total = __fadd_rn(total, c[r]);
+        }
+        const int key = ((lane >> 3) & 1) * 8 + (lane & 3) * 2 + ((lane >> 2) & 1);
+        const int64_t j = base + warp * 16 + key;
+        if (j < n) scores[j] = cand && !cand[j] ? -CUDART_INF_F : rounded(total);
     }
 }
 

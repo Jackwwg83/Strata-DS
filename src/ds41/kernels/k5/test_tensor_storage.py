@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""K5-11 source/layout audit; optional generated PTX audit. No GPU is executed."""
+"""K5-17 source/layout audit; optional generated PTX audit. No GPU is executed."""
 from pathlib import Path
 import hashlib
 import re
@@ -10,15 +10,18 @@ SOURCE = Path(__file__).resolve().parents[1] / 'k5_indexer.cu'
 
 def main():
     source = SOURCE.read_text()
-    start = source.index('__global__ void tensor_scores(')
-    end = source.index('\n}\n', start) + 3
-    scorer = source[start:end]
-    # Body from K5-02 at 9b8d285fab562d91d9f11a5ba208b98f79996f78.
-    assert hashlib.sha256(scorer.encode()).hexdigest() == (
-        'a7a3deedad9c5b69b106831009b88c5d90e6fc4c8a393e89a4210ff8236d05d3')
+    start = source.index('// The operand layout')
+    end = source.index('// Candidate block maxima', start)
+    assert hashlib.sha256(source[start:end].encode()).hexdigest() == (
+        'e208f68525919fd31c232d57ae58356d2f230d4d3d16d922ee4c305294f75d00')
+    # Every part outside the raw-MMA scorer/helpers stays byte-identical to
+    # control K5-11 at 1f3dd904c5f996c9f5226a7d3677c207de2c39c4.
+    assert hashlib.sha256(source[source.index('namespace strata'):start].encode()).hexdigest() == (
+        '8ff440ecac6b1f249dce957c81222a1b7605acca2dc380b9e93193e6968c778f')
+    assert hashlib.sha256(source[end:].encode()).hexdigest() == (
+        '0c2718b624541e48781d16c7cffef869c96ecfb4d981f4449a9a57add5e7a485')
     start = source.index('// Every produced score')
     end = source.index('\n}  // namespace', start)
-    # Complete caller-storage pipeline from K5-07 at 466796657f0df8b68ca15615cebe9e28075bbfc5.
     assert hashlib.sha256(source[start:end].encode()).hexdigest() == (
         '07f2744ddf867d77ce388dc0b8ad78b19eb61b4cf55d23466c41de127258f1cd')
     for token in ('cudaMalloc', 'cudaFree', 'cudaMemcpy', 'cudaStreamSynchronize',
@@ -28,44 +31,36 @@ def main():
     launches = re.findall(r'<<<(.*?)>>>', source)
     assert launches and all(x.strip().endswith(', stream') for x in launches)
 
-    # All matrix loads and stores refer to disjoint, aligned, in-bounds tiles.
-    writes = [0] * (32 * 64)
-    for warp in range(4):
-        for half in range(2):
-            for row in range(16):
-                for col in range(16):
-                    dst = (half * 16 + row) * 64 + warp * 16 + col
-                    writes[dst] += 1
-        for d in range(0, 128, 16):
-            assert (d * 2) % 32 == 0
-            assert ((warp * 16 * 128 + d) * 2) % 32 == 0
-            for row in range(16):
-                for col in range(16):
-                    a0 = row * 128 + d + col
-                    a1 = 16 * 128 + a0
-                    b = (warp * 16 + col) * 128 + d + row
-                    assert 0 <= a0 < 32 * 128 and 0 <= a1 < 32 * 128
-                    assert 0 <= b < 64 * 128
-    assert all(x == 1 for x in writes)
-    for n in (513, 575, 576, 577, 4095, 4096, 4097, 16384, 131072, 131201):
-        covered = [0] * n
-        for base in range(0, n, 64):
-            for tid in range(64):
-                if base + tid < n:
-                    covered[base + tid] += 1
-        assert all(x == 1 for x in covered)
+    from test_register_epilogue import main as register_model
+    register_model()
     # For C=1, N>=4096; for C>=2 use minimum N=4096*(C-1)+1.
     # Both metadata spans grow more slowly than that minimum N.
     for count in list(range(1, 4097)) + [2**20, 2**32, 2**40]:
         n = 4096 if count == 1 else 4096 * (count - 1) + 1
         assert 8 + 1024 * min(count, 256) <= n
         assert 8 + 8 * count <= n
-    print('PASS exact scorer/metadata source provenance; tensor layout/tails; '
+    print('PASS exact K5-11 selector/dispatch provenance; register scorer source; '
           'stream-only launches; no allocator/cache/sync; metadata capacity')
 
     if len(sys.argv) == 2:
         ptx = Path(sys.argv[1]).read_text()
         entries = re.split(r'(?=^\.entry )', ptx, flags=re.MULTILINE)[1:]
+        scorer = [entry for entry in entries if 'tensor_scores' in entry.split('(', 1)[0]]
+        assert len(scorer) == 1
+        scorer = scorer[0]
+        assert scorer.count('mma.sync.aligned.m16n8k16.row.col.f32.bf16.bf16.f32') == 32
+        assert scorer.count('ldmatrix.sync.aligned') == 32
+        assert scorer.count('bar.sync') == 1
+        assert scorer.count('shfl.sync.bfly.b32') == 24
+        assert scorer.count('shfl.sync.idx.b32') == 1
+        assert scorer.count('add.rn.f32') == 32
+        assert not re.search(r'\b(?:ld|st)\.local', scorer)
+        # All shared stores precede the only barrier; MMA and epilogue have
+        # no shared stores, and nothing is spilled to local memory in PTX.
+        assert 'st.shared' not in scorer[scorer.index('bar.sync'):]
+        assert '.shared .align 32 .b8' in scorer
+        print('PASS PTX: 32 raw MMA, 24 permutation shuffles, 1 carry shuffle, '
+              '32 explicit ordered adds, 1 staging barrier, no epilogue shared stores')
         wanted = ('parallel_histogram', 'choose_parallel_byte', 'count_partitions',
                   'prefix_partitions', 'emit_partitions', 'restore_scores')
         checked = 0
