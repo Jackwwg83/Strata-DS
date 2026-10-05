@@ -50,11 +50,15 @@ __global__ void quantize(const uint16_t* __restrict__ x, int64_t blocks,
 // SPLIT warps cooperate on ROWS output rows. Small N gets more independent K slices;
 // adjacent output rows reuse each float4 activation load and have independent accumulators.
 // Every weight vector is loaded and decoded once for all M activation rows.
+// Verify windows use one packed word per lane: less live decoded weight and
+// activation state lets the split-K warps keep more blocks resident. Single-token
+// decode retains 16-byte weight loads to maximize bytes in flight.
 template<int M, int ROWS, int SPLIT, bool WIDE>
 __global__ void gemv(const float* __restrict__ x, const uint8_t* __restrict__ w,
                      const uint8_t* __restrict__ scales, uint16_t* __restrict__ y,
                      int64_t k, int64_t n) {
     constexpr int GROUPS = THREADS / (32 * SPLIT);
+    constexpr int BYTES = M == 1 ? 16 : 4;
     const int lane = threadIdx.x & 31;
     const int warp = threadIdx.x / 32;
     const int split = warp % SPLIT;
@@ -64,7 +68,8 @@ __global__ void gemv(const float* __restrict__ x, const uint8_t* __restrict__ w,
          base < n; base += int64_t(gridDim.x) * GROUPS * ROWS) {
         const int64_t row = base + group * ROWS;
         float acc[ROWS][M] = {};
-        for (int64_t col = int64_t(split * 32 + lane) * 16; col < k; col += SPLIT * 512) {
+        for (int64_t col = int64_t(split * 32 + lane) * BYTES;
+             col < k; col += SPLIT * 32 * BYTES) {
             uint4 packed[ROWS];
             // ROWS is 1 or 2 and row is a multiple of ROWS, so the group never crosses a scale row.
             const float sw = row < n ? detail::decode_e8m0(scales[(row / 32) * (k / 32) + col / 32]) : 0;
@@ -74,17 +79,22 @@ __global__ void gemv(const float* __restrict__ x, const uint8_t* __restrict__ w,
                 if (row + r < n) {
                     const uint8_t* p = w + (row + r) * k + col;
                     if constexpr (WIDE) {
-                        packed[r] = *reinterpret_cast<const uint4*>(p);
+                        // Each weight is consumed once by this CTA. Bypass L1 for
+                        // these streaming reads so reused activations can stay there.
+                        if constexpr (BYTES == 16)
+                            packed[r] = __ldcg(reinterpret_cast<const uint4*>(p));
+                        else
+                            packed[r].x = __ldcg(reinterpret_cast<const uint32_t*>(p));
                     } else {
                         uint32_t words[4] = {};
                         #pragma unroll
-                        for (int j = 0; j < 16; ++j) words[j / 4] |= uint32_t(p[j]) << ((j % 4) * 8);
+                        for (int j = 0; j < BYTES; ++j) words[j / 4] |= uint32_t(p[j]) << ((j % 4) * 8);
                         packed[r] = make_uint4(words[0], words[1], words[2], words[3]);
                     }
                 }
             }
             #pragma unroll
-            for (int j = 0; j < 4; ++j) {
+            for (int j = 0; j < BYTES / 4; ++j) {
                 float4 weight[ROWS];
                 #pragma unroll
                 for (int r = 0; r < ROWS; ++r) {
