@@ -4,8 +4,8 @@
 // qtip-kernels/src/inference.cu) on the unmodified EXL3 format:
 //
 // - warps split k and never synchronize during the main loop: no block-wide pipeline barriers;
-//   B streams straight to registers with ld.global.cs (evict-first; B is single-use) behind a
-//   register prefetch ring
+//   B streams straight to registers behind the original register prefetch ring; narrow
+//   integer loads use ld.global.cg (L2-only), other configurations retain ld.global.cs
 // - the two-word bit windows of the trellis stream are resolved in-warp: with SMEM_STAGE = false
 //   via lane shuffles (the extraction helpers in exl3_dq.cuh read exactly two words per lane, at
 //   lane-computable indices), with SMEM_STAGE = true by staging the tile words through
@@ -182,8 +182,13 @@ __device__ __forceinline__ void dq8_regs_half(uint32_t a7, uint32_t b7, int s7, 
 // ptxas spends 81-85 registers on them on sm_86/sm_89 (one 512-thread block per SM instead of two, measured
 // 18-28% slower at attention-projection shapes on the 3090). They are packed into one register (see x_pack) and
 // the bound keeps the compiler at the integer instances' 64
+// Strata K10: the raw-job integer instance reaches 79 registers on CUDA 12.8
+// sm_89 without the two-block bound, leaving only 16 resident warps. Apply the
+// same bound to narrow integer GEMV: ptxas uses 63 registers without spills,
+// allowing 32 resident warps to cover the streaming trellis-load latency.
+// This changes register allocation only; keep the prefetch/MMA/fold body intact.
 template <int bits, bool c_fp32, int cb, int MMODE, int CFG, bool SMEM_STAGE, bool HALF = false>
-__global__ __launch_bounds__(CFG == 0 ? 512 : 256, HALF && CFG == 0 ? 2 : 1)
+__global__ __launch_bounds__(CFG == 0 ? 512 : 256, CFG == 0 ? 2 : 1)
 void exl3_gemv_kernel(const strata_exl3::GemvJob* jobs)
 {
     // A is already in the Hadamard basis. A null trellis marks an empty slot.
@@ -277,10 +282,23 @@ void exl3_gemv_kernel(const strata_exl3::GemvJob* jobs)
         // Prefetch ring (indices must be compile-time or pf lands in local memory)
         auto ld_b = [&] (int i, int l) -> uint32_t
         {
-            if constexpr (LSTRIDE < 32)
-                return lane < LSTRIDE ? __ldcs(bp + (size_t) i * slice_stride + l * LSTRIDE) : 0;
+            // Keep the same scalar uint32 load, alignment, lane guard and address.
+            // Narrow integer weights stream through L2 without filling L1; other
+            // configurations retain the upstream streaming/evict-first policy.
+            if constexpr (CFG == 0 && !HALF)
+            {
+                if constexpr (LSTRIDE < 32)
+                    return lane < LSTRIDE ? __ldcg(bp + (size_t) i * slice_stride + l * LSTRIDE) : 0;
+                else
+                    return __ldcg(bp + (size_t) i * slice_stride + l * LSTRIDE);
+            }
             else
-                return __ldcs(bp + (size_t) i * slice_stride + l * LSTRIDE);
+            {
+                if constexpr (LSTRIDE < 32)
+                    return lane < LSTRIDE ? __ldcs(bp + (size_t) i * slice_stride + l * LSTRIDE) : 0;
+                else
+                    return __ldcs(bp + (size_t) i * slice_stride + l * LSTRIDE);
+            }
         };
 
         uint32_t pf[PF][LOADS];

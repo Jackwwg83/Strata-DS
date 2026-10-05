@@ -19,6 +19,32 @@ VENDOR = ROOT / "third_party/exllamav3_gpu"
 CU = ROOT / "src/ds41/kernels/k10_exl3_moe.cu"
 PIPELINE = CU.parent / "k10/pipeline.cuh"
 
+# This exact substitution is the sole K10-03 change inside the upstream main loop.
+# Keep both branches explicit so fallback loads and all address/guard expressions are audited.
+WEIGHT_LOAD_UPSTREAM = """            if constexpr (LSTRIDE < 32)
+                return lane < LSTRIDE ? __ldcs(bp + (size_t) i * slice_stride + l * LSTRIDE) : 0;
+            else
+                return __ldcs(bp + (size_t) i * slice_stride + l * LSTRIDE);
+"""
+WEIGHT_LOAD_CANDIDATE = """            // Keep the same scalar uint32 load, alignment, lane guard and address.
+            // Narrow integer weights stream through L2 without filling L1; other
+            // configurations retain the upstream streaming/evict-first policy.
+            if constexpr (CFG == 0 && !HALF)
+            {
+                if constexpr (LSTRIDE < 32)
+                    return lane < LSTRIDE ? __ldcg(bp + (size_t) i * slice_stride + l * LSTRIDE) : 0;
+                else
+                    return __ldcg(bp + (size_t) i * slice_stride + l * LSTRIDE);
+            }
+            else
+            {
+                if constexpr (LSTRIDE < 32)
+                    return lane < LSTRIDE ? __ldcs(bp + (size_t) i * slice_stride + l * LSTRIDE) : 0;
+                else
+                    return __ldcs(bp + (size_t) i * slice_stride + l * LSTRIDE);
+            }
+"""
+
 
 def section(text, start, end):
     return text.split(start, 1)[1].split(end, 1)[0]
@@ -44,6 +70,10 @@ def provenance():
                                    "quant/exl3_gemv_kernel.cuh"]
         old = (restored / "quant/exl3_gemv_kernel.cuh").read_text()
         new = (VENDOR / "quant/exl3_gemv_kernel.cuh").read_text()
+        assert new.count(WEIGHT_LOAD_CANDIDATE) == 1
+        assert new.count("__ldcg(") == 2
+        new = new.replace(WEIGHT_LOAD_CANDIDATE, WEIGHT_LOAD_UPSTREAM)
+        assert "CFG == 0 ? 512 : 256, CFG == 0 ? 2 : 1" in new
         for start, end in [
             ("namespace exl3_gemv_ns {", "}  // namespace exl3_gemv_ns"),
             ("    static_assert(HALF", "    auto grid = cooperative_groups::this_grid();"),
@@ -58,7 +88,7 @@ def provenance():
         for rel in manifest:
             assert (restored / rel).read_bytes() == (VENDOR / rel).read_bytes(), rel
         print(f"PASS provenance: {len(manifest)} pristine SHA-256 hashes; reverse/forward patch round trip")
-        print("PASS preservation: GEMV helpers, constants, decode/MMA/fold/reduction core byte-identical")
+        print("PASS preservation: exact weight cache-policy substitution only; helpers, constants, decode/MMA/fold/reduction byte-identical")
 
 
 def include_and_scope_checks():
@@ -104,6 +134,9 @@ def indexing():
         words = ks * (n // 16) * 24 + group * 48 + load * 24 + lane
         count = (k // 16) * (n // 16) * 24
         assert np.array_equal(np.sort(words.ravel()), np.arange(count))
+        # Cache policy keeps uint32 access width. No 8/16-byte vector alignment
+        # is assumed; every offset preserves the original 4-byte requirement.
+        assert np.all((words * np.dtype(np.uint32).itemsize) % 4 == 0)
         # Only lanes 0..3 read A for MMODE=0; they read the low/high k halves.
         ar = ks[..., 0, 0, None] * 8 + np.arange(4)
         assert ar.min() == 0 and (ar + 4).max() == k // 2 - 1
