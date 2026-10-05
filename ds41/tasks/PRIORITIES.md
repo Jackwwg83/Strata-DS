@@ -17,7 +17,7 @@ Controls are measured on the current box (RTX 4090 + i9-14900K) with the current
 
 | # | Task | Why | Control (merged) |
 | --- | --- | --- | --- |
-| 1 | K11 CPU EXL3 expert kernel (AVX2) | the CPU experts are ~90% of a decode step on AVX2 PCs; new task | vendored moe_mul1, 5,987 us (m1 3,573) |
+| 1 | K11 CPU EXL3 expert kernel (AVX2) | the CPU experts are ~90% of a decode step on AVX2 PCs; new task | K11-01 (AVX-VNNI), 5,264 us (m1 3,181); vendored 5,987 |
 | 1b | K10 GPU EXL3 experts | about 2 ms per token; the largest GPU expert cost | K10-08, 170.7 us (m1 90.4); K10-03 re-run 184.5 |
 | 2 | K8 router top-k | CLOSED: ~26 us per token left; no more variants | K8-07, 19.84 us (m1 16.38) |
 | 3 | K3 sparse attention | merged | K3-25, 42.33 us (m1 27.65) |
