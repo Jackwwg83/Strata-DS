@@ -14,6 +14,7 @@ namespace {
 using Key = unsigned long long;
 constexpr int kThreads = 512;
 constexpr int kSharedCapacity = 4096;
+constexpr int kThresholdSamples = 4096;
 
 void check(cudaError_t e, const char* what) {
     if (e != cudaSuccess) {
@@ -153,18 +154,37 @@ __global__ void select_k(const float* scores, int64_t n, int k, int capacity, Ke
     Key* values = Shared ? local_values : global_values;
     Key threshold = 0;
     if (n > capacity) {
-        Key low = ULLONG_MAX, high = 0;
-        for (int64_t i = threadIdx.x; i < n; i += blockDim.x) {
-            const Key key = order_key(scores[i], i);
-            low = low < key ? low : key;
-            high = high > key ? high : key;
+        Key low = 0, high = ULLONG_MAX, pivot = 0;
+        if (Shared && n >= kThresholdSamples) {
+            // A deterministic stratified sample chooses only the first trial
+            // threshold. The full-input count below certifies it, so arbitrary
+            // distributions, masks and ties remain exact even if the sample is
+            // unrepresentative. Reuse this storage for the final compact set.
+            for (int i = threadIdx.x; i < kThresholdSamples; i += blockDim.x) {
+                const int64_t position = int64_t(i) * n / kThresholdSamples;
+                values[i] = order_key(scores[position], position);
+            }
+            __syncthreads();
+            shared_sort(values, kThresholdSamples, true);
+            int rank = static_cast<int>((int64_t(k) + capacity) * kThresholdSamples / (2 * n)) - 1;
+            rank = rank < 0 ? 0 : (rank >= kThresholdSamples ? kThresholdSamples - 1 : rank);
+            pivot = values[rank];
+            __syncthreads();
+        } else {
+            low = ULLONG_MAX;
+            high = 0;
+            for (int64_t i = threadIdx.x; i < n; i += blockDim.x) {
+                const Key key = order_key(scores[i], i);
+                low = low < key ? low : key;
+                high = high > key ? high : key;
+            }
+            summarize(low, high, 0, summary);
+            low = summary.minimum[0];
+            high = summary.maximum[0];
+            __syncthreads();
+            pivot = low + ((high - low) >> 1);
         }
-        summarize(low, high, 0, summary);
-        low = summary.minimum[0];
-        high = summary.maximum[0];
-        __syncthreads();
         for (;;) {
-            const Key pivot = low + ((high - low) >> 1);
             Key first_above = ULLONG_MAX, last_below = 0;
             int count = 0;
             for (int64_t i = threadIdx.x; i < n; i += blockDim.x) {
@@ -187,6 +207,7 @@ __global__ void select_k(const float* scores, int64_t n, int k, int capacity, Ke
             }
             if (count < k) high = next_high;
             else low = next_low + 1;
+            pivot = low + ((high - low) >> 1);
         }
     }
     for (int i = threadIdx.x; i < capacity; i += blockDim.x) values[i] = 0;
@@ -285,7 +306,9 @@ void select(const float* scores, int64_t n, int k, int32_t* out, int32_t offset,
     const int64_t wanted = std::min<int64_t>(n, int64_t(k) * 2);
     while (capacity < wanted) capacity <<= 1;
     if (capacity <= kSharedCapacity) {
-        select_k<true><<<1, kThreads, size_t(capacity) * sizeof(Key), stream>>>(
+        const int storage = n > capacity && n >= kThresholdSamples ?
+            std::max(capacity, kThresholdSamples) : capacity;
+        select_k<true><<<1, kThreads, size_t(storage) * sizeof(Key), stream>>>(
             scores, n, k, capacity, nullptr, out, offset, cand, t, block);
     } else {
         Key* values = nullptr;
