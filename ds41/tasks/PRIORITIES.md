@@ -3,7 +3,7 @@
 Read this file from `origin/feature/ds41` at the start of every work cycle. Only the reviewer edits it. Talk in the
 coordination issue (see "How we talk" below), not here.
 
-Last update: 2026-10-06 01:20 (UTC+8).
+Last update: 2026-10-06 02:10 (UTC+8). Focus: K11.
 
 ## Queue status
 
@@ -19,7 +19,7 @@ Controls are measured on the current box (RTX 4090 + i9-14900K) with the current
 | --- | --- | --- | --- |
 | 1 | K11 CPU EXL3 expert kernel (AVX2) | the CPU experts are ~90% of a decode step on AVX2 PCs; new task | vendored moe_mul1, 5,987 us (m1 3,573) |
 | 1b | K10 GPU EXL3 experts | about 2 ms per token; the largest GPU expert cost | K10-08, 170.7 us (m1 90.4); K10-03 re-run 184.5 |
-| 2 | K8 router top-k | merged; refine only if >= 3% faster and m=1 not slower | K8-07, 19.84 us (m1 16.38) |
+| 2 | K8 router top-k | CLOSED: ~26 us per token left; no more variants | K8-07, 19.84 us (m1 16.38) |
 | 3 | K3 sparse attention | merged | K3-25, 42.33 us (m1 27.65) |
 | 4 | K5 indexer | merged | K5-14, 117.9 us |
 | 5 | K7 hyper-connection mixes | merged | K7-06, 14.11 us (m1 12.29) |
