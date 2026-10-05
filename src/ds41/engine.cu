@@ -1,11 +1,16 @@
 // src/ds41/engine.cu - DeepSeek V4.1 Flash decode, one token at a time. See engine.hpp.
 //
 // Each block of code below restates one method of DeepSeek's model.py (Block, Attention, Compressor, Indexer,
-// MoE, Engram, ParallelHead) for one token. Host-side pieces (routing top-k, indexer top-k, n-gram hashes) are
-// small and stay on the CPU in M1; the GPU work is ordered on the default stream.
+// MoE, Engram, ParallelHead) for one token. The GPU work is ordered on the default stream. Routing and the
+// indexer top-k go through the task kernels (K8, K5). The routed experts run on a CPU thread that meets the
+// stream once per layer through an ExpertDoorbell (upstream's doorbell), so the host thread only enqueues work
+// and waits once, for the logits. The engram rows of both engram layers are read at the start of the step.
 #include "strata/ds41/engine.hpp"
 
 #include "strata/ds41/config.hpp"
+#include "strata/ds41/doorbell.hpp"
+#include "strata/ds41/kernels/k5_indexer.hpp"
+#include "strata/ds41/kernels/k8_router.hpp"
 #include "strata/ds41/ops.hpp"
 
 #include "moe_mul1.h"   // third_party/exllamav3_moe
@@ -16,13 +21,17 @@
 #include <unistd.h>
 
 #include <algorithm>
+#include <atomic>
 #include <chrono>
 #include <cmath>
 #include <cstdio>
 #include <cstdlib>
+#include <condition_variable>
 #include <cstring>
+#include <mutex>
 #include <numeric>
 #include <stdexcept>
+#include <thread>
 
 namespace strata::ds41 {
 
@@ -75,8 +84,6 @@ std::vector<float> rope_table(int seqlen, bool yarn) {
     return t;
 }
 
-float softplus(float x) { return x > 20.0f ? x : std::log1p(std::exp(x)); }
-
 }  // namespace
 
 struct Engine::Impl {
@@ -100,7 +107,6 @@ struct Engine::Impl {
         bf16* idx_keys = nullptr;                  // [max_seq/ratio][128]   (kv sources)
         float *kv_state = nullptr, *score_state = nullptr;   // [ratio][512]   (kv sources, ratio > 1)
         int64_t moe_handle = -1;
-        std::vector<float> gate_bias_host;
     };
     std::vector<Layer> L;
     const bf16 *embed, *head, *final_norm;
@@ -109,18 +115,32 @@ struct Engine::Impl {
     float* rope_plain = nullptr;
     float* rope_yarn = nullptr;
 
-    // engram
+    // engram: rows of both engram layers for the current step, read before the step's GPU work
     std::vector<int> eng_fd;
     std::vector<int32_t> history;      // compressed token ids fed so far
+    static constexpr int kEngRows = 24;
+    uint8_t* eng_host = nullptr;       // pinned: per engram layer, kEngRows*256 weight bytes then kEngRows*8 scales
+    uint8_t* eng_dev = nullptr;        // the same on the device
+
+    // routed experts: the CPU thread and its doorbell (round l+1 = layer l)
+    std::unique_ptr<ExpertDoorbell> db;
+    std::thread worker;
+    std::mutex mu;
+    std::condition_variable cv;
+    uint64_t go = 0;                   // steps released to the worker
+    std::atomic<bool> stop{false};
+    std::atomic<int64_t> worker_us{0}; // CPU expert time of the current step
+    int32_t* routes_dev = nullptr;     // [40][6]
+    float* weights_dev = nullptr;      // [40][6]
+    uint8_t* cand_dev = nullptr;       // [max_seq] candidate mask of the candidate layer
 
     // scratch
     bf16 *h, *h2, *xa, *xf, *qr, *q, *kvv, *o, *oa, *attn_out, *latent, *ik, *iq, *iw_raw, *iw, *g, *u, *sh_h,
         *sh_out, *ffn_out, *eng_vals, *eng_kv, *final_x;
     float *act, *pre_mix, *pre, *post, *comb, *mix_scratch, *ffn_pre, *attn_pre, *attn_post, *attn_comb, *ffn_post,
-        *ffn_comb, *ckv, *cscore, *scores, *router, *routed, *logits;
+        *ffn_comb, *ckv, *cscore, *scores, *routed, *logits;
     uint16_t* x_half_dev;
-    int32_t* idx_dev;
-    uint8_t *eng_w_dev, *eng_s_dev;
+    int32_t* idx_dev;                  // attention index list: [0, 128) window, then the compressed top-k
 
     // DS41_DEBUG=<file>: per step, the intermediates of layers 1 and 2 (bf16 bits), for bisecting a mismatch
     std::FILE* dbg = nullptr;
@@ -134,11 +154,18 @@ struct Engine::Impl {
     // shared attention state for the current token (SharedAttentionRuntime)
     const bf16* cur_comp = nullptr;
     const bf16* cur_index_k = nullptr;
-    std::vector<int32_t> cur_topk;     // compressed part, already offset by kWindow
-    std::vector<uint8_t> candidates;   // from the candidate source layer, per compressed position
     std::vector<float> lg;             // logits of the last step
 
     Impl(const std::string& dir, int max_seq_, int threads) : pack(dir), max_seq(max_seq_), cpu_threads(threads) {}
+    ~Impl() {
+        {
+            std::lock_guard<std::mutex> lk(mu);
+            stop = true;
+        }
+        cv.notify_all();
+        if (worker.joinable()) worker.join();
+        if (eng_host) cudaFreeHost(eng_host);
+    }
 
     Fp8 fp8(const std::string& name) {
         const auto& w = pack.dense(name + ".weight");
@@ -186,8 +213,6 @@ struct Engine::Impl {
             y.hc_ffn_scale = f32(p + "hc_ffn_scale");
             y.gate_w = bf(p + "ffn.gate.weight");
             y.gate_bias = f32(p + "ffn.gate.bias");
-            y.gate_bias_host.resize(kExperts);
-            ck(cudaMemcpy(y.gate_bias_host.data(), y.gate_bias, kExperts * 4, cudaMemcpyDeviceToHost), "bias");
             y.sh_w1 = fp8(p + "ffn.shared_experts.w1");
             y.sh_w2 = fp8(p + "ffn.shared_experts.w2");
             y.sh_w3 = fp8(p + "ffn.shared_experts.w3");
@@ -228,6 +253,9 @@ struct Engine::Impl {
             if (fd < 0) throw std::runtime_error("cannot open engram table " + t.path);
             eng_fd.push_back(fd);
         }
+        const size_t eng_bytes = eng_fd.size() * kEngRows * (256 + 8);
+        ck(cudaHostAlloc((void**) &eng_host, std::max<size_t>(eng_bytes, 1), cudaHostAllocDefault), "engram pinned");
+        eng_dev = dalloc<uint8_t>(std::max<size_t>(eng_bytes, 1));
         // scratch
         h = dalloc<bf16>(kHc * kDim);
         h2 = dalloc<bf16>(kHc * kDim);
@@ -267,14 +295,16 @@ struct Engine::Impl {
         ckv = dalloc<float>(kHeadDim);
         cscore = dalloc<float>(kHeadDim);
         scores = dalloc<float>(max_seq + 1);
-        router = dalloc<float>(kExperts);
         routed = dalloc<float>(kDim);
         logits = dalloc<float>(kVocab);
         x_half_dev = dalloc<uint16_t>(kDim);
-        idx_dev = dalloc<int32_t>(1024);
-        eng_w_dev = dalloc<uint8_t>(24 * 256);
-        eng_s_dev = dalloc<uint8_t>(24 * 8);
+        idx_dev = dalloc<int32_t>(kWindow + kIndexTopK);
+        routes_dev = dalloc<int32_t>(kLayers * kTopK);
+        weights_dev = dalloc<float>(kLayers * kTopK);
+        cand_dev = dalloc<uint8_t>(max_seq + 1);
         history.reserve(max_seq);
+        db = std::make_unique<ExpertDoorbell>(1, kTopK, kDim);
+        worker = std::thread([this] { worker_loop(); });
         if (const char* p = std::getenv("DS41_DEBUG")) dbg = std::fopen(p, "wb");
     }
 
@@ -306,8 +336,36 @@ struct Engine::Impl {
 
     void fp8_linear(const bf16* x, const Fp8& w, bf16* y) { ops::fp8_linear(x, w.k, w.w, w.s, w.n, y, act); }
 
+    // ------------------------------------------------------------------------------------- cpu experts
+    /// The CPU expert thread: per released step, layers 0..39 in order, each when the GPU publishes it.
+    void worker_loop() {
+        uint64_t seen = 0;
+        for (;;) {
+            {
+                std::unique_lock<std::mutex> lk(mu);
+                cv.wait(lk, [&] { return stop.load() || go != seen; });
+                if (stop) return;
+                seen = go;
+            }
+            for (int l = 0; l < kLayers; ++l) {
+                if (!db->wait_published(l + 1, stop)) return;
+                const double t0 = now_ms();
+                c10::Half wh[kTopK];
+                for (int i = 0; i < kTopK; ++i) {
+                    const __half hv = __float2half_rn(db->w()[i]);
+                    wh[i] = c10::Half(__half_as_ushort(hv), c10::Half::from_bits());
+                }
+                exl3_moe_cpu_forward_raw(L[l].moe_handle, (const at::Half*) db->x(), db->ids(), wh, db->y(), 1, kTopK,
+                                         cpu_threads);
+                worker_us += (int64_t) ((now_ms() - t0) * 1000.0);
+                db->mark_done(l + 1);
+            }
+        }
+    }
+
     // ------------------------------------------------------------------------------------- engram
-    void engram(int l, int li, int pos) {
+    /// Hash the n-grams ending at pos for engram layer li and read its rows into the pinned buffer (host only).
+    void engram_read(int l, int li, int pos) {
         const auto& hs = pack.engram_hash();
         const int n = hs.max_ngram, nh = hs.n_heads, cols = (n - 1) * nh;
         std::vector<int64_t> toks(n);
@@ -324,22 +382,30 @@ struct Engine::Impl {
         }
         const auto& t = pack.engram_tables()[li];
         if (t.layer != l) throw std::runtime_error("engram table order does not match engram_hash.txt");
-        uint8_t w[24 * 256], s[24 * 8];
+        if (cols > kEngRows) throw std::runtime_error("engram: more n-gram heads than the row buffer holds");
+        uint8_t* w = eng_host + (size_t) li * kEngRows * (256 + 8);
+        uint8_t* s = w + kEngRows * 256;
         for (int c = 0; c < cols; ++c) {
             if (pread(eng_fd[li], w + c * 256, 256, (off_t) (t.weight_offset + (uint64_t) ids[c] * 256)) != 256 ||
                 pread(eng_fd[li], s + c * 8, 8, (off_t) (t.scale_offset + (uint64_t) ids[c] * 8)) != 8)
                 throw std::runtime_error("engram row read failed");
         }
-        ck(cudaMemcpy(eng_w_dev, w, sizeof w, cudaMemcpyHostToDevice), "engram rows");
-        ck(cudaMemcpy(eng_s_dev, s, sizeof s, cudaMemcpyHostToDevice), "engram scales");
-        ops::engram_dequant(eng_w_dev, eng_s_dev, cols, eng_vals);
+    }
+
+    /// Engram.forward for layer l (engram layer li) from the rows engram_read put on the device.
+    void engram(int l, int li) {
+        const auto& hs = pack.engram_hash();
+        const int cols = (hs.max_ngram - 1) * hs.n_heads;
+        const uint8_t* w = eng_dev + (size_t) li * kEngRows * (256 + 8);
+        ops::engram_dequant(w, w + kEngRows * 256, cols, eng_vals);
         fp8_linear(eng_vals, L[l].eng_wkv, eng_kv);
         ops::engram_apply(h, eng_kv, L[l].eng_qw, L[l].eng_kw, kNormEps);
     }
 
     // ------------------------------------------------------------------------------------- indexer
-    /// Top-k compressed positions for this layer (Indexer.forward, decode with one query). Returns them offset.
-    std::vector<int32_t> indexer(int l, int pos, bool have_latent) {
+    /// Top-k compressed positions for this layer (Indexer.forward, decode with one query), offset by kWindow,
+    /// written after the window part of idx_dev.
+    void indexer(int l, int pos, bool have_latent) {
         auto& y = L[l];
         const int ratio = y.ratio;
         const int t = (pos + 1) / ratio;
@@ -357,39 +423,11 @@ struct Engine::Impl {
         ops::fp4_quant_inplace(iq, kIndexHeads * kIndexDim, 32, false);
         ops::bf16_linear(xa, nullptr, y.idx_wp, kDim, kIndexHeads, iw_raw, nullptr);
         ops::scale_bf16(iw_raw, (float) (std::pow(kIndexDim, -0.5) * std::pow(kIndexHeads, -0.5)), iw, kIndexHeads);
-        ops::indexer_scores(iq, cur_index_k, t, iw, scores);
-        std::vector<float> s(t);
-        ck(cudaMemcpy(s.data(), scores, (size_t) t * 4, cudaMemcpyDeviceToHost), "scores");
-        if (l == kCandidateLayer) {
-            // select_candidate_blocks: best position per block of 8; the newest block is always kept
-            const int nb = (t + kCandidateBlock - 1) / kCandidateBlock;
-            std::vector<float> bs(nb, -INFINITY);
-            for (int i = 0; i < t; ++i) bs[i / kCandidateBlock] = std::max(bs[i / kCandidateBlock], s[i]);
-            bs[(t - 1) / kCandidateBlock] = INFINITY;
-            std::vector<int> order(nb);
-            std::iota(order.begin(), order.end(), 0);
-            const int keep = std::min(kCandidateBlocks, nb);
-            std::partial_sort(order.begin(), order.begin() + keep, order.end(),
-                              [&](int a, int b) { return bs[a] > bs[b] || (bs[a] == bs[b] && a < b); });
-            candidates.assign(t, 0);
-            for (int i = 0; i < keep; ++i) {
-                if (bs[order[i]] == -INFINITY) continue;
-                for (int j = order[i] * kCandidateBlock; j < std::min(t, (order[i] + 1) * kCandidateBlock); ++j)
-                    candidates[j] = 1;
-            }
-        } else if (l > kCandidateLayer) {
-            for (int i = 0; i < t; ++i)
-                if (!candidates[i]) s[i] = -INFINITY;
-        }
-        const int k = std::min(kIndexTopK, t);
-        std::vector<int> order(t);
-        std::iota(order.begin(), order.end(), 0);
-        std::partial_sort(order.begin(), order.begin() + k, order.end(),
-                          [&](int a, int b) { return s[a] > s[b] || (s[a] == s[b] && a < b); });
-        std::vector<int32_t> out(order.begin(), order.begin() + k);
-        std::sort(out.begin(), out.end());
-        for (auto& v : out) v += kWindow;
-        return out;
+        // the candidate layer selects blocks from its own unmasked scores; the layers after it mask with them
+        const uint8_t* cand = l > kCandidateLayer ? cand_dev : nullptr;
+        kernels::indexer_topk(iq, cur_index_k, t, iw, cand, std::min(kIndexTopK, t), kWindow, scores, idx_dev + kWindow,
+                              0);
+        if (l == kCandidateLayer) kernels::candidate_blocks(scores, t, kCandidateBlocks, kCandidateBlock, cand_dev, 0);
     }
 
     // ------------------------------------------------------------------------------------- attention
@@ -407,10 +445,7 @@ struct Engine::Impl {
         ops::act_quant_inplace(kvv, kHeadDim);
         ck(cudaMemcpy(y.window + (size_t) (pos % kWindow) * kHeadDim, kvv, kHeadDim * 2, cudaMemcpyDeviceToDevice),
            "window");
-        std::vector<int32_t> idx;
-        const int oldest = pos % kWindow + 1;
-        for (int i = oldest; i < kWindow; ++i) idx.push_back(i > pos ? -1 : i);
-        for (int i = 0; i < oldest; ++i) idx.push_back(i > pos ? -1 : i);
+        int n_idx = kWindow;   // idx_dev holds the window part for the whole step (window_index at step start)
         const bf16* comp = nullptr;
         if (y.ratio > 0) {
             const int ratio = y.ratio;
@@ -433,69 +468,38 @@ struct Engine::Impl {
                 }
                 cur_comp = y.comp;
             }
-            if (is_index_source(l)) {
-                cur_topk = compress_len == 0 ? std::vector<int32_t>() : indexer(l, pos, have_latent);
-            }
+            if (is_index_source(l) && compress_len > 0) indexer(l, pos, have_latent);
             if (have_latent) {
                 ops::rope(latent, 1, kHeadDim, rope_at(true, pos + 1 - ratio), false);
                 ops::fp4_quant_inplace(latent, kHeadDim, 16, true);
                 ck(cudaMemcpy(y.comp + (size_t) (pos / ratio) * kHeadDim, latent, kHeadDim * 2,
                               cudaMemcpyDeviceToDevice), "compressed kv");
             }
-            idx.insert(idx.end(), cur_topk.begin(), cur_topk.end());
+            n_idx += std::min(kIndexTopK, compress_len);   // this group's index source wrote them (none yet: 0)
             comp = cur_comp;
         }
-        ck(cudaMemcpy(idx_dev, idx.data(), idx.size() * 4, cudaMemcpyHostToDevice), "attention index");
-        ops::sparse_attn(q, y.window, comp, idx_dev, (int) idx.size(), y.sink, (float) std::pow(kHeadDim, -0.5), o);
+        ops::sparse_attn(q, y.window, comp, idx_dev, n_idx, y.sink, (float) std::pow(kHeadDim, -0.5), o);
         ops::rope(o, kHeads, kHeadDim, rope_at(yarn, pos), true);
         ops::wo_a_grouped(o, y.wo_a, oa);
         fp8_linear(oa, y.wo_b, attn_out);
     }
 
     // ------------------------------------------------------------------------------------- moe
-    void moe(int l, StepDump* dump, Timing& tm) {
+    void moe(int l) {
         auto& y = L[l];
-        ops::bf16_linear(xf, nullptr, y.gate_w, kDim, kExperts, nullptr, router);
-        float sc[kExperts];
-        ck(cudaMemcpy(sc, router, sizeof sc, cudaMemcpyDeviceToHost), "router");
-        float score[kExperts], biased[kExperts];
-        for (int e = 0; e < kExperts; ++e) {
-            score[e] = std::sqrt(softplus(sc[e]));
-            biased[e] = score[e] + y.gate_bias_host[e];
-        }
-        int sel[kTopK];
-        {
-            int order[kExperts];
-            std::iota(order, order + kExperts, 0);
-            std::partial_sort(order, order + kTopK, order + kExperts,
-                              [&](int a, int b) { return biased[a] > biased[b] || (biased[a] == biased[b] && a < b); });
-            std::copy(order, order + kTopK, sel);
-        }
-        float w[kTopK], sum = 0.0f;
-        for (int i = 0; i < kTopK; ++i) sum += (w[i] = score[sel[i]]);
-        for (int i = 0; i < kTopK; ++i) w[i] = w[i] / (sum + 1e-20f) * kRouteScale;
-        if (dump) {
-            for (int i = 0; i < kTopK; ++i) { dump->routes[l][i] = sel[i]; dump->weights[l][i] = w[i]; }
-        }
-        // routed experts on the CPU, from the mmap'ed pack
+        int32_t* ids = routes_dev + l * kTopK;
+        float* w = weights_dev + l * kTopK;
+        kernels::router_topk(xf, 1, y.gate_w, y.gate_bias, ids, w, 0);
+        // routed experts: hand the input to the CPU thread, which reads the mmap'ed pack
         ops::to_half_fp8q(xf, x_half_dev, kDim);
-        uint16_t xh[kDim];
-        ck(cudaMemcpy(xh, x_half_dev, sizeof xh, cudaMemcpyDeviceToHost), "expert input");
-        const double t0 = now_ms();
-        c10::Half wh[kTopK];
-        for (int i = 0; i < kTopK; ++i) {
-            const __half hv = __float2half_rn(w[i]);
-            wh[i] = c10::Half(__half_as_ushort(hv), c10::Half::from_bits());
-        }
-        float out[kDim];
-        exl3_moe_cpu_forward_raw(y.moe_handle, (const at::Half*) xh, sel, wh, out, 1, kTopK, cpu_threads);
-        tm.cpu_experts_ms += now_ms() - t0;
-        ck(cudaMemcpy(routed, out, sizeof out, cudaMemcpyHostToDevice), "expert output");
-        // shared expert
+        db->publish(x_half_dev, ids, w, 1, nullptr, nullptr, (uint32_t) (l + 1), 0);
+        // shared expert, while the CPU works
         fp8_linear(xf, y.sh_w1, g);
         fp8_linear(xf, y.sh_w3, u);
         ops::swiglu(g, u, kSwigluLimit, sh_h, kMoeInter);
         fp8_linear(sh_h, y.sh_w2, sh_out);
+        ck(cudaMemsetAsync(routed, 0, kDim * sizeof(float), 0), "routed");
+        db->wait_add(routed, 1, (uint32_t) (l + 1), 0);
         ops::add_f32_bf16(routed, sh_out, ffn_out, kDim);
     }
 
@@ -506,22 +510,36 @@ struct Engine::Impl {
         tm = Timing{};
         const double t_start = now_ms();
         history.push_back(pack.engram_hash().token_map[token]);
+        {
+            const double t0 = now_ms();
+            int li = 0;
+            for (int l = 0; l < kLayers; ++l)
+                if (is_engram_layer(l)) engram_read(l, li++, pos);
+            tm.engram_ms = now_ms() - t0;
+        }
+        db->reset();
+        worker_us = 0;
+        {
+            std::lock_guard<std::mutex> lk(mu);
+            ++go;
+        }
+        cv.notify_one();
         if (dump) {
             dump->hidden.assign((size_t) kLayers * kHc * kDim, 0);
             dump->routes.assign(kLayers, {});
             dump->weights.assign(kLayers, {});
         }
+        if (!eng_fd.empty())
+            ck(cudaMemcpyAsync(eng_dev, eng_host, eng_fd.size() * kEngRows * (256 + 8), cudaMemcpyHostToDevice, 0),
+               "engram rows");
+        ops::window_index(pos, idx_dev);
         ops::embed(embed, token, h);
         const float one_hot[kHc] = {1, 0, 0, 0};
         ck(cudaMemcpy(pre_mix, one_hot, sizeof one_hot, cudaMemcpyHostToDevice), "pre_mix");
         int eng_i = 0;
         for (int l = 0; l < kLayers; ++l) {
             auto& y = L[l];
-            if (is_engram_layer(l)) {
-                const double t0 = now_ms();
-                engram(l, eng_i++, pos);
-                tm.engram_ms += now_ms() - t0;
-            }
+            if (is_engram_layer(l)) engram(l, eng_i++);
             const bool dbg_layer = dbg && (l == 1 || l == 2);
             if (dbg_layer) dbg_write(h, kHc * kDim);                    // block input (after engram)
             // attention sub-block: h -> h2
@@ -537,7 +555,7 @@ struct Engine::Impl {
             ops::hc_pre(h2, attn_pre, xf);
             ops::rmsnorm(xf, y.ffn_norm, xf, kDim, kNormEps);
             if (dbg_layer) dbg_write(xf, kDim);                         // ffn input
-            moe(l, dump, tm);
+            moe(l);
             if (dbg_layer) dbg_write(ffn_out, kDim);                    // ffn output
             ops::hc_post(ffn_out, h2, ffn_post, ffn_comb, h);
             ck(cudaMemcpy(pre_mix, ffn_pre, kHc * 4, cudaMemcpyDeviceToDevice), "pre_mix");
@@ -552,6 +570,15 @@ struct Engine::Impl {
         ck(cudaMemcpy(lg.data(), logits, kVocab * 4, cudaMemcpyDeviceToHost), "logits");
         const int best = (int) (std::max_element(lg.begin(), lg.end()) - lg.begin());
         if (dump) {
+            int32_t r[kLayers * kTopK];
+            float wv[kLayers * kTopK];
+            ck(cudaMemcpy(r, routes_dev, sizeof r, cudaMemcpyDeviceToHost), "dump routes");
+            ck(cudaMemcpy(wv, weights_dev, sizeof wv, cudaMemcpyDeviceToHost), "dump weights");
+            for (int l = 0; l < kLayers; ++l)
+                for (int i = 0; i < kTopK; ++i) {
+                    dump->routes[l][i] = r[l * kTopK + i];
+                    dump->weights[l][i] = wv[l * kTopK + i];
+                }
             std::vector<int> order(kVocab);
             std::iota(order.begin(), order.end(), 0);
             std::partial_sort(order.begin(), order.begin() + 8, order.end(), [&](int a, int b) { return lg[a] > lg[b]; });
@@ -559,7 +586,8 @@ struct Engine::Impl {
             for (int i = 0; i < 8; ++i) dump->top_logits.push_back({order[i], lg[order[i]]});
         }
         tm.total_ms = now_ms() - t_start;
-        tm.gpu_ms = tm.total_ms - tm.cpu_experts_ms - tm.engram_ms;
+        tm.cpu_experts_ms = worker_us.load() / 1000.0;
+        tm.gpu_ms = tm.total_ms - tm.engram_ms;
         return best;
     }
 };

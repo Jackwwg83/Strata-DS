@@ -1,7 +1,8 @@
-// include/strata/ds41/engine.hpp - DeepSeek V4.1 Flash decode, one token at a time (M1: correctness first).
+// include/strata/ds41/engine.hpp - DeepSeek V4.1 Flash decode, one token at a time.
 //
 // GPU: everything except the routed experts. CPU: routed experts with exllamav3's moe_mul1, reading the
 // mmap'ed experts.bin in place (upstream Strata's "CPU computes the misses in RAM", with no VRAM cache yet).
+// A CPU thread serves the experts layer by layer through an ExpertDoorbell while the GPU runs the shared expert.
 // Token 0 runs the same path as every later token; the prototype's prefill of one token is equivalent.
 #pragma once
 
@@ -36,6 +37,8 @@ public:
     /// FP32 logits of the last step (all 129280)
     const std::vector<float>& last_logits() const;
 
+    /// engram_ms: the engram reads at the step start. gpu_ms: the rest of the step (wall time). cpu_experts_ms: the
+    /// time the CPU thread spent computing experts, inside gpu_ms.
     struct Timing { double gpu_ms = 0, cpu_experts_ms = 0, engram_ms = 0, total_ms = 0; };
     const Timing& last_timing() const { return timing_; }
 

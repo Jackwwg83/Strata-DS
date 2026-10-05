@@ -8,6 +8,8 @@ foreach(task k2_fp8_gemm k3_sparse_attn k5_indexer k7_hc k8_router k10_exl3_moe)
   add_test(NAME ${task}_test COMMAND ${task}_test)
   set_tests_properties(${task}_test PROPERTIES SKIP_RETURN_CODE 77 TIMEOUT 900)
 endforeach()
+# the engine routes and selects KV positions through the task kernels (K8, K5): a merged winner speeds it up
+target_link_libraries(strata_ds41_engine PUBLIC ds41_k8_router ds41_k5_indexer)
 
 # K1c: the decode GEMV itself (src/ds41/kernels/fp8_gemv.cu, library strata_ds41) is the replaceable file
 add_executable(k1c_fp8_gemv_test src/ds41/tests/k1c_fp8_gemv_test.cu)

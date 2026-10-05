@@ -74,8 +74,8 @@ int main(int argc, char** argv) {
             }
             if (pos >= (int) prompt.size() - 1) { decode_ms += t.total_ms; ++decode_steps; }
             if (pos >= (int) prompt.size() - 1 && forced.empty()) out.push_back(next);
-            std::fprintf(stderr, "pos %d tok %d -> %d  total %.1f ms (cpu experts %.1f, engram %.1f, gpu+sync %.1f)\n",
-                         pos, tok, next, t.total_ms, t.cpu_experts_ms, t.engram_ms, t.gpu_ms);
+            std::fprintf(stderr, "pos %d tok %d -> %d  total %.1f ms (engram reads %.1f, layers %.1f, of which cpu experts %.1f)\n",
+                         pos, tok, next, t.total_ms, t.engram_ms, t.gpu_ms, t.cpu_experts_ms);
             if (dump) {
                 const int32_t hdr[2] = {tok, next};
                 std::fwrite(hdr, 4, 2, dump);
