@@ -145,6 +145,8 @@ __global__ void gemv(const float* __restrict__ x, const uint8_t* __restrict__ w,
     }
 }
 
+#include "fp8_gemv/async_weights.cuh"
+
 unsigned grid_for(int64_t rows) {
     const int64_t grid = (rows - 1) / (THREADS / 32) + 1;
     return unsigned(grid < 65535 ? grid : 65535);
@@ -175,6 +177,17 @@ void launch_split(const float* x, const uint8_t* w, const uint8_t* scales, uint1
 template<int M>
 void launch(const float* x, const uint8_t* w, const uint8_t* scales, uint16_t* y,
             int64_t k, int64_t n, cudaStream_t stream) {
+    // Staging has two CTA barriers per first tile and one thereafter. Keep the
+    // direct-load path for low reuse, small grids, short K, and unaligned views.
+    if constexpr (M >= 4) {
+        if (n >= 4096 && k >= 2048 &&
+            ((reinterpret_cast<uintptr_t>(w) | reinterpret_cast<uintptr_t>(x)) & 15u) == 0) {
+            const int64_t blocks = (n - 1) / ASYNC_ROWS + 1;
+            const unsigned grid = unsigned(blocks < 65535 ? blocks : 65535);
+            gemv_async_weights<M><<<grid, THREADS, 0, stream>>>(x, w, scales, y, k, n);
+            return;
+        }
+    }
     if (detail::gemv_rows_per_group(n) == 2)
         launch_split<M, 2>(x, w, scales, y, k, n, stream);
     else
