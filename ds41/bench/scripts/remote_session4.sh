@@ -38,7 +38,8 @@ EOF
   echo SETUP_DONE
   ;;
 build)
-  cd $R && cmake -S . -B build -DSTRATA_ENABLE_CUDA=ON -DCMAKE_CUDA_ARCHITECTURES=89 -DSTRATA_BUILD_TESTS=ON \
+  G=""; [ -d $W/llama.cpp ] && G="-DSTRATA_GGML_DIR=$W/llama.cpp"
+  cd $R && cmake -S . -B build $G -DSTRATA_ENABLE_CUDA=ON -DCMAKE_CUDA_ARCHITECTURES=89 -DSTRATA_BUILD_TESTS=ON \
       -DCMAKE_BUILD_TYPE=Release -DCMAKE_CUDA_COMPILER_LAUNCHER=ccache -DCMAKE_CXX_COMPILER_LAUNCHER=ccache \
       > $W/s4_cmake.log 2>&1 || { tail -30 $W/s4_cmake.log; exit 1; }
   cmake --build build -j"$(nproc)" > $W/s4_build.log 2>&1 || { grep -E "error|Error" $W/s4_build.log | head -40; exit 1; }
@@ -62,6 +63,9 @@ ci)
     git -C $W/ci/repo fetch -q origin '+refs/heads/*:refs/remotes/origin/*'
     git -C $W/ci/repo for-each-ref --format='%(objectname)' 'refs/remotes/origin/task/' > $W/ci/state/tested.txt
   fi
+  # one local llama.cpp source (upstream's ggml dependency) instead of a clone per test build
+  if [ ! -d $W/llama.cpp ] && [ -f $W/llama.tgz ]; then mkdir -p $W/llama.cpp && tar xzf $W/llama.tgz -C $W/llama.cpp --strip-components=1; fi
+  [ -d $W/llama.cpp ] && export CMAKE_EXTRA="-DSTRATA_GGML_DIR=$W/llama.cpp"
   setsid nohup bash $W/ci/runner.sh > $W/ci/runner.out 2>&1 < /dev/null &
   echo CI_STARTED
   ;;

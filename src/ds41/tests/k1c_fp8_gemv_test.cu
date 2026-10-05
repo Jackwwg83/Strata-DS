@@ -58,6 +58,13 @@ int main() {
                 worst = std::max(worst, rel_l2(got, ry.down()));
             }
             v.check(worst <= 2e-3, std::string(s.name) + ": error above 2e-3");
+            if (m == 1 && &s == &shapes[0])
+                graph_check(v, std::string("quantize + fp8_block_gemv_q m=1 ") + s.name,
+                            [&](cudaStream_t st) {
+                                sd::fp8_quantize_activation_f32((const uint16_t*) x.p, m, s.k, xq.p, st);
+                                sd::fp8_block_gemv_q(xq.p, m, s.k, w.p, ws.p, s.n, (uint16_t*) y.p, st);
+                            },
+                            [&] { return as_doubles(y.down()); }, [&] { poison_dev(y); poison_dev(xq); });
             int c = 0;
             const double us = median_us([&] {
                 sd::fp8_block_gemv_q(xq.p, m, s.k, w.p + wb * (c++ % copies), ws.p, s.n, (uint16_t*) y.p, nullptr);

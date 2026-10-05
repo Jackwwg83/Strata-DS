@@ -76,6 +76,13 @@ int main() {
         const double err = rel_l2(out.down(), want);
         std::printf("m=%d rel_l2=%.3g\n", m, err);
         v.check(err <= 5e-3, "relative L2 error above 5e-3 against exllamav3");
+        if (m == 1)
+            graph_check(v, "exl3_moe_decode m=1",
+                        [&](cudaStream_t st) {
+                            ck(cudaMemsetAsync(out.p, 0, (size_t) m * 5120 * sizeof(float), st), "reset out");
+                            kk::exl3_moe_decode(x.p, m, sel.p, w.p, 6, experts.p, out.p, ws.p, ws_bytes, st);
+                        },
+                        [&] { return as_doubles(out.down()); }, [&] { poison_dev(out); });
         if (m != 4) {
             const double us = median_us([&] { kk::exl3_moe_decode(x.p, m, sel.p, w.p, 6, experts.p, out.p, ws.p, ws_bytes, 0); });
             std::printf("  time m=%d: %.1f us\n", m, us);

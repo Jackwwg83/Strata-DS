@@ -4,7 +4,8 @@
 # Agents push branches named task/<TASK-ID>/<anything>. Every POLL seconds this script looks for branch heads it
 # has not tested, and tests them one at a time (one GPU, so timings stay valid):
 #   1. check out the head in its own worktree
-#   2. read the task spec ds41/tasks/<TASK-ID>.md from the BASE branch (agents cannot edit their own acceptance)
+#   2. read the task spec ds41/tasks/<TASK-ID>.md and the tests src/ds41/tests/ from the BASE branch (agents cannot
+#      edit their own acceptance, and an older branch is tested with the current tests)
 #   3. check that the branch changes only the files the spec allows
 #   4. build the targets the spec lists, run the spec's test command with a timeout
 #   5. append the result to results/<TASK-ID>.tsv and comment on the task's GitHub issue
@@ -17,7 +18,8 @@
 # Results never need a GitHub token on this (public cloud) machine: each result is written to $STATE/outbox/ as
 # "<issue number>\n<markdown comment>", and ds41/ci/relay.sh on the reviewer's machine posts and archives them.
 #
-# Env: REPO_DIR (clone of the repo), BASE (default origin/feature/ds41), POLL (default 60).
+# Env: REPO_DIR (clone of the repo), BASE (default origin/feature/ds41), POLL (default 60), CMAKE_EXTRA (more configure
+# options, e.g. -DSTRATA_GGML_DIR=/workspace/llama.cpp so a configure does not clone llama.cpp each time).
 set -u
 REPO_DIR=${REPO_DIR:-/workspace/ci/repo}
 BASE=${BASE:-origin/feature/ds41}
@@ -62,10 +64,14 @@ test_branch() {
         record "$task" "$branch" "$sha" fail "files-not-allowed:$bad" "$issue"; return
     fi
 
+    # the acceptance tests always come from BASE: a branch made before a test changed still gets the current test
+    git -C "$wt" checkout -q "$BASE" -- src/ds41/tests 2>/dev/null
+
     {
         echo "== $branch $sha  $(date -u +%FT%TZ)"
         cmake -S "$wt" -B "$wt/build" -DSTRATA_ENABLE_CUDA=ON -DCMAKE_CUDA_ARCHITECTURES=89 -DSTRATA_BUILD_TESTS=ON \
-              -DCMAKE_BUILD_TYPE=Release -DCMAKE_CUDA_COMPILER_LAUNCHER=ccache -DCMAKE_CXX_COMPILER_LAUNCHER=ccache 2>&1 | tail -3
+              -DCMAKE_BUILD_TYPE=Release -DCMAKE_CUDA_COMPILER_LAUNCHER=ccache -DCMAKE_CXX_COMPILER_LAUNCHER=ccache \
+              ${CMAKE_EXTRA:-} 2>&1 | tail -3
         cmake --build "$wt/build" -j"$(nproc)" --target $targets 2>&1 | grep -E "error|warning: unused|Error" | head -40
         echo "== test: $test"
         (cd "$wt/build" && timeout 900 bash -c "$test") 2>&1 | tail -60
