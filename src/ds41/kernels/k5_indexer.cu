@@ -8,6 +8,7 @@
 #include <cmath>
 #include <cstdio>
 #include <cstdlib>
+#include <vector>
 
 namespace strata::ds41::kernels {
 namespace {
@@ -309,18 +310,109 @@ __global__ void all_candidates(const float* scores, int64_t n, int block_size, u
     for (int d = 0; d < block_size && b * block_size + d < n; ++d) cand[b * block_size + d] = keep;
 }
 
-// Allocation belongs to this call and stream; no shared cache or host copy, and
-// overlapping invocations cannot overwrite one another's selection state.
+// Each host thread owns its scratch slots. A completion event protects each
+// slot across CUDA streams (including reused stream handles): only completed
+// work can lend its allocation to another call. Concurrent calls on different
+// host threads have separate pools, and simultaneous GPU work gets separate
+// slots. Retaining the actual allocation avoids an allocation/free API pair on
+// every call; no default-memory-pool setting is changed.
+struct WorkspaceSlot {
+    int device;
+    size_t capacity;
+    void* pointer;
+    cudaEvent_t completed;
+    bool recorded;
+};
+
+struct WorkspaceCache {
+    std::vector<WorkspaceSlot> slots;
+
+    ~WorkspaceCache() {
+        // Thread exit can precede GPU completion. Wait before releasing storage;
+        // if the runtime has already shut down, CUDA owns resource reclamation.
+        int previous_device = 0;
+        if (cudaGetDevice(&previous_device) != cudaSuccess) return;
+        for (auto& slot : slots) {
+            if (cudaSetDevice(slot.device) != cudaSuccess) continue;
+            if (slot.recorded && cudaEventSynchronize(slot.completed) != cudaSuccess) continue;
+            cudaFree(slot.pointer);
+            cudaEventDestroy(slot.completed);
+        }
+        cudaSetDevice(previous_device);
+    }
+
+    WorkspaceSlot* acquire(size_t bytes, cudaStream_t stream) {
+        int device = 0;
+        check(cudaGetDevice(&device), "workspace device");
+        WorkspaceSlot* grow = nullptr;
+        for (auto& slot : slots) {
+            if (slot.device != device) continue;
+            const cudaError_t ready = slot.recorded ? cudaEventQuery(slot.completed) : cudaSuccess;
+            if (ready == cudaErrorNotReady) {
+                // NotReady is a polling result, not a failed kernel launch.
+                const cudaError_t last = cudaGetLastError();
+                if (last != cudaSuccess && last != cudaErrorNotReady)
+                    check(last, "workspace polling");
+                continue;
+            }
+            check(ready, "workspace completion");
+            if (slot.capacity >= bytes) return &slot;
+            grow = &slot;
+        }
+        size_t capacity = 256 * 1024;
+        while (capacity < bytes) capacity *= 2;
+        if (grow) {
+            check(cudaFreeAsync(grow->pointer, stream), "resize workspace");
+            check(cudaMallocAsync(&grow->pointer, capacity, stream), "grow workspace");
+            grow->capacity = capacity;
+            return grow;
+        }
+        WorkspaceSlot fresh{device, capacity, nullptr, nullptr, false};
+        check(cudaMallocAsync(&fresh.pointer, capacity, stream), "new workspace");
+        check(cudaEventCreateWithFlags(&fresh.completed, cudaEventDisableTiming), "workspace event");
+        slots.push_back(fresh);
+        return &slots.back();
+    }
+};
+
+struct Workspace {
+    void* pointer = nullptr;
+    WorkspaceSlot* slot = nullptr;
+    cudaStream_t stream;
+
+    Workspace(size_t bytes, cudaStream_t use_stream) : stream(use_stream) {
+        cudaStreamCaptureStatus capture;
+        check(cudaStreamIsCapturing(stream, &capture), "workspace capture status");
+        if (capture != cudaStreamCaptureStatusNone) {
+            // A captured graph may replay after this host call returns. Graph-
+            // owned async allocations prevent the eager pool from reusing it.
+            check(cudaMallocAsync(&pointer, bytes, stream), "captured workspace");
+        } else {
+            thread_local WorkspaceCache cache;
+            slot = cache.acquire(bytes, stream);
+            pointer = slot->pointer;
+        }
+    }
+    Workspace(const Workspace&) = delete;
+    Workspace& operator=(const Workspace&) = delete;
+    ~Workspace() {
+        if (slot) {
+            check(cudaEventRecord(slot->completed, stream), "record workspace completion");
+            slot->recorded = true;
+        } else {
+            check(cudaFreeAsync(pointer, stream), "release captured workspace");
+        }
+    }
+};
 template <bool Bf16Scores, bool Candidate>
 void select_and_emit(const float* scores, int64_t n, int k, int32_t offset, int32_t* out,
                      int block_size, int64_t positions, uint8_t* cand, cudaStream_t stream) {
     const int tiles = int((n + kItems - 1) / kItems);
     const size_t histogram_bytes = size_t(tiles) * 256 * sizeof(uint32_t);
     const size_t counts_bytes = size_t(tiles) * sizeof(Counts);
-    void* allocation = nullptr;
-    check(cudaMallocAsync(&allocation, histogram_bytes + 2 * counts_bytes + sizeof(Selection), stream), "workspace");
-    auto* histogram_data = static_cast<uint32_t*>(allocation);
-    auto* counts = reinterpret_cast<Counts*>(static_cast<char*>(allocation) + histogram_bytes);
+    Workspace workspace(histogram_bytes + 2 * counts_bytes + sizeof(Selection), stream);
+    auto* histogram_data = static_cast<uint32_t*>(workspace.pointer);
+    auto* counts = reinterpret_cast<Counts*>(static_cast<char*>(workspace.pointer) + histogram_bytes);
     auto* prefixes = counts + tiles;
     auto* state = reinterpret_cast<Selection*>(prefixes + tiles);
     constexpr int first_shift = Bf16Scores ? 8 : 24;
@@ -334,7 +426,6 @@ void select_and_emit(const float* scores, int64_t n, int k, int32_t offset, int3
     scan_tiles<<<1, kThreads, 0, stream>>>(counts, prefixes, tiles);
     emit_selected<Bf16Scores, Candidate><<<tiles, kThreads, 0, stream>>>(
         scores, n, state, prefixes, offset, out, block_size, positions, cand);
-    check(cudaFreeAsync(allocation, stream), "release workspace");
 }
 
 }  // namespace
