@@ -1,0 +1,25 @@
+== no tier, code_py_0 (must equal M1 byte for byte)
+generated:
+teacher_forced_mean_nll 1.059282 ppl 2.8843 over 199 tokens
+decode_ms_per_token 279.3 over 200 steps (cpu experts 247.5)
+vram_expert_slots 0 hit_rate 0.0000
+DUMP_IDENTICAL
+== tier adaptive, code_py_0 (M1 nll: nll 1.059282)
+generated:
+teacher_forced_mean_nll 1.056640 ppl 2.8767 over 199 tokens
+decode_ms_per_token 156.0 over 200 steps (cpu experts 112.6)
+vram_expert_slots 896 hit_rate 0.6694
+== tier adaptive, zh_0 (M1 nll: nll 3.581346)
+generated:
+teacher_forced_mean_nll 3.618278 ppl 37.2733 over 199 tokens
+decode_ms_per_token 203.6 over 200 steps (cpu experts 155.7)
+vram_expert_slots 896 hit_rate 0.5106
+== zh_mail decode 128, tier --adapt-every 0
+decode_ms_per_token 402.4 over 129 steps (cpu experts 364.8)
+vram_expert_slots 896 hit_rate 0.0721
+generated: 666 83285 12279 49338 666 1824 303 17909 19916 47
+== zh_mail decode 128, tier 
+decode_ms_per_token 187.9 over 129 steps (cpu experts 139.4)
+vram_expert_slots 896 hit_rate 0.5131
+generated: 666 83285 12279 49338 666 1824 478 2788 18594 142
+M2B_DONE

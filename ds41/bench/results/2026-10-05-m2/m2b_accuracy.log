@@ -1,0 +1,37 @@
+{"id": "code_py_0", "tokens": 200, "mean_nll": 1.0767515897750854, "ppl": 2.935129404067993}
+{"id": "code_cpp_1", "tokens": 200, "mean_nll": 2.1464855670928955, "ppl": 8.554740905761719}
+{"id": "zh_0", "tokens": 200, "mean_nll": 3.6442906856536865, "ppl": 38.2556266784668}
+{"id": "zh_2", "tokens": 200, "mean_nll": 2.3262743949890137, "ppl": 10.239721298217773}
+{"id": "en_0", "tokens": 200, "mean_nll": 1.9434943199157715, "ppl": 6.983109474182129}
+KeyError: 'text'
+  File "<string>", line 1
+    import numpy as np; print(,.join(map(str, np.load(/fp16/.npz)[ids].tolist())))
+                              ^
+SyntaxError: invalid syntax
+ENGINE code_py_0 notier  | tier 
+  File "<string>", line 1
+    import numpy as np; print(,.join(map(str, np.load(/fp16/.npz)[ids].tolist())))
+                              ^
+SyntaxError: invalid syntax
+ENGINE zh_0 notier  | tier 
+  File "<string>", line 1
+    import numpy as np; print(,.join(map(str, np.load(/fp16/.npz)[ids].tolist())))
+                              ^
+SyntaxError: invalid syntax
+ENGINE en_0 notier  | tier 
+  File "<string>", line 1
+    import numpy as np; print(,.join(map(str, np.load(/fp16/.npz)[ids].tolist())))
+                              ^
+SyntaxError: invalid syntax
+ENGINE chat_0 notier  | tier 
+  File "<string>", line 1
+    import numpy as np; print(,.join(map(str, np.load(/fp16/.npz)[ids].tolist())))
+                              ^
+SyntaxError: invalid syntax
+ENGINE code_cpp_1 notier  | tier 
+  File "<string>", line 1
+    import numpy as np; print(,.join(map(str, np.load(/fp16/.npz)[ids].tolist())))
+                              ^
+SyntaxError: invalid syntax
+ENGINE zh_2 notier  | tier 
+ACC_DONE
