@@ -37,6 +37,21 @@ int main() {
         std::printf("m=%d y=%.3g pre=%.3g post=%.3g comb=%.3g\n", m, e_y, e_pre, e_post, e_comb);
         v.check(e_y <= 1e-3, "y error above 1e-3");
         v.check(e_pre <= 1e-5 && e_post <= 1e-5 && e_comb <= 1e-5, "coefficient error above 1e-5");
+        if (m == 1)
+            graph_check(v, "hc_mixes_pre m=1",
+                        [&](cudaStream_t st) {
+                            sd::kernels::hc_mixes_pre(x.p, m, fn.p, scale.p, base.p, pre_in.p, y.p, pre.p, post.p,
+                                                      comb.p, st);
+                        },
+                        [&] {
+                            auto d = as_doubles(y.down());
+                            for (const auto& part : {pre.down(), post.down(), comb.down()}) {
+                                const auto e = as_doubles(part);
+                                d.insert(d.end(), e.begin(), e.end());
+                            }
+                            return d;
+                        },
+                        [&] { poison_dev(y); poison_dev(pre); poison_dev(post); poison_dev(comb); });
         if (m != 3) {
             const double us = median_us([&] {
                 sd::kernels::hc_mixes_pre(x.p, m, fn.p, scale.p, base.p, pre_in.p, y.p, pre.p, post.p, comb.p, 0);

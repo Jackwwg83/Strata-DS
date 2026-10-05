@@ -49,6 +49,13 @@ int main() {
         const double err = rel_l2(o.down(), ref.down());
         std::printf("m=%d n_idx=%d window_valid=%d rel_l2=%.3g\n", c.m, c.n_idx, c.window_valid, err);
         v.check(err <= 3e-3, "relative L2 error above 3e-3");
+        if (c.n_idx == 640 && c.m == 1)
+            graph_check(v, "sparse_attn_decode m=1 n_idx=640",
+                        [&](cudaStream_t s) {
+                            sd::kernels::sparse_attn_decode(q.p, window.p, comp.p, idx.p, c.m, c.n_idx, sink.p, scale,
+                                                            o.p, s);
+                        },
+                        [&] { return as_doubles(o.down()); }, [&] { poison_dev(o); });
         if (c.n_idx == 640) {
             const double us = median_us([&] {
                 sd::kernels::sparse_attn_decode(q.p, window.p, comp.p, idx.p, c.m, c.n_idx, sink.p, scale, o.p, 0);

@@ -13,6 +13,7 @@
 #include <cstring>
 #include <random>
 #include <string>
+#include <type_traits>
 #include <vector>
 
 namespace ds41test {
@@ -121,6 +122,11 @@ double median_us(F fn, int reps = 25) {
 }
 
 /// collects pass/fail and metrics; prints one RESULT line at the end (the CI verdict)
+struct Verdict;
+template <typename Call, typename Read, typename Poison>
+void graph_check(Verdict& v, const std::string& what, Call call, Read read, Poison poison);
+
+/// collects pass/fail and metrics; prints one RESULT line at the end (the CI verdict)
 struct Verdict {
     bool pass = true;
     std::string metrics;
@@ -137,5 +143,74 @@ struct Verdict {
         return pass ? 0 : 1;
     }
 };
+
+/// bf16 / fp16 / int device outputs as doubles, for graph_check's read()
+/// fill a device buffer with 0xFF bytes (NaN for floats, -1 for ints): graph_check's poison()
+template <typename T>
+void poison_dev(Dev<T>& d) { ck(cudaMemset(d.p, 0xFF, d.n * sizeof(T)), "poison"); }
+
+template <typename T>
+std::vector<double> as_doubles(const std::vector<T>& v) {
+    std::vector<double> d(v.size());
+    for (size_t i = 0; i < v.size(); ++i) {
+        if constexpr (std::is_same<T, __nv_bfloat16>::value) d[i] = __bfloat162float(v[i]);
+        else d[i] = (double) v[i];
+    }
+    return d;
+}
+
+/// Rule 7 (ds41/tasks/README.md): the engine captures each decode step as one CUDA graph. One call captured on a
+/// non-default stream in global capture mode, then replayed twice, must give the eager call's outputs (relative L2
+/// at most 1e-6; non-finite values must match exactly). A host sync or a legacy allocation inside the call makes the
+/// capture fail. call(stream) enqueues one call (and any output reset) on the stream; read() returns the outputs;
+/// poison() fills every output with garbage before each replay, so a graph that misses work (for example a call that
+/// ignored the stream and ran eagerly during the capture) shows up as a difference.
+template <typename Call, typename Read, typename Poison>
+void graph_check(Verdict& v, const std::string& what, Call call, Read read, Poison poison) {
+    cudaStream_t s = nullptr;
+    ck(cudaStreamCreateWithFlags(&s, cudaStreamNonBlocking), "graph stream");
+    std::string why;
+    cudaGraph_t g = nullptr;
+    cudaGraphExec_t ex = nullptr;
+    try {
+        call(s);
+        ck(cudaStreamSynchronize(s), "eager call on a non-default stream");
+        const std::vector<double> eager = read();
+        cudaError_t e = cudaStreamBeginCapture(s, cudaStreamCaptureModeGlobal);
+        if (e == cudaSuccess) {
+            call(s);
+            e = cudaStreamEndCapture(s, &g);
+        }
+        if (e == cudaSuccess) e = cudaGraphInstantiate(&ex, g, 0);
+        if (e != cudaSuccess) why = std::string("capture failed: ") + cudaGetErrorString(e);
+        for (int r = 0; r < 2 && why.empty(); ++r) {
+            poison();
+            ck(cudaDeviceSynchronize(), "poison outputs");
+            e = cudaGraphLaunch(ex, s);
+            if (e == cudaSuccess) e = cudaStreamSynchronize(s);
+            if (e != cudaSuccess) { why = std::string("replay failed: ") + cudaGetErrorString(e); break; }
+            const std::vector<double> got = read();
+            double num = 0, den = 0;
+            bool special = got.size() != eager.size();
+            for (size_t i = 0; !special && i < got.size(); ++i) {
+                if (std::isfinite(got[i]) && std::isfinite(eager[i])) {
+                    num += (got[i] - eager[i]) * (got[i] - eager[i]);
+                    den += eager[i] * eager[i];
+                } else if (!(got[i] == eager[i])) {
+                    special = true;
+                }
+            }
+            if (special || std::sqrt(num / std::max(den, 1e-300)) > 1e-6) why = "a replay differs from the eager call";
+        }
+    } catch (const std::exception& x) {
+        why = std::string("exception: ") + x.what();
+    }
+    if (ex) cudaGraphExecDestroy(ex);
+    if (g) cudaGraphDestroy(g);
+    cudaGetLastError();
+    cudaStreamDestroy(s);
+    std::printf("graph check (%s): %s\n", what.c_str(), why.empty() ? "pass" : why.c_str());
+    v.check(why.empty(), "rule 7 graph capture, " + what + ": " + why);
+}
 
 }  // namespace ds41test

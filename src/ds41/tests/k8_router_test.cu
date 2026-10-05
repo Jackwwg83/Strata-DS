@@ -50,6 +50,16 @@ int main() {
             }
         }
         std::printf("m=%d checked\n", m);
+        if (m == 8)
+            graph_check(v, "router_topk m=8",
+                        [&](cudaStream_t s) { sd::kernels::router_topk(x.p, m, w.p, bias.p, ids.p, wt.p, s); },
+                        [&] {
+                            auto d = as_doubles(ids.down());
+                            const auto b = as_doubles(wt.down());
+                            d.insert(d.end(), b.begin(), b.end());
+                            return d;
+                        },
+                        [&] { poison_dev(ids); poison_dev(wt); });
         if (m != 5) {
             const double us = median_us([&] { sd::kernels::router_topk(x.p, m, w.p, bias.p, ids.p, wt.p, 0); });
             std::printf("  time m=%d: %.1f us\n", m, us);

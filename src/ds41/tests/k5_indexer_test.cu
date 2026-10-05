@@ -92,6 +92,22 @@ int main() {
                         for (int64_t j = order[i] * 8; j < std::min<int64_t>(t, (order[i] + 1) * 8); ++j) rc[j] = 1;
                 v.check(cb.down() == rc, "candidate_blocks mask differs");
             }
+            Dev<uint8_t> blocks_out(with_cand && t == 16384 ? t : 1);
+            if (with_cand && t == 16384)
+                graph_check(v, "indexer_topk + candidate_blocks t=16384 masked",
+                            [&](cudaStream_t s) {
+                                sd::kernels::indexer_topk(q.p, keys.p, t, w.p, cp, sd::kIndexTopK, sd::kWindow, scores.p,
+                                                          out.p, s);
+                                sd::kernels::candidate_blocks(scores.p, t, 64, sd::kCandidateBlock, blocks_out.p, s);
+                            },
+                            [&] {
+                                auto d = as_doubles(out.down());
+                                const auto a = as_doubles(scores.down()), b = as_doubles(blocks_out.down());
+                                d.insert(d.end(), a.begin(), a.end());
+                                d.insert(d.end(), b.begin(), b.end());
+                                return d;
+                            },
+                            [&] { poison_dev(out); poison_dev(scores); poison_dev(blocks_out); });
             if (with_cand && (t == 16384 || t == 131072)) {
                 const double us = median_us([&] {
                     sd::kernels::indexer_topk(q.p, keys.p, t, w.p, cp, sd::kIndexTopK, sd::kWindow, scores.p, out.p, 0);
