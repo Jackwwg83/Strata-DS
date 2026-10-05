@@ -18,7 +18,7 @@ Controls are measured on the current box (RTX 4090 + i9-14900K) with the current
 | # | Task | Why | Control (merged) |
 | --- | --- | --- | --- |
 | 1 | K10 GPU EXL3 experts | 2.5 ms per token; Codex's version is at about 62% of DRAM bandwidth | codex-1 (re-run after K10 GOLDEN READY) |
-| 2 | K8 router top-k | merged; refine only if >= 3% faster and m=1 not slower | K8-02, 20.99 us (m1 17.41) |
+| 2 | K8 router top-k | merged; refine only if >= 3% faster and m=1 not slower | K8-07, 19.84 us (m1 16.38) |
 | 3 | K3 sparse attention | merged | K3-11, 49.92 us |
 | 4 | K5 indexer | merged | K5-14, 117.9 us |
 | 5 | K7 hyper-connection mixes | merged | K7-06, 14.11 us (m1 12.29) |
