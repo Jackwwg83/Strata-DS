@@ -7,6 +7,8 @@
 #include <cmath>
 #include <cstdio>
 #include <cstdlib>
+#include <mutex>
+#include <vector>
 
 namespace strata::ds41::kernels {
 namespace {
@@ -172,6 +174,58 @@ void check_cuda(cudaError_t status, const char* operation) {
     }
 }
 
+// An owned pool keeps only this kernel's reusable scratch resident across event
+// synchronizations. The default device pool and all device-wide settings remain
+// untouched. Allocations are still private to each invocation and stream-ordered.
+class ScratchPools {
+    struct Entry {
+        int device;
+        cudaMemPool_t pool;
+    };
+    std::mutex mutex_;
+    std::vector<Entry> pools_;
+
+public:
+    cudaMemPool_t get(int device) {
+        std::lock_guard<std::mutex> lock(mutex_);
+        for (const Entry& entry : pools_)
+            if (entry.device == device) return entry.pool;
+
+        cudaMemPoolProps properties{};
+        properties.allocType = cudaMemAllocationTypePinned;
+        properties.handleTypes = cudaMemHandleTypeNone;
+        properties.location.type = cudaMemLocationTypeDevice;
+        properties.location.id = device;
+        cudaMemPool_t pool = nullptr;
+        check_cuda(cudaMemPoolCreate(&pool, &properties), "create scratch pool");
+        // At most 8.04 MiB is needed by a legal individual call. A 16 MiB
+        // retention target also covers allocator page rounding; excess memory
+        // used by concurrent calls can be released at the next synchronization.
+        uint64_t retention = 16ull * 1024 * 1024;
+        check_cuda(cudaMemPoolSetAttribute(pool, cudaMemPoolAttrReleaseThreshold,
+                                          &retention), "retain scratch pages");
+        // Do not inject cross-stream dependencies merely to recycle a block.
+        int internal_dependencies = 0;
+        check_cuda(cudaMemPoolSetAttribute(pool, cudaMemPoolReuseAllowInternalDependencies,
+                                          &internal_dependencies), "scratch pool dependencies");
+        pools_.push_back({device, pool});
+        return pool;
+    }
+
+    ~ScratchPools() {
+        // CUDA defers pool teardown until all outstanding stream-ordered frees
+        // finish, so no stream/device synchronization is needed here either.
+        for (const Entry& entry : pools_) cudaMemPoolDestroy(entry.pool);
+    }
+};
+
+cudaMemPool_t scratch_pool() {
+    static ScratchPools pools;
+    int device = 0;
+    check_cuda(cudaGetDevice(&device), "current device");
+    return pools.get(device);
+}
+
 }  // namespace
 
 void sparse_attn_decode(const bf16* q, const bf16* window, const bf16* comp,
@@ -186,10 +240,11 @@ void sparse_attn_decode(const bf16* q, const bf16* window, const bf16* comp,
     const size_t parts = (size_t) m * kHeads * partitions;
     const size_t numerator_bytes = parts * kHeadDim * sizeof(float);
     float* workspace = nullptr;
-    // Stream-ordered scratch is private to this call. There is no shared mutable
-    // workspace, no default-stream assumption, and no device synchronization.
-    check_cuda(cudaMallocAsync(reinterpret_cast<void**>(&workspace),
-                               numerator_bytes + parts * sizeof(float2), stream), "allocate partials");
+    // Stream-ordered scratch is private to this call, including simultaneous
+    // calls on different streams. Retained pool pages avoid per-call OS release.
+    check_cuda(cudaMallocFromPoolAsync(reinterpret_cast<void**>(&workspace),
+                                       numerator_bytes + parts * sizeof(float2),
+                                       scratch_pool(), stream), "allocate partials");
     auto* stats = reinterpret_cast<float2*>(reinterpret_cast<char*>(workspace) + numerator_bytes);
     sparse_partials<<<dim3(kHeads, partitions, m), kThreads, 0, stream>>>(
         q, window, comp, idx, n_idx, partitions, scale, workspace, stats);
