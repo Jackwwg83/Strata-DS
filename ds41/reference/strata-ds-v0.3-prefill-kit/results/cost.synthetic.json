@@ -1,0 +1,19 @@
+{
+  "status": "OFFLINE_PROPOSAL_ONLY",
+  "can_execute": false,
+  "quote_sha256": "9204438918499e2cd0d55bbe01354779a18f7aece56fbbc4933d4bf0479ffd6f",
+  "estimated_total_usd": 6.27,
+  "blockers": [
+    "max_hourly_usd must be approved locally before spending",
+    "max_total_usd must be approved locally before spending",
+    "max_duration_hours must be approved locally before spending",
+    "paid creation not authorized"
+  ],
+  "required": [
+    "Re-query exact offer and price immediately before rental.",
+    "Fresh signed/approved local budget + recipe + image digest + deadline.",
+    "Copy result artifacts before destruction; verify destruction through provider.",
+    "Stopping a job or container does not destroy a rented instance.",
+    "Download charges and disk charges may persist; use actual provider units."
+  ]
+}

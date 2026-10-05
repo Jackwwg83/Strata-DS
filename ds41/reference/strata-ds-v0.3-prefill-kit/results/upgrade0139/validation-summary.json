@@ -1,0 +1,32 @@
+{
+  "design_version": "0.2.1",
+  "tested_on": "2026-10-04",
+  "python": "3.13.5",
+  "platform": "Linux-6.18.44-x86_64-with-glibc2.41",
+  "scope": "OFFLINE_TOOLING_AND_CONTRACTS_ONLY",
+  "unittest": {
+    "total": 127,
+    "original_cases": 75,
+    "new_cases": 52,
+    "passed": 127,
+    "failed": 0,
+    "skipped": 0
+  },
+  "cpp": {
+    "command": "c++ -std=c++17 -Iinclude -fsyntax-only tools/check_contract.cpp",
+    "passed": true,
+    "cuda": false
+  },
+  "preserved_recipe_files": 11,
+  "model_pins_changed": false,
+  "new_planned_tasks": 12,
+  "merged_planned_tasks": 30,
+  "runtime_design_profiles": 8,
+  "upstream_built": false,
+  "model_weights_downloaded": false,
+  "gpu_run": false,
+  "responses_server_implemented": false,
+  "cloud_instances_created": 0,
+  "github_written": false,
+  "design_checks": "results/upgrade0139/design-contracts.json"
+}

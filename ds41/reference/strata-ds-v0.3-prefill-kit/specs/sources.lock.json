@@ -1,0 +1,79 @@
+{
+  "schema_version": 1,
+  "recorded_on": "2026-10-04",
+  "lock_status": "PARTIAL; null fields block real execution",
+  "base_revision_for_quant_oracle": "df42c109f1defefcbfcedbe7d905718a12266e40",
+  "legacy_v01_base_revision_not_interchangeable": "2cba9e42aa026125f3ed06c6d98c1db82f7ca027",
+  "coolbho3k": {
+    "runtime_repo": "coolbho3k/DeepSeek-v4.1-Flash-2x-DGX-Spark",
+    "runtime_commit": "1d8ac64af01c6fec87f39eb1dd526ff183615c73",
+    "model_repo": "coolbho3k/DeepSeek-V4.1-Flash-EXL3-3bpw",
+    "model_revision": "650cae2c13aaaec303871a35301503570889c0be",
+    "model_manifest_sha256": "828b7b5d7a672c5f2e44caca3d72d9c114c39634e46eb51deabd067a0f44a2c9",
+    "engram_revision": "93a185660c42c90e26c326239ce8c8fd95179d64",
+    "engram_manifest_path": "engram-page15-v1/manifest.json",
+    "engram_manifest_sha256": "43b3b6305d3edd8ec24b9014fccd842c623f7cfce41014611cbd85244dc62854",
+    "runtime_scope": "TP2/DCP2 GB10; NOT an x86 single discrete GPU launch lock",
+    "our_single_gpu_image_digest": null,
+    "tokenizer_digest": null,
+    "template_digest": null,
+    "license_note": "weights MIT; specified derived Engram reader/integration AGPL-3.0-only"
+  },
+  "q2": {
+    "model_repo": "antirez/deepseek-v4.1-flash-gguf",
+    "model_revision": null,
+    "manifest_sha256": null,
+    "runtime_commit_from_prior_review": "0aaea5a238fb41a35106a551e73c8409dfb751ac",
+    "single_discrete_gpu_qualified": false
+  },
+  "sage": {
+    "model_repo": "vcruz305/DSV4.1-Flash-SAGE-EXL3-1.59bpw",
+    "model_revision": null,
+    "manifest_sha256": null
+  },
+  "weights_downloaded": false,
+  "gpu_model_validated": false,
+  "strata_reference": {
+    "repo": "Niko1221/Strata",
+    "tag": "v0.1.39",
+    "commit": "6f32ec070f23ced9f50e704d854d775da52591ab",
+    "prior_baseline_commit": "99f3dbd0b21d1401b3769e0c0d963913607f380b",
+    "release_id": 403010090,
+    "release_published_at_utc": "2026-10-04T12:32:47Z",
+    "review_date": "2026-10-04",
+    "purpose": "Reference mechanisms; NOT DeepSeek or EXL3 runtime",
+    "review_scope": "Targeted source snapshots and release/doc review; not a complete repository diff audit",
+    "reviewed_files": [
+      {
+        "path": "docs/BATCHING.md",
+        "git_blob_sha1": "7672dcc586152372712e8ef18b1c8a953c32738d",
+        "scope": "documentation; exactness, scheduling, penalties, performance scope"
+      },
+      {
+        "path": "src/prefill/prefill.cpp",
+        "git_blob_sha1": "e76fb6ddc12c43cc151724e62bc778918acc67c3",
+        "scope": "lines 1-190, ring and architecture constants"
+      },
+      {
+        "path": "include/strata/platform/memory.hpp",
+        "git_blob_sha1": "202a3bf25b258c70c55190726aacc46abe515ee7",
+        "scope": "file_cache_keeps contract"
+      },
+      {
+        "path": "src/core/expert_source.cpp",
+        "git_blob_sha1": "98e1952d67c4683268593ae3bb9b4c39485b3704",
+        "scope": "lines 1-180 plus #577 search fragments"
+      },
+      {
+        "path": "serve/responses.py",
+        "git_blob_sha1": "4a017c38d83e7814de6d26146b6ec5591e86bb1e",
+        "scope": "lines 1-190 and 200-355; not entire security audit"
+      }
+    ],
+    "baseline_prefill_blob_sha1": "5d46e4bfb9fde25a58ebd70df86a863d67acebe0",
+    "upstream_source_compiled": false,
+    "upstream_gpu_tested": false,
+    "all_existing_model_asset_pins_preserved": true,
+    "model_assets_revalidated_this_update": false
+  }
+}

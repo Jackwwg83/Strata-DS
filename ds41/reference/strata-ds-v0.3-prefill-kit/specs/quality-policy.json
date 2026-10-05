@@ -1,0 +1,22 @@
+{
+  "schema_version": 1,
+  "approval_state": "UNAPPROVED",
+  "base_revision": "df42c109f1defefcbfcedbe7d905718a12266e40",
+  "quant_quality": {
+    "dataset_manifest_sha256": null,
+    "max_task_success_drop_percentage_points": null,
+    "minimum_confidence_level": null
+  },
+  "offload_parity": {
+    "same_quant_oracle_manifest_sha256": null,
+    "max_abs_logit_error": null,
+    "max_mean_kl": null,
+    "storage_rows_require_bit_exact": true
+  },
+  "product_slo": {
+    "warm_append_ttft_p95_ms": null,
+    "single_session_tok_s_min": null,
+    "five_session_goodput_min": null
+  },
+  "null_means": "gate unresolved, never implicit PASS"
+}

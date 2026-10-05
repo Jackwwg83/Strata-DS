@@ -1,0 +1,316 @@
+{
+  "schema_version": 1,
+  "status": "PLANNED_NOT_IMPLEMENTED",
+  "tasks": [
+    {
+      "id": "U39-000",
+      "priority": "P0",
+      "title": "固定 v0.1.39 参考与适配边界",
+      "depends_on": [],
+      "target_paths_design": [
+        "specs/sources.lock.json",
+        "docs/UPSTREAM_v0.1.39_DELTA.zh-CN.md"
+      ],
+      "acceptance": [
+        "确认 tag SHA 与文件 blob；不复制未合并 PR 分支替代标签",
+        "EXL3/Engram/Q2 pin 不变；来源许可证与参考/移植范围明确"
+      ],
+      "upstream_refs": [
+        "U1",
+        "U2",
+        "U11"
+      ],
+      "status": "planned"
+    },
+    {
+      "id": "U39-001",
+      "priority": "P0",
+      "title": "阶段内存契约与 mandatory-first 准入",
+      "depends_on": [
+        "U39-000",
+        "SD-001"
+      ],
+      "target_paths_design": [
+        "strata_ds/planning/phase_memory.py",
+        "tests/planning/"
+      ],
+      "acceptance": [
+        "load/prefill/decode/capture/transition 有各自峰值",
+        "按 allocated/configured slots 而非 C 计状态；unknown 不填0",
+        "head/logits及全部强制权重先于cache；低cgroup/显存拒绝"
+      ],
+      "upstream_refs": [
+        "U1",
+        "U8"
+      ],
+      "status": "planned"
+    },
+    {
+      "id": "U39-002",
+      "priority": "P0",
+      "title": "驻留后专家 I/O 工作集策略",
+      "depends_on": [
+        "U39-001",
+        "SD-003",
+        "SD-004"
+      ],
+      "target_paths_design": [
+        "strata_ds/storage/io_policy.py",
+        "native/io/"
+      ],
+      "acceptance": [
+        "不使用全部shard大小；available为驻留后且不重复扣",
+        "纳入prefill借出GPU槽位的refill专家；Engram工作集独立",
+        "buffered/direct A/B用物理io.stat证明，不只pread计数"
+      ],
+      "upstream_refs": [
+        "U7",
+        "U8",
+        "U12"
+      ],
+      "status": "planned"
+    },
+    {
+      "id": "U39-003",
+      "priority": "P1",
+      "title": "字节 ring 与 chunk/cache/slot 联合规划",
+      "depends_on": [
+        "U39-001",
+        "SD-002",
+        "SD-004"
+      ],
+      "target_paths_design": [
+        "native/prefill/",
+        "strata_ds/planning/prefill_budget.py"
+      ],
+      "acceptance": [
+        "bundle stride来自实际EXL3/GGUF布局，不抄Qwen槽数",
+        "underbudget最低槽位不能超额clamp；未知workspace阻止执行",
+        "同量化fixed/byte/byte+chunk对照，短append不退化；借用event/lease安全"
+      ],
+      "upstream_refs": [
+        "U5",
+        "U6"
+      ],
+      "status": "planned"
+    },
+    {
+      "id": "U39-004",
+      "priority": "P0",
+      "title": "独立 Responses 协议与脚本化后端测试",
+      "depends_on": [
+        "U39-000"
+      ],
+      "target_paths_design": [
+        "strata_ds/service/responses.py",
+        "strata_ds/service/conversation_ir.py",
+        "tests/service/"
+      ],
+      "acceptance": [
+        "SSE/非流、call_id、工具逆序、UTF8分片、超时和取消覆盖",
+        "未知hosted/strict能力显式拒绝；不输出Base64伪加密",
+        "本地现有Codex开发会话与被测客户端配置隔离"
+      ],
+      "upstream_refs": [
+        "U9",
+        "U10"
+      ],
+      "status": "planned"
+    },
+    {
+      "id": "U39-005",
+      "priority": "P1",
+      "title": "DeepSeek 编码器与真实 Codex 工具循环",
+      "depends_on": [
+        "U39-004",
+        "SD-006"
+      ],
+      "target_paths_design": [
+        "strata_ds/service/deepseek_codec.py",
+        "bench/codex/"
+      ],
+      "acceptance": [
+        "固定tokenizer/template/effort，不能调用Qwen formatter",
+        "真实固定版本Codex读改测多轮；统计精确token前缀命中",
+        "API stateless不承诺previous_response_id；内部cache按owner身份隔离"
+      ],
+      "upstream_refs": [
+        "U9",
+        "U10"
+      ],
+      "status": "planned"
+    },
+    {
+      "id": "U39-006",
+      "priority": "P1",
+      "title": "batch 数学、惩罚与每请求随机数契约",
+      "depends_on": [
+        "SD-006",
+        "SD-010",
+        "U39-001"
+      ],
+      "target_paths_design": [
+        "strata_ds/sampling/",
+        "tests/batch/"
+      ],
+      "acceptance": [
+        "同量化controlled路径solo/batch parity；不同kernel另做数值qual",
+        "penalties不能静默失效；RNG不依赖batch row和迁移次数",
+        "请求S与effectiveS不符试验不能记为成功"
+      ],
+      "upstream_refs": [
+        "U3"
+      ],
+      "status": "planned"
+    },
+    {
+      "id": "U39-007",
+      "priority": "P1",
+      "title": "solo/batch/yield/park 转移与取消隔离",
+      "depends_on": [
+        "SD-011",
+        "SD-012",
+        "U39-005"
+      ],
+      "target_paths_design": [
+        "strata_ds/scheduler/",
+        "strata_ds/session/",
+        "tests/interleaving/"
+      ],
+      "acceptance": [
+        "一decode+长prefill+后到短请求，无丢/重token无跨session",
+        "aging防止短请求饿死长请求，状态换出也计峰值",
+        "取消等待真实GPU和I/O最后消费者；SSE watermark独立"
+      ],
+      "upstream_refs": [
+        "U3"
+      ],
+      "status": "planned"
+    },
+    {
+      "id": "U39-008",
+      "priority": "P2",
+      "title": "Linux THP/NUMA/有效CPU观测与受控A/B",
+      "depends_on": [
+        "U39-001",
+        "SD-008"
+      ],
+      "target_paths_design": [
+        "tools/probe_worker.py",
+        "bench/platform/"
+      ],
+      "acceptance": [
+        "记录cpuset/NUMA/pinned/AnonHugePages与实际分配",
+        "无特权/不改共享宿主机；THP失败显式回普通页",
+        "没有CPU EXL3核就不认领IQ CPU优化收益"
+      ],
+      "upstream_refs": [
+        "U1",
+        "U12"
+      ],
+      "status": "planned"
+    },
+    {
+      "id": "U39-009",
+      "priority": "P1",
+      "title": "非有限值和重复截断的正确错误语义",
+      "depends_on": [
+        "SD-006",
+        "U39-004"
+      ],
+      "target_paths_design": [
+        "strata_ds/runtime/diagnostics.py",
+        "tests/service/"
+      ],
+      "acceptance": [
+        "意外NaN/+Inf及未允许的-Inf最早位置报错；合法mask -Inf不误判，不用nan_to_num掩盖",
+        "重复阈值有合法重复负例，heuristic_stop不是正常业务成功",
+        "stream/nonstream终态一致且仅发一次"
+      ],
+      "upstream_refs": [
+        "U1"
+      ],
+      "status": "planned"
+    },
+    {
+      "id": "U39-010",
+      "priority": "P2",
+      "title": "profile后再做低host干预graph路径",
+      "depends_on": [
+        "SD-004",
+        "SD-006",
+        "U39-003"
+      ],
+      "target_paths_design": [
+        "native/exl3/graph/",
+        "tests/cuda/"
+      ],
+      "acceptance": [
+        "eager基线先过；所有捕获指针/slot代际稳定",
+        "GPU-ready与无需文件/H2D等待的前提实际成立，否则fallback",
+        "覆盖rows×top_k边界；收益只报告实际目标卡"
+      ],
+      "upstream_refs": [
+        "U1",
+        "U13"
+      ],
+      "status": "planned"
+    },
+    {
+      "id": "U39-011",
+      "priority": "P1",
+      "title": "槽位/负载分离矩阵与配方报告",
+      "depends_on": [
+        "SD-008",
+        "SD-011",
+        "SD-014",
+        "U39-005",
+        "U39-007",
+        "U39-009"
+      ],
+      "target_paths_design": [
+        "bench/matrix/",
+        "private-results/"
+      ],
+      "acceptance": [
+        "覆盖8个profile；不盲目全排列11硬件配方",
+        "先256/24后192/128，物理与限额分开；请求/生效S不可混",
+        "独立逻辑/物理IO与H2D、业务成功率、费用和取消尾延迟；可选THP/graph关闭也能完成主表"
+      ],
+      "upstream_refs": [
+        "U3",
+        "U12"
+      ],
+      "status": "planned"
+    }
+  ],
+  "augment_existing_prerequisites": {
+    "SD-000": [
+      "U39-000"
+    ],
+    "SD-007": [
+      "U39-001"
+    ],
+    "SD-008": [
+      "U39-002"
+    ],
+    "SD-010": [
+      "U39-003"
+    ],
+    "SD-011": [
+      "U39-006"
+    ],
+    "SD-014": [
+      "U39-005",
+      "U39-009"
+    ],
+    "SD-002": [
+      "U39-001"
+    ]
+  },
+  "optional_optimization_tasks": [
+    "U39-008",
+    "U39-010"
+  ],
+  "note": "Union of SD and U39 DAG. No real task is marked done by offline planner tests."
+}

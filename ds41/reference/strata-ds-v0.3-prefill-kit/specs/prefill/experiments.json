@@ -1,0 +1,65 @@
+{
+  "schema_version": 1,
+  "kind": "PLANNED_NOT_RUN",
+  "first_anchor": "exl3-3-r256-v24",
+  "format": "EXL3 all3 MUL1 TP1",
+  "model_layers_executed": 40,
+  "speculation": false,
+  "vision": false,
+  "default_math": "fixed packed executor; no auto reconstruction; reference BF16 KV",
+  "seed_16": {
+    "chunk": 1024,
+    "ring_mib": 256,
+    "ring_slots": 20,
+    "wave_experts": 4,
+    "expert_row_tile": 64
+  },
+  "seed_24": {
+    "chunk": 2048,
+    "ring_mib": 512,
+    "ring_slots": 40,
+    "wave_experts": 8,
+    "expert_row_tile": 64
+  },
+  "bounds": {
+    "attention_query_tile": 64,
+    "attention_key_tile": 64,
+    "index_query_tile": 16,
+    "index_key_tile": 4096,
+    "index_head_tile": 4,
+    "engram_query_tile": 256
+  },
+  "ring_sweep_mib": [
+    256,
+    512,
+    1024
+  ],
+  "chunk_sweep": [
+    256,
+    512,
+    1024,
+    2048,
+    3072,
+    4096
+  ],
+  "probe_rows": [
+    1,
+    8,
+    16,
+    32,
+    64,
+    128,
+    256
+  ],
+  "append_lengths": [
+    64,
+    256,
+    1024
+  ],
+  "minimum_repeats": 3,
+  "full_model_time_objective": "prefill + cache_refill + fixed_following_decode",
+  "decode_gap_threshold_ms": null,
+  "quality_thresholds": "inherit unapproved/null policy; approve before seeing final measurements",
+  "created_instances": 0,
+  "automatic_paid_operations": false
+}

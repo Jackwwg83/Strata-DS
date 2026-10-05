@@ -1,0 +1,41 @@
+{
+  "date": "2026-10-04",
+  "kit_version": "0.3.0.dev0",
+  "python": "3.13.5 (main, Jul 15 2026, 20:25:40) [GCC 14.2.0]",
+  "platform": "Linux-6.18.44-x86_64-with-glibc2.41",
+  "test_suite": {
+    "total": 212,
+    "passed": 212,
+    "failed": 0,
+    "skipped": 0,
+    "seconds": 0.056,
+    "evidence": "CPU_OFFLINE_UNIT_TESTS"
+  },
+  "previous_suite_retained": 127,
+  "new_prefill_tests": 85,
+  "executed": [
+    "old and new unittest suite",
+    "source-derived layout and seed plans",
+    "cross-shard synthetic safetensors with actual model shapes",
+    "local CLI outputs",
+    "old SD/U39 + new PF design validation",
+    "C++17 legacy backend interface syntax",
+    "GPU probe syntax and --help only"
+  ],
+  "not_executed": [
+    "complete actual HF checkpoint header or payload audit",
+    "real pretrained tensor loading",
+    "CUDA kernel execution",
+    "real GPU allocated/reserved peak measurement",
+    "whole-model numeric/quality/performance test",
+    "Vast cloud operations",
+    "GitHub publication"
+  ],
+  "sparse_fixture_identity": "SYNTHETIC_BYTES_REAL_SOURCE_SHAPES_NOT_PRETRAINED_WEIGHTS",
+  "hf_direct_access": "attempted fixed config URLs; inaccessible; used pinned publisher runtime + checked-in official config mirror",
+  "whole_engine_backends_ready": false,
+  "source_pins_and_eleven_recipes_unchanged": true,
+  "gpu_probe_status": "PROVIDED_NOT_GPU_EXECUTED",
+  "derived_expert_payload_bytes": 13315596,
+  "designed_expert_slot_bytes": 13316352
+}

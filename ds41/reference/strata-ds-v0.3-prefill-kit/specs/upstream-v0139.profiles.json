@@ -1,0 +1,178 @@
+{
+  "schema_version": 1,
+  "scope": "Project design profiles; not current engine flags or launch configs",
+  "default_requested_slots": 1,
+  "effective_slots_mismatch": "FAIL_OR_SEPARATELY_LABEL_TRIAL",
+  "initial_recipe": "exl3-3-r256-v24",
+  "initial_profiles": [
+    "serial-fixed",
+    "serial-byte"
+  ],
+  "phase_memory_measurement_required": true,
+  "ds_session_bytes": null,
+  "estimated_ring_budget_candidates_mib": [
+    256,
+    512,
+    1024
+  ],
+  "expert_file_io_ablation": [
+    "auto_advice",
+    "buffered",
+    "direct"
+  ],
+  "do_not_cross_product_ablation_with_all_recipes": true,
+  "profiles": [
+    {
+      "id": "serial-fixed",
+      "requested_slots": 1,
+      "offered_concurrency": 1,
+      "load_pattern": "single",
+      "ring_policy": "fixed_measured_design",
+      "scheduler_policy": "serial_design",
+      "speculation": false,
+      "vision": false,
+      "prefill_borrow": false,
+      "math_profile": "controlled_same_quant",
+      "fixed_sampling_policy": "greedy_then_seeded_per_request",
+      "context_targets": [
+        1024,
+        8192
+      ],
+      "readiness": "PLANNED_NOT_IMPLEMENTED",
+      "can_launch": false
+    },
+    {
+      "id": "serial-byte",
+      "requested_slots": 1,
+      "offered_concurrency": 1,
+      "load_pattern": "single",
+      "ring_policy": "joint_byte_design",
+      "scheduler_policy": "serial_design",
+      "speculation": false,
+      "vision": false,
+      "prefill_borrow": false,
+      "math_profile": "controlled_same_quant",
+      "fixed_sampling_policy": "greedy_then_seeded_per_request",
+      "context_targets": [
+        1024,
+        8192
+      ],
+      "readiness": "PLANNED_NOT_IMPLEMENTED",
+      "can_launch": false
+    },
+    {
+      "id": "slots2-idle",
+      "requested_slots": 2,
+      "offered_concurrency": 1,
+      "load_pattern": "single",
+      "ring_policy": "joint_byte_design",
+      "scheduler_policy": "microbatch_design",
+      "speculation": false,
+      "vision": false,
+      "prefill_borrow": false,
+      "math_profile": "controlled_same_quant",
+      "fixed_sampling_policy": "greedy_then_seeded_per_request",
+      "context_targets": [
+        1024,
+        8192
+      ],
+      "readiness": "PLANNED_NOT_IMPLEMENTED",
+      "can_launch": false
+    },
+    {
+      "id": "slots2-load",
+      "requested_slots": 2,
+      "offered_concurrency": 2,
+      "load_pattern": "simultaneous",
+      "ring_policy": "joint_byte_design",
+      "scheduler_policy": "microbatch_design",
+      "speculation": false,
+      "vision": false,
+      "prefill_borrow": false,
+      "math_profile": "controlled_same_quant",
+      "fixed_sampling_policy": "greedy_then_seeded_per_request",
+      "context_targets": [
+        1024,
+        8192
+      ],
+      "readiness": "PLANNED_NOT_IMPLEMENTED",
+      "can_launch": false
+    },
+    {
+      "id": "slots2-queue",
+      "requested_slots": 2,
+      "offered_concurrency": 5,
+      "load_pattern": "simultaneous",
+      "ring_policy": "joint_byte_design",
+      "scheduler_policy": "microbatch_design",
+      "speculation": false,
+      "vision": false,
+      "prefill_borrow": false,
+      "math_profile": "controlled_same_quant",
+      "fixed_sampling_policy": "greedy_then_seeded_per_request",
+      "context_targets": [
+        1024,
+        8192
+      ],
+      "readiness": "PLANNED_NOT_IMPLEMENTED",
+      "can_launch": false
+    },
+    {
+      "id": "slots5-idle",
+      "requested_slots": 5,
+      "offered_concurrency": 1,
+      "load_pattern": "single",
+      "ring_policy": "joint_byte_design",
+      "scheduler_policy": "microbatch_design",
+      "speculation": false,
+      "vision": false,
+      "prefill_borrow": false,
+      "math_profile": "controlled_same_quant",
+      "fixed_sampling_policy": "greedy_then_seeded_per_request",
+      "context_targets": [
+        1024,
+        8192
+      ],
+      "readiness": "PLANNED_NOT_IMPLEMENTED",
+      "can_launch": false
+    },
+    {
+      "id": "slots5-load",
+      "requested_slots": 5,
+      "offered_concurrency": 5,
+      "load_pattern": "simultaneous",
+      "ring_policy": "joint_byte_design",
+      "scheduler_policy": "microbatch_design",
+      "speculation": false,
+      "vision": false,
+      "prefill_borrow": false,
+      "math_profile": "controlled_same_quant",
+      "fixed_sampling_policy": "greedy_then_seeded_per_request",
+      "context_targets": [
+        1024,
+        8192
+      ],
+      "readiness": "PLANNED_NOT_IMPLEMENTED",
+      "can_launch": false
+    },
+    {
+      "id": "long-short-yield",
+      "requested_slots": 2,
+      "offered_concurrency": 3,
+      "load_pattern": "one_decode_then_long_prefill_then_short",
+      "ring_policy": "joint_byte_design",
+      "scheduler_policy": "microbatch_design",
+      "speculation": false,
+      "vision": false,
+      "prefill_borrow": false,
+      "math_profile": "controlled_same_quant",
+      "fixed_sampling_policy": "greedy_then_seeded_per_request",
+      "context_targets": [
+        1024,
+        8192
+      ],
+      "readiness": "PLANNED_NOT_IMPLEMENTED",
+      "can_launch": false
+    }
+  ]
+}

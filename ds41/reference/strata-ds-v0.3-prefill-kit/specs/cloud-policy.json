@@ -1,0 +1,13 @@
+{
+  "schema_version": 1,
+  "allow_paid_create": false,
+  "allow_model_download": false,
+  "max_hourly_usd": null,
+  "max_total_usd": null,
+  "max_duration_hours": null,
+  "max_active_instances": 1,
+  "automatic_retries": 0,
+  "require_pinned_image_digest": true,
+  "require_destroy_receipt": true,
+  "note": "用户在本地授权后填值；本设计包没有执行云端写操作的代码。"
+}

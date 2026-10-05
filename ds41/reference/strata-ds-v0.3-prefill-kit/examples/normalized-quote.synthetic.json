@@ -1,0 +1,9 @@
+{
+  "provenance": "synthetic_test_NOT_MARKET_PRICE",
+  "hourly_including_disk_usd": 1.0,
+  "duration_hours": 2.0,
+  "download_gb": 425.0,
+  "upload_gb": 1.0,
+  "download_usd_per_gb": 0.01,
+  "upload_usd_per_gb": 0.02
+}

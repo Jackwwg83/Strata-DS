@@ -1,0 +1,57 @@
+{
+  "from_version": "v0.2.1",
+  "files": [
+    {
+      "path": "recipes/exl3-3-r192-v24.json",
+      "sha256": "0c0a5ade2e3eadc20e239ce6cc76b0a1846fb87e6c9c56d8e80375c2ccc27ec1"
+    },
+    {
+      "path": "recipes/exl3-3-r128-v16.json",
+      "sha256": "179c2c2eec349a453992406b7e201b147be622092b213f8073cdb089d140e73d"
+    },
+    {
+      "path": "recipes/q2-r192-v24.json",
+      "sha256": "3779e2df73071e44ad7f17db9944b256887d4c5bdb577f5174b2473684bc5f2f"
+    },
+    {
+      "path": "recipes/sage-1.59-r128-v24.json",
+      "sha256": "0cb66287d6534f2fb9662c92735fcdf21093569c18ccd701f532e5e9a14fe826"
+    },
+    {
+      "path": "recipes/exl3-3-r128-v24.json",
+      "sha256": "e3899a0a94d57182e62231859bcdaa7139cc9d548ff7334fcc188b5343518e94"
+    },
+    {
+      "path": "recipes/exl3-3-r384-v24.json",
+      "sha256": "b91ce66b8832e40846ed8c7156855e311efa1e2c4b569ce782619feeb71e0c5d"
+    },
+    {
+      "path": "recipes/exl3-3-r256-v16.json",
+      "sha256": "b25402355f06823ed2ae063ff780b5c71d7ea9f259ca8bf13aa5bad0b0c6c54f"
+    },
+    {
+      "path": "recipes/native-r384-v24.json",
+      "sha256": "7277904ea199141e1af09702f9b09b3535c4ef466e1753091591aac691fb0ed4"
+    },
+    {
+      "path": "recipes/exl3-3-r256-v24.json",
+      "sha256": "714119cbb08d84ad97e106a83cc282b42a598555214224d0121faf487d8bfcfb"
+    },
+    {
+      "path": "recipes/q2-r128-v24.json",
+      "sha256": "e9cc8e92adfa395395766343ec21176a93f426fbe87e84acf7af88209aa47678"
+    },
+    {
+      "path": "recipes/q2-r128-v16.json",
+      "sha256": "f2642c1c64109c93282779c07993646152e6fdac59c4301092d23464414aa8e4"
+    },
+    {
+      "path": "specs/sources.lock.json",
+      "sha256": "34bc126863d981324cbbfdb11e8dedb39b8565b10566ef785f1f8aa52cfd0b08"
+    },
+    {
+      "path": "specs/cloud-policy.json",
+      "sha256": "4009fbc41b1a2a5912b7da19ceb4a7e4c4f6076a30d73e812b04794c020b4f1a"
+    }
+  ]
+}

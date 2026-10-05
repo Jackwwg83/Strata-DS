@@ -1,0 +1,127 @@
+{
+  "schema_version": 1,
+  "old_tasks_preserved": true,
+  "tasks": [
+    {
+      "id": "PF-000",
+      "title": "将真实checkpoint审计绑定到源布局",
+      "depends_on": [
+        "SD-000",
+        "SD-001"
+      ],
+      "target_paths": [
+        "strata_ds_lab/prefill/audit.py",
+        "strata_ds_lab/prefill/layout.py"
+      ],
+      "acceptance": [
+        "核对config镜像与真实target config",
+        "完整15360 experts/184320 components或明确subset",
+        "验证12组件shape/dtype/MUL1与payload hashes；生成file offsets",
+        "精确text-mandatory清单；vision/draft不凭猜测排除"
+      ],
+      "status": "CPU auditor implemented; full real-checkpoint audit pending"
+    },
+    {
+      "id": "PF-001",
+      "title": "TP1受限EXL3专家运算",
+      "depends_on": [
+        "PF-000",
+        "SD-002"
+      ],
+      "target_paths": [
+        "tools/probe_exl3_prefill_gpu.py",
+        "src/exl3/tp1_executor (to implement)"
+      ],
+      "acceptance": [
+        "真实H5120/F2304，MUL1，权重在down前缩放",
+        "目标GPU default/reconstruct的峰值与数值记录",
+        "packed路径禁止隐式大重建；fallback45MiB合同单独识别",
+        "不把TP2/GB10二进制视为3090/4090/50系列通用"
+      ],
+      "status": "Probe provided, GPU run and engine kernel adaptation pending"
+    },
+    {
+      "id": "PF-002",
+      "title": "有界文件/ring/wave接入",
+      "depends_on": [
+        "PF-001",
+        "SD-003",
+        "SD-004",
+        "U39-002"
+      ],
+      "target_paths": [
+        "strata_ds_lab/prefill/routes.py",
+        "src/prefill/streaming_waves (to implement)"
+      ],
+      "acceptance": [
+        "20/40 slots与G4/G8双wave最小条件",
+        "稳定route grouping后每专家每chunk-layer加载一次；skew行分段不重复fetch",
+        "动态global-expert→slot描述符与真实CUDAevent代际",
+        "TP1 missing硬失败；每token六个贡献无丢无重；异常排空"
+      ],
+      "status": "CPU scheduler implemented, I/O/CUDA integration pending"
+    },
+    {
+      "id": "PF-003",
+      "title": "Attention/index二维slab",
+      "depends_on": [
+        "PF-001",
+        "SD-005"
+      ],
+      "target_paths": [
+        "strata_ds_lab/prefill/planner.py",
+        "src/attention/slab_executor (to implement)"
+      ],
+      "acceptance": [
+        "query64/key64在线softmax、sink、RoPE、mask与独立oracle",
+        "index16/4096/head4完整32头归约；精确top-k与候选领域",
+        "四source bank的page/ratio边界，不对DCP再除",
+        "不给head复制KV，不创建全context score tensor"
+      ],
+      "status": "Exact buffer contract implemented; kernels pending"
+    },
+    {
+      "id": "PF-004",
+      "title": "阶段预算绑定真实分配",
+      "depends_on": [
+        "PF-002",
+        "PF-003",
+        "SD-006",
+        "SD-007",
+        "U39-001"
+      ],
+      "target_paths": [
+        "strata_ds_lab/prefill/planner.py",
+        "engine admission adapter (to implement)"
+      ],
+      "acceptance": [
+        "allocation与合同逐项对账，包括非专家格式、上下文、ring、scratch、external、margin",
+        "首次warmup/取消恢复/备用副本峰值受控",
+        "实际MemAvailable/cgroup/VRAM小于nominal时拒绝或重新计划",
+        "沿独立source/math gate，不提前改BACKENDS.implemented"
+      ],
+      "status": "Model-specific planner implemented; measured whole-engine admission pending"
+    },
+    {
+      "id": "PF-005",
+      "title": "真实Prefill调参与Agent回归",
+      "depends_on": [
+        "PF-004",
+        "SD-010",
+        "U39-003",
+        "U39-005"
+      ],
+      "target_paths": [
+        "strata_ds_lab/prefill/tune.py",
+        "specs/prefill/experiments.json"
+      ],
+      "acceptance": [
+        "至少3次匹配重复，prefill+refill+固定decode目标，单因素试验",
+        "actual routes SSD/H2D分开；64/256/1024 append",
+        "fixed/byte策略同量化quality；failure样本保留",
+        "whole-model证据前不从组件throughput外推"
+      ],
+      "status": "Measured-record selector implemented; actual campaign pending"
+    }
+  ]
+}
