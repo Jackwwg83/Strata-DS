@@ -1,15 +1,19 @@
 // src/ds41/engine.cu - DeepSeek V4.1 Flash decode, one token at a time. See engine.hpp.
 //
 // Each block of code below restates one method of DeepSeek's model.py (Block, Attention, Compressor, Indexer,
-// MoE, Engram, ParallelHead) for one token. The GPU work is ordered on the default stream. Routing and the
-// indexer top-k go through the task kernels (K8, K5). The routed experts run on a CPU thread that meets the
+// MoE, Engram, ParallelHead) for one token. The GPU work is ordered on the default stream. The dense FP8 GEMVs
+// (K1), the hyper-connection mixes (K7), the sparse attention (K3), routing (K8) and the indexer top-k (K5) go
+// through the task kernels. The routed experts run on a CPU thread that meets the
 // stream once per layer through an ExpertDoorbell (upstream's doorbell), so the host thread only enqueues work
 // and waits once, for the logits. The engram rows of both engram layers are read at the start of the step.
 #include "strata/ds41/engine.hpp"
 
 #include "strata/ds41/config.hpp"
 #include "strata/ds41/doorbell.hpp"
+#include "strata/ds41/fp8_gemv.hpp"
+#include "strata/ds41/kernels/k3_sparse_attn.hpp"
 #include "strata/ds41/kernels/k5_indexer.hpp"
+#include "strata/ds41/kernels/k7_hc.hpp"
 #include "strata/ds41/kernels/k8_router.hpp"
 #include "strata/ds41/ops.hpp"
 #include "strata/ds41/vram_experts.hpp"
@@ -142,7 +146,7 @@ struct Engine::Impl {
     // scratch
     bf16 *h, *h2, *xa, *xf, *qr, *q, *kvv, *o, *oa, *attn_out, *latent, *ik, *iq, *iw_raw, *iw, *g, *u, *sh_h,
         *sh_out, *ffn_out, *eng_vals, *eng_kv, *final_x;
-    float *act, *pre_mix, *pre, *post, *comb, *mix_scratch, *ffn_pre, *attn_pre, *attn_post, *attn_comb, *ffn_post,
+    float *act, *pre_mix, *pre, *post, *comb, *ffn_pre, *attn_pre, *attn_post, *attn_comb, *ffn_post,
         *ffn_comb, *ckv, *cscore, *scores, *routed, *logits;
     uint16_t* x_half_dev;
     int32_t* idx_dev;                  // attention index list: [0, 128) window, then the compressed top-k
@@ -291,7 +295,6 @@ struct Engine::Impl {
         pre = dalloc<float>(kHc);
         post = dalloc<float>(kHc);
         comb = dalloc<float>(kHc * kHc);
-        mix_scratch = dalloc<float>(32);
         attn_pre = dalloc<float>(kHc);
         attn_post = dalloc<float>(kHc);
         attn_comb = dalloc<float>(kHc * kHc);
@@ -352,7 +355,11 @@ struct Engine::Impl {
         return (yarn ? rope_yarn : rope_plain) + (size_t) pos * kRopeDim;
     }
 
-    void fp8_linear(const bf16* x, const Fp8& w, bf16* y) { ops::fp8_linear(x, w.k, w.w, w.s, w.n, y, act); }
+    /// model.py linear() for one token: K1's activation quantizer, then K1's GEMV (act holds up to 8192 floats)
+    void fp8_linear(const bf16* x, const Fp8& w, bf16* y) {
+        fp8_quantize_activation_f32((const uint16_t*) x, 1, w.k, act, nullptr);
+        fp8_block_gemv_q(act, 1, w.k, w.w, w.s, w.n, (uint16_t*) y, nullptr);
+    }
 
     // ------------------------------------------------------------------------------------- cpu experts
     /// The CPU expert thread: per released step, layers 0..39 in order, each when the GPU publishes it.
@@ -499,7 +506,8 @@ struct Engine::Impl {
             n_idx += std::min(kIndexTopK, compress_len);   // this group's index source wrote them (none yet: 0)
             comp = cur_comp;
         }
-        ops::sparse_attn(q, y.window, comp, idx_dev, n_idx, y.sink, (float) std::pow(kHeadDim, -0.5), o);
+        kernels::sparse_attn_decode(q, y.window, comp, idx_dev, 1, n_idx, y.sink, (float) std::pow(kHeadDim, -0.5), o,
+                                    0);
         ops::rope(o, kHeads, kHeadDim, rope_at(yarn, pos), true);
         ops::wo_a_grouped(o, y.wo_a, oa);
         fp8_linear(oa, y.wo_b, attn_out);
@@ -571,16 +579,16 @@ struct Engine::Impl {
             const bool dbg_layer = dbg && (l == 1 || l == 2);
             if (dbg_layer) dbg_write(h, kHc * kDim);                    // block input (after engram)
             // attention sub-block: h -> h2
-            ops::hc_mixes(h, y.hc_attn_fn, y.hc_attn_scale, y.hc_attn_base, attn_pre, attn_post, attn_comb, mix_scratch);
-            ops::hc_pre(h, pre_mix, xa);
+            kernels::hc_mixes_pre(h, 1, y.hc_attn_fn, y.hc_attn_scale, y.hc_attn_base, pre_mix, xa, attn_pre, attn_post,
+                                  attn_comb, 0);
             ops::rmsnorm(xa, y.attn_norm, xa, kDim, kNormEps);
             if (dbg_layer) dbg_write(xa, kDim);                         // attention input
             attention(l, pos);
             if (dbg_layer) dbg_write(attn_out, kDim);                   // attention output
             ops::hc_post(attn_out, h, attn_post, attn_comb, h2);
             // ffn sub-block: h2 -> h
-            ops::hc_mixes(h2, y.hc_ffn_fn, y.hc_ffn_scale, y.hc_ffn_base, ffn_pre, ffn_post, ffn_comb, mix_scratch);
-            ops::hc_pre(h2, attn_pre, xf);
+            kernels::hc_mixes_pre(h2, 1, y.hc_ffn_fn, y.hc_ffn_scale, y.hc_ffn_base, attn_pre, xf, ffn_pre, ffn_post,
+                                  ffn_comb, 0);
             ops::rmsnorm(xf, y.ffn_norm, xf, kDim, kNormEps);
             if (dbg_layer) dbg_write(xf, kDim);                         // ffn input
             moe(l);
