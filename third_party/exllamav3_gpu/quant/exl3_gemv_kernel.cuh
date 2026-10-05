@@ -13,15 +13,14 @@
 // - one m16n8k16 MMA pair per 16x16 weight tile with fp16 accumulation, folded to fp32 on a fixed
 //   cadence; per-block cross-warp reduction over the k splits through shared memory
 //
-// Same launch signature as exl3_gemm_kernel so kernel args and graph parameter patching are
-// interchangeable. Cooperative launch: one grid.sync after the input Hadamard stage and one before
-// the output stage, no other cross-block coordination. 2, 3 and 4 bpw.
+// Strata adaptation: one device job per grid.y entry. Input/output Hadamards run in
+// surrounding launches; the main GEMV arithmetic below is unchanged. No cooperative launch.
 //
 // CFG 0 ("narrow", 512 threads, 2 n-tiles/warp, 16 k-splits) wins at attention-projection sizes;
 // CFG 1 ("wide", 256 threads, 4 n-tiles/warp, 8 k-splits) wins at large-n FFN sizes. MMODE 0 is
 // the m == 1 fast path, MMODE 1 covers 2 <= m <= 8 with row-guarded fragment loads.
 
-#include <cooperative_groups.h>
+#include "exl3_gemv.cuh"
 #include "../ptx.cuh"
 #include "exl3_dq.cuh"
 #include "exl3_kernel_map.cuh"
@@ -185,8 +184,17 @@ __device__ __forceinline__ void dq8_regs_half(uint32_t a7, uint32_t b7, int s7, 
 // the bound keeps the compiler at the integer instances' 64
 template <int bits, bool c_fp32, int cb, int MMODE, int CFG, bool SMEM_STAGE, bool HALF = false>
 __global__ __launch_bounds__(CFG == 0 ? 512 : 256, HALF && CFG == 0 ? 2 : 1)
-void exl3_gemv_kernel(EXL3_GEMM_ARGS)
+void exl3_gemv_kernel(const strata_exl3::GemvJob* jobs)
 {
+    // A is already in the Hadamard basis. A null trellis marks an empty slot.
+    const strata_exl3::GemvJob job = jobs[blockIdx.y];
+    if (!job.B) return;  // uniform for the whole block, before any barrier
+    const half* A = job.A;
+    const uint16_t* B = job.B;
+    void* C = job.C;
+    const int size_m = 1;
+    const int size_k = job.k;
+    const int size_n = job.n;
     static_assert(HALF ? (bits >= 1 && bits <= 3 && cb == 2) : (bits == 2 || bits == 3 || bits == 4),
                   "exl3_gemv_kernel supports 2, 3 and 4 bpw, and 1.5, 2.5 and 3.5 bpw with mul1");
     constexpr int WK   = CFG == 0 ? 16 : 8;     // k-split (warps per block)
@@ -202,27 +210,6 @@ void exl3_gemv_kernel(EXL3_GEMM_ARGS)
     constexpr int LOADS = TWO_PER_LOAD ? WNT / 2 : WNT;                       // warp loads per k-slice
     constexpr int LSTRIDE = TWO_PER_LOAD ? 2 * TWORDS : (TWORDS < 32 ? TWORDS : 32);   // uint32 per load (lanes < LSTRIDE load)
     static_assert(!TWO_PER_LOAD || WNT % 2 == 0, "two tiles per warp load needs an even tile count per warp");
-
-    auto grid = cooperative_groups::this_grid();
-
-    // Input scales and Hadamard transform, same as exl3_gemm_kernel
-    {
-        int total_warps = size_m * size_k / 128;
-        int warps_grid = gridDim.x * blockDim.x / 32;
-        int this_warp = threadIdx.x / 32 + blockDim.x / 32 * blockIdx.x;
-
-        for(; this_warp < total_warps; this_warp += warps_grid)
-            had_hf_r_128_inner<true, false>
-            (
-                A + this_warp * 128,
-                A_had + this_warp * 128,
-                suh + (this_warp * 128) % size_k,
-                0.088388347648f  // 1/sqrt(128)
-            );
-
-        grid.sync();
-        A = A_had;
-    }
 
     const int warp = threadIdx.x / 32;
     const int lane = threadIdx.x % 32;
@@ -451,32 +438,5 @@ void exl3_gemv_kernel(EXL3_GEMM_ARGS)
 
     #undef XP
 
-    // Output scales and Hadamard transform, same semantics as the inner GEMM epilogue
-    {
-        grid.sync();
-
-        int total_warps = size_m * size_n / 128;
-        int warps_grid = gridDim.x * blockDim.x / 32;
-        int this_warp = threadIdx.x / 32 + blockDim.x / 32 * blockIdx.x;
-
-        for(; this_warp < total_warps; this_warp += warps_grid)
-        {
-            if constexpr (c_fp32)
-                had_ff_r_128_inner<false, true>
-                (
-                    ((const float*) C) + this_warp * 128,
-                    ((float*) C) + this_warp * 128,
-                    svh + (this_warp * 128) % size_n,
-                    0.088388347648f  // 1/sqrt(128)
-                );
-            else
-                had_hf_r_128_inner<false, true>
-                (
-                    ((const half*) C) + this_warp * 128,
-                    ((half*) C) + this_warp * 128,
-                    svh + (this_warp * 128) % size_n,
-                    0.088388347648f  // 1/sqrt(128)
-                );
-        }
-    }
+    // Output Hadamard and svh scaling are performed by the caller.
 }
