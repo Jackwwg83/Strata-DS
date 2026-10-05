@@ -2241,6 +2241,8 @@ struct ForwardCtx
     std::vector<PreparedIn> prep_g, prep_u, prep_d;
 
     int phase = 0;
+    // Strata-DS K11-04: invocation-local tickets; reset only between completed phases.
+    alignas(64) std::atomic<int64_t> next_gemv_band{0};
 };
 
 struct ForwardArena
@@ -2362,6 +2364,9 @@ inline void assign_gemvs(int worker, int num_workers, int total, int tiles_n, Ge
         gemv(j, std::max(f0 - j * tiles_n, 0), std::min(f1 - j * tiles_n, tiles_n));
 }
 
+// Strata-DS K11-04: fine-grained AVX2/AVX-VNNI work sharing for small batches.
+#include "strata_dynamic_schedule.h"
+
 void forward_phase(void* vctx, int worker, int num_workers)
 {
     ForwardCtx& c = *static_cast<ForwardCtx*>(vctx);
@@ -2391,7 +2396,7 @@ void forward_phase(void* vctx, int worker, int num_workers)
         {
             // Gate + up GEMVs (see assign_gemvs)
             const int gu = L.gates.empty() ? 1 : 2;
-            assign_gemvs(worker, num_workers, nc * gu, I / 16, [&](int j, int t0, int t1)
+            strata_assign_gemvs(c, worker, num_workers, nc * gu, I / 16, [&](int j, int t0, int t1)
             {
                 const Chunk& ch = c.chunks[j / gu];
                 const bool up = gu == 1 || (j % gu);
@@ -2475,7 +2480,7 @@ void forward_phase(void* vctx, int worker, int num_workers)
         case 3:
         {
             // Down GEMVs
-            assign_gemvs(worker, num_workers, nc, H / 16, [&](int j, int t0, int t1)
+            strata_assign_gemvs(c, worker, num_workers, nc, H / 16, [&](int j, int t0, int t1)
             {
                 const Chunk& ch = c.chunks[j];
                 float* tout = c.tout_d + static_cast<size_t>(j) * MAX_SLOTS * H;
@@ -2971,6 +2976,10 @@ void exl3_moe_cpu_forward_raw(
     const int num_phases = rows == 1 ? 5 : 6;
     for (int phase = 0; phase < num_phases; ++phase) {
         ctx.phase = phase;
+        // Strata-DS K11-04: the previous run has acknowledged every participant before
+        // the next release dispatch publishes this reset. No worker resets the queue.
+        if ((phase == 1 || phase == 3) && strata_dynamic_schedule_enabled(ctx))
+            ctx.next_gemv_band.store(0, std::memory_order_relaxed);
         if (prof)
         {
             const auto t0 = std::chrono::steady_clock::now();
