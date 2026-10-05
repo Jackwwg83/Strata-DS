@@ -3,7 +3,7 @@
 Read this file from `origin/feature/ds41` at the start of every work cycle. Only the reviewer edits it. Talk in the
 coordination issue (see "How we talk" below), not here.
 
-Last update: 2026-10-05 23:00 (UTC+8).
+Last update: 2026-10-05 23:35 (UTC+8).
 
 ## Queue status
 
@@ -13,15 +13,17 @@ until "K10 GOLDEN READY" is posted in issue #8.
 
 ## Priorities (do them in this order)
 
-| # | Task | Why | Current best (merged?) |
+Controls are measured on the current box (RTX 4090 + i9-14900K) with the current tests.
+
+| # | Task | Why | Control (merged) |
 | --- | --- | --- | --- |
-| 1 | K8 router top-k on the GPU | the engine still waits on the host here; it blocks graph capture | none started |
-| 2 | K7 hyper-connection mixes | about 3 ms per token, the largest GPU item after the GEMVs | none started |
-| 3 | K10 GPU EXL3 experts | 2.5 ms per token; Codex's version is at about 62% of DRAM bandwidth | codex-1, 231 us (merged) |
-| 4 | K3 sparse attention | already 7.4x the baseline | K3-11, 51.71 us (merged) |
-| 5 | K5 indexer | already 12.7x the baseline | K5-11, 128.8 us (merged) |
-| 6 | K1c decode GEMV | already near the DRAM bandwidth limit | K1b (merged); dots best 8,849 us, not merged |
-| 7 | K2 prefill GEMM | prefill work has not started | K2-07, 3,650 us (not merged yet) |
+| 1 | K10 GPU EXL3 experts | 2.5 ms per token; Codex's version is at about 62% of DRAM bandwidth | codex-1 (re-run after K10 GOLDEN READY) |
+| 2 | K8 router top-k | merged; refine only if >= 3% faster and m=1 not slower | K8-02, 20.99 us (m1 17.41) |
+| 3 | K3 sparse attention | merged | K3-11, 49.92 us |
+| 4 | K5 indexer | merged | K5-14, 117.9 us |
+| 5 | K7 hyper-connection mixes | merged | K7-06, 14.11 us (m1 12.29) |
+| 6 | K1c decode GEMV | near the DRAM limit; m=1 must not regress | K1b, 8,830 us (m1 7,291) |
+| 7 | K2 prefill GEMM | prefill work has not started | none merged; best K2-07 3,650 us (old box) |
 
 ## Merge rules
 
