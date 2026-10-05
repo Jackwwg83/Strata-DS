@@ -18,6 +18,9 @@ struct GemvJob {
 
 // K10: 3-bit mul1, narrow configuration, one row per job. max_n sizes grid.x;
 // each job's n must be a multiple of 128 and no larger than max_n.
+// K10 gate/up (max_n=2304) requires every nonempty job to have k=5120,
+// as constructed and checked by input_had; it uses eight narrow k-splits.
+// Other calls retain sixteen narrow k-splits, including K10 down.
 void gemv_mul1_3bit(const GemvJob* jobs, int count, int max_n, cudaStream_t stream);
 
 }  // namespace strata_exl3

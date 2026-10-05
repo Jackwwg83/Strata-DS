@@ -182,8 +182,20 @@ __device__ __forceinline__ void dq8_regs_half(uint32_t a7, uint32_t b7, int s7, 
 // ptxas spends 81-85 registers on them on sm_86/sm_89 (one 512-thread block per SM instead of two, measured
 // 18-28% slower at attention-projection shapes on the 3090). They are packed into one register (see x_pack) and
 // the bound keeps the compiler at the integer instances' 64
-template <int bits, bool c_fp32, int cb, int MMODE, int CFG, bool SMEM_STAGE, bool HALF = false>
-__global__ __launch_bounds__(CFG == 0 ? 512 : 256, HALF && CFG == 0 ? 2 : 1)
+// Strata K10: the raw-job integer instance reaches 79 registers on CUDA 12.8
+// sm_89 without the two-block bound, leaving only 16 resident warps. Apply the
+// same bound to narrow integer GEMV: ptxas uses 63 registers without spills,
+// allowing 32 resident warps to cover the streaming trellis-load latency.
+// This changes register allocation only; keep the prefetch/MMA/fold body intact.
+// Optional eight-warp narrow geometry for K10 gate/up only. Keep the narrow
+// two-tile, four-slice FP16 schedule; CFG 1 has a different fold cadence.
+// Gate/up K=5120 divides into 20 slices/warp at 16 warps or 40 at 8 warps,
+// preserving all FP16 fold boundaries. The FP32 grouping is different and
+// requires unchanged golden acceptance. Down K=2304 must keep 16 warps.
+template <int bits, bool c_fp32, int cb, int MMODE, int CFG, bool SMEM_STAGE,
+          bool HALF = false, bool KSPLIT8 = false>
+__global__ __launch_bounds__(KSPLIT8 ? 256 : (CFG == 0 ? 512 : 256),
+                            KSPLIT8 ? 3 : (CFG == 0 ? 2 : 1))
 void exl3_gemv_kernel(const strata_exl3::GemvJob* jobs)
 {
     // A is already in the Hadamard basis. A null trellis marks an empty slot.
@@ -197,7 +209,10 @@ void exl3_gemv_kernel(const strata_exl3::GemvJob* jobs)
     const int size_n = job.n;
     static_assert(HALF ? (bits >= 1 && bits <= 3 && cb == 2) : (bits == 2 || bits == 3 || bits == 4),
                   "exl3_gemv_kernel supports 2, 3 and 4 bpw, and 1.5, 2.5 and 3.5 bpw with mul1");
-    constexpr int WK   = CFG == 0 ? 16 : 8;     // k-split (warps per block)
+    static_assert(!KSPLIT8 || (bits == 3 && c_fp32 && cb == 2 && MMODE == 0 &&
+                               CFG == 0 && !SMEM_STAGE && !HALF),
+                  "eight-warp override is only for the K10 narrow FP16 path");
+    constexpr int WK   = KSPLIT8 ? 8 : (CFG == 0 ? 16 : 8);     // k-split (warps per block)
     constexpr int WNT  = CFG == 0 ? 2 : 4;      // adjacent n-tiles per warp
     constexpr int PF   = CFG == 0 ? 4 : 2;      // prefetch ring depth
     constexpr int FOLD = CFG == 0 ? 4 : 2;      // fp16->fp32 fold cadence (divides PF)

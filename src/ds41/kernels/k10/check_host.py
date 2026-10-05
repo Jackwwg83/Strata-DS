@@ -51,14 +51,24 @@ def provenance():
         ]:
             old_part = section(old, start, end)
             new_end = "    const int warp = threadIdx.x / 32;" if "auto grid" in end else end
-            assert old_part == section(new, start, new_end), start
+            new_part = section(new, start, new_end)
+            if start == "    static_assert(HALF":
+                override = '''    static_assert(!KSPLIT8 || (bits == 3 && c_fp32 && cb == 2 && MMODE == 0 &&
+                               CFG == 0 && !SMEM_STAGE && !HALF),
+                  "eight-warp override is only for the K10 narrow FP16 path");
+'''
+                assert new_part.count(override) == 1
+                assert new_part.count("KSPLIT8 ? 8 : (CFG == 0 ? 16 : 8)") == 1
+                new_part = new_part.replace(override, "").replace(
+                    "KSPLIT8 ? 8 : (CFG == 0 ? 16 : 8)", "CFG == 0 ? 16 : 8")
+            assert old_part == new_part, start
         subprocess.run(["patch", "--batch", "-p1", "-d", str(tmp),
                         "-i", str(VENDOR / "strata.patch")],
                        check=True, capture_output=True, text=True)
         for rel in manifest:
             assert (restored / rel).read_bytes() == (VENDOR / rel).read_bytes(), rel
         print(f"PASS provenance: {len(manifest)} pristine SHA-256 hashes; reverse/forward patch round trip")
-        print("PASS preservation: GEMV helpers, constants, decode/MMA/fold/reduction core byte-identical")
+        print("PASS preservation: helpers and decode/MMA/fold/reduction core byte-identical; only reviewed WK override in constants")
 
 
 def include_and_scope_checks():
@@ -81,7 +91,7 @@ def include_and_scope_checks():
                          r"cudaDeviceSynchronize|cudaStreamSynchronize|cudaGetDevice\w*|"
                          r"cudaLaunchCooperativeKernel)\s*\(", active)
     assert "grid.sync" not in (VENDOR / "quant/exl3_gemv_kernel.cuh").read_text()
-    assert active.count("<<<") == 4  # GEMV wrapper called twice, plus three pipeline kernels
+    assert active.count("<<<") == 5  # mutually exclusive GEMV launch sites; wrapper called twice, plus three pipeline kernels
     print("PASS launch source audit: 5 launches; no allocation, host sync, device query or cooperative barrier")
     changed = subprocess.check_output(["git", "diff", "--name-only", "HEAD"], cwd=ROOT, text=True).splitlines()
     changed += subprocess.check_output(["git", "ls-files", "--others", "--exclude-standard"], cwd=ROOT, text=True).splitlines()
@@ -96,9 +106,9 @@ def include_and_scope_checks():
 def indexing():
     # Enumerate the narrow GEMV's actual trellis-load address formulas. Every
     # uint32 word of each shape must be read exactly once, with no OOB loads.
-    for k, n in [(5120, 2304), (2304, 5120)]:
-        chunk = (k // 16 + 15) // 16
-        group, warp, i, load, lane = np.indices((n // 32, 16, chunk, 2, 24))
+    for k, n, splits in [(5120, 2304, 16), (5120, 2304, 8), (2304, 5120, 16)]:
+        chunk = (k // 16 + splits - 1) // splits
+        group, warp, i, load, lane = np.indices((n // 32, splits, chunk, 2, 24))
         ks = warp * chunk + i
         assert np.all(ks < k // 16)
         words = ks * (n // 16) * 24 + group * 48 + load * 24 + lane
@@ -110,7 +120,7 @@ def indexing():
         # Hadamard's scale uses y*32 + lane in half4 units.
         scales = np.arange(n // 128)[:, None, None] * 128 + np.arange(32)[None, :, None] * 4 + np.arange(4)
         assert np.array_equal(scales.ravel(), np.arange(n))
-        print(f"PASS address model k={k} n={n}: {count} trellis words exactly once; input/scales in bounds")
+        print(f"PASS address model k={k} n={n} splits={splits}: {count} trellis words exactly once; input/scales in bounds")
     job_size = 32  # three 64-bit pointers, two int32 fields; verified by host C++ check below
     for m in (1, 4, 8):
         slots = m * 6
@@ -123,7 +133,7 @@ def indexing():
         for token in range(m):
             assert [slot // 6 for slot in range(token * 6, (token + 1) * 6)] == [token] * 6
         print(f"PASS workspace model m={m}: {offsets[-1]} bytes, aligned/disjoint, within 64 MiB")
-    print("PASS declared shared array bytes: GEMV 2052; activation 1280; output 512 (not ptxas measurements)")
+    print("PASS declared shared array bytes: gate/up GEMV 1028, down GEMV 2052; activation 1280; output 512 (not ptxas measurements)")
 
 
 def scale_rounding():

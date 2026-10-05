@@ -8,10 +8,16 @@ namespace strata_exl3 {
 
 void gemv_mul1_3bit(const GemvJob* jobs, int count, int max_n, cudaStream_t stream)
 {
-    // CFG=0: 16 k-split warps, two n-tiles per warp, four-step FP16 fold.
-    // Ordinary launches let all tokens/slots run without a residency restriction.
-    exl3_gemv_kernel<3, true, 2, 0, 0, false>
-        <<<dim3(max_n / 32, count), 512, 0, stream>>>(jobs);
+    // K10 gate/up jobs have K=5120, N=2304 (checked by input_had). Eight
+    // k-splits keep the original four-slice FP16 fold boundaries. Down jobs
+    // have K=2304 and retain 16 splits because their chunk tails differ.
+    // Both paths keep two n-tiles/warp and the four-entry prefetch ring.
+    if (max_n == 2304)
+        exl3_gemv_kernel<3, true, 2, 0, 0, false, false, true>
+            <<<dim3(max_n / 32, count), 256, 0, stream>>>(jobs);
+    else
+        exl3_gemv_kernel<3, true, 2, 0, 0, false>
+            <<<dim3(max_n / 32, count), 512, 0, stream>>>(jobs);
 }
 
 }  // namespace strata_exl3

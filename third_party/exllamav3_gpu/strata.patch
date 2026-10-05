@@ -1,6 +1,6 @@
 --- a/third_party/exllamav3_gpu/quant/exl3_gemv.cu
 +++ b/third_party/exllamav3_gpu/quant/exl3_gemv.cu
-@@ -1,259 +1,17 @@
+@@ -1,259 +1,23 @@
 -#include <cuda_fp16.h>
 +// Strata raw-pointer adapter for the upstream small-row GEMV kernel.
  #include "exl3_gemv.cuh"
@@ -37,10 +37,16 @@
 -    const char* env = std::getenv("EXL3_GEMV");
 -    if (!env) return 1;
 -    return atoi(env);
-+    // CFG=0: 16 k-split warps, two n-tiles per warp, four-step FP16 fold.
-+    // Ordinary launches let all tokens/slots run without a residency restriction.
-+    exl3_gemv_kernel<3, true, 2, 0, 0, false>
-+        <<<dim3(max_n / 32, count), 512, 0, stream>>>(jobs);
++    // K10 gate/up jobs have K=5120, N=2304 (checked by input_had). Eight
++    // k-splits keep the original four-slice FP16 fold boundaries. Down jobs
++    // have K=2304 and retain 16 splits because their chunk tails differ.
++    // Both paths keep two n-tiles/warp and the four-entry prefetch ring.
++    if (max_n == 2304)
++        exl3_gemv_kernel<3, true, 2, 0, 0, false, false, true>
++            <<<dim3(max_n / 32, count), 256, 0, stream>>>(jobs);
++    else
++        exl3_gemv_kernel<3, true, 2, 0, 0, false>
++            <<<dim3(max_n / 32, count), 512, 0, stream>>>(jobs);
  }
  
 -// -1 = default per bits, 0 = force shuffle extraction, 1 = force smem staging (testing)
@@ -270,7 +276,7 @@
 +}  // namespace strata_exl3
 --- a/third_party/exllamav3_gpu/quant/exl3_gemv.cuh
 +++ b/third_party/exllamav3_gpu/quant/exl3_gemv.cuh
-@@ -1,44 +1,23 @@
+@@ -1,44 +1,26 @@
  #pragma once
  
 -#include <ATen/Tensor.h>
@@ -316,6 +322,9 @@
 -void* exl3_gemv_select_kernel_half(int bits, bool c_fp32, int mmode, int cfg, bool smem);
 +// K10: 3-bit mul1, narrow configuration, one row per job. max_n sizes grid.x;
 +// each job's n must be a multiple of 128 and no larger than max_n.
++// K10 gate/up (max_n=2304) requires every nonempty job to have k=5120,
++// as constructed and checked by input_had; it uses eight narrow k-splits.
++// Other calls retain sixteen narrow k-splits, including K10 down.
 +void gemv_mul1_3bit(const GemvJob* jobs, int count, int max_n, cudaStream_t stream);
  
 -// Direct entry point (testing): errors if the call is not hard-eligible
@@ -352,12 +361,28 @@
  #include "../ptx.cuh"
  #include "exl3_dq.cuh"
  #include "exl3_kernel_map.cuh"
-@@ -185,8 +184,17 @@
+@@ -183,13 +182,37 @@
+ // ptxas spends 81-85 registers on them on sm_86/sm_89 (one 512-thread block per SM instead of two, measured
+ // 18-28% slower at attention-projection shapes on the 3090). They are packed into one register (see x_pack) and
  // the bound keeps the compiler at the integer instances' 64
- template <int bits, bool c_fp32, int cb, int MMODE, int CFG, bool SMEM_STAGE, bool HALF = false>
- __global__ __launch_bounds__(CFG == 0 ? 512 : 256, HALF && CFG == 0 ? 2 : 1)
+-template <int bits, bool c_fp32, int cb, int MMODE, int CFG, bool SMEM_STAGE, bool HALF = false>
+-__global__ __launch_bounds__(CFG == 0 ? 512 : 256, HALF && CFG == 0 ? 2 : 1)
 -void exl3_gemv_kernel(EXL3_GEMM_ARGS)
 -{
++// Strata K10: the raw-job integer instance reaches 79 registers on CUDA 12.8
++// sm_89 without the two-block bound, leaving only 16 resident warps. Apply the
++// same bound to narrow integer GEMV: ptxas uses 63 registers without spills,
++// allowing 32 resident warps to cover the streaming trellis-load latency.
++// This changes register allocation only; keep the prefetch/MMA/fold body intact.
++// Optional eight-warp narrow geometry for K10 gate/up only. Keep the narrow
++// two-tile, four-slice FP16 schedule; CFG 1 has a different fold cadence.
++// Gate/up K=5120 divides into 20 slices/warp at 16 warps or 40 at 8 warps,
++// preserving all FP16 fold boundaries. The FP32 grouping is different and
++// requires unchanged golden acceptance. Down K=2304 must keep 16 warps.
++template <int bits, bool c_fp32, int cb, int MMODE, int CFG, bool SMEM_STAGE,
++          bool HALF = false, bool KSPLIT8 = false>
++__global__ __launch_bounds__(KSPLIT8 ? 256 : (CFG == 0 ? 512 : 256),
++                            KSPLIT8 ? 3 : (CFG == 0 ? 2 : 1))
 +void exl3_gemv_kernel(const strata_exl3::GemvJob* jobs)
 +{
 +    // A is already in the Hadamard basis. A null trellis marks an empty slot.
@@ -371,8 +396,15 @@
 +    const int size_n = job.n;
      static_assert(HALF ? (bits >= 1 && bits <= 3 && cb == 2) : (bits == 2 || bits == 3 || bits == 4),
                    "exl3_gemv_kernel supports 2, 3 and 4 bpw, and 1.5, 2.5 and 3.5 bpw with mul1");
-     constexpr int WK   = CFG == 0 ? 16 : 8;     // k-split (warps per block)
-@@ -202,27 +210,6 @@
+-    constexpr int WK   = CFG == 0 ? 16 : 8;     // k-split (warps per block)
++    static_assert(!KSPLIT8 || (bits == 3 && c_fp32 && cb == 2 && MMODE == 0 &&
++                               CFG == 0 && !SMEM_STAGE && !HALF),
++                  "eight-warp override is only for the K10 narrow FP16 path");
++    constexpr int WK   = KSPLIT8 ? 8 : (CFG == 0 ? 16 : 8);     // k-split (warps per block)
+     constexpr int WNT  = CFG == 0 ? 2 : 4;      // adjacent n-tiles per warp
+     constexpr int PF   = CFG == 0 ? 4 : 2;      // prefetch ring depth
+     constexpr int FOLD = CFG == 0 ? 4 : 2;      // fp16->fp32 fold cadence (divides PF)
+@@ -202,27 +225,6 @@
      constexpr int LOADS = TWO_PER_LOAD ? WNT / 2 : WNT;                       // warp loads per k-slice
      constexpr int LSTRIDE = TWO_PER_LOAD ? 2 * TWORDS : (TWORDS < 32 ? TWORDS : 32);   // uint32 per load (lanes < LSTRIDE load)
      static_assert(!TWO_PER_LOAD || WNT % 2 == 0, "two tiles per warp load needs an even tile count per warp");
@@ -400,7 +432,7 @@
  
      const int warp = threadIdx.x / 32;
      const int lane = threadIdx.x % 32;
-@@ -451,32 +438,5 @@
+@@ -451,32 +453,5 @@
  
      #undef XP
  
