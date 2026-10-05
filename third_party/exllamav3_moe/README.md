@@ -7,4 +7,11 @@ LICENSE, copyright Turboderp).
 The first commit of this directory holds the files unmodified. The changes for Strata-DS are in the commits
 after it (`git log -p -- third_party/exllamav3_moe`): the PyTorch types are replaced by `torch_shim.h`, the
 PyTorch-tensor entry points are compiled only with `EXL3_MOE_WITH_TORCH`, and a raw-pointer layer
-registration (`exl3_moe_cpu_make_layer_raw`) is added. The kernels themselves are not changed.
+registration (`exl3_moe_cpu_make_layer_raw`) is added. The original integration left the kernels unchanged.
+
+Strata-DS K11-02 adds `strata_avx2_k3_rows.h`: the integer 3-bit AVX2 kernel
+is specialized for one through four prepared activation rows, and state windows
+wholly inside one packed word omit the redundant funnel-shift half. Other
+bitrates, activation quantization, and AVX-512 dispatch remain on vendor code.
+Supplemental synthetic tests are under `tests/`; acceptance and target-machine
+performance still use the fixed K11 test. See `ds41/tasks/K11.dots-K11-02.md`.

@@ -1602,6 +1602,9 @@ void avx2_tiles(const MoeCpuMatrix& mat, const PreparedIn& in, float* tout, int 
     }
 }
 
+// Strata-DS K11-02 patch: a K3-only row-count-specialized AVX2 implementation.
+#include "strata_avx2_k3_rows.h"
+
 // -------------------------------------------------------------------------------------------
 //   Scalar fallback
 // -------------------------------------------------------------------------------------------
@@ -1908,7 +1911,15 @@ void run_tiles(const MoeCpuMatrix& mat, const PreparedIn& in, float* tout, int m
             {
                 case 1: avx2_tiles<1, false>(mat, in, tout, m, tn0, tn1); return;
                 case 2: avx2_tiles<2, false>(mat, in, tout, m, tn0, tn1); return;
-                case 3: avx2_tiles<3, false>(mat, in, tout, m, tn0, tn1); return;
+                // Strata-DS K11-02: keep row-count branches outside the K3 tile loop.
+                case 3:
+                    switch (m) {
+                        case 1: strata_avx2_k3_tiles<1>(mat, in, tout, tn0, tn1); return;
+                        case 2: strata_avx2_k3_tiles<2>(mat, in, tout, tn0, tn1); return;
+                        case 3: strata_avx2_k3_tiles<3>(mat, in, tout, tn0, tn1); return;
+                        case 4: strata_avx2_k3_tiles<4>(mat, in, tout, tn0, tn1); return;
+                    }
+                    return;
                 case 4: avx2_tiles<4, false>(mat, in, tout, m, tn0, tn1); return;
                 case 5: avx2_tiles<5, false>(mat, in, tout, m, tn0, tn1); return;
                 case 6: avx2_tiles<6, false>(mat, in, tout, m, tn0, tn1); return;
