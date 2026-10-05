@@ -1,5 +1,6 @@
 // K2: three-stage asynchronous packed-input pipeline with streamed FP8 decode.
 // A 64x128 output tile uses 32 accumulator floats per lane and 32.1 KiB shared.
+// Register-resident A fragments permit two CTA barriers per steady-state tile.
 // All temporary global storage comes from the caller; every launch uses stream.
 #include "strata/ds41/kernels/k2_fp8_gemm.hpp"
 
@@ -186,35 +187,40 @@ __global__ __launch_bounds__(Threads, 3) void gemm_three_stage(
                                       row_base, col_base, 0, M, N, K);
         prefetch<TileM, TileN, Threads>(shared.stages[1], activation, weight, scales,
                                       row_base, col_base, 1, M, N, K);
+        prefetch<TileM, TileN, Threads>(shared.stages[2], activation, weight, scales,
+                                      row_base, col_base, 2, M, N, K);
     }
     int read_stage = 0;
-    int write_stage = 2;
     for (int64_t tile_k = 0; tile_k < tiles_k; ++tile_k) {
-        prefetch<TileM, TileN, Threads>(shared.stages[write_stage], activation, weight, scales,
-                                      row_base, col_base, tile_k + 2, M, N, K);
         asm volatile("cp.async.wait_group 2;" ::: "memory");
-        // Each thread waits for its own copies, then all consumers may read.
+        // This barrier both publishes the oldest asynchronous input group
+        // and waits for the preceding iteration's last shared-B readers.
         __syncthreads();
         const auto& stage = shared.stages[read_stage];
         decode_stage<TileM, TileN, Threads>(stage, shared.b, col_base, tile_k, K);
+        unsigned a[kTileK / 16][4];
+#pragma unroll
+        for (int k = 0; k < kTileK; k += 16)
+            load_a(a[k / 16], stage.a + swizzled(warp_m + lane % 16,
+                                               k + (lane / 16) * 8));
+        // B is now decoded and all A operands are held in registers. No warp
+        // will read this ring slot again, so it can receive tile_k + 3 while
+        // tensor cores consume the current B tile. The next loop's first
+        // barrier protects that B tile, avoiding a third barrier here.
         __syncthreads();
+        prefetch<TileM, TileN, Threads>(shared.stages[read_stage], activation, weight, scales,
+                                      row_base, col_base, tile_k + 3, M, N, K);
 #pragma unroll
         for (int k = 0; k < kTileK; k += 16) {
-            unsigned a[4];
-            load_a(a, stage.a + swizzled(warp_m + lane % 16, k + (lane / 16) * 8));
 #pragma unroll
             for (int j = 0; j < WarpN / 8; ++j) {
                 unsigned b[2];
                 load_b(b, shared.b + swizzled(warp_n + j * 8 + lane % 8,
                                              k + ((lane / 8) % 2) * 8));
-                mma(accum[j], a, b);
+                mma(accum[j], a[k / 16], b);
             }
         }
-        // Protect both the single decoded B tile and the A ring slot from
-        // reuse until all tensor-core readers have finished with them.
-        __syncthreads();
         read_stage = read_stage == 2 ? 0 : read_stage + 1;
-        write_stage = write_stage == 2 ? 0 : write_stage + 1;
     }
     // Drain zero-fill lookahead copies before the CTA releases shared memory.
     asm volatile("cp.async.wait_group 0;" ::: "memory");
