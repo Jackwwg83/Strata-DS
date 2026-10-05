@@ -1,4 +1,4 @@
-// K5-11: 64-key BF16 tensor-core scores and caller-storage exact radix selection.
+// K5-14: K5-11 tensor scores and caller-storage radix with warp-private histograms.
 // The same pipeline is used eagerly and in CUDA graphs; no internal global scratch exists.
 #include "strata/ds41/kernels/k5_indexer.hpp"
 
@@ -294,27 +294,47 @@ __device__ __forceinline__ void store_count(float* scores, int64_t index, Count 
 
 // Four low halfwords hold each 64-bit count. With P<=ceil(n/4096),
 // 8+1024*P<=n for every n>=4096, including a partial final partition.
+// Each bounded round visits at most 16 batches of 256 positions per CTA.
+// A warp therefore contributes at most 16*32=512 to any uint32_t local bin,
+// regardless of n or the 256-CTA launch cap. Each bin's owner converts all
+// eight local counts to Count before accumulating into its 64-bit total.
+// The scorer, two radix bytes, global count layout, and launch count are unchanged.
 template<bool First>
 __global__ void parallel_histogram(float* scores, int64_t n) {
-    __shared__ Count bins[256];
-    const int tid = threadIdx.x, lane = tid & 31;
-    bins[tid] = 0;
+    __shared__ uint32_t warp_bins[kThreads / 32][256];
+    constexpr int batches_per_round = kRadixItems / kThreads;
+    static_assert(batches_per_round * 32 == 512, "warp-local count bound");
+    const int tid = threadIdx.x, lane = tid & 31, warp = tid >> 5;
     const uint32_t prefix = First ? 0u : load_word(scores, 0);
-    __syncthreads();
-    for (int64_t base = int64_t(blockIdx.x) * kThreads; base < n;
-         base += int64_t(gridDim.x) * kThreads) {
-        const int64_t j = base + tid;
-        const uint32_t key = j < n ? high_key(scores, j) : 0;
-        const bool valid = j < n && (First || (key & 0xff00u) == prefix);
-        const unsigned active = __ballot_sync(kFullWarp, valid);
-        if (valid) {
-            const uint32_t bin = First ? key >> 8 : key & 255u;
-            const unsigned peers = __match_any_sync(active, bin);
-            if (lane == __ffs(peers) - 1) atomicAdd(bins + bin, Count(__popc(peers)));
+    const int64_t stride = int64_t(gridDim.x) * kThreads;
+    Count total = 0;
+    for (int64_t begin = int64_t(blockIdx.x) * kThreads; begin < n;
+         begin += stride * batches_per_round) {
+#pragma unroll
+        for (int w = 0; w < kThreads / 32; ++w) warp_bins[w][tid] = 0;
+        __syncthreads();
+        for (int batch = 0; batch < batches_per_round; ++batch) {
+            const int64_t base = begin + int64_t(batch) * stride;
+            if (base >= n) break;  // Uniform for the complete CTA.
+            const int64_t j = base + tid;
+            const uint32_t key = j < n ? high_key(scores, j) : 0;
+            const bool valid = j < n && (First || (key & 0xff00u) == prefix);
+            const unsigned active = __ballot_sync(kFullWarp, valid);
+            if (valid) {
+                const uint32_t bin = First ? key >> 8 : key & 255u;
+                const unsigned peers = __match_any_sync(active, bin);
+                if (lane == __ffs(peers) - 1)
+                    atomicAdd(&warp_bins[warp][bin], uint32_t(__popc(peers)));
+            }
         }
+        __syncthreads();
+#pragma unroll
+        for (int w = 0; w < kThreads / 32; ++w) total += Count(warp_bins[w][tid]);
+        // All eight readers finish before any thread resets the next round.
+        // No extra barrier is needed after the final round's read-only reduction.
+        if (begin + stride * batches_per_round < n) __syncthreads();
     }
-    __syncthreads();
-    store_count(scores, kMetadataHeader + (int64_t(blockIdx.x) * 256 + tid) * 4, bins[tid]);
+    store_count(scores, kMetadataHeader + (int64_t(blockIdx.x) * 256 + tid) * 4, total);
 }
 
 template<bool First>
