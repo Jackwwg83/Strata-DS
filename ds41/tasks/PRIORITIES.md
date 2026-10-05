@@ -20,7 +20,7 @@ Controls are measured on the current box (RTX 4090 + i9-14900K) with the current
 | 1 | K11 CPU EXL3 expert kernel (AVX2) | the CPU experts are ~90% of a decode step on AVX2 PCs; new task | vendored moe_mul1, 5,987 us (m1 3,573) |
 | 1b | K10 GPU EXL3 experts | about 2 ms per token; the largest GPU expert cost | K10-03, 179.0 us (m1 95.04); codex-1 was 244.0 |
 | 2 | K8 router top-k | merged; refine only if >= 3% faster and m=1 not slower | K8-07, 19.84 us (m1 16.38) |
-| 3 | K3 sparse attention | merged | K3-11, 49.92 us |
+| 3 | K3 sparse attention | merged | K3-25, 42.33 us (m1 27.65) |
 | 4 | K5 indexer | merged | K5-14, 117.9 us |
 | 5 | K7 hyper-connection mixes | merged | K7-06, 14.11 us (m1 12.29) |
 | 6 | K1c decode GEMV | near the DRAM limit; m=1 must not regress | K1b, 8,830 us (m1 7,291) |
