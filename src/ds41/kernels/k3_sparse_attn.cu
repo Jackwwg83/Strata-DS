@@ -1,7 +1,7 @@
-// K3-10: 128-key online softmax with streamed 128-dimension KV slices.
-// Eight heads share each CTA, and four output partitions expose 32 CTAs per
-// query. The selected output slice is consumed last by QK, then reused by PV.
-// Scores and BF16 probabilities share storage after an explicit read barrier.
+// K3-14: register-resident QK softmax on the K3-11 ping-pong KV pipeline.
+// Eight heads and 128 output dimensions share each CTA. Raw MMA scores
+// stay in registers: only per-warp head statistics and BF16 P reach shared.
+// The last two 128x64 KV slices feed PV; the entire CTA uses 44,096 bytes.
 #include "strata/ds41/kernels/k3_sparse_attn.hpp"
 
 #include <math_constants.h>
@@ -16,29 +16,29 @@ constexpr int kDim = 512;
 constexpr int kWindow = 128;
 constexpr int kHeadTile = 8;
 constexpr int kRows = 128;
-constexpr int kSlice = 128;
+constexpr int kSlice = 64;
+constexpr int kOutputDim = 128;
 constexpr int kQueryStride = kDim + 8;
-constexpr int kSliceStride = kSlice + 8;
 constexpr int kProbStride = kRows + 8;
 constexpr int kWarps = 4;
 constexpr int kThreads = 32 * kWarps;
 constexpr int kFragments = kRows / (16 * kWarps);
-constexpr int kOutputFragments = kSlice / (16 * kWarps);
+constexpr int kOutputFragments = kOutputDim / (16 * kWarps);
 constexpr unsigned kWarpMask = 0xffffffffu;
 
 struct __align__(32) TileStorage {
     bf16 q[kHeadTile * kQueryStride];
-    bf16 kv[kRows * kSliceStride];
-    union {
-        float scores[kHeadTile][kRows];
-        bf16 probabilities[kHeadTile * kProbStride];
-    } softmax;
+    bf16 kv[2][kRows * kSlice];
+    bf16 probabilities[kHeadTile * kProbStride];
+    // Distinct arrays let a fast warp publish sums while another still
+    // reads maxima. Neither array aliases scores, P, or the KV ring.
+    float warp_maximum[kWarps][kHeadTile];
+    float warp_sum[kWarps][kHeadTile];
     int indices[kRows];
     float maximum[kHeadTile];
     float sum[kHeadTile];
-    float rescale[kHeadTile];
 };
-static_assert(sizeof(TileStorage) == 47840, "shared-memory layout changed");
+static_assert(sizeof(TileStorage) == 44096, "shared-memory layout changed");
 static_assert(sizeof(TileStorage) <= 48 * 1024, "no shared-memory opt-in required");
 static_assert(kRows == kThreads, "one thread gathers each index");
 
@@ -70,10 +70,18 @@ __device__ __forceinline__ void mma(float (&c)[4], const unsigned (&a)[4], const
                  : "r"(a[0]), "r"(a[1]), "r"(a[2]), "r"(a[3]), "r"(b[0]), "r"(b[1]));
 }
 
-// Zero-fill negative indices without forming an address from them. The
-// 128x512 KV tile is never resident: only one 128x128 slice is staged.
-__device__ __forceinline__ void gather_slice(TileStorage& tile, const bf16* window,
-                                             const bf16* comp, int dimension) {
+// XOR complete 16-byte chunks, leaving the eight BF16 values in each
+// chunk contiguous and aligned. Eight adjacent rows use distinct banks.
+__device__ __forceinline__ int kv_offset(int row, int dimension) {
+    return row * kSlice + (dimension ^ ((row & 7) * 8));
+}
+
+// Issue only: the caller overlaps these copies with MMA on the other
+// buffer and waits immediately before the destination's first read.
+// Negative indices use a safe base with src-size zero, never a bad address.
+__device__ __forceinline__ void gather_slice(TileStorage& tile, int buffer,
+                                             const bf16* window, const bf16* comp,
+                                             int dimension) {
 #pragma unroll
     for (int i = threadIdx.x; i < kRows * kSlice / 8; i += kThreads) {
         const int r = i / (kSlice / 8);
@@ -86,14 +94,21 @@ __device__ __forceinline__ void gather_slice(TileStorage& tile, const bf16* wind
             source += dimension + d;
         }
         asm volatile("cp.async.cg.shared.global [%0], [%1], 16, %2;\n"
-                     :: "r"(shared_address(tile.kv + r * kSliceStride + d)),
+                     :: "r"(shared_address(tile.kv[buffer] + kv_offset(r, d))),
                         "l"(source), "r"(j >= 0 ? 16 : 0) : "memory");
     }
-    asm volatile("cp.async.commit_group;\ncp.async.wait_group 0;\n" ::: "memory");
+    asm volatile("cp.async.commit_group;\n" ::: "memory");
+}
+
+__device__ __forceinline__ void wait_slice() {
+    asm volatile("cp.async.wait_group 0;\n" ::: "memory");
+    // Each thread waits for its own writes, then the CTA publishes all
+    // completed copies and finishes all readers of the other buffer.
     __syncthreads();
 }
 
-__global__ __launch_bounds__(kThreads) void attention_online(
+// Bound register allocation; actual residency is limited by shared memory.
+__global__ __launch_bounds__(kThreads, 6) void attention_online(
         const bf16* __restrict__ q, const bf16* __restrict__ window,
         const bf16* __restrict__ comp, const int32_t* __restrict__ idx,
         int n_idx, const float* __restrict__ sink, float scale,
@@ -103,7 +118,7 @@ __global__ __launch_bounds__(kThreads) void attention_online(
     const int warp = threadIdx.x >> 5;
     const int query = blockIdx.z;
     const int output_group = blockIdx.y;
-    const int output_dimension = output_group * kSlice;
+    const int output_dimension = output_group * kOutputDim;
     const int head = blockIdx.x * kHeadTile;
     const int head0 = (lane & 3) * 2;
     const int head1 = head0 + 1;
@@ -129,11 +144,21 @@ __global__ __launch_bounds__(kThreads) void attention_online(
         tile.indices[threadIdx.x] = position < n_idx ? indices[position] : -1;
         __syncthreads();
         float score[kFragments][4] = {};
-        // Cyclic slice order ends at the output partition. This saves a
-        // fifth gather for PV while retaining FP32 score accumulation.
+        // A cyclic dimension order keeps the same FP32 accumulation order
+        // as 128-dimension slices, ending at this CTA's two output slices.
+        const int first_dimension = (output_dimension + kOutputDim) & (kDim - 1);
+        gather_slice(tile, 0, window, comp, first_dimension);
+        wait_slice();
         for (int slice = 0; slice < kDim / kSlice; ++slice) {
-            const int dimension = ((output_group + 1 + slice) & 3) * kSlice;
-            gather_slice(tile, window, comp, dimension);
+            const int buffer = slice & 1;
+            const int dimension = (first_dimension + slice * kSlice) & (kDim - 1);
+            if (slice + 1 < kDim / kSlice) {
+                // On slice zero the other buffer has no readers. Later,
+                // the preceding wait_slice barrier retired every reader
+                // of that buffer before this overwrite can be issued.
+                const int next_dimension = (dimension + kSlice) & (kDim - 1);
+                gather_slice(tile, buffer ^ 1, window, comp, next_dimension);
+            }
 #pragma unroll
             for (int d = 0; d < kSlice; d += 16) {
                 unsigned query_fragment[2];
@@ -143,59 +168,105 @@ __global__ __launch_bounds__(kThreads) void attention_online(
                 for (int v = 0; v < kFragments; ++v) {
                     const int key_tile = (warp * kFragments + v) * 16;
                     unsigned keys[4];
-                    load_a(keys, tile.kv + (key_tile + (lane % 16)) * kSliceStride
-                                           + d + (lane / 16) * 8);
+                    load_a(keys, tile.kv[buffer] + kv_offset(key_tile + (lane % 16),
+                                                           d + (lane / 16) * 8));
                     mma(score[v], keys, query_fragment);
                 }
             }
-            __syncthreads();  // readers finish before this slice is reused
+            // This wait is AFTER current-slice MMA, overlapping all four
+            // K=16 steps with the next gather. It publishes the next slice
+            // and protects current-buffer reuse with one CTA barrier.
+            // The final slice has no outstanding copies; the head-statistic
+            // barrier below retires its readers without another empty wait.
+            if (slice + 1 < kDim / kSlice) wait_slice();
         }
+        // m16n8k16 C mapping: lane=4*g+t owns heads 2*t and 2*t+1,
+        // and key rows 16*(warp*kFragments+v)+g and that row+8.
+        // Each lane has four keys per head. XOR 4/8/16 changes only g,
+        // reducing all 32 keys of a warp without mixing head pairs.
+        // Snapshot old maxima before the first barrier: only then may
+        // warp zero publish the new values while other warps compute P.
+        const float old_maximum0 = tile.maximum[head0];
+        const float old_maximum1 = tile.maximum[head1];
+        float maximum0 = old_maximum0;
+        float maximum1 = old_maximum1;
 #pragma unroll
         for (int v = 0; v < kFragments; ++v) {
             const int row = (warp * kFragments + v) * 16 + mma_row;
-            tile.softmax.scores[head0][row] = score[v][0];
-            tile.softmax.scores[head1][row] = score[v][1];
-            tile.softmax.scores[head0][row + 8] = score[v][2];
-            tile.softmax.scores[head1][row + 8] = score[v][3];
+            const bool valid0 = tile.indices[row] >= 0;
+            const bool valid1 = tile.indices[row + 8] >= 0;
+            score[v][0] = valid0 ? score[v][0] * scale : -CUDART_INF_F;
+            score[v][1] = valid0 ? score[v][1] * scale : -CUDART_INF_F;
+            score[v][2] = valid1 ? score[v][2] * scale : -CUDART_INF_F;
+            score[v][3] = valid1 ? score[v][3] * scale : -CUDART_INF_F;
+            maximum0 = fmaxf(maximum0, fmaxf(score[v][0], score[v][2]));
+            maximum1 = fmaxf(maximum1, fmaxf(score[v][1], score[v][3]));
         }
-        __syncthreads();
+#pragma unroll
+        for (int offset = 4; offset <= 16; offset <<= 1) {
+            maximum0 = fmaxf(maximum0, __shfl_xor_sync(kWarpMask, maximum0, offset));
+            maximum1 = fmaxf(maximum1, __shfl_xor_sync(kWarpMask, maximum1, offset));
+        }
+        if (mma_row == 0) {
+            tile.warp_maximum[warp][head0] = maximum0;
+            tile.warp_maximum[warp][head1] = maximum1;
+        }
+        __syncthreads();  // publish 4x8 maxima and finish all old-max reads
+#pragma unroll
+        for (int w = 0; w < kWarps; ++w) {
+            maximum0 = fmaxf(maximum0, tile.warp_maximum[w][head0]);
+            maximum1 = fmaxf(maximum1, tile.warp_maximum[w][head1]);
+        }
+        const float alpha0 = expf(old_maximum0 - maximum0);
+        const float alpha1 = expf(old_maximum1 - maximum1);
+        float sum0 = 0.0f;
+        float sum1 = 0.0f;
+#pragma unroll
+        for (int v = 0; v < kFragments; ++v) {
+            const int row = (warp * kFragments + v) * 16 + mma_row;
+            const float p0 = score[v][0] == -CUDART_INF_F ? 0.0f : expf(score[v][0] - maximum0);
+            const float p1 = score[v][1] == -CUDART_INF_F ? 0.0f : expf(score[v][1] - maximum1);
+            const float p2 = score[v][2] == -CUDART_INF_F ? 0.0f : expf(score[v][2] - maximum0);
+            const float p3 = score[v][3] == -CUDART_INF_F ? 0.0f : expf(score[v][3] - maximum1);
+            // Denominator reduction consumes UNROUNDED FP32 exponentials.
+            // BF16 rounding affects only the separately stored PV operand.
+            sum0 += p0;
+            sum0 += p2;
+            sum1 += p1;
+            sum1 += p3;
+            tile.probabilities[head0 * kProbStride + row] = __float2bfloat16_rn(p0);
+            tile.probabilities[head1 * kProbStride + row] = __float2bfloat16_rn(p1);
+            tile.probabilities[head0 * kProbStride + row + 8] = __float2bfloat16_rn(p2);
+            tile.probabilities[head1 * kProbStride + row + 8] = __float2bfloat16_rn(p3);
+        }
+#pragma unroll
+        for (int offset = 4; offset <= 16; offset <<= 1) {
+            sum0 += __shfl_xor_sync(kWarpMask, sum0, offset);
+            sum1 += __shfl_xor_sync(kWarpMask, sum1, offset);
+        }
+        if (mma_row == 0) {
+            tile.warp_sum[warp][head0] = sum0;
+            tile.warp_sum[warp][head1] = sum1;
+            if (warp == 0) {
+                tile.maximum[head0] = maximum0;
+                tile.maximum[head1] = maximum1;
+            }
+        }
+        __syncthreads();  // publish BF16 P and 4x8 unrounded partial sums
+        if (warp == 0 && mma_row == 0) {
+            // One writer per head; the PV completion barrier below publishes
+            // these sums before the next tile or the final sink denominator.
+            float total0 = tile.warp_sum[0][head0];
+            float total1 = tile.warp_sum[0][head1];
+#pragma unroll
+            for (int w = 1; w < kWarps; ++w) {
+                total0 += tile.warp_sum[w][head0];
+                total1 += tile.warp_sum[w][head1];
+            }
+            tile.sum[head0] = tile.sum[head0] * alpha0 + total0;
+            tile.sum[head1] = tile.sum[head1] * alpha1 + total1;
+        }
 
-        // Sixteen lanes own one head, with eight keys per lane. All score
-        // reads finish before ANY probability write aliases the union.
-        const int h = threadIdx.x / 16;
-        const int sublane = threadIdx.x % 16;
-        float scores[kRows / 16];
-        float maximum = tile.maximum[h];
-#pragma unroll
-        for (int e = 0; e < kRows / 16; ++e) {
-            const int r = sublane + e * 16;
-            scores[e] = tile.indices[r] >= 0 ? tile.softmax.scores[h][r] * scale : -CUDART_INF_F;
-            maximum = fmaxf(maximum, scores[e]);
-        }
-#pragma unroll
-        for (int offset = 8; offset; offset >>= 1)
-            maximum = fmaxf(maximum, __shfl_xor_sync(kWarpMask, maximum, offset, 16));
-        const float alpha = expf(tile.maximum[h] - maximum);
-        __syncthreads();
-        float sum = 0.0f;
-#pragma unroll
-        for (int e = 0; e < kRows / 16; ++e) {
-            const float p = scores[e] == -CUDART_INF_F ? 0.0f : expf(scores[e] - maximum);
-            sum += p;
-            tile.softmax.probabilities[h * kProbStride + sublane + e * 16] = __float2bfloat16_rn(p);
-        }
-#pragma unroll
-        for (int offset = 8; offset; offset >>= 1)
-            sum += __shfl_xor_sync(kWarpMask, sum, offset, 16);
-        if (sublane == 0) {
-            tile.maximum[h] = maximum;
-            tile.sum[h] = tile.sum[h] * alpha + sum;
-            tile.rescale[h] = alpha;
-        }
-        __syncthreads();
-
-        const float alpha0 = tile.rescale[head0];
-        const float alpha1 = tile.rescale[head1];
 #pragma unroll
         for (int v = 0; v < kOutputFragments; ++v) {
             result[v][0] *= alpha0;
@@ -206,14 +277,16 @@ __global__ __launch_bounds__(kThreads) void attention_online(
 #pragma unroll
         for (int r = 0; r < kRows; r += 16) {
             unsigned probabilities[2];
-            load_b(probabilities, tile.softmax.probabilities + (lane % 8) * kProbStride
+            load_b(probabilities, tile.probabilities + (lane % 8) * kProbStride
                                                                    + r + ((lane / 8) & 1) * 8);
 #pragma unroll
             for (int v = 0; v < kOutputFragments; ++v) {
                 const int d = (warp * kOutputFragments + v) * 16;
                 unsigned values[4];
-                load_a_transposed(values, tile.kv + (r + (lane % 8) + (lane / 16) * 8) * kSliceStride
-                                                     + d + ((lane / 8) & 1) * 8);
+                // The final even/odd slices remain in buffers zero/one.
+                load_a_transposed(values, tile.kv[d / kSlice] +
+                    kv_offset(r + (lane % 8) + (lane / 16) * 8,
+                              (d % kSlice) + ((lane / 8) & 1) * 8));
                 mma(result[v], values, probabilities);
             }
         }
@@ -245,7 +318,7 @@ void sparse_attn_decode(const bf16* q, const bf16* window, const bf16* comp,
         std::fprintf(stderr, "sparse_attn_decode: invalid shape m=%d n_idx=%d\n", m, n_idx);
         std::abort();
     }
-    attention_online<<<dim3(kHeads / kHeadTile, kDim / kSlice, m), kThreads, 0, stream>>>(
+    attention_online<<<dim3(kHeads / kHeadTile, kDim / kOutputDim, m), kThreads, 0, stream>>>(
         q, window, comp, idx, n_idx, sink, scale, o);
 }
 }  // namespace strata::ds41::kernels
