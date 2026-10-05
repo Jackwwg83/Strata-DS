@@ -67,9 +67,13 @@ def main():
     ap.add_argument("--gen-tokens", type=int, default=32)
     ap.add_argument("--kernels", default="torch")
     ap.add_argument("--hidden-tokens", type=int, default=16)
+    ap.add_argument("--experts", default="cpu", choices=["cpu", "gpu"],
+                    help="cpu: exllamav3 moe_mul1, the kernel the C++ engine uses (default)")
     a = ap.parse_args()
     os.makedirs(a.out, exist_ok=True)
     model, tok, args, info = P.build_model(a.model_dir, 1024, a.kernels)
+    if a.experts == "cpu":
+        P.STATE["cpu_experts"] = P.CpuExperts(P.STATE["ckpt"])
     for line in open(a.prompts):
         p = json.loads(line)
         ids = tok.encode(P.chat_prompt(p["messages"], p.get("thinking_mode", "chat")))

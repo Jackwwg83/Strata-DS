@@ -185,8 +185,33 @@ class RouteLog:
         return ids.numpy(), w.numpy()
 
 
+class CpuExperts:
+    """Routed experts on the CPU with exllamav3's moe_mul1 kernel, the kernel the C++ engine uses.
+    Weights are zero-copy views of the mmap'ed checkpoint; a layer registers on first use, unswizzled."""
+
+    def __init__(self, ckpt, threads=8):
+        self.ckpt, self.threads, self.handles = ckpt, threads, {}
+
+    def handle(self, layer):
+        if layer not in self.handles:
+            from exllamav3.ext import exllamav3_ext as ext
+            lists = []
+            for w in ("w1", "w3", "w2"):
+                for p in ("trellis", "suh", "svh"):
+                    lists.append([self.ckpt.get(f"layers.{layer}.ffn.experts.{e}.{w}.{p}") for e in range(384)])
+            self.handles[layer] = ext.exl3_moe_cpu_make_layer(*lists, [], [], [], 0, 10.0, 0)
+        return self.handles[layer]
+
+    def forward(self, layer, x_half, indices, weights):
+        from exllamav3.ext import exllamav3_ext as ext
+        out = torch.empty(x_half.shape[0], x_half.shape[1], dtype=torch.float32)
+        ext.exl3_moe_cpu_forward(self.handle(layer), x_half.cpu(), indices.cpu().to(torch.int64),
+                                 weights.cpu().to(torch.float16), out, self.threads)
+        return out
+
+
 STATE = {"store": None, "routes": RouteLog(), "act_fp8": True, "kernel": None,
-         "moe_s": 0.0, "nll_targets": None, "nll": None}
+         "moe_s": 0.0, "nll_targets": None, "nll": None, "cpu_experts": None}
 
 
 def moe_forward(self, x, image_mask=None):
@@ -205,6 +230,9 @@ def moe_forward(self, x, image_mask=None):
         kern.act_quant(xin, 32, "ue8m0", torch.float8_e8m0fnu, True)
     xin = xin.half()
     lim = 10.0
+    if STATE["cpu_experts"] is not None:
+        y += STATE["cpu_experts"].forward(self.layer_id, xin, indices, weights).to(y.device)
+        active = []
     for e, (w1, w3, w2) in STATE["store"].stream(self.layer_id, active):
         idx, top = torch.where(indices == e)
         xe = xin[idx].contiguous()
@@ -334,6 +362,7 @@ def build_model(model_dir, max_seq_len, kernels):
             path = os.path.join(model_dir, "engrams", f"engram-layer-{lid:02d}.safetensors")
             layer.engram.embed.bind(eng(path), lid)
     STATE["store"] = ExpertStore(ckpt)
+    STATE["ckpt"] = ckpt
     info = {"kernels": kname, "load_s": round(time.perf_counter() - t0, 1),
             "gpu_alloc_gib_after_load": round(torch.cuda.memory_allocated() / 2**30, 2)}
     print("model ready", info, flush=True)
