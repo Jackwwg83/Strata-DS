@@ -39,3 +39,13 @@ input and codebook loads, decode arithmetic, FP16 folds and reductions remain
 unchanged. The host check normalizes exactly this explicit policy block before
 its whole-loop comparison; the reversible patch and all pristine hashes are
 rechecked. Timing and GPU acceptance remain pending.
+
+K10-08 combines the exact K10-03 narrow integer cache policy with K10-02's
+register schedule: two prefetch slots, retaining the original four-slice
+narrow arithmetic unroll and FP16 fold boundaries. The two-CTA bound stays.
+Wide/half-integer load policies, guards, widths and addresses remain unchanged.
+The reversible patch contains both changes; the host audit normalizes only
+those explicit substitutions before comparing upstream arithmetic. An actual
+source-extracted C++ schedule model checks ring tails and fixed upstream fold
+boundaries, including mutation rejection. K10-08's own GPU acceptance and
+performance are pending; individual controls' gains are not assumed additive.
