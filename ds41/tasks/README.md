@@ -11,6 +11,7 @@ implementations of the same task may compete; the fastest one that passes wins a
 | [K3](K3.md) | sparse attention, decode and verify windows | `include/strata/ds41/kernels/k3_sparse_attn.hpp` | `score_us` |
 | [K5](K5.md) | indexer scores, candidate blocks, top-k | `include/strata/ds41/kernels/k5_indexer.hpp` | `score_us` |
 | [K7](K7.md) | hyper-connection mix + collapse | `include/strata/ds41/kernels/k7_hc.hpp` | `score_us` |
+| [K10](K10.md) | routed experts on the GPU from EXL3 weights (vendor exllamav3) | `include/strata/ds41/kernels/k10_exl3_moe.hpp` | `score_us` |
 | [K8](K8.md) | MoE router on the GPU | `include/strata/ds41/kernels/k8_router.hpp` | `score_us` |
 
 ## Rules for every task
