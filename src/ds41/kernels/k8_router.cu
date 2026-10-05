@@ -2,6 +2,7 @@
 #include "strata/ds41/kernels/k8_router.hpp"
 #include "strata/ds41/config.hpp"
 #include "k8/math.hpp"
+#include "k8/register_prefetch.hpp"
 
 #include <cstdio>
 #include <cstdlib>
@@ -55,17 +56,40 @@ __device__ __forceinline__ float warp_sum(float value) {
     return value;
 }
 
+// Load one complete input/weight pair ahead, without splitting the FMA chain.
+struct DirectPair {
+    const __nv_bfloat16* x;
+    const __nv_bfloat16* row;
+    int lane;
+    __device__ __forceinline__ k8_detail::Pair operator()(int step) const {
+        const int d = lane + step * kWarp;
+        return {__bfloat162float(x[d]), __bfloat162float(row[d])};
+    }
+};
+
+struct SharedPair {
+    const __nv_bfloat16* x;
+    const float* row;
+    int lane;
+    __device__ __forceinline__ k8_detail::Pair operator()(int step) const {
+        const int d = lane + step * kWarp;
+        return {__bfloat162float(x[d]), row[d]};
+    }
+};
+
+struct Fma {
+    __device__ __forceinline__ float operator()(float a, float b, float c) const {
+        return __fmaf_rn(a, b, c);
+    }
+};
+
 __global__ void decode_scores(const __nv_bfloat16* __restrict__ x,
                               const __nv_bfloat16* __restrict__ w,
                               double* __restrict__ scores) {
     const int lane = threadIdx.x & 31;
     const int expert = blockIdx.x * 4 + (threadIdx.x >> 5);
     const __nv_bfloat16* row = w + expert * kDim;
-    float acc = 0.0f;
-#pragma unroll 8
-    for (int d = lane; d < kDim; d += kWarp) {
-        acc = __fmaf_rn(__bfloat162float(x[d]), __bfloat162float(row[d]), acc);
-    }
+    float acc = k8_detail::register_prefetch<kDim / kWarp>(DirectPair{x, row, lane}, Fma{});
     acc = warp_sum(acc);
     if (lane == 0) scores[expert] = k8_detail::score(acc);
 }
@@ -87,11 +111,8 @@ __global__ void tile_scores(const __nv_bfloat16* __restrict__ x,
     const int token = threadIdx.x >> 5;
     const int lane = threadIdx.x & 31;
     if (token < Tokens) {
-        float acc = 0.0f;
-#pragma unroll 8
-        for (int d = lane; d < kDim; d += kWarp) {
-            acc = __fmaf_rn(__bfloat162float(x[token * kDim + d]), row[d], acc);
-        }
+        float acc = k8_detail::register_prefetch<kDim / kWarp>(
+            SharedPair{x + token * kDim, row, lane}, Fma{});
         acc = warp_sum(acc);
         // Scores are computed where logits are produced, spreading the small
         // nonlinear step across the GEMV grid instead of bottlenecking one CTA.
