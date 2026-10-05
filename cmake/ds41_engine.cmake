@@ -6,6 +6,10 @@ add_library(strata_ds41_engine STATIC
   src/ds41/ops.cu
   src/ds41/doorbell.cu
   src/ds41/vram_experts.cu
+  src/ds41/engram_rows.cpp
+  src/ds41/host_experts.cpp
+  src/ds41/lookahead.cpp
+  src/platform/direct_file.cpp
   src/ds41/engine.cu
   third_party/exllamav3_moe/moe_mul1.cpp)
 target_include_directories(strata_ds41_engine PUBLIC
@@ -26,6 +30,18 @@ if(STRATA_BUILD_TESTS)
   target_link_libraries(doorbell_test PRIVATE strata_ds41_engine)
   add_test(NAME doorbell_test COMMAND doorbell_test)
   set_tests_properties(doorbell_test PROPERTIES SKIP_RETURN_CODE 77 TIMEOUT 300)
+  add_executable(lookahead_test src/ds41/tests/lookahead_test.cpp)
+  target_link_libraries(lookahead_test PRIVATE strata_ds41_engine)
+  add_test(NAME lookahead_test COMMAND lookahead_test)
+  add_executable(host_experts_test src/ds41/tests/host_experts_test.cpp)
+  target_link_libraries(host_experts_test PRIVATE strata_ds41_engine)
+  add_test(NAME host_experts_test COMMAND host_experts_test)
+  add_executable(moe_set_expert_test src/ds41/tests/moe_set_expert_test.cpp)
+  target_link_libraries(moe_set_expert_test PRIVATE strata_ds41_engine)
+  add_test(NAME moe_set_expert_test COMMAND moe_set_expert_test)
+  add_executable(engram_rows_test src/ds41/tests/engram_rows_test.cpp)
+  target_link_libraries(engram_rows_test PRIVATE strata_ds41_engine)
+  add_test(NAME engram_rows_test COMMAND engram_rows_test)
   add_executable(vram_experts_test src/ds41/tests/vram_experts_test.cu)
   target_link_libraries(vram_experts_test PRIVATE strata_ds41_engine)
   add_test(NAME vram_experts_test COMMAND vram_experts_test)
