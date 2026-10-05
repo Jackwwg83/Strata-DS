@@ -30,5 +30,11 @@ implementations of the same task may compete; the fastest one that passes wins a
    dependencies.
 6. Do not change the numerics to pass. The reference functions in `src/ds41/ops.cu` define the math; they restate
    DeepSeek's `ds41/proto/ref/model.py`.
+7. The engine captures each decode step as one CUDA graph on a non-default stream (as upstream Strata does). So a call
+   must not synchronize with the host (no `cudaMemcpy` to or from host memory, no `cudaStreamSynchronize`, no
+   reading device results on the host) and must not allocate or free memory (no `cudaMalloc`, `cudaMallocAsync`,
+   `cudaMallocFromPoolAsync`, `cudaFree*`). Scratch memory: allocate it once, on the first call, keep it for the
+   life of the process (one buffer per device, sized for the largest call the interface allows), and reuse it.
+   The engine always makes one eager call before it captures. Use only the stream argument.
 
 Machine-read fields for the CI runner are at the top of each task file.
