@@ -7,15 +7,19 @@
 //             queue box's i9-14900K). The experts are copied to RAM first: the kernel, not the SSD, is measured.
 // Env: K11_PACK (default /workspace/pack-3bpw), K11_GOLDEN (default /workspace/ci/golden/k10), K11_THREADS,
 //      K11_WEIGHTS: ram (default, the only scored mode) | mmap-warm | mmap-ptecold | mmap-cold | all. The mmap modes
-//      read the experts through the mapped experts.bin as the engine's file tier does: warm page cache; fresh page
-//      tables (MADV_DONTNEED) before each timed forward; or a dropped page cache (MADV_DONTNEED, then
-//      POSIX_FADV_DONTNEED, checked with mincore) before each timed forward. They print metrics, never the score.
+//      read the experts through the test's own shared mapping of experts.bin, as the engine's file tier does:
+//      mmap-warm: every page cached (checked with mincore before each timed forward);
+//      mmap-ptecold: a fresh mapping at the same address (MAP_FIXED) before each timed forward, every page cached;
+//      mmap-cold: a fresh mapping and POSIX_FADV_DONTNEED before each timed forward, no page cached (mincore).
+//      A mode whose state cannot be established is reported INVALID and not timed. Every forward is checked.
+//      They print metrics (and the storage MB read per forward, /proc/self/io), never the score.
 #include "moe_mul1.h"
 #include "strata/ds41/pack.hpp"
 
 #if defined(__linux__)
 #include <fcntl.h>
 #include <sys/mman.h>
+#include <sys/stat.h>
 #include <unistd.h>
 #endif
 
@@ -71,6 +75,16 @@ at::Half to_half(float f) {   // round to nearest even, normal range (routing we
     return at::Half((uint16_t) h, at::Half::from_bits());
 }
 
+/// bytes this process read from storage so far (/proc/self/io read_bytes), in MB; -1 when unavailable
+double read_bytes_mb() {
+    std::ifstream f("/proc/self/io");
+    std::string k;
+    unsigned long long v = 0;
+    while (f >> k >> v)
+        if (k == "read_bytes:") return v / 1e6;
+    return -1;
+}
+
 double now_us() {
     return std::chrono::duration<double, std::micro>(std::chrono::steady_clock::now().time_since_epoch()).count();
 }
@@ -114,8 +128,12 @@ int main() {
         }
         return exl3_moe_cpu_make_layer_raw(g.data(), u.data(), d.data(), (int) le.size(), 0, 10.0f, 0);
     };
-    // accuracy at m = 1, 4, 8 and the median time at m = 1, 8; `before` runs before every timed forward (cold modes)
-    auto measure = [&](int64_t layer, const std::string& tag, auto before, int reps, double& t1, double& t8) {
+    // Accuracy at m = 1, 4, 8 and the median time at m = 1, 8. `condition` runs before every timed forward and returns
+    // false when it could not put the weights into the wanted state; such a mode is reported INVALID, not timed.
+    // Every forward's output, timed or not, is checked (finite, error limit) outside the timer.
+    struct Stats { bool valid = true; double max_bad = 0; std::vector<double> read_mb; };
+    auto measure = [&](int64_t layer, const std::string& tag, auto condition, int reps, double& t1, double& t8,
+                       Stats& st) {
         for (int m : {1, 4, 8}) {
             const std::string s = std::to_string(m);
             const auto x = read_bin<uint16_t>(gold + "/x_" + s + ".bin", (size_t) m * H);
@@ -126,30 +144,42 @@ int main() {
             for (size_t i = 0; i < wf.size(); ++i) w[i] = to_half(wf[i]);
             std::vector<float> out((size_t) m * H);
             auto run = [&] {
+                std::fill(out.begin(), out.end(), std::nanf(""));   // a forward that writes nothing fails the check
                 exl3_moe_cpu_forward_raw(layer, (const at::Half*) x.data(), sel.data(), w.data(), out.data(), m, K,
                                          threads);
             };
+            auto verify = [&](const char* when) {
+                double num = 0, den = 0;
+                bool finite = true;
+                for (size_t i = 0; i < out.size(); ++i) {
+                    finite = finite && std::isfinite(out[i]);
+                    num += ((double) out[i] - want[i]) * ((double) out[i] - want[i]);
+                    den += (double) want[i] * want[i];
+                }
+                const double err = std::sqrt(num / std::max(den, 1e-300));
+                check(finite, tag + " m=" + s + " " + when + ": non-finite output");
+                check(err <= kMaxErr, tag + " m=" + s + " " + when + ": relative L2 above the limit");
+                return err;
+            };
             run();
-            double num = 0, den = 0;
-            bool finite = true;
-            for (size_t i = 0; i < out.size(); ++i) {
-                finite = finite && std::isfinite(out[i]);
-                num += ((double) out[i] - want[i]) * ((double) out[i] - want[i]);
-                den += (double) want[i] * want[i];
-            }
-            const double err = std::sqrt(num / std::max(den, 1e-300));
+            const double err = verify("first forward");
             std::printf("[%s] m=%d rel_l2 vs FP16 golden = %.5f\n", tag.c_str(), m, err);
-            check(finite, tag + ": non-finite output");
-            check(err <= kMaxErr, tag + ": relative L2 against the FP16 golden above the limit");
             if (tag == "ram") metric(("err_m" + s).c_str(), err);
             if (m != 4) {
                 std::vector<double> t;
-                for (int r = 0; r < 3; ++r) run();
-                for (int r = 0; r < reps; ++r) {
-                    before();
+                for (int r = 0; r < 3; ++r) { run(); verify("warm-up"); }
+                for (int r = 0; r < reps && st.valid; ++r) {
+                    if (!condition(st)) { st.valid = false; break; }
+                    const double rb0 = read_bytes_mb();
                     const double a = now_us();
                     run();
                     t.push_back(now_us() - a);
+                    st.read_mb.push_back(read_bytes_mb() - rb0);
+                    verify("timed");
+                }
+                if (!st.valid) {
+                    std::printf("  [%s] INVALID: the weights could not be put into the mode's state\n", tag.c_str());
+                    return;
                 }
                 std::sort(t.begin(), t.end());
                 const double med = t[t.size() / 2];
@@ -165,59 +195,104 @@ int main() {
     for (size_t i = 0; i < le.size(); ++i) {
         const auto& s = pack.expert(le[i].first, le[i].second);
         ram[i].assign(pack.expert_base() + s.offset, pack.expert_base() + s.offset + s.bytes);
+#if defined(__linux__)
+        // the copy mapped these pages through the pack's own mapping; unmap them there, or a cold mode cannot drop them
+        const uintptr_t pa = (uintptr_t) (pack.expert_base() + s.offset) & ~(uintptr_t) 4095;
+        madvise((void*) pa, (uintptr_t) (pack.expert_base() + s.offset + s.bytes) - pa, MADV_DONTNEED);
+#endif
     }
     const int64_t layer = make_layer([&](size_t i) { return (const uint8_t*) ram[i].data(); });
     double t1 = 0, t8 = 0;
-    measure(layer, "ram", [] {}, 21, t1, t8);
+    {
+        Stats st;
+        measure(layer, "ram", [](Stats&) { return true; }, 21, t1, t8, st);
+    }
 
-    // 2. diagnostics, not scored (K11_WEIGHTS = mmap-warm | mmap-ptecold | mmap-cold | all): the experts read
-    // through the pack's read-only shared mapping of experts.bin, as the engine reads its file tier
+    // 2. diagnostics, not scored (K11_WEIGHTS = mmap-warm | mmap-ptecold | mmap-cold | all). The test maps
+    // experts.bin itself (read-only, shared, as the engine's file tier) so that it can replace the mapping in place.
     const char* we = std::getenv("K11_WEIGHTS");
     const std::string modes = we ? we : "ram";
     if (modes != "ram") {
 #if defined(__linux__)
+        const std::string path = pack_dir + "/experts.bin";
+        const int fd = open(path.c_str(), O_RDONLY);
+        struct stat sb {};
+        if (fd < 0 || fstat(fd, &sb) != 0) {
+            std::printf("RESULT fail cannot-open=%s\n", path.c_str());
+            return 1;
+        }
+        const size_t file_bytes = (size_t) sb.st_size;
+        uint8_t* map = (uint8_t*) mmap(nullptr, file_bytes, PROT_READ, MAP_SHARED, fd, 0);
+        if (map == MAP_FAILED) { std::printf("RESULT fail mmap-failed\n"); return 1; }
         const int64_t flayer =
-            make_layer([&](size_t i) { return pack.expert_base() + pack.expert(le[i].first, le[i].second).offset; });
-        const int fd = open((pack_dir + "/experts.bin").c_str(), O_RDONLY);
-        // the 32 experts' page-aligned ranges in the mapping and in the file
+            make_layer([&](size_t i) { return (const uint8_t*) map + pack.expert(le[i].first, le[i].second).offset; });
+        // a fresh mapping at the same address: every page-table entry of the old one is gone, the descriptors stay valid
+        auto remap = [&] {
+            return mmap(map, file_bytes, PROT_READ, MAP_SHARED | MAP_FIXED, fd, 0) == (void*) map;
+        };
+        // the 32 experts' page ranges, as (address in the mapping, length, file offset)
         auto each_range = [&](auto fn) {
+            bool ok = true;
             for (const auto& [l, e] : le) {
                 const auto& s = pack.expert(l, e);
-                const uintptr_t a = (uintptr_t) (pack.expert_base() + s.offset) & ~(uintptr_t) 4095;
-                const uintptr_t b = (uintptr_t) (pack.expert_base() + s.offset + s.bytes);
-                fn((void*) a, (size_t) (b - a), (off_t) (s.offset & ~(uint64_t) 4095));
+                const uint64_t a = s.offset & ~(uint64_t) 4095, b = s.offset + s.bytes;
+                ok = fn(map + a, (size_t) (b - a), (off_t) a) && ok;
             }
+            return ok;
         };
-        auto drop_ptes = [&] { each_range([](void* a, size_t n, off_t) { madvise(a, n, MADV_DONTNEED); }); };
-        auto drop_cache = [&] {   // unmap from this process first: mapped pages cannot be evicted
-            drop_ptes();
-            each_range([&](void*, size_t n, off_t off) { posix_fadvise(fd, off, (off_t) n, POSIX_FADV_DONTNEED); });
-        };
+        // fraction of the experts' pages in the page cache (mincore reports the cache for a file mapping), -1 on error
         auto resident = [&] {
             size_t in = 0, all = 0;
             std::vector<unsigned char> v;
-            each_range([&](void* a, size_t n, off_t) {
+            const bool ok = each_range([&](uint8_t* a, size_t n, off_t) {
                 v.resize((n + 4095) / 4096);
-                if (mincore(a, n, v.data()) == 0)
-                    for (unsigned char c : v) { in += c & 1; ++all; }
+                if (mincore(a, n, v.data()) != 0) return false;
+                for (unsigned char c : v) { in += c & 1; ++all; }
+                return true;
             });
-            return all ? (double) in / all : 0.0;
+            return ok && all ? (double) in / all : -1.0;
+        };
+        auto warm_ok = [&](Stats& st) {   // the page cache must hold every page
+            const double r = resident();
+            st.max_bad = std::max(st.max_bad, r < 0 ? 1.0 : 1.0 - r);
+            return r >= 0.999;
+        };
+        auto drop = [&] {
+            return remap() && each_range([&](uint8_t*, size_t n, off_t off) {
+                       return posix_fadvise(fd, off, (off_t) n, POSIX_FADV_DONTNEED) == 0;
+                   });
+        };
+        auto cold_ok = [&](Stats& st) {   // none of the pages may be cached; up to three drops
+            double r = -1;
+            for (int i = 0; i < 3; ++i) {
+                if (!drop()) return false;
+                r = resident();
+                if (r == 0.0) break;
+            }
+            st.max_bad = std::max(st.max_bad, r < 0 ? 1.0 : r);
+            return r >= 0 && r <= 0.001;
         };
         for (const std::string mode : {"mmap-warm", "mmap-ptecold", "mmap-cold"}) {
             if (modes != "all" && modes != mode) continue;
             double f1 = 0, f8 = 0;
-            if (mode == "mmap-warm") measure(flayer, mode, [] {}, 21, f1, f8);
-            else if (mode == "mmap-ptecold") measure(flayer, mode, drop_ptes, 21, f1, f8);
-            else {
-                drop_cache();
-                std::printf("  [mmap-cold] resident fraction after the drop: %.4f\n", resident());
-                measure(flayer, mode, drop_cache, 9, f1, f8);
-            }
+            Stats st;
+            if (mode == "mmap-warm") measure(flayer, mode, warm_ok, 21, f1, f8, st);
+            else if (mode == "mmap-ptecold")
+                measure(flayer, mode, [&](Stats& x) { return remap() && warm_ok(x); }, 21, f1, f8, st);
+            else measure(flayer, mode, cold_ok, 9, f1, f8, st);
+            std::sort(st.read_mb.begin(), st.read_mb.end());
+            const double rmb = st.read_mb.empty() ? -1 : st.read_mb[st.read_mb.size() / 2];
+            std::printf("  [%s] %s; worst %s %.4f; median storage read per timed forward %.1f MB\n", mode.c_str(),
+                        st.valid ? "valid" : "INVALID", mode == "mmap-cold" ? "resident fraction" : "missing fraction",
+                        st.max_bad, rmb);
+            if (!st.valid) continue;
             metric(("us_m1_" + mode).c_str(), f1);
             metric(("us_m8_" + mode).c_str(), f8);
+            metric(("read_mb_" + mode).c_str(), rmb);
         }
-        close(fd);
         exl3_moe_cpu_free_layer(flayer);
+        munmap(map, file_bytes);
+        close(fd);
 #else
         std::printf("K11_WEIGHTS=%s: file modes need Linux; skipped\n", modes.c_str());
 #endif
