@@ -7,6 +7,8 @@
 
 #include <cstdio>
 #include <cstdlib>
+#include <mutex>
+#include <vector>
 
 namespace strata::ds41::kernels {
 namespace {
@@ -213,20 +215,74 @@ void check_cuda(cudaError_t error, const char* where) {
     }
 }
 
+// Keep reusable pages in an owned pool rather than the application's default
+// pool. A zero release threshold returns unused pages at every event/stream
+// synchronization, forcing the next call to obtain backing memory again.
+// Each invocation still owns a distinct stream-ordered allocation: no pointer
+// is cached across calls or shared by concurrently executing attention work.
+class ScratchPools {
+    struct Entry {
+        int device;
+        cudaMemPool_t pool;
+    };
+    std::mutex mutex_;
+    std::vector<Entry> pools_;
+
+public:
+    cudaMemPool_t get(int device) {
+        std::lock_guard<std::mutex> lock(mutex_);
+        for (const Entry& entry : pools_)
+            if (entry.device == device) return entry.pool;
+
+        cudaMemPoolProps properties{};
+        properties.allocType = cudaMemAllocationTypePinned;
+        properties.handleTypes = cudaMemHandleTypeNone;
+        properties.location.type = cudaMemLocationTypeDevice;
+        properties.location.id = device;
+        cudaMemPool_t pool = nullptr;
+        check_cuda(cudaMemPoolCreate(&pool, &properties), "create scratch pool");
+        // The largest legal call uses 2 MiB + 2 KiB. Retain at most a 4 MiB
+        // target after synchronization, including allocator page rounding.
+        // Concurrent work can allocate more; excess unused pages are releasable.
+        uint64_t retention = 4ull * 1024 * 1024;
+        check_cuda(cudaMemPoolSetAttribute(pool, cudaMemPoolAttrReleaseThreshold,
+                                          &retention), "retain scratch pages");
+        // Never serialize otherwise independent streams to reuse scratch.
+        int internal_dependencies = 0;
+        check_cuda(cudaMemPoolSetAttribute(pool, cudaMemPoolReuseAllowInternalDependencies,
+                                          &internal_dependencies), "scratch pool dependencies");
+        pools_.push_back({device, pool});
+        return pool;
+    }
+
+    ~ScratchPools() {
+        // Pool destruction is nonblocking: CUDA defers releasing resources
+        // until outstanding allocations and stream-ordered frees complete.
+        for (const Entry& entry : pools_) cudaMemPoolDestroy(entry.pool);
+    }
+};
+
+cudaMemPool_t scratch_pool() {
+    static ScratchPools pools;
+    int device = 0;
+    check_cuda(cudaGetDevice(&device), "current device");
+    return pools.get(device);
+}
+
 }  // namespace
 
 void sparse_attn_decode(const __nv_bfloat16* q, const __nv_bfloat16* window, const __nv_bfloat16* comp,
                         const int32_t* idx, int m, int n_idx, const float* sink, float scale,
                         __nv_bfloat16* o, cudaStream_t stream) {
     if (m <= 0) return;
-    // A private stream-ordered allocation avoids global caches and works for
-    // overlapping calls on different streams. CUDA 12.8 supports the pool API
-    // on every required target; freeing is ordered after the last consumer.
+    // Pool ownership only changes page retention. Workspace lifetime is still
+    // private to this invocation and ordered on the caller's stream.
     const int stride = n_idx > 0 ? (n_idx + kRowTile - 1) / kRowTile * kRowTile : kRowTile;
     const size_t heads = static_cast<size_t>(m) * kHeads;
     float* scratch = nullptr;
-    check_cuda(cudaMallocAsync(reinterpret_cast<void**>(&scratch),
-                               (heads * stride + heads) * sizeof(float), stream), "allocate workspace");
+    check_cuda(cudaMallocFromPoolAsync(reinterpret_cast<void**>(&scratch),
+                                       (heads * stride + heads) * sizeof(float), scratch_pool(), stream),
+               "allocate workspace");
     float* denominators = scratch + heads * stride;
     qk_tiles<<<dim3(stride / kRowTile, kHeads / kHeadTile, m), kThreads, 0, stream>>>(
         q, window, comp, idx, n_idx, stride, scale, scratch);
