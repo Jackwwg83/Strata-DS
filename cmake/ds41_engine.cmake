@@ -5,6 +5,7 @@ add_library(strata_ds41_engine STATIC
   src/ds41/pack.cpp
   src/ds41/ops.cu
   src/ds41/doorbell.cu
+  src/ds41/vram_experts.cu
   src/ds41/engine.cu
   third_party/exllamav3_moe/moe_mul1.cpp)
 target_include_directories(strata_ds41_engine PUBLIC
@@ -25,4 +26,7 @@ if(STRATA_BUILD_TESTS)
   target_link_libraries(doorbell_test PRIVATE strata_ds41_engine)
   add_test(NAME doorbell_test COMMAND doorbell_test)
   set_tests_properties(doorbell_test PROPERTIES SKIP_RETURN_CODE 77 TIMEOUT 300)
+  add_executable(vram_experts_test src/ds41/tests/vram_experts_test.cu)
+  target_link_libraries(vram_experts_test PRIVATE strata_ds41_engine)
+  add_test(NAME vram_experts_test COMMAND vram_experts_test)
 endif()
