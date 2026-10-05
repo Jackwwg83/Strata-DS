@@ -12,6 +12,25 @@ CTA's first warp performs the original deterministic double-precision top-six
 selection. No CTA spins or waits for another CTA to become resident. m=2..8 keep
 K8-07's existing score kernel, selector kernel, launch geometry and stream usage.
 
+## Revision 2: explicit score-writer and winner fences
+
+Following [reviewer directive 5998972308](https://github.com/Jackwwg83/Strata-DS/issues/8#issuecomment-5998972308),
+this revision adds `__threadfence()` in each score-writing lane (thread IDs
+0, 32, 64, 96) after its store and before the first CTA barrier. Every thread in
+the winning CTA also executes `__threadfence()` after the winner-flag barrier and
+uniform nonwinner return, before any selector score load. All three existing CTA
+barriers, the device-scope acq_rel RMW and release reset remain in place.
+
+The [CUDA 12.8 memory-fence documentation](https://docs.nvidia.com/cuda/archive/12.8.1/cuda-c-programming-guide/index.html#memory-fence-functions)
+defines the device-scope fence and demonstrates producer-store-before-ticket
+ordering for last-block reduction. Fences order memory accesses; they do not
+replace the retained acquire/release visibility proof or CTA barriers here.
+
+The prior unfenced head `2c835e1e2e0e1e57bb0dc474a9fac16ac517dbe5` scored
+18.92 us (m1 15.36) in the queue. Those measurements do not belong to this revision.
+The added-fence head needs its own queue result and must beat 19.84 us by at least
+3%, with m1 no slower than 16.38 us. It is not approved for merge on old timings.
+
 ## Workspace and ordering contract
 
 One K8-private `Workspace` allocation per CUDA device contains all eight tokens'
@@ -39,10 +58,11 @@ therefore does not change the counter.
 The protocol follows K7-05's reviewed device-scope acquire/release design, not its
 collapse computation. `Completion` is
 `cuda::atomic_ref<unsigned, cuda::thread_scope_device>` with explicitly required
-alignment. No legacy unsuffixed atomic/fence/volatile approximation is used.
+alignment. Explicit producer and reader fences supplement this protocol; they
+do not replace it with legacy unsuffixed atomics.
 
-1. Each CTA's four warp leaders write their disjoint scores, then all 128 threads
-   join the first CTA barrier. All four writes happen-before the CTA leader's
+1. Each CTA's four warp leaders write their disjoint scores and each writer
+   executes a device fence. Then all 128 threads join the first CTA barrier. All four writes happen-before the CTA leader's
    completion operation.
 2. The leader performs one `fetch_add(1, memory_order_acq_rel)`. Integer RMWs form
    a modification order. Each RMW acquires the immediately preceding published
@@ -50,7 +70,8 @@ alignment. No legacy unsuffixed atomic/fence/volatile approximation is used.
    the final ticket (95) acquires every expert score, independent of CTA order.
 3. The second CTA barrier distributes the acquired history and shared winner
    flag. Nonwinning CTAs return uniformly and never access the arena again. The
-   winner's entire warp 0 loads the 384 scores and executes the unchanged
+   winner's 128 threads each execute a device fence. Its entire warp 0 then loads
+   the 384 scores and executes the unchanged
    deterministic selector. All 32 lanes participate in each shuffle.
 4. All winner threads join the third CTA barrier after selection. Every score
    read and every output write happens-before the leader's release store of zero.
@@ -61,7 +82,9 @@ This is regular device-scope C++ acquire/release message passing, with CTA
 barriers connecting the participating non-atomic writers/readers to the atomic
 leader. Ordinary global score loads are ordered; volatile is unnecessary. The
 CUDA 12.8 PTX emitted here uses `atom.add.acq_rel.gpu.u32` and
-`st.release.gpu.b32`, with three executed CTA barriers on the winning path.
+`st.release.gpu.b32`, plus two static `membar.gl` fence sites and three
+executed CTA barriers on the winning path. The first fence site runs in the four
+score-writing lanes of every CTA; the second runs in all 128 winner threads.
 
 A rejected launch that executes no work leaves the counter unchanged. Recovery
 from a partially executed kernel/device fault is not supported: failure before
@@ -97,7 +120,10 @@ The first checks exact source equivalence to K8-07; device-scope ordered protoco
 and workspace invariants; all 5,913 completion permutations for grids of size
 1..7; each of 96 possible final CTAs; 1,024 randomized mixed-shape calls across
 three independent device arenas; and negative examples for missing publication,
-missing producer barriers and partial-failure reuse. It models happens-before
+missing producer barriers and partial-failure reuse. It also checks every writer
+and selector-reader fence, rejecting 36 omitted-lane coverage cases. The runtime
+source audit proves the revision adds exactly the requested fences to the prior
+head and retains its arithmetic, workspace, dispatch and synchronization. It models happens-before
 relationships; it does not execute the device weak-memory implementation.
 
 The inherited numerical model passes 2,503 routing cases, including 13,824
@@ -115,7 +141,8 @@ uses 93 registers per thread on each architecture, one shared byte and no
 stack/spill loads or stores. All task kernels use at most 20,480 shared bytes,
 below 99 KiB. The old decode producer used 27/28 registers and its separate
 selector used 80; fusion can reduce occupancy across all four producer warps.
-Ninety-six serialized integer atomics, three winner-path CTA barriers, increased
+Ninety-six serialized integer atomics, explicit device fences, three winner-path
+CTA barriers, increased
 register footprint and the single-warp tail can cost more than one saved launch.
 Only an exact-head GPU measurement can decide this experiment.
 
@@ -133,6 +160,6 @@ through `k8_graph_validation 8` to cover every first-eager shape. It checks:
 
 The fixed queue's K8 graph test covers m8 only. Its pass must never be described
 as validation of the new fused m1 capture path. The optional test must actually
-run to establish m1 graph-replay evidence. GPU correctness, m1 graph runtime,
+run to establish m1 graph-replay evidence. Revised-head GPU correctness, m1 graph runtime,
 compute-sanitizer and latency are pending; no speedup is claimed from these CPU
 or compile checks.

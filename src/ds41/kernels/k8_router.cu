@@ -244,7 +244,12 @@ __global__ void decode_top6(const __nv_bfloat16* __restrict__ x,
         acc = __fmaf_rn(__bfloat162float(x[d]), __bfloat162float(row[d]), acc);
     }
     acc = warp_sum(acc);
-    if (lane == 0) scores[expert] = k8_detail::score(acc);
+    if (lane == 0) {
+        scores[expert] = k8_detail::score(acc);
+        // Each actual score writer fences its own store before CTA publication,
+        // following the documented threadFenceReduction producer pattern.
+        __threadfence();
+    }
 
     // Publish all four score writers through the leader's device-scope RMW.
     __syncthreads();
@@ -258,6 +263,10 @@ __global__ void decode_top6(const __nv_bfloat16* __restrict__ x,
     // Pass the acquired history and winner flag to the complete CTA.
     __syncthreads();
     if (!last) return;  // Uniform; no spinning or grid-residency assumption.
+    // Every thread of the winning CTA fences after learning it is last. Thus
+    // all selector lanes execute the fence before loading any global score.
+    // Keep the acq_rel ticket and both publication barriers as well.
+    __threadfence();
     if (threadIdx.x < kWarp) select_decode_top6(scores, bias, ids, weights);
 
     // All score reads and output writes finish before the reusable zero.
