@@ -2756,6 +2756,38 @@ int64_t exl3_moe_cpu_make_layer_raw
     return static_cast<int64_t>(g_layers.size() - 1);
 }
 
+// Strata-DS: point one expert of a registered layer at other bytes with the same shapes and rate (the expert moved
+// between the engine's RAM copy and its mapped file). Call only between forwards of that layer.
+void exl3_moe_cpu_set_expert_raw
+(
+    int64_t handle,
+    int expert,
+    const MoeCpuMatrixDesc* gate,
+    const MoeCpuMatrixDesc* up,
+    const MoeCpuMatrixDesc* down,
+    int swizzled
+)
+{
+    std::lock_guard<std::mutex> lock(g_layers_mutex);
+    TORCH_CHECK(handle >= 0 && handle < static_cast<int64_t>(g_layers.size()) && g_layers[handle], "bad layer handle");
+    MoeCpuLayer* layer = g_layers[handle];
+    TORCH_CHECK(expert >= 0 && expert < layer->num_experts && up && down, "bad expert");
+    TORCH_CHECK((gate != nullptr) == !layer->gates.empty(), "gate presence differs from the layer");
+    // check all three first: a refused call leaves the expert as it was
+    auto make = [&](const MoeCpuMatrix& old, const MoeCpuMatrixDesc& d)
+    {
+        const MoeCpuMatrix m = make_matrix_raw(d, swizzled != 0);
+        TORCH_CHECK(m.k == old.k && m.n == old.n && m.bits == old.bits && m.hb == old.hb && m.swz == old.swz,
+                    "the new bytes differ in shape or rate");
+        return m;
+    };
+    const MoeCpuMatrix new_up = make(layer->ups[expert], *up);
+    const MoeCpuMatrix new_down = make(layer->downs[expert], *down);
+    if (gate) layer->gates[expert] = make(layer->gates[expert], *gate);
+    layer->ups[expert] = new_up;
+    layer->downs[expert] = new_down;
+}
+
 void exl3_moe_cpu_free_layer(int64_t handle)
 {
     std::lock_guard<std::mutex> lock(g_layers_mutex);
@@ -3003,6 +3035,7 @@ int64_t exl3_moe_cpu_make_layer(
 #endif
 int64_t exl3_moe_cpu_make_layer_raw(const MoeCpuMatrixDesc*, const MoeCpuMatrixDesc*, const MoeCpuMatrixDesc*, int, int, float, int) { NO_MOE_CPU(); return 0; }
 void exl3_moe_cpu_free_layer(int64_t) {}
+void exl3_moe_cpu_set_expert_raw(int64_t, int, const MoeCpuMatrixDesc*, const MoeCpuMatrixDesc*, const MoeCpuMatrixDesc*, int) { NO_MOE_CPU(); }
 void exl3_moe_cpu_forward_raw(int64_t, const at::Half*, const int32_t*, const at::Half*, float*, int, int, int) { NO_MOE_CPU(); }
 #ifdef EXL3_MOE_WITH_TORCH
 void exl3_moe_cpu_forward(int64_t, const at::Tensor&, const at::Tensor&, const at::Tensor&, at::Tensor&, int64_t) { NO_MOE_CPU(); }

@@ -118,6 +118,18 @@ void exl3_moe_cpu_forward
 
 #endif
 
+// Strata-DS: point one expert of a registered layer at other bytes with the same shapes and rate. Call only between
+// forwards of that layer (no forward of it may run at the same time). gate is null for a gateless layer.
+void exl3_moe_cpu_set_expert_raw
+(
+    int64_t handle,
+    int expert,
+    const MoeCpuMatrixDesc* gate,
+    const MoeCpuMatrixDesc* up,
+    const MoeCpuMatrixDesc* down,
+    int swizzled
+);
+
 // Raw-pointer variant used by the persistent worker (moe_handoff.cu): same computation as
 // exl3_moe_cpu_forward, expert selection as int32, buffers caller-owned
 void exl3_moe_cpu_forward_raw
