@@ -198,9 +198,10 @@ std::vector<uint16_t> host_lane_model(const std::vector<uint16_t>& input, const 
     }
     std::vector<uint16_t> y(size_t(m * s.n));
     for (int64_t row = 0; row < s.n; ++row) {
-        float acc[8][32] = {};
-        for (int lane = 0; lane < 32; ++lane) {
-            for (int64_t col = lane * 16; col < s.k; col += 512) {
+        const int splits = device_math::gemv_split_warps(s.n);
+        float acc[8][128] = {};
+        for (int lane = 0; lane < splits * 32; ++lane) {
+            for (int64_t col = lane * 16; col < s.k; col += splits * 512) {
                 const float sw = device_math::decode_e8m0(scales[size_t((row / 32) * (s.k / 32) + col / 32)]);
                 for (int j = 0; j < 16; ++j) {
                     const float weight = device_math::decode_e4m3(w[size_t(row * s.k + col + j)]) * sw;
@@ -210,15 +211,59 @@ std::vector<uint16_t> host_lane_model(const std::vector<uint16_t>& input, const 
             }
         }
         for (int t = 0; t < m; ++t) {
-            for (int d = 16; d; d >>= 1)
-                for (int lane = 0; lane < d; ++lane) acc[t][lane] += acc[t][lane + d];
-            y[size_t(t * s.n + row)] = bf16_from_f32(acc[t][0]);
+            for (int z = 0; z < splits; ++z)
+                for (int d = 16; d; d >>= 1)
+                    for (int lane = 0; lane < d; ++lane)
+                        acc[t][z * 32 + lane] += acc[t][z * 32 + lane + d];
+            float sum = acc[t][0];
+            for (int z = 1; z < splits; ++z) sum += acc[t][z * 32];
+            y[size_t(t * s.n + row)] = bf16_from_f32(sum);
         }
     }
     return y;
 }
 
+// Check write ownership, 16-byte K tails, and the capped grid-stride path independently of arithmetic.
+void host_layout_test() {
+    int cases = 0;
+    for (int64_t n : {1, 33, 511, 512, 1023, 1024, 1025, 2048, 2049, 8192, 8193, 524289}) {
+        for (int m : {1, 2, 8}) {
+            const int splits = device_math::gemv_split_warps(n);
+            const int rows = device_math::gemv_rows_per_group(n);
+            const int per_block = 4 / splits * rows;
+            const int64_t grid = std::min<int64_t>((n - 1) / per_block + 1, 65535);
+            std::vector<int> writes(size_t(n), 0);
+            for (int64_t block = 0; block < grid; ++block)
+                for (int64_t base = block * per_block; base < n; base += grid * per_block)
+                    for (int group = 0; group < 4 / splits; ++group)
+                        for (int r = 0; r < rows; ++r) {
+                            const int64_t row = base + group * rows + r;
+                            if (row < n) {
+                                ++writes[size_t(row)];
+                                require(row / 32 == (base + group * rows) / 32, "shared weight scale row");
+                                for (int t = 0; t < m; ++t)
+                                    require(int64_t(t) * n + row < int64_t(m) * n, "output token offset");
+                            }
+                        }
+            require(std::all_of(writes.begin(), writes.end(), [](int v) { return v == 1; }), "output ownership");
+            for (int64_t k : {32, 96, 544, 1280, 2304, 5120, 6144, 8192}) {
+                std::vector<int> reads(size_t(k), 0);
+                for (int lane = 0; lane < splits * 32; ++lane)
+                    for (int64_t col = lane * 16; col < k; col += splits * 512)
+                        for (int j = 0; j < 16; ++j) {
+                            require(col + j < k, "16-byte load outside K");
+                            ++reads[size_t(col + j)];
+                        }
+                require(std::all_of(reads.begin(), reads.end(), [](int v) { return v == 1; }), "weight ownership");
+                ++cases;
+            }
+        }
+    }
+    std::printf("host layout: %d geometries, each output/weight owned once, tails and grid-stride cap OK\n", cases);
+}
+
 void host_selftest(bool full_shapes) {
+    host_layout_test();
     size_t finite_bf16 = 0, ties = 0;
     for (unsigned bits = 0; bits <= 0xffff; ++bits) {
         const float v = f32_from_bf16(uint16_t(bits));
@@ -260,12 +305,26 @@ void host_selftest(bool full_shapes) {
     std::printf("host conversions: %zu finite BF16 inputs, 256 E4M3 codes, 256 E8M0 codes, %zu FP8 tie probes OK\n",
                 finite_bf16, ties);
     std::printf("host BF16: 32639 positive boundaries and their negatives, ties and adjacent doubles OK\n");
-    const Shape small[] = {{1, 32, "zero"}, {33, 96, "tail"}, {65, 544, "tail_k"}, {17, 1280, "blocks"}};
+    const Shape small[] = {{1, 32, "zero"}, {33, 96, "tail"}, {65, 544, "tail_k"}, {17, 1280, "blocks"},
+                           {1025, 96, "paired_tail"}, {2049, 544, "split2_tail"}, {8193, 96, "split1_tail"}};
     double worst = 0;
     int cases = 0;
     auto run = [&](const Shape& s, int m) {
         auto x = make_activation(m, s.k);
         auto q = reference_quantize(x);
+        for (size_t b = 0; b < q.scales.size(); ++b) {
+            float amax = 1e-4f;
+            for (int j = 0; j < 32; ++j) amax = std::max(amax, std::fabs(f32_from_bf16(x[b * 32 + j])));
+            const float scale = device_math::activation_scale(amax);
+            require(device_math::float_bits(scale) == device_math::float_bits(q.scales[b]), "host scale bits");
+            for (int j = 0; j < 32; ++j) {
+                const size_t i = b * 32 + j;
+                const uint8_t byte = device_math::encode_e4m3(f32_from_bf16(x[i]) / scale);
+                require(byte == q.bytes[i], "host activation bytes");
+                require(device_math::float_bits(device_math::decode_e4m3(byte) * scale) ==
+                        device_math::float_bits(q.values[i]), "host dequantized float bits");
+            }
+        }
         std::vector<uint8_t> w, scales;
         make_weight(s, w, scales);
         const auto want = reference_gemv(q, w, scales, m, s);
@@ -312,7 +371,7 @@ struct Event {
 
 void quantization_parity(const std::vector<uint16_t>& x, int m, int64_t k,
                          const Quantized& ref, const uint16_t* dx, cudaStream_t stream) {
-    Buffer<uint8_t> dq(x.size()); Buffer<float> ds(x.size() / 32);
+    Buffer<uint8_t> dq(x.size()); Buffer<float> ds(x.size() / 32), deq(x.size() + 1);
     std::vector<uint8_t> got(x.size()); std::vector<float> scales(x.size() / 32);
     strata::ds41::fp8_quantize_activation(dx, m, k, dq.p, ds.p, stream);
     check(cudaMemcpyAsync(got.data(), dq.p, got.size(), cudaMemcpyDeviceToHost, stream), "quantized bytes");
@@ -322,6 +381,15 @@ void quantization_parity(const std::vector<uint16_t>& x, int m, int64_t k,
     require(got == ref.bytes, "activation FP8 bytes differ from reference");
     require(std::memcmp(scales.data(), ref.scales.data(), scales.size() * sizeof(float)) == 0,
             "activation FP32 scale bits differ from reference");
+    std::vector<float> values(x.size());
+    for (int offset : {0, 1}) {
+        strata::ds41::fp8_quantize_activation_f32(dx, m, k, deq.p + offset, stream);
+        check(cudaMemcpyAsync(values.data(), deq.p + offset, values.size() * sizeof(float),
+                              cudaMemcpyDeviceToHost, stream), "dequantized values");
+        check(cudaStreamSynchronize(stream), "dequantization completion");
+        require(std::memcmp(values.data(), ref.values.data(), values.size() * sizeof(float)) == 0,
+                "activation dequantized FP32 bits differ from reference");
+    }
 }
 
 void gpu_conversion_edges(cudaStream_t stream) {
@@ -340,7 +408,7 @@ void gpu_conversion_edges(cudaStream_t stream) {
     require(x.size() % 32 == 0, "edge corpus block alignment");
     Buffer<uint16_t> dx(x.size()); upload(dx.p, x, stream);
     quantization_parity(x, 1, int64_t(x.size()), reference_quantize(x), dx.p, stream);
-    std::printf("GPU quantization edge corpus: %zu values, bytes and scales bitwise OK\n", x.size());
+    std::printf("GPU quantization edge corpus: %zu values, bytes/scales/dequantized FP32 bitwise OK\n", x.size());
 }
 
 void gpu_concurrent_streams() {
@@ -351,12 +419,15 @@ void gpu_concurrent_streams() {
     const auto ref2 = reference_gemv(reference_quantize(x2), w, scales, 7, shape);
     Buffer<uint8_t> dw(w.size()), ds(scales.size());
     Buffer<uint16_t> dx1(x1.size()), dx2(x2.size()), dy1(ref1.bits.size()), dy2(ref2.bits.size());
+    Buffer<float> q1(x1.size()), q2(x2.size());
     Stream a, b;
     upload(dw.p, w, a.s); upload(ds.p, scales, a.s);
     check(cudaStreamSynchronize(a.s), "shared weights ready");
     upload(dx1.p, x1, a.s); upload(dx2.p, x2, b.s);
-    strata::ds41::fp8_block_gemv(dx1.p, 3, shape.k, dw.p, ds.p, shape.n, dy1.p, a.s);
-    strata::ds41::fp8_block_gemv(dx2.p, 7, shape.k, dw.p, ds.p, shape.n, dy2.p, b.s);
+    strata::ds41::fp8_quantize_activation_f32(dx1.p, 3, shape.k, q1.p, a.s);
+    strata::ds41::fp8_quantize_activation_f32(dx2.p, 7, shape.k, q2.p, b.s);
+    strata::ds41::fp8_block_gemv_q(q1.p, 3, shape.k, dw.p, ds.p, shape.n, dy1.p, a.s);
+    strata::ds41::fp8_block_gemv_q(q2.p, 7, shape.k, dw.p, ds.p, shape.n, dy2.p, b.s);
     std::vector<uint16_t> y1(ref1.bits.size()), y2(ref2.bits.size());
     check(cudaMemcpyAsync(y1.data(), dy1.p, y1.size() * sizeof(uint16_t), cudaMemcpyDeviceToHost, a.s), "stream a");
     check(cudaMemcpyAsync(y2.data(), dy2.p, y2.size() * sizeof(uint16_t), cudaMemcpyDeviceToHost, b.s), "stream b");
@@ -364,6 +435,80 @@ void gpu_concurrent_streams() {
     check(cudaStreamSynchronize(b.s), "stream b complete");
     require(relative_error(y1, ref1) <= 2e-3 && relative_error(y2, ref2) <= 2e-3, "concurrent-stream parity");
     std::printf("GPU two-stream scratch isolation: m=3 and m=7 OK\n");
+}
+
+struct Graph {
+    cudaGraph_t graph = nullptr;
+    cudaGraphExec_t exec = nullptr;
+    ~Graph() {
+        if (exec) cudaGraphExecDestroy(exec);
+        if (graph) cudaGraphDestroy(graph);
+    }
+    void finish(cudaStream_t stream, size_t expected_nodes) {
+        check(cudaStreamEndCapture(stream, &graph), "end capture");
+        size_t count = 0;
+        check(cudaGraphGetNodes(graph, nullptr, &count), "graph node count");
+        require(count == expected_nodes, "captured graph must contain only expected kernel launches");
+        std::vector<cudaGraphNode_t> nodes(count);
+        check(cudaGraphGetNodes(graph, nodes.data(), &count), "graph nodes");
+        for (auto node : nodes) {
+            cudaGraphNodeType type;
+            check(cudaGraphNodeGetType(node, &type), "graph node type");
+            require(type == cudaGraphNodeTypeKernel, "allocation-free API captured a non-kernel node");
+        }
+        check(cudaGraphInstantiate(&exec, graph, nullptr, nullptr, 0), "instantiate graph");
+    }
+};
+
+void gpu_graph_reuse(cudaStream_t stream) {
+    int cases = 0;
+    for (const Shape shape : {Shape{33, 544, "graph_split4"}, Shape{2049, 96, "graph_split2"},
+                              Shape{8193, 96, "graph_split1"}}) {
+        std::vector<uint8_t> wa, scales; make_weight(shape, wa, scales);
+        auto wb = wa;
+        for (auto& byte : wb) byte ^= 128;
+        Buffer<uint8_t> dwa(wa.size()), dwb(wb.size()), ds(scales.size());
+        upload(dwa.p, wa, stream); upload(dwb.p, wb, stream); upload(ds.p, scales, stream);
+        for (int m : {1, 3, 8}) {
+            auto x = make_activation(m, shape.k);
+            Buffer<uint16_t> dx(x.size()), ya(size_t(m * shape.n)), yb(size_t(m * shape.n));
+            Buffer<float> deq(x.size());
+            upload(dx.p, x, stream);
+            // Exercise both a complete quantize+two-weight graph and a graph consuming prequantized input.
+            for (bool with_quantizer : {true, false}) {
+                check(cudaStreamSynchronize(stream), "before graph capture");
+                Graph graph;
+                check(cudaStreamBeginCapture(stream, cudaStreamCaptureModeThreadLocal), "begin capture");
+                if (with_quantizer) strata::ds41::fp8_quantize_activation_f32(dx.p, m, shape.k, deq.p, stream);
+                strata::ds41::fp8_block_gemv_q(deq.p, m, shape.k, dwa.p, ds.p, shape.n, ya.p, stream);
+                strata::ds41::fp8_block_gemv_q(deq.p, m, shape.k, dwb.p, ds.p, shape.n, yb.p, stream);
+                graph.finish(stream, with_quantizer ? 3 : 2);
+                for (int replay = 0; replay < 2; ++replay) {
+                    for (auto& bits : x) bits ^= 0x8000;
+                    const auto q = reference_quantize(x);
+                    const auto ra = reference_gemv(q, wa, scales, m, shape);
+                    const auto rb = reference_gemv(q, wb, scales, m, shape);
+                    upload(dx.p, x, stream);
+                    if (!with_quantizer) strata::ds41::fp8_quantize_activation_f32(dx.p, m, shape.k, deq.p, stream);
+                    check(cudaGraphLaunch(graph.exec, stream), "replay graph");
+                    std::vector<uint16_t> a(ra.bits.size()), b(rb.bits.size());
+                    std::vector<float> values(x.size());
+                    check(cudaMemcpyAsync(a.data(), ya.p, a.size() * sizeof(uint16_t), cudaMemcpyDeviceToHost, stream),
+                          "graph output a");
+                    check(cudaMemcpyAsync(b.data(), yb.p, b.size() * sizeof(uint16_t), cudaMemcpyDeviceToHost, stream),
+                          "graph output b");
+                    check(cudaMemcpyAsync(values.data(), deq.p, values.size() * sizeof(float),
+                                          cudaMemcpyDeviceToHost, stream), "graph quantized input");
+                    check(cudaStreamSynchronize(stream), "graph replay completion");
+                    require(relative_error(a, ra) <= 2e-3 && relative_error(b, rb) <= 2e-3, "graph output parity");
+                    require(std::memcmp(values.data(), q.values.data(), values.size() * sizeof(float)) == 0,
+                            "graph dequantized FP32 bits");
+                    ++cases;
+                }
+            }
+        }
+    }
+    std::printf("GPU graph replay/reuse: %d cases, changed inputs, two weights, kernel-only nodes OK\n", cases);
 }
 
 double gpu_case(const Shape& shape, int m, const std::vector<uint8_t>& w,
@@ -375,13 +520,28 @@ double gpu_case(const Shape& shape, int m, const std::vector<uint8_t>& w,
     Buffer<uint16_t> dx(x.size()), dy(size_t(m * shape.n));
     upload(dx.p, x, stream);
     quantization_parity(x, m, shape.k, q, dx.p, stream);
-    auto call = [&] { strata::ds41::fp8_block_gemv(dx.p, m, shape.k, dw, ds, shape.n, dy.p, stream); };
+    Buffer<float> deq(x.size() + 1);
+    float* x_deq = deq.p + (timing ? 0 : 1);
+    auto call = [&] { strata::ds41::fp8_block_gemv_q(x_deq, m, shape.k, dw, ds, shape.n, dy.p, stream); };
+    strata::ds41::fp8_quantize_activation_f32(dx.p, m, shape.k, x_deq, stream);
     call();
     std::vector<uint16_t> got(ref.bits.size());
     check(cudaMemcpyAsync(got.data(), dy.p, got.size() * sizeof(uint16_t), cudaMemcpyDeviceToHost, stream), "output");
     check(cudaStreamSynchronize(stream), "GEMV completion");
     const double error = relative_error(got, ref);
-    require(error <= 2e-3, "GPU relative L2 error > 2e-3");
+    require(error <= 2e-3, "GPU q relative L2 error > 2e-3");
+    std::vector<uint16_t> other(got.size());
+    auto read_other = [&] {
+        check(cudaMemcpyAsync(other.data(), dy.p, other.size() * sizeof(uint16_t), cudaMemcpyDeviceToHost, stream),
+              "comparison output");
+        check(cudaStreamSynchronize(stream), "comparison completion");
+    };
+    strata::ds41::fp8_block_gemv(dx.p, m, shape.k, dw, ds, shape.n, dy.p, stream);
+    read_other();
+    require(relative_error(other, ref) <= 2e-3 && other == got, "wrapper/q parity");
+    upload(x_deq, q.values, stream);
+    call(); read_other();
+    require(relative_error(other, ref) <= 2e-3 && other == got, "CPU-quantized/q parity");
     double us = 0;
     if (timing) {
         for (int i = 0; i < 3; ++i) call();
@@ -402,7 +562,7 @@ double gpu_case(const Shape& shape, int m, const std::vector<uint8_t>& w,
         std::sort(samples.begin(), samples.end()); us = samples[samples.size() / 2];
     }
     const double gbps = us > 0 ? double(w.size() + scales.size()) / (us * 1000) : 0;
-    std::printf("%-18s N=%lld K=%lld m=%d rel=%.9g double_rel=%.9g time_us=%.3f GB/s=%.3f quant=bitwise%s\n",
+    std::printf("%-18s N=%lld K=%lld m=%d rel=%.9g double_rel=%.9g time_us=%.3f GB/s=%.3f quant=bitwise api=q wrapper=equal%s\n",
                 shape.name, (long long)shape.n, (long long)shape.k, m, error, relative_error(got, ref, false),
                 us, gbps, timing ? "" : " (untimed)");
     std::fflush(stdout);
@@ -418,7 +578,7 @@ int gpu_selftest() {
     check(status, "device count");
     int device = 0; check(cudaGetDevice(&device), "current device");
     cudaDeviceProp prop{}; check(cudaGetDeviceProperties(&prop, device), "device properties");
-    std::printf("GPU: %s; median of 11 CUDA-event samples, L2 eviction before each public call\n", prop.name);
+    std::printf("GPU: %s; median of 11 CUDA-event samples, L2 eviction before each q-only call (quantization excluded)\n", prop.name);
     // Retain the tiny activation allocation across event synchronizations; restore the caller's pool setting.
     cudaMemPool_t pool;
     check(cudaDeviceGetDefaultMemPool(&pool, device), "default pool");
@@ -430,6 +590,9 @@ int gpu_selftest() {
     Buffer<uint8_t> eviction(eviction_bytes);
     gpu_conversion_edges(stream.s);
     gpu_concurrent_streams();
+    gpu_graph_reuse(stream.s);
+    std::array<double, 8> times{}, bandwidths{}, ratios{};
+    size_t shape_index = 0;
     for (const auto& s : SHAPES) {
         std::vector<uint8_t> w, scales; make_weight(s, w, scales);
         Buffer<uint8_t> dw(w.size()), ds(scales.size());
@@ -441,8 +604,13 @@ int gpu_selftest() {
             if (m == 8) eight = us;
         }
         const double bandwidth = double(w.size() + scales.size()) / (one * 1000);
-        std::printf("speed %-18s m8/m1=%.3f (limit 1.5), m1=%.3f GB/s (4090 large-matrix floor 667.8)\n",
-                    s.name, eight / one, bandwidth);
+        times[shape_index] = one; bandwidths[shape_index] = bandwidth; ratios[shape_index] = eight / one;
+        ++shape_index;
+        const bool bandwidth_ok = s.n * s.k < 5000000 || bandwidth >= 715.5;
+        const bool latency_ok = !((s.n == 512 && s.k == 5120) || (s.n == 4096 && s.k == 1280)) || one <= 10;
+        std::printf("speed %-18s m8/m1=%.3f (limit 1.5), m1=%.3f GB/s (4090 floor 715.5), target=%s\n",
+                    s.name, eight / one, bandwidth,
+                    bandwidth_ok && latency_ok && eight / one <= 1.5 ? "PASS" : "MISS");
     }
     for (int64_t k : {32, 96, 544}) {
         const Shape s{33, k, "tail/unaligned"};
@@ -453,6 +621,26 @@ int gpu_selftest() {
         for (int m = 1; m <= 8; ++m)
             gpu_case(s, m, w, scales, dw.p + 1, ds.p, nullptr, 0, m & 1 ? stream.s : nullptr, false);
     }
+    // Dispatch boundaries, paired-row tails, and the capped grid-stride loop on the real kernel.
+    for (const Shape s : {Shape{1025, 96, "paired_tail"}, Shape{2049, 544, "split2_tail"},
+                          Shape{8193, 96, "split1_tail"}, Shape{524289, 96, "grid_stride"}}) {
+        std::vector<uint8_t> w, scales; make_weight(s, w, scales);
+        Buffer<uint8_t> dw(w.size()), ds(scales.size());
+        upload(dw.p, w, stream.s); upload(ds.p, scales, stream.s);
+        if (s.n == 524289) gpu_case(s, 2, w, scales, dw.p, ds.p, nullptr, 0, stream.s, false);
+        else for (int m = 1; m <= 8; ++m)
+            gpu_case(s, m, w, scales, dw.p, ds.p, nullptr, 0, stream.s, false);
+    }
+    constexpr double old_us[] = {19.5, 70.6, 14.3, 69.6, 16.4, 26.5, 25.6, 236.5};
+    constexpr double old_gbps[] = {337, 595, 183, 603, 320, 446, 461, 666};
+    constexpr double old_ratio[] = {1.84, 2.13, 1.64, 2.12, 1.86, 1.94, 1.88, 2.20};
+    std::printf("\nOld: supplied RTX 4090 K1 wrapper measurements. New: q-only on %s.\n", prop.name);
+    std::printf("| Weight | N | K | old m1 us | new m1 us | old GB/s | new GB/s | old m8/m1 | new m8/m1 |\n");
+    std::printf("| --- | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: |\n");
+    for (size_t i = 0; i < times.size(); ++i)
+        std::printf("| %s | %lld | %lld | %.1f | %.3f | %.0f | %.3f | %.2f | %.3f |\n",
+                    SHAPES[i].name, (long long)SHAPES[i].n, (long long)SHAPES[i].k,
+                    old_us[i], times[i], old_gbps[i], bandwidths[i], old_ratio[i], ratios[i]);
     check(cudaMemPoolSetAttribute(pool, cudaMemPoolAttrReleaseThreshold, &old_threshold), "restore pool threshold");
     std::printf("fp8_gemv_parity OK (numerics); speed thresholds require RTX 4090 review\n");
     return 0;
