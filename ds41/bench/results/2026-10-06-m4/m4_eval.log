@@ -1,0 +1,8 @@
+== machine: 32 CPUs, cgroup memory.max 68719476736, 125 GiB
+== 1. byte identity (adapt off): no RAM tier vs RAM tier
+ds41: 854 VRAM expert slots (10.59 GiB)
+ds41: RAM tier 4834 experts (60.0 GiB, locked), filled in 44.1 s
+DUMP_IDENTICAL
+teacher_forced_mean_nll 1.063326 ppl 2.8960 over 199 tokens decode_ms_per_token 356.9 over 200 steps (cpu experts 329.5) vram_expert_slots 854 hit_rate 0.3366 tiers_share vram 0.3366 ram 0.0000 file 0.6634 ssd 0.0911 lookahead warmed 0 useful 0 (0.000) 
+teacher_forced_mean_nll 1.063326 ppl 2.8960 over 199 tokens decode_ms_per_token 552.3 over 200 steps (cpu experts 522.7) vram_expert_slots 854 hit_rate 0.3366 tiers_share vram 0.3366 ram 0.4530 file 0.2104 ssd 0.1796 lookahead warmed 11421 useful 5263 (0.461) 
+== 2. docs, RAM tier auto, lookahead on

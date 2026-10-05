@@ -1,0 +1,5 @@
+GEN both: decode_ms_per_token 417.4 over 129 steps (cpu experts 381.1) vram_expert_slots 854 hit_rate 0.5298 tiers_share vram 0.5298 ram 0.0000 file 0.4702 ssd 0.2000 lookahead warmed 21006 useful 10194 (0.485) 
+GEN none: decode_ms_per_token 431.4 over 129 steps (cpu experts 398.3) vram_expert_slots 854 hit_rate 0.5298 tiers_share vram 0.5298 ram 0.0000 file 0.4702 ssd 0.1967 lookahead warmed 0 useful 0 (0.000) 
+GEN fetch: decode_ms_per_token 425.0 over 129 steps (cpu experts 386.9) vram_expert_slots 854 hit_rate 0.5298 tiers_share vram 0.5298 ram 0.0000 file 0.4702 ssd 0.2225 lookahead warmed 0 useful 0 (0.000) 
+GEN look: decode_ms_per_token 457.1 over 129 steps (cpu experts 423.5) vram_expert_slots 854 hit_rate 0.5298 tiers_share vram 0.5298 ram 0.0000 file 0.4702 ssd 0.1847 lookahead warmed 20966 useful 10008 (0.477) 
+FETCH_DONE
