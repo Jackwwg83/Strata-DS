@@ -13,7 +13,7 @@ namespace {
 
 constexpr int kMaxTokens = 8;  // Fixed interface, not a benchmark-derived limit.
 constexpr int kWarp = 32;
-constexpr int kSelectThreads = 128;
+constexpr int kSelectThreads = kWarp;  // One independent warp CTA per token.
 static_assert(kDim == 5120 && kExperts == 384 && kTopK == 6);
 
 void check(cudaError_t error, const char* where) {
@@ -114,25 +114,23 @@ __global__ void select_top6(const double* __restrict__ scores,
                             const float* __restrict__ bias,
                             int32_t* __restrict__ ids,
                             float* __restrict__ weights) {
-    constexpr int kWarps = kSelectThreads / kWarp;
-    constexpr int kPerThread = kExperts / kSelectThreads;
-    __shared__ double warp_values[kWarps];
-    __shared__ int warp_ids[kWarps];
-    __shared__ int winner;
-    __shared__ double selected[kTopK];
+    constexpr int kPerThread = kExperts / kWarp;
     const int token = blockIdx.x;
-    const int lane = threadIdx.x & 31;
-    const int warp = threadIdx.x >> 5;
+    const int lane = threadIdx.x;
+    // Twelve register-resident candidates per lane, with the original expert
+    // IDs retained for ties. Each token is an independent, full-warp CTA.
     double raw[kPerThread];
     double values[kPerThread];
     int expert_ids[kPerThread];
 #pragma unroll
     for (int j = 0; j < kPerThread; ++j) {
-        const int id = threadIdx.x + j * kSelectThreads;
+        const int id = lane + j * kWarp;
         raw[j] = scores[token * kExperts + id];
         values[j] = raw[j] + double(bias[id]);
         expert_ids[j] = id;
     }
+    double selected = 0.0;
+    double sum = 0.0;
 #pragma unroll
     for (int i = 0; i < kTopK; ++i) {
         double value = -INFINITY;
@@ -145,40 +143,29 @@ __global__ void select_top6(const double* __restrict__ scores,
             }
         }
         warp_best(value, id);
-        if (lane == 0) {
-            warp_values[warp] = value;
-            warp_ids[warp] = id;
-        }
-        __syncthreads();
-        if (warp == 0) {
-            value = lane < kWarps ? warp_values[lane] : -INFINITY;
-            id = lane < kWarps ? warp_ids[lane] : kExperts;
-            warp_best(value, id);
-            if (lane == 0) winner = id;
-        }
-        __syncthreads();
-        const int chosen = winner;
+        const int chosen = __shfl_sync(0xffffffffu, id, 0);
+        double unbiased = 0.0;
 #pragma unroll
         for (int j = 0; j < kPerThread; ++j) {
             if (expert_ids[j] == chosen) {
-                // Exactly one thread owns each expert; unbiased zero scores
-                // are valid and require no ballot or special owner inference.
-                ids[token * kTopK + i] = chosen;
-                selected[i] = raw[j];
+                unbiased = raw[j];
                 values[j] = -INFINITY;
                 expert_ids[j] = kExperts;
             }
         }
-    }
-    __syncthreads();
-    if (threadIdx.x == 0) {
-        double sum = 0.0;
-#pragma unroll
-        for (int i = 0; i < kTopK; ++i) sum += selected[i];
-#pragma unroll
-        for (int i = 0; i < kTopK; ++i) {
-            weights[token * kTopK + i] = float(selected[i] / (sum + 1e-20) * double(kRouteScale));
+        // Broadcast the owner's original score, including zero. Subtracting
+        // the bias from a rounded comparison value would change normalization.
+        unbiased = __shfl_sync(0xffffffffu, unbiased, chosen & (kWarp - 1));
+        if (lane == 0) {
+            ids[token * kTopK + i] = chosen;
+            // Exactly the reference's left-to-right selected-score sum.
+            sum += unbiased;
         }
+        if (lane == i) selected = unbiased;
+    }
+    sum = __shfl_sync(0xffffffffu, sum, 0);
+    if (lane < kTopK) {
+        weights[token * kTopK + lane] = float(selected / (sum + 1e-20) * double(kRouteScale));
     }
 }
 

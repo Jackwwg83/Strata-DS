@@ -13,7 +13,7 @@
 #include <vector>
 
 namespace kd = strata::ds41::kernels::k8_detail;
-constexpr int N = 384, D = 5120, K = 6, T = 128;
+constexpr int N = 384, D = 5120, K = 6, T = 32;
 struct Result { std::array<int, K> ids; std::array<float, K> weights; };
 struct Candidate { double value; int id; };
 static int cases = 0, logits_checked = 0;
@@ -119,18 +119,21 @@ Result simulated_select(const std::vector<float>& logits, const std::vector<floa
             }
             local[thread] = best;
         }
-        std::array<Candidate, 32> warp_winners;
-        warp_winners.fill({-INFINITY, N});
-        for (int warp = 0; warp < T / 32; ++warp) {
-            std::array<Candidate, 32> lanes;
-            std::copy_n(local.begin() + warp * 32, 32, lanes.begin());
-            warp_winners[warp] = warp_reduce(lanes);
-        }
-        const int winner = warp_reduce(warp_winners).id;
+        const int winner = warp_reduce(local).id;
         require(winner < N, "selection produced sentinel");
         result.ids[i] = winner;
-        selected[i] = raw[winner];
-        values[winner] = {-INFINITY, N};
+        std::array<double, T> owner_scores{};
+        for (int lane = 0; lane < T; ++lane) {
+            for (int j = 0; j < N / T; ++j) {
+                const int slot = lane + j * T;
+                if (values[slot].id == winner) {
+                    owner_scores[lane] = raw[slot];
+                    values[slot] = {-INFINITY, N};
+                }
+            }
+        }
+        // Mirror the source-lane shuffle and register in output lane i.
+        selected[i] = owner_scores[winner & (T - 1)];
     }
     double sum = 0;
     for (double s : selected) sum += s;
@@ -143,7 +146,7 @@ Result compare(const std::vector<float>& logits, const std::vector<float>& bias)
     for (int i = 0; i < K; ++i) {
         require(std::isfinite(got.weights[i]), "nonfinite output weight");
         const double error = std::abs(double(got.weights[i]) - ref.weights[i]);
-        require(error <= 1e-5 * std::abs(double(ref.weights[i])), "weight tolerance exceeded");
+        require(error == 0, "CPU normalization bits differ");
         if (ref.weights[i] != 0) max_relative_error = std::max(max_relative_error, error / std::abs(double(ref.weights[i])));
     }
     ++cases;
@@ -191,8 +194,66 @@ int main() {
         for (int e = 0; e < N; e += 17) { logits[e] = 0; b[e] = 0.5f; }
         compare(logits, b);
     }
+    // Every expert visits the top rank: checks all 32 owners and 12 registers.
+    logits.assign(N, 0);
+    b.assign(N, 0);
+    for (int e = 0; e < N; ++e) {
+        b[e] = std::ldexp(1.0f, -26);
+        require(compare(logits, b).ids[0] == e, "winner owner lane/register differs");
+        b[e] = 0;
+    }
+    // All six winners can belong to one lane; removal must update its state.
+    for (int lane = 0; lane < T; ++lane) {
+        logits.assign(N, -1000);
+        b.assign(N, 0);
+        for (int i = 0; i < K; ++i) logits[lane + i * T] = float(100 - i);
+        const auto same_owner = compare(logits, b);
+        for (int i = 0; i < K; ++i)
+            require(same_owner.ids[i] == lane + i * T, "same-lane winner removal differs");
+    }
+    // Bias may dominate or saturate comparisons but never enters normalization.
+    logits.assign(N, -1000);
+    b.assign(N, -std::numeric_limits<float>::infinity());
+    const auto negative_infinity = compare(logits, b);
+    for (int i = 0; i < K; ++i)
+        require(negative_infinity.ids[i] == i && negative_infinity.weights[i] == 0,
+                "negative-infinity ties selected removed sentinel");
+    const std::array<float, 5> bias_edges = {
+        -std::numeric_limits<float>::max(), -1e20f, 0, 1e20f,
+        std::numeric_limits<float>::max()};
+    for (float bias_edge : bias_edges) {
+        b.assign(N, bias_edge);
+        for (int e = 0; e < N; ++e) logits[e] = edges[e % edges.size()];
+        compare(logits, b);
+    }
+    // Carry each original expert's score and bias through random permutations.
+    // Unique scores must preserve rank/weights after mapping IDs back; ties are
+    // independently checked against the new physical expert IDs by the oracle.
+    std::mt19937 shuffle_rng(80207);
+    std::array<int, N> perm;
+    std::iota(perm.begin(), perm.end(), 0);
+    std::vector<float> original_logits(N), original_bias(N), pl(N), pb(N);
+    for (int e = 0; e < N; ++e) original_logits[e] = float(e - N / 2) * 0.125f;
+    const auto unique = compare(original_logits, original_bias);
+    for (int trial = 0; trial < 512; ++trial) {
+        std::shuffle(perm.begin(), perm.end(), shuffle_rng);
+        for (int e = 0; e < N; ++e) {
+            pl[e] = original_logits[perm[e]];
+            pb[e] = original_bias[perm[e]];
+        }
+        const auto shuffled = compare(pl, pb);
+        for (int i = 0; i < K; ++i) {
+            require(perm[shuffled.ids[i]] == unique.ids[i], "permutation changed unique ranking");
+            require(shuffled.weights[i] == unique.weights[i], "permutation changed unique weights");
+        }
+        for (int e = 0; e < N; ++e) {
+            pl[e] = edges[perm[e] % edges.size()];
+            pb[e] = float((perm[e] % 7) - 3) * 0.125f;
+        }
+        compare(pl, pb);
+    }
     std::printf("PASS CPU semantics: %d routing cases, %d bit-exact FP32 logits, max relative weight error %.3g\n", cases, logits_checked, max_relative_error);
-    std::puts("Covers all m=1..8, exact ties, FP32-collapsed near-ties, softplus threshold neighbors, large positive and underflow logits.");
+    std::puts("Covers all m=1..8, exact ties, FP32-collapsed near-ties, softplus threshold neighbors, large positive and underflow logits, all owner lanes/registers, bias extremes and 1,024 permutation cases.");
     std::puts("GPU execution, CUDA libm parity, graph capture/replay, and timings remain untested.");
 }
 
