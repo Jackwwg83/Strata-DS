@@ -14,7 +14,8 @@
 //   cadence; per-block cross-warp reduction over the k splits through shared memory
 //
 // Strata adaptation: one device job per grid.y entry. Input/output Hadamards run in
-// surrounding launches; the main GEMV arithmetic below is unchanged. No cooperative launch.
+// surrounding launches. The two-slot weight ring is independent of the unchanged
+// four-step narrow GEMV fold cadence. No cooperative launch.
 //
 // CFG 0 ("narrow", 512 threads, 2 n-tiles/warp, 16 k-splits) wins at attention-projection sizes;
 // CFG 1 ("wide", 256 threads, 4 n-tiles/warp, 8 k-splits) wins at large-n FFN sizes. MMODE 0 is
@@ -181,9 +182,10 @@ __device__ __forceinline__ void dq8_regs_half(uint32_t a7, uint32_t b7, int s7, 
 // The half-integer instances carry six lane constants for window extraction; without a minimum-blocks bound
 // ptxas spends 81-85 registers on them on sm_86/sm_89 (one 512-thread block per SM instead of two, measured
 // 18-28% slower at attention-projection shapes on the 3090). They are packed into one register (see x_pack) and
-// the bound keeps the compiler at the integer instances' 64
+// the bound keeps the compiler at the integer instances' 64. K10 applies the two-block
+// bound to all narrow instances so a two-slot weight ring can retain two 512-thread CTAs.
 template <int bits, bool c_fp32, int cb, int MMODE, int CFG, bool SMEM_STAGE, bool HALF = false>
-__global__ __launch_bounds__(CFG == 0 ? 512 : 256, HALF && CFG == 0 ? 2 : 1)
+__global__ __launch_bounds__(CFG == 0 ? 512 : 256, CFG == 0 ? 2 : 1)
 void exl3_gemv_kernel(const strata_exl3::GemvJob* jobs)
 {
     // A is already in the Hadamard basis. A null trellis marks an empty slot.
@@ -199,8 +201,9 @@ void exl3_gemv_kernel(const strata_exl3::GemvJob* jobs)
                   "exl3_gemv_kernel supports 2, 3 and 4 bpw, and 1.5, 2.5 and 3.5 bpw with mul1");
     constexpr int WK   = CFG == 0 ? 16 : 8;     // k-split (warps per block)
     constexpr int WNT  = CFG == 0 ? 2 : 4;      // adjacent n-tiles per warp
-    constexpr int PF   = CFG == 0 ? 4 : 2;      // prefetch ring depth
-    constexpr int FOLD = CFG == 0 ? 4 : 2;      // fp16->fp32 fold cadence (divides PF)
+    constexpr int PF   = 2;                     // prefetch ring depth, independent of FOLD
+    constexpr int FOLD = CFG == 0 ? 4 : 2;      // upstream fp16->fp32 fold cadence
+    static_assert(FOLD % PF == 0, "prefetch ring must divide the arithmetic unroll");
     constexpr int THREADS = WK * 32;
     constexpr int ROWS = MMODE == 0 ? 1 : EXL3_GEMV_MAX_M;
     constexpr int COLS = WNT * 16;
@@ -294,10 +297,12 @@ void exl3_gemv_kernel(const strata_exl3::GemvJob* jobs)
         FragC_h ch[WNT][2] = {};
         float2 acc0[WNT][2] = {};
 
-        for (int ib = 0; ib < myn; ib += PF)
+        // Keep the upstream arithmetic unroll/fold boundaries. Ring slots repeat
+        // within each fold group and are refilled before their next use.
+        for (int ib = 0; ib < myn; ib += FOLD)
         {
         #pragma unroll
-        for (int d = 0; d < PF; ++d)
+        for (int d = 0; d < FOLD; ++d)
         {
             const int i = ib + d;
             if (i >= myn) break;
@@ -305,13 +310,13 @@ void exl3_gemv_kernel(const strata_exl3::GemvJob* jobs)
             uint32_t bw[LOADS];
             #pragma unroll
             for (int l = 0; l < LOADS; ++l)
-                bw[l] = pf[d][l];
+                bw[l] = pf[d % PF][l];
 
             if (i + PF < myn)
             {
                 #pragma unroll
                 for (int l = 0; l < LOADS; ++l)
-                    pf[d][l] = ld_b(i + PF, l);
+                    pf[d % PF][l] = ld_b(i + PF, l);
             }
 
             if constexpr (SMEM_STAGE)

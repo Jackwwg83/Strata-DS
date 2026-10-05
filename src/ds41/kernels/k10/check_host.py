@@ -24,6 +24,63 @@ def section(text, start, end):
     return text.split(start, 1)[1].split(end, 1)[0]
 
 
+def upstream_schedule(text):
+    # Normalize only the explicitly reviewed prefetch scheduling changes. All
+    # decode, MMA, fold and reduction code is still compared with pristine
+    # upstream below. This is a source audit, not GPU numerical validation.
+    replacements = [
+        ("    constexpr int PF   = 2;                     // prefetch ring depth, independent of FOLD",
+         "    constexpr int PF   = CFG == 0 ? 4 : 2;      // prefetch ring depth"),
+        ("    constexpr int FOLD = CFG == 0 ? 4 : 2;      // upstream fp16->fp32 fold cadence",
+         "    constexpr int FOLD = CFG == 0 ? 4 : 2;      // fp16->fp32 fold cadence (divides PF)"),
+        ('    static_assert(FOLD % PF == 0, "prefetch ring must divide the arithmetic unroll");\n', ""),
+        ("        // Keep the upstream arithmetic unroll/fold boundaries. Ring slots repeat\n"
+         "        // within each fold group and are refilled before their next use.\n", ""),
+        ("for (int ib = 0; ib < myn; ib += FOLD)", "for (int ib = 0; ib < myn; ib += PF)"),
+        ("for (int d = 0; d < FOLD; ++d)", "for (int d = 0; d < PF; ++d)"),
+        ("bw[l] = pf[d % PF][l];", "bw[l] = pf[d][l];"),
+        ("pf[d % PF][l] = ld_b(i + PF, l);", "pf[d][l] = ld_b(i + PF, l);"),
+    ]
+    for new, old in replacements:
+        assert text.count(new) == 1, new
+        text = text.replace(new, old)
+    return text
+
+
+def prefetch_schedule():
+    def trace(myn, pf, fold):
+        ring = [None] * pf
+        loads = []
+        for d in range(pf):
+            if d < myn:
+                ring[d] = d
+                loads.append(d)
+        consumed, folded = [], []
+        for ib in range(0, myn, fold):
+            for d in range(fold):
+                i = ib + d
+                if i >= myn:
+                    break
+                slot = d % pf
+                # A slot must contain exactly the weight slice to be decoded.
+                assert ring[slot] == i
+                consumed.append(ring[slot])
+                if i + pf < myn:
+                    ring[slot] = i + pf
+                    loads.append(i + pf)
+                if (d + 1) % fold == 0 or i + 1 == myn:
+                    folded.append(i + 1)
+        assert sorted(loads) == list(range(myn))  # no extra, missing or repeated loads
+        return consumed, folded
+
+    # Include zero work, both legal K10 warp chunks (9 and 20), ring tails,
+    # fold tails and larger chunks. Narrow/wide arithmetic order is unchanged.
+    for fold in (4, 2):
+        for myn in range(258):
+            assert trace(myn, 2, fold) == trace(myn, fold, fold)
+    print("PASS prefetch schedule: two-slot ring preserves every consumed slice and fold boundary for 516 tail cases")
+
+
 def provenance():
     with tempfile.TemporaryDirectory(prefix="k10-pristine-") as name:
         tmp = Path(name)
@@ -43,7 +100,7 @@ def provenance():
         assert sorted(changed) == ["quant/exl3_gemv.cu", "quant/exl3_gemv.cuh",
                                    "quant/exl3_gemv_kernel.cuh"]
         old = (restored / "quant/exl3_gemv_kernel.cuh").read_text()
-        new = (VENDOR / "quant/exl3_gemv_kernel.cuh").read_text()
+        new = upstream_schedule((VENDOR / "quant/exl3_gemv_kernel.cuh").read_text())
         for start, end in [
             ("namespace exl3_gemv_ns {", "}  // namespace exl3_gemv_ns"),
             ("    static_assert(HALF", "    auto grid = cooperative_groups::this_grid();"),
@@ -58,7 +115,7 @@ def provenance():
         for rel in manifest:
             assert (restored / rel).read_bytes() == (VENDOR / rel).read_bytes(), rel
         print(f"PASS provenance: {len(manifest)} pristine SHA-256 hashes; reverse/forward patch round trip")
-        print("PASS preservation: GEMV helpers, constants, decode/MMA/fold/reduction core byte-identical")
+        print("PASS preservation: GEMV helpers and arithmetic core byte-identical after explicit schedule normalization")
 
 
 def include_and_scope_checks():
@@ -187,6 +244,7 @@ int main() {
 
 def main():
     provenance()
+    prefetch_schedule()
     include_and_scope_checks()
     indexing()
     scale_rounding()

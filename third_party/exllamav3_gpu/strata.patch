@@ -1,26 +1,24 @@
 --- a/third_party/exllamav3_gpu/quant/exl3_gemv.cu
 +++ b/third_party/exllamav3_gpu/quant/exl3_gemv.cu
-@@ -1,259 +1,17 @@
+@@ -1 +1 @@
 -#include <cuda_fp16.h>
 +// Strata raw-pointer adapter for the upstream small-row GEMV kernel.
- #include "exl3_gemv.cuh"
+@@ -3,5 +2,0 @@
 -
 -#include <c10/cuda/CUDAGuard.h>
 -#include <ATen/cuda/CUDAContext.h>
 -#include <cooperative_groups.h>
 -namespace cg = cooperative_groups;
- #include "../util.h"
- #include "../util.cuh"
- #include "exl3_gemv_kernel.cuh"
+@@ -11,2 +5,0 @@
 -#include "exl3_devctx.cuh"
 -#include <map>
- 
+@@ -14,4 +7 @@
 -/*
 -QTIP-style small-m GEMV path, kernel in exl3_gemv_kernel.cuh. Dispatched from exl3_gemm via
 -exl3_gemv_try_launch when the shape heuristic applies, or forced through the exl3_gemv entry
 -point. Kernel arguments and graph parameter offsets are identical to exl3_gemm_kernel.
 +namespace strata_exl3 {
- 
+@@ -19,11 +9 @@
 -Env: EXL3_GEMV = 0 disables the path, 1/unset = heuristic (default), 2 = use wherever the hard
 -constraints allow (testing).
 -
@@ -33,7 +31,7 @@
 -
 -static int exl3_gemv_env_mode()
 +void gemv_mul1_3bit(const GemvJob* jobs, int count, int max_n, cudaStream_t stream)
- {
+@@ -31,3 +11,4 @@
 -    const char* env = std::getenv("EXL3_GEMV");
 -    if (!env) return 1;
 -    return atoi(env);
@@ -41,8 +39,7 @@
 +    // Ordinary launches let all tokens/slots run without a residency restriction.
 +    exl3_gemv_kernel<3, true, 2, 0, 0, false>
 +        <<<dim3(max_n / 32, count), 512, 0, stream>>>(jobs);
- }
- 
+@@ -36,224 +17 @@
 -// -1 = default per bits, 0 = force shuffle extraction, 1 = force smem staging (testing)
 -static int exl3_gemv_env_smem()
 -{
@@ -270,19 +267,17 @@
 +}  // namespace strata_exl3
 --- a/third_party/exllamav3_gpu/quant/exl3_gemv.cuh
 +++ b/third_party/exllamav3_gpu/quant/exl3_gemv.cuh
-@@ -1,44 +1,23 @@
- #pragma once
- 
+@@ -3 +3 @@
 -#include <ATen/Tensor.h>
 +#include <cuda_fp16.h>
- #include <cuda_runtime.h>
+@@ -4,0 +5 @@
 +#include <cstdint>
- 
+@@ -6,3 +7 @@
 -// QTIP-style small-m GEMV path (see exl3_gemv_kernel.cuh). Launched from exl3_gemm when the
 -// heuristic applies; also exposed directly for testing. Same kernel arguments as
 -// exl3_gemm_kernel, so graph recording/patching is identical.
 +namespace strata_exl3 {
- 
+@@ -10,19 +9,9 @@
 -// Try to dispatch a GEMM call to the GEMV kernel. Returns false (launching nothing) if the
 -// call is not eligible. On success *launched_kernel receives the kernel pointer for graph
 -// recording. `force` bypasses the shape heuristic but not the hard constraints.
@@ -311,13 +306,13 @@
 +    int k;
 +    int n;
 +};
- 
+@@ -30,2 +19,3 @@
 -// Kernel instances for the half-integer bitrates (comp_units/exl3_gemv_half_inst.cu)
 -void* exl3_gemv_select_kernel_half(int bits, bool c_fp32, int mmode, int cfg, bool smem);
 +// K10: 3-bit mul1, narrow configuration, one row per job. max_n sizes grid.x;
 +// each job's n must be a multiple of 128 and no larger than max_n.
 +void gemv_mul1_3bit(const GemvJob* jobs, int count, int max_n, cudaStream_t stream);
- 
+@@ -33,12 +23 @@
 -// Direct entry point (testing): errors if the call is not hard-eligible
 -void exl3_gemv
 -(
@@ -333,31 +328,25 @@
 +}  // namespace strata_exl3
 --- a/third_party/exllamav3_gpu/quant/exl3_gemv_kernel.cuh
 +++ b/third_party/exllamav3_gpu/quant/exl3_gemv_kernel.cuh
-@@ -13,15 +13,14 @@
- // - one m16n8k16 MMA pair per 16x16 weight tile with fp16 accumulation, folded to fp32 on a fixed
- //   cadence; per-block cross-warp reduction over the k splits through shared memory
- //
+@@ -16,3 +16,3 @@
 -// Same launch signature as exl3_gemm_kernel so kernel args and graph parameter patching are
 -// interchangeable. Cooperative launch: one grid.sync after the input Hadamard stage and one before
 -// the output stage, no other cross-block coordination. 2, 3 and 4 bpw.
 +// Strata adaptation: one device job per grid.y entry. Input/output Hadamards run in
-+// surrounding launches; the main GEMV arithmetic below is unchanged. No cooperative launch.
- //
- // CFG 0 ("narrow", 512 threads, 2 n-tiles/warp, 16 k-splits) wins at attention-projection sizes;
- // CFG 1 ("wide", 256 threads, 4 n-tiles/warp, 8 k-splits) wins at large-n FFN sizes. MMODE 0 is
- // the m == 1 fast path, MMODE 1 covers 2 <= m <= 8 with row-guarded fragment loads.
- 
++// surrounding launches. The two-slot weight ring is independent of the unchanged
++// four-step narrow GEMV fold cadence. No cooperative launch.
+@@ -24 +24 @@
 -#include <cooperative_groups.h>
 +#include "exl3_gemv.cuh"
- #include "../ptx.cuh"
- #include "exl3_dq.cuh"
- #include "exl3_kernel_map.cuh"
-@@ -185,8 +184,17 @@
- // the bound keeps the compiler at the integer instances' 64
- template <int bits, bool c_fp32, int cb, int MMODE, int CFG, bool SMEM_STAGE, bool HALF = false>
- __global__ __launch_bounds__(CFG == 0 ? 512 : 256, HALF && CFG == 0 ? 2 : 1)
+@@ -185 +185,2 @@
+-// the bound keeps the compiler at the integer instances' 64
++// the bound keeps the compiler at the integer instances' 64. K10 applies the two-block
++// bound to all narrow instances so a two-slot weight ring can retain two 512-thread CTAs.
+@@ -187,3 +188,12 @@
+-__global__ __launch_bounds__(CFG == 0 ? 512 : 256, HALF && CFG == 0 ? 2 : 1)
 -void exl3_gemv_kernel(EXL3_GEMM_ARGS)
 -{
++__global__ __launch_bounds__(CFG == 0 ? 512 : 256, CFG == 0 ? 2 : 1)
 +void exl3_gemv_kernel(const strata_exl3::GemvJob* jobs)
 +{
 +    // A is already in the Hadamard basis. A null trellis marks an empty slot.
@@ -369,13 +358,13 @@
 +    const int size_m = 1;
 +    const int size_k = job.k;
 +    const int size_n = job.n;
-     static_assert(HALF ? (bits >= 1 && bits <= 3 && cb == 2) : (bits == 2 || bits == 3 || bits == 4),
-                   "exl3_gemv_kernel supports 2, 3 and 4 bpw, and 1.5, 2.5 and 3.5 bpw with mul1");
-     constexpr int WK   = CFG == 0 ? 16 : 8;     // k-split (warps per block)
-@@ -202,27 +210,6 @@
-     constexpr int LOADS = TWO_PER_LOAD ? WNT / 2 : WNT;                       // warp loads per k-slice
-     constexpr int LSTRIDE = TWO_PER_LOAD ? 2 * TWORDS : (TWORDS < 32 ? TWORDS : 32);   // uint32 per load (lanes < LSTRIDE load)
-     static_assert(!TWO_PER_LOAD || WNT % 2 == 0, "two tiles per warp load needs an even tile count per warp");
+@@ -194,2 +204,3 @@
+-    constexpr int PF   = CFG == 0 ? 4 : 2;      // prefetch ring depth
+-    constexpr int FOLD = CFG == 0 ? 4 : 2;      // fp16->fp32 fold cadence (divides PF)
++    constexpr int PF   = 2;                     // prefetch ring depth, independent of FOLD
++    constexpr int FOLD = CFG == 0 ? 4 : 2;      // upstream fp16->fp32 fold cadence
++    static_assert(FOLD % PF == 0, "prefetch ring must divide the arithmetic unroll");
+@@ -205,21 +215,0 @@
 -
 -    auto grid = cooperative_groups::this_grid();
 -
@@ -397,13 +386,21 @@
 -        grid.sync();
 -        A = A_had;
 -    }
- 
-     const int warp = threadIdx.x / 32;
-     const int lane = threadIdx.x % 32;
-@@ -451,32 +438,5 @@
- 
-     #undef XP
- 
+@@ -310 +300,3 @@
+-        for (int ib = 0; ib < myn; ib += PF)
++        // Keep the upstream arithmetic unroll/fold boundaries. Ring slots repeat
++        // within each fold group and are refilled before their next use.
++        for (int ib = 0; ib < myn; ib += FOLD)
+@@ -313 +305 @@
+-        for (int d = 0; d < PF; ++d)
++        for (int d = 0; d < FOLD; ++d)
+@@ -321 +313 @@
+-                bw[l] = pf[d][l];
++                bw[l] = pf[d % PF][l];
+@@ -327 +319 @@
+-                    pf[d][l] = ld_b(i + PF, l);
++                    pf[d % PF][l] = ld_b(i + PF, l);
+@@ -454,29 +446,2 @@
 -    // Output scales and Hadamard transform, same semantics as the inner GEMM epilogue
 -    {
 -        grid.sync();

@@ -22,3 +22,17 @@ Only 3-bit mul1, single-row, narrow GEMV is instantiated.
 recover the unmodified vendor tree; verify against UPSTREAM.sha256. This makes
 the first commit reproducible without relying on an untracked temporary copy.
 The patch itself belongs to the subsequent adaptation commit.
+
+## K10-02 prefetch experiment (2026-10-05)
+
+The narrow kernel now uses a two-slot register prefetch ring, while retaining
+its four-slice unrolled arithmetic group, four-slice FP16-to-FP32 fold,
+16 K-split warps, two N tiles and ordered cross-warp reduction. The narrow
+launch bound permits two 512-thread blocks. No decode/MMA/fold arithmetic,
+Hadamard, workspace, job dispatch or routing logic changes.
+
+`strata.patch` includes this scheduling change and still reverses to all 13
+pristine hashes. `check_host.py` compares the arithmetic core after explicitly
+normalizing only the reviewed scheduling edits, and checks ring contents and
+fold boundaries across zero-work and partial-tail cases. CUDA 12.8 compilation
+passes for sm_86, sm_89 and sm_120; GPU correctness and speed are unmeasured.
