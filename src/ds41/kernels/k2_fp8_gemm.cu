@@ -45,15 +45,16 @@ struct __align__(32) Stage {
     bf16 a[kTileM * kStride];
     bf16 b[kTileN * kStride];
     uint8_t packed_b[kTileN * kTileK];
+    float scales[kTileN / 32];
 };
 
-// The epilogue reuses the stages after a CTA-wide barrier. 76 KiB total,
+// The epilogue reuses the stages after a CTA-wide barrier. 76 KiB + 64 bytes,
 // including both packed-weight staging buffers, fits the 99 KiB task limit.
 union __align__(32) SharedStorage {
     Stage stages[2];
     float output[kWarps * 16 * 16];
 };
-static_assert(sizeof(SharedStorage) == 76 * 1024, "Unexpected shared-memory layout");
+static_assert(sizeof(SharedStorage) == 76 * 1024 + 64, "Unexpected shared-memory layout");
 static_assert(sizeof(SharedStorage) <= 99 * 1024, "K2 shared-memory limit exceeded");
 
 __device__ __forceinline__ void copy_async_16(void* dst, const void* src, bool valid) {
@@ -76,7 +77,7 @@ __device__ __forceinline__ void wait_async() {
 // Select an in-bounds source even for zero-fill copies, avoiding invalid pointer
 // arithmetic for partial output tiles. All destinations and sources are aligned.
 __device__ __forceinline__ void prefetch_stage(
-    Stage& stage, const bf16* activation, const uint8_t* weight,
+    Stage& stage, const bf16* activation, const uint8_t* weight, const uint8_t* scales,
     int64_t row_base, int64_t col_base, int64_t k_base,
     int64_t M, int64_t N, int64_t K) {
     const int a_row = threadIdx.x / 4;
@@ -92,23 +93,36 @@ __device__ __forceinline__ void prefetch_stage(
     const bool valid_b = global_col < N;
     const uint8_t* b_src = weight + (valid_b ? global_col : 0) * K + k_base + b_k;
     copy_async_16(stage.packed_b + b_col * kTileK + b_k, b_src, valid_b);
+    // One scale is shared by 32 consecutive weight columns. Cache it once per
+    // stage instead of recomputing ldexpf in all 512 dequantization threads.
+    if (threadIdx.x < kTileN / 32) {
+        const int64_t scale_col = col_base + threadIdx.x * 32;
+        stage.scales[threadIdx.x] = scale_col < N
+            ? ldexpf(1.0f, int(scales[(scale_col / 32) * (K / 32) + k_base / 32]) - 127)
+            : 1.0f;
+    }
     commit_async();
 }
 
-__device__ __forceinline__ void dequantize_stage(
-    Stage& stage, const uint8_t* scales, int64_t col_base,
-    int64_t k_base, int64_t N, int64_t K) {
-    const int col = threadIdx.x / 2;
-    const int k = (threadIdx.x % 2) * 16;
-    const int64_t global_col = col_base + col;
-    const float scale = global_col < N
-        ? ldexpf(1.0f, int(scales[(global_col / 32) * (K / 32) + k_base / 32]) - 127)
-        : 1.0f;
+__device__ __forceinline__ void dequantize_stage(Stage& stage) {
+    // Consecutive lanes handle four consecutive K elements. The packed loads
+    // and paired BF16 stores are coalesced, rather than one scalar store per
+    // lane at widely separated column offsets. FP8 pairs convert through exact
+    // FP16 representations, then scale in FP32 before the final BF16 rounding.
 #pragma unroll
-    for (int i = 0; i < 16; ++i) {
-        __nv_fp8_e4m3 q;
-        q.__x = stage.packed_b[col * kTileK + k + i];
-        stage.b[col * kStride + k + i] = __float2bfloat16_rn(float(q) * scale);
+    for (int index = threadIdx.x * 4; index < kTileN * kTileK; index += kThreads * 4) {
+        const int col = index / kTileK;
+        const int k = index % kTileK;
+        const unsigned packed = *reinterpret_cast<const unsigned*>(stage.packed_b + index);
+        const float scale = stage.scales[col / 32];
+#pragma unroll
+        for (int pair = 0; pair < 2; ++pair) {
+            __nv_fp8x2_e4m3 q;
+            q.__x = static_cast<unsigned short>(packed >> (pair * 16));
+            const float2 values = static_cast<float2>(q);
+            const __nv_bfloat162 result = __floats2bfloat162_rn(values.x * scale, values.y * scale);
+            *reinterpret_cast<__nv_bfloat162*>(stage.b + col * kStride + k + pair * 2) = result;
+        }
     }
 }
 
@@ -135,11 +149,11 @@ __global__ __launch_bounds__(kThreads) void gemm_two_stage(
     }
 
     if (K > 0) {
-        prefetch_stage(shared.stages[0], activation, weight,
+        prefetch_stage(shared.stages[0], activation, weight, scales,
                        row_base, col_base, 0, M, N, K);
         wait_async();
         __syncthreads();
-        dequantize_stage(shared.stages[0], scales, col_base, 0, N, K);
+        dequantize_stage(shared.stages[0]);
         __syncthreads();
     }
 
@@ -150,7 +164,7 @@ __global__ __launch_bounds__(kThreads) void gemm_two_stage(
         // The previous end-of-iteration barrier releases this alternate stage.
         // Global copies proceed while tensor cores consume the current stage.
         if (have_next)
-            prefetch_stage(shared.stages[next], activation, weight,
+            prefetch_stage(shared.stages[next], activation, weight, scales,
                            row_base, col_base, k_base + kTileK, M, N, K);
         const Stage& stage = shared.stages[current];
 #pragma unroll
@@ -173,7 +187,7 @@ __global__ __launch_bounds__(kThreads) void gemm_two_stage(
         wait_async();
         __syncthreads();
         if (have_next) {
-            dequantize_stage(shared.stages[next], scales, col_base, k_base + kTileK, N, K);
+            dequantize_stage(shared.stages[next]);
             __syncthreads();
         }
         current = next;
