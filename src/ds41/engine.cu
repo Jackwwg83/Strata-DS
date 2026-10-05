@@ -136,6 +136,7 @@ struct Engine::Impl {
     const bf16* cur_index_k = nullptr;
     std::vector<int32_t> cur_topk;     // compressed part, already offset by kWindow
     std::vector<uint8_t> candidates;   // from the candidate source layer, per compressed position
+    std::vector<float> lg;             // logits of the last step
 
     Impl(const std::string& dir, int max_seq_, int threads) : pack(dir), max_seq(max_seq_), cpu_threads(threads) {}
 
@@ -547,7 +548,7 @@ struct Engine::Impl {
         ops::hc_pre(h, pre_mix, final_x);
         ops::rmsnorm(final_x, final_norm, final_x, kDim, kNormEps);
         ops::bf16_linear(final_x, nullptr, head, kDim, kVocab, nullptr, logits);
-        std::vector<float> lg(kVocab);
+        lg.resize(kVocab);
         ck(cudaMemcpy(lg.data(), logits, kVocab * 4, cudaMemcpyDeviceToHost), "logits");
         const int best = (int) (std::max_element(lg.begin(), lg.end()) - lg.begin());
         if (dump) {
@@ -571,5 +572,7 @@ Engine::Engine(const std::string& pack_dir, int max_seq, int cpu_threads)
 Engine::~Engine() = default;
 
 int Engine::step(int token, int pos, StepDump* dump) { return impl_->step(token, pos, dump, timing_); }
+
+const std::vector<float>& Engine::last_logits() const { return impl_->lg; }
 
 }  // namespace strata::ds41

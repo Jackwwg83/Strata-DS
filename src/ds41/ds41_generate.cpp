@@ -7,6 +7,7 @@
 #include "strata/ds41/config.hpp"
 #include "strata/ds41/engine.hpp"
 
+#include <cmath>
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
@@ -57,12 +58,20 @@ int main(int argc, char** argv) {
         const int total = forced.empty() ? (int) prompt.size() + gen : (int) forced.size();
         int next = -1;
         std::vector<int> out;
-        double decode_ms = 0;
-        int decode_steps = 0;
+        double decode_ms = 0, nll_sum = 0;
+        int decode_steps = 0, nll_n = 0;
         for (int pos = 0; pos < total; ++pos) {
             const int tok = !forced.empty() ? forced[pos] : pos < (int) prompt.size() ? prompt[pos] : next;
             next = engine.step(tok, pos, dump ? &sd : nullptr);
             const auto& t = engine.last_timing();
+            if (!forced.empty() && pos + 1 < (int) forced.size()) {    // teacher-forced -log p(next token)
+                const auto& lg = engine.last_logits();
+                double mx = -1e300, se = 0;
+                for (float v : lg) mx = std::max(mx, (double) v);
+                for (float v : lg) se += std::exp((double) v - mx);
+                nll_sum += mx + std::log(se) - lg[forced[pos + 1]];
+                ++nll_n;
+            }
             if (pos >= (int) prompt.size() - 1) { decode_ms += t.total_ms; ++decode_steps; }
             if (pos >= (int) prompt.size() - 1 && forced.empty()) out.push_back(next);
             std::fprintf(stderr, "pos %d tok %d -> %d  total %.1f ms (cpu experts %.1f, engram %.1f, gpu+sync %.1f)\n",
@@ -80,6 +89,8 @@ int main(int argc, char** argv) {
         if (dump) std::fclose(dump);
         std::printf("generated:");
         for (int v : out) std::printf(" %d", v);
+        if (nll_n) std::printf("\nteacher_forced_mean_nll %.6f ppl %.4f over %d tokens", nll_sum / nll_n,
+                               std::exp(nll_sum / nll_n), nll_n);
         std::printf("\ndecode_ms_per_token %.1f over %d steps\n", decode_steps ? decode_ms / decode_steps : 0.0,
                     decode_steps);
     } catch (const std::exception& ex) {

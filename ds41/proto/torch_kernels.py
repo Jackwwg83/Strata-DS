@@ -7,9 +7,14 @@ GEMMs and the attention differs from the tiled kernels, so results match to roun
 bit. tests/test_torch_kernels.py checks the rounding rules on CPU; on a GPU with TileLang,
 `compare_with_tilelang()` measures the difference against the real kernels.
 """
+import os
+
 import torch
 
 FP8_MAX = 448.0
+# DS41_TK_FP32_GEMM=1 accumulates the FP8 GEMM in fp32 instead of a bf16 GEMM: same math, another summation
+# order. Used to measure how far two equally valid implementations drift apart (the engine comparison baseline).
+FP32_GEMM = os.environ.get("DS41_TK_FP32_GEMM") == "1"
 FP4_MAX = 6.0
 
 
@@ -81,7 +86,10 @@ def fp8_gemm(a, a_s, b, b_s, scale_dtype=torch.float32, block_size=128):
     n = b.size(0)
     a_deq = (a.float().view(m, k // block_size, block_size) * a_s.float().view(m, -1, 1)).view(m, k)
     b_deq = b.float() * _expand_block_scale(b_s, n, k, block_size)
-    c = a_deq.to(torch.bfloat16) @ b_deq.to(torch.bfloat16).t()
+    if FP32_GEMM:
+        c = (a_deq @ b_deq.t()).to(torch.bfloat16)
+    else:
+        c = a_deq.to(torch.bfloat16) @ b_deq.to(torch.bfloat16).t()
     return c.view(*a.shape[:-1], n).to(torch.get_default_dtype())
 
 

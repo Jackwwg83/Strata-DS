@@ -33,6 +33,9 @@ public:
     /// With `dump` non-null, fills it for this step.
     int step(int token, int pos, StepDump* dump = nullptr);
 
+    /// FP32 logits of the last step (all 129280)
+    const std::vector<float>& last_logits() const;
+
     struct Timing { double gpu_ms = 0, cpu_experts_ms = 0, engram_ms = 0, total_ms = 0; };
     const Timing& last_timing() const { return timing_; }
 
