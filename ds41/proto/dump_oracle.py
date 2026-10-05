@@ -8,7 +8,8 @@ Usage:
 
 Writes oracle/<id>.npz with:
   ids        int32 [T]        prompt ids followed by the greedy continuation (the fed tokens)
-  hidden     float16 [H, 40, 4, 5120]   the hc stream after each block, for the first H fed tokens
+  hidden     uint16 [H, 40, 4, 5120]    bf16 bits of the hc stream after each block, for the first H fed tokens
+  dbg        uint16 [H, 2, 5 parts]     layers 1-2: block input, attn input, attn output, ffn input, ffn output
   logits_top int32 [T, 8], logits_val float32 [T, 8]  top 8 of the last-position logits
   routes     int16 [T, 40, 6], weights float32 [T, 40, 6]
 """
@@ -24,15 +25,28 @@ import ds41_proto as P
 
 @torch.inference_mode()
 def run(model, ids_prompt, gen_tokens, hidden_tokens):
-    hidden = []
+    hidden, dbg = [], []
     hooks = []
     cur = {}
 
     for i, layer in enumerate(model.layers):
         def hook(m, inp, out, i=i):
-            cur.setdefault("h", {})[i] = out[0][0, -1].float().cpu().numpy()   # [4, 5120] of the last token
+            cur.setdefault("h", {})[i] = out[0][0, -1].contiguous().view(torch.int16).cpu().numpy().view(np.uint16)
             return None
         hooks.append(layer.register_forward_hook(hook))
+        if i in (1, 2):
+            def bits(t):
+                return t[0, -1].contiguous().view(torch.int16).cpu().numpy().view(np.uint16).reshape(-1)
+
+            def pre_block(m, args, i=i):
+                cur.setdefault("dbg", {})[(i, 0)] = bits(args[0])
+            def attn_hook(m, args, out, i=i):
+                cur["dbg"][(i, 1)] = bits(args[0]); cur["dbg"][(i, 2)] = bits(out)
+            def ffn_hook(m, args, out, i=i):
+                cur["dbg"][(i, 3)] = bits(args[0]); cur["dbg"][(i, 4)] = bits(out)
+            hooks.append(layer.register_forward_pre_hook(pre_block))
+            hooks.append(layer.attn.register_forward_hook(attn_hook))
+            hooks.append(layer.ffn.register_forward_hook(ffn_hook))
 
     fed, tops, vals, routes, weights = [], [], [], [], []
     nxt = None
@@ -48,13 +62,14 @@ def run(model, ids_prompt, gen_tokens, hidden_tokens):
         tops.append(li.cpu().numpy().astype(np.int32))
         vals.append(lv.cpu().numpy())
         if pos < hidden_tokens:
-            hidden.append(np.stack([cur["h"][i] for i in range(len(model.layers))]).astype(np.float16))
+            hidden.append(np.stack([cur["h"][i] for i in range(len(model.layers))]))
+            dbg.append(np.concatenate([cur["dbg"][(l, k)] for l in (1, 2) for k in range(5)]))
         r, w = P.STATE["routes"].stacked()
         routes.append(r[0])
         weights.append(w[0].astype(np.float32))
     for h in hooks:
         h.remove()
-    return {"ids": np.array(fed, np.int32), "hidden": np.stack(hidden),
+    return {"ids": np.array(fed, np.int32), "hidden": np.stack(hidden), "dbg": np.stack(dbg),
             "logits_top": np.stack(tops), "logits_val": np.stack(vals),
             "routes": np.stack(routes).astype(np.int16), "weights": np.stack(weights)}
 

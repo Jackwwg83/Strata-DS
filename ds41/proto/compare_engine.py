@@ -52,7 +52,8 @@ def main():
         if s["tok"] != int(z["ids"][i]):
             raise SystemExit(f"step {i}: engine fed {s['tok']}, oracle fed {z['ids'][i]}: run with --force-ids")
         if i < len(z["hidden"]):
-            ref = z["hidden"][i].astype(np.float32)
+            ref = z["hidden"][i]
+            ref = (ref.astype(np.uint32) << 16).view(np.float32) if ref.dtype == np.uint16 else ref.astype(np.float32)
             for l in range(L):
                 per_layer[i, l] = np.linalg.norm(s["hidden"][l] - ref[l]) / max(np.linalg.norm(ref[l]), 1e-30)
         for l in range(L):

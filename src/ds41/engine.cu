@@ -19,6 +19,7 @@
 #include <chrono>
 #include <cmath>
 #include <cstdio>
+#include <cstdlib>
 #include <cstring>
 #include <numeric>
 #include <stdexcept>
@@ -120,6 +121,15 @@ struct Engine::Impl {
     uint16_t* x_half_dev;
     int32_t* idx_dev;
     uint8_t *eng_w_dev, *eng_s_dev;
+
+    // DS41_DEBUG=<file>: per step, the intermediates of layers 1 and 2 (bf16 bits), for bisecting a mismatch
+    std::FILE* dbg = nullptr;
+    void dbg_write(const bf16* dev, int n) {
+        if (!dbg) return;
+        std::vector<uint16_t> b(n);
+        ck(cudaMemcpy(b.data(), dev, (size_t) n * 2, cudaMemcpyDeviceToHost), "debug dump");
+        std::fwrite(b.data(), 2, n, dbg);
+    }
 
     // shared attention state for the current token (SharedAttentionRuntime)
     const bf16* cur_comp = nullptr;
@@ -264,6 +274,7 @@ struct Engine::Impl {
         eng_w_dev = dalloc<uint8_t>(24 * 256);
         eng_s_dev = dalloc<uint8_t>(24 * 8);
         history.reserve(max_seq);
+        if (const char* p = std::getenv("DS41_DEBUG")) dbg = std::fopen(p, "wb");
     }
 
     void register_cpu_experts(int l) {
@@ -510,17 +521,23 @@ struct Engine::Impl {
                 engram(l, eng_i++, pos);
                 tm.engram_ms += now_ms() - t0;
             }
+            const bool dbg_layer = dbg && (l == 1 || l == 2);
+            if (dbg_layer) dbg_write(h, kHc * kDim);                    // block input (after engram)
             // attention sub-block: h -> h2
             ops::hc_mixes(h, y.hc_attn_fn, y.hc_attn_scale, y.hc_attn_base, attn_pre, attn_post, attn_comb, mix_scratch);
             ops::hc_pre(h, pre_mix, xa);
             ops::rmsnorm(xa, y.attn_norm, xa, kDim, kNormEps);
+            if (dbg_layer) dbg_write(xa, kDim);                         // attention input
             attention(l, pos);
+            if (dbg_layer) dbg_write(attn_out, kDim);                   // attention output
             ops::hc_post(attn_out, h, attn_post, attn_comb, h2);
             // ffn sub-block: h2 -> h
             ops::hc_mixes(h2, y.hc_ffn_fn, y.hc_ffn_scale, y.hc_ffn_base, ffn_pre, ffn_post, ffn_comb, mix_scratch);
             ops::hc_pre(h2, attn_pre, xf);
             ops::rmsnorm(xf, y.ffn_norm, xf, kDim, kNormEps);
+            if (dbg_layer) dbg_write(xf, kDim);                         // ffn input
             moe(l, dump, tm);
+            if (dbg_layer) dbg_write(ffn_out, kDim);                    // ffn output
             ops::hc_post(ffn_out, h2, ffn_post, ffn_comb, h);
             ck(cudaMemcpy(pre_mix, ffn_pre, kHc * 4, cudaMemcpyDeviceToDevice), "pre_mix");
             if (dump)
