@@ -21,7 +21,7 @@ void exl3_moe_decode(const __half* x, int m, const int32_t* sel, const float* w,
         throw std::invalid_argument("K10: workspace must be 16-byte aligned");
     const k10::Workspace ws(workspace, slots);
 
-    k10::input_had<<<dim3(2 * slots, k10::H / 128), 32, 0, stream>>>
+    k10::input_had<<<dim3(slots, k10::H / 128), 32, 0, stream>>>
         (x, sel, topk, experts, ws.input, ws.gu, ws.jobs);
     strata_exl3::gemv_mul1_3bit(ws.jobs, 2 * slots, k10::F, stream);
     k10::activate_down_had<<<dim3(slots, k10::F / 128), 32, 0, stream>>>

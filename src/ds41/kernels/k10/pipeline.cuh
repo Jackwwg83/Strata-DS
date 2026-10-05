@@ -44,25 +44,75 @@ __device__ inline void check_proj(const Exl3Proj& p, int k, int n) {
     assert(p.trellis && p.suh && p.svh);
 }
 
-// Upstream had_*_r_128_inner uses blockIdx.y for scale indexing. Keep y as the
-// 128-element chunk, pass the FULL scale vector, and offset only input/output.
+// This is had_hf_r_128_inner<true, false> with its load hoisted to the
+// caller. The half4 is passed by value so the two suh vectors remain separate.
+// Preserve upstream FP16 pre-multiply, float butterfly order, shuffle helper,
+// and FP32 normalization followed by round-to-nearest FP16 conversion.
+__device__ inline void input_had_preloaded(half4 v, half* output_ptr,
+                                           const half* scale, const float r_scale) {
+
+    int t = threadIdx.x & 31;
+
+    // Pre scale
+    {
+        int i = blockIdx.y * 32 + t;
+        half4 scales = ((half4*) scale)[i];
+        v.x = __hmul2(v.x, scales.x);
+        v.y = __hmul2(v.y, scales.y);
+    }
+
+    // 4 element had
+    float v0 = __half2float(__low2half(v.x));
+    float v1 = __half2float(__high2half(v.x));
+    float v2 = __half2float(__low2half(v.y));
+    float v3 = __half2float(__high2half(v.y));
+    float s0 = v0 + v1;
+    float d0 = v0 - v1;
+    float s1 = v2 + v3;
+    float d1 = v2 - v3;
+    float h0 = s0 + s1;
+    float h1 = d0 + d1;
+    float h2 = s0 - s1;
+    float h3 = d0 - d1;
+
+    // 32 element had, warp shuffle
+    shuffle_had_f4x32(h0, h1, h2, h3, t);
+    v.x = __floats2half2_rn(h0 * r_scale, h1 * r_scale);
+    v.y = __floats2half2_rn(h2 * r_scale, h3 * r_scale);
+
+    // Store
+    ((half4*) output_ptr)[t] = v;
+}
+
+// One warp owns both projections of a slot/chunk. Load x once, but transform
+// it separately with W1/W3 suh: their signs/scales need not agree. blockIdx.y
+// keeps the upstream 128-element scale index; workspace and job IDs are unchanged.
 __global__ void input_had(const half* x, const int32_t* sel, int topk,
                           const Exl3Expert* experts, half* input, float* gu, Job* jobs) {
-    const int job = blockIdx.x;
-    const int slot = job / 2;
+    const int slot = blockIdx.x;
+    const int job = 2 * slot;
     const int id = sel[slot];
     const int off = blockIdx.y * 128;
     if (id < 0) {
-        if (off == 0 && threadIdx.x == 0) jobs[job] = Job{};
+        if (off == 0 && threadIdx.x == 0) {
+            jobs[job] = Job{};
+            jobs[job + 1] = Job{};
+        }
         return;
     }
-    const Exl3Proj p = (job & 1) ? experts[id].w3 : experts[id].w1;
-    check_proj(p, H, F);
-    half* a = input + size_t(job) * H;
-    if (off == 0 && threadIdx.x == 0)
-        jobs[job] = Job{a, p.trellis, gu + size_t(job) * F, H, F};
-    had_hf_r_128_inner<true, false>(x + size_t(slot / topk) * H + off,
-                                   a + off, p.suh, HAD_SCALE);
+    const Exl3Proj gate = experts[id].w1;
+    const Exl3Proj up = experts[id].w3;
+    check_proj(gate, H, F);
+    check_proj(up, H, F);
+    half* a_gate = input + size_t(job) * H;
+    half* a_up = input + size_t(job + 1) * H;
+    if (off == 0 && threadIdx.x == 0) {
+        jobs[job] = Job{a_gate, gate.trellis, gu + size_t(job) * F, H, F};
+        jobs[job + 1] = Job{a_up, up.trellis, gu + size_t(job + 1) * F, H, F};
+    }
+    const half4 v = reinterpret_cast<const half4*>(x + size_t(slot / topk) * H + off)[threadIdx.x];
+    input_had_preloaded(v, a_gate + off, gate.suh, HAD_SCALE);
+    input_had_preloaded(v, a_up + off, up.suh, HAD_SCALE);
 }
 
 __device__ inline float round_pow2(float a) {
