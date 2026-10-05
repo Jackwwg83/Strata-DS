@@ -1,6 +1,7 @@
 // Fused tensor-core sparse attention: 16 heads share a 64-row KV tile.
-// FP32 online softmax carries the output in registers between KV tiles; only
-// the current (unnormalized) probability tile is rounded to BF16 for PV.
+// Four independent 128-wide output groups expose single-query parallelism
+// without global temporary storage. FP32 online softmax carries the output
+// between KV tiles; only the current probability tile is rounded to BF16.
 #include "strata/ds41/kernels/k3_sparse_attn.hpp"
 
 #include <mma.h>
@@ -16,13 +17,14 @@ namespace wmma = nvcuda::wmma;
 constexpr int kHeads = 64;
 constexpr int kDim = 512;
 constexpr int kWindow = 128;
+constexpr int kOutputDim = 128;
 constexpr int kHeadTile = 16;
 constexpr int kRows = 64;
 constexpr int kStride = kDim + 8;
 constexpr int kProbStride = kRows + 8;
 constexpr int kWarps = 8;
 constexpr int kThreads = kWarps * 32;
-constexpr int kOutputsPerWarp = kDim / (16 * kWarps);
+constexpr int kOutputsPerWarp = kOutputDim / (16 * kWarps);
 
 struct __align__(32) TileStorage {
     bf16 q[kHeadTile * kStride];
@@ -44,8 +46,9 @@ __device__ __forceinline__ const bf16* kv_row(const bf16* window, const bf16* co
                        : comp + static_cast<size_t>(j - kWindow) * kDim;
 }
 
-// A block handles one query and 16 heads. Loading each selected KV row once
-// serves both QK and PV for every head in the block. There is no global score
+// A block handles one query, 16 heads, and 128 output dimensions. Loading
+// each selected KV row serves both QK and PV for every head in the block.
+// The four output groups repeat QK to trade compute for occupancy. No global score
 // matrix, temporary allocation, inter-kernel softmax, or default-stream work.
 __global__ void fused_online(const bf16* __restrict__ q, const bf16* __restrict__ window,
                               const bf16* __restrict__ comp, const int32_t* __restrict__ idx,
@@ -55,7 +58,8 @@ __global__ void fused_online(const bf16* __restrict__ q, const bf16* __restrict_
     TileStorage& tile = *reinterpret_cast<TileStorage*>(shared);
     const int warp = threadIdx.x >> 5;
     const int lane = threadIdx.x & 31;
-    const int query = blockIdx.y;
+    const int query = blockIdx.z;
+    const int output_dim = blockIdx.y * kOutputDim;
     const int head = blockIdx.x * kHeadTile;
     const bf16* qbase = q + (static_cast<size_t>(query) * kHeads + head) * kDim;
     const int32_t* indices = idx + static_cast<size_t>(query) * n_idx;
@@ -156,7 +160,7 @@ __global__ void fused_online(const bf16* __restrict__ q, const bf16* __restrict_
             wmma::load_matrix_sync(p, tile.p + r, kProbStride);
 #pragma unroll
             for (int v = 0; v < kOutputsPerWarp; ++v) {
-                const int d = (v * kWarps + warp) * 16;
+                const int d = output_dim + (v * kWarps + warp) * 16;
                 wmma::load_matrix_sync(value, tile.kv + r * kStride + d, kStride);
                 wmma::mma_sync(out[v], p, value, out[v]);
             }
@@ -171,7 +175,7 @@ __global__ void fused_online(const bf16* __restrict__ q, const bf16* __restrict_
         __syncwarp();
         for (int i = lane; i < 16 * 16; i += 32) {
             const int h = i / 16;
-            const int d = (v * kWarps + warp) * 16 + i % 16;
+            const int d = output_dim + (v * kWarps + warp) * 16 + i % 16;
             const float denom = tile.sum[h] + expf(sink[head + h] - tile.maximum[h]);
             output[(static_cast<size_t>(query) * kHeads + head + h) * kDim + d] =
                 __float2bfloat16_rn(stage[i] / denom);
@@ -194,7 +198,7 @@ void sparse_attn_decode(const __nv_bfloat16* q, const __nv_bfloat16* window, con
     if (m <= 0) return;
     check_cuda(cudaFuncSetAttribute(fused_online, cudaFuncAttributeMaxDynamicSharedMemorySize,
                                    sizeof(TileStorage)), "opt in shared memory");
-    fused_online<<<dim3(kHeads / kHeadTile, m), kThreads, sizeof(TileStorage), stream>>>(
+    fused_online<<<dim3(kHeads / kHeadTile, kDim / kOutputDim, m), kThreads, sizeof(TileStorage), stream>>>(
         q, window, comp, idx, n_idx, sink, scale, o);
 }
 }  // namespace strata::ds41::kernels
