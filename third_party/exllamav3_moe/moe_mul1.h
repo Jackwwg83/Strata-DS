@@ -1,6 +1,9 @@
 #pragma once
 
+#include "torch_shim.h"
+#ifdef EXL3_MOE_WITH_TORCH
 #include <ATen/Tensor.h>
+#endif
 #include <cstdint>
 #include <vector>
 
@@ -34,8 +37,10 @@ struct MoeCpuLayer
     std::vector<MoeCpuMatrix> gates;
     std::vector<MoeCpuMatrix> ups;
     std::vector<MoeCpuMatrix> downs;
+#ifdef EXL3_MOE_WITH_TORCH
     // Tensor references keeping the CPU weight storage alive
     std::vector<at::Tensor> refs;
+#endif
     int num_experts;
     int hidden_size;      // k of gate/up, n of down (unpadded handling is the caller's problem)
     int interm_size;      // n of gate/up, k of down
@@ -43,6 +48,7 @@ struct MoeCpuLayer
     float act_limit;      // swiglu_oai clamp
 };
 
+#ifdef EXL3_MOE_WITH_TORCH
 // Register a layer: per-expert tensor lists (CPU, contiguous). Returns a handle.
 int64_t exl3_moe_cpu_make_layer
 (
@@ -63,8 +69,35 @@ int64_t exl3_moe_cpu_make_layer
     int64_t swizzled        // caller repacked trellis tensors band-contiguous (K8 exempt)
 );
 
+#endif
+
+// Strata-DS: register a layer from raw pointers (no PyTorch). One descriptor per expert and projection;
+// gates may be null for gateless experts. The caller keeps the weight memory alive and unchanged until
+// exl3_moe_cpu_free_layer. trellis is [k_tiles, n_tiles, tile_w] uint16; suh has k halves, svh n halves.
+struct MoeCpuMatrixDesc
+{
+    const uint16_t* trellis;
+    const at::Half* suh;
+    const at::Half* svh;
+    int k_tiles;
+    int n_tiles;
+    int tile_w;
+};
+
+int64_t exl3_moe_cpu_make_layer_raw
+(
+    const MoeCpuMatrixDesc* gates,
+    const MoeCpuMatrixDesc* ups,
+    const MoeCpuMatrixDesc* downs,
+    int num_experts,
+    int activation,
+    float act_limit,
+    int swizzled
+);
+
 void exl3_moe_cpu_free_layer(int64_t handle);
 
+#ifdef EXL3_MOE_WITH_TORCH
 // Run the routed experts for one forward:
 //   x:        [m, hidden] fp16, CPU
 //   selected: [m, top_k] int64, CPU (global expert ids)
@@ -82,6 +115,8 @@ void exl3_moe_cpu_forward
     at::Tensor& out,
     int64_t num_threads
 );
+
+#endif
 
 // Raw-pointer variant used by the persistent worker (moe_handoff.cu): same computation as
 // exl3_moe_cpu_forward, expert selection as int32, buffers caller-owned

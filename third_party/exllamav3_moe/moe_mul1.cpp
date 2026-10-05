@@ -1,7 +1,9 @@
 #if (defined(__x86_64__) || defined(__i386__) || defined(_M_X64) || defined(_M_IX86))
 #include "moe_mul1.h"
+#ifdef EXL3_MOE_WITH_TORCH
 #include <c10/util/Half.h>
 #include <torch/extension.h>
+#endif
 
 #include <algorithm>
 #include <array>
@@ -2606,6 +2608,7 @@ bool exl3_moe_cpu_has_avx512_bw() { return g_isa >= Isa::Bw; }
 bool exl3_moe_cpu_has_avx512_vnni() { return g_isa >= Isa::Vnni; }
 bool exl3_moe_cpu_has_avx512_vbmi() { return g_isa == Isa::Vbmi; }
 
+#ifdef EXL3_MOE_WITH_TORCH
 static MoeCpuMatrix make_matrix
 (
     const at::Tensor& trellis,
@@ -2691,6 +2694,63 @@ int64_t exl3_moe_cpu_make_layer
     TORCH_CHECK(layer->downs[0].k == layer->interm_size && layer->downs[0].n == layer->hidden_size,
                 "expert shape mismatch");
 
+    std::lock_guard<std::mutex> lock(g_layers_mutex);
+    g_layers.push_back(layer);
+    return static_cast<int64_t>(g_layers.size() - 1);
+}
+
+#endif
+
+// Strata-DS: the same checks as make_matrix, from a raw descriptor
+static MoeCpuMatrix make_matrix_raw(const MoeCpuMatrixDesc& d, bool swizzled)
+{
+    TORCH_CHECK(d.trellis && d.suh && d.svh, "null weight pointer");
+    MoeCpuMatrix m;
+    m.trellis = d.trellis;
+    m.suh = d.suh;
+    m.svh = d.svh;
+    m.bias = nullptr;
+    m.k = d.k_tiles * 16;
+    m.n = d.n_tiles * 16;
+    const int tile_w = d.tile_w;
+    m.bits = tile_w / 16;
+    m.hb = tile_w % 16 == 8 ? 1 : 0;
+    TORCH_CHECK(tile_w % 16 == 0 || (m.hb && m.bits <= 3), "unsupported trellis tile width ", tile_w);
+    m.swz = swizzled && m.bits != 8 ? 1 : 0;
+    TORCH_CHECK(m.bits >= 1 && m.bits <= 8, "CPU MoE requires K in [1, 8]");
+    TORCH_CHECK(m.k % 128 == 0 && m.n % 128 == 0, "dims must be divisible by 128");
+    TORCH_CHECK(m.k <= 8192, "k too large for i32 accumulation");
+    return m;
+}
+
+int64_t exl3_moe_cpu_make_layer_raw
+(
+    const MoeCpuMatrixDesc* gates,
+    const MoeCpuMatrixDesc* ups,
+    const MoeCpuMatrixDesc* downs,
+    int num_experts,
+    int activation,
+    float act_limit,
+    int swizzled
+)
+{
+    const bool gated = gates != nullptr;
+    TORCH_CHECK(num_experts > 0 && ups && downs, "empty layer");
+    TORCH_CHECK(gated ? (activation == 0 || activation == 1 || activation == 3) : activation == 2, "gated experts take silu/gelu/swiglu_oai, gateless take relu2");
+    auto* layer = new MoeCpuLayer;
+    layer->num_experts = num_experts;
+    layer->activation = activation;
+    layer->act_limit = act_limit;
+    for (int e = 0; e < num_experts; ++e)
+    {
+        if (gated) layer->gates.push_back(make_matrix_raw(gates[e], swizzled != 0));
+        layer->ups.push_back(make_matrix_raw(ups[e], swizzled != 0));
+        layer->downs.push_back(make_matrix_raw(downs[e], swizzled != 0));
+    }
+    layer->hidden_size = layer->ups[0].k;
+    layer->interm_size = layer->ups[0].n;
+    TORCH_CHECK(layer->downs[0].k == layer->interm_size && layer->downs[0].n == layer->hidden_size,
+                "expert shape mismatch");
     std::lock_guard<std::mutex> lock(g_layers_mutex);
     g_layers.push_back(layer);
     return static_cast<int64_t>(g_layers.size() - 1);
@@ -2875,6 +2935,7 @@ void exl3_moe_cpu_forward_raw(
     }
 }
 
+#ifdef EXL3_MOE_WITH_TORCH
 void exl3_moe_cpu_forward
 (
     int64_t handle,
@@ -2916,9 +2977,13 @@ void exl3_moe_cpu_forward
     );
 }
 
+#endif
+
 #else  // !x86: EXL3_AARCH64_STUB — CPU MoE offload kernels are AVX-only; stubbed on this architecture
 #include "moe_mul1.h"
+#ifdef EXL3_MOE_WITH_TORCH
 #include <torch/extension.h>
+#endif
 #define NO_MOE_CPU() TORCH_CHECK(false, "CPU MoE offload (moe_mul1) is not available on this CPU architecture (x86 AVX2/AVX-512 only)")
 void exl3_moe_cpu_set_prof(bool) {}
 void exl3_moe_cpu_pool_prime(int) {}
@@ -2928,13 +2993,18 @@ bool exl3_moe_cpu_has_avx2() { return false; }
 bool exl3_moe_cpu_has_avx512_bw() { return false; }
 bool exl3_moe_cpu_has_avx512_vnni() { return false; }
 bool exl3_moe_cpu_has_avx512_vbmi() { return false; }
+#ifdef EXL3_MOE_WITH_TORCH
 int64_t exl3_moe_cpu_make_layer(
     const std::vector<at::Tensor>&, const std::vector<at::Tensor>&, const std::vector<at::Tensor>&,
     const std::vector<at::Tensor>&, const std::vector<at::Tensor>&, const std::vector<at::Tensor>&,
     const std::vector<at::Tensor>&, const std::vector<at::Tensor>&, const std::vector<at::Tensor>&,
     const std::vector<at::Tensor>&, const std::vector<at::Tensor>&, const std::vector<at::Tensor>&,
     int64_t, double, int64_t) { NO_MOE_CPU(); return 0; }
+#endif
+int64_t exl3_moe_cpu_make_layer_raw(const MoeCpuMatrixDesc*, const MoeCpuMatrixDesc*, const MoeCpuMatrixDesc*, int, int, float, int) { NO_MOE_CPU(); return 0; }
 void exl3_moe_cpu_free_layer(int64_t) {}
 void exl3_moe_cpu_forward_raw(int64_t, const at::Half*, const int32_t*, const at::Half*, float*, int, int, int) { NO_MOE_CPU(); }
+#ifdef EXL3_MOE_WITH_TORCH
 void exl3_moe_cpu_forward(int64_t, const at::Tensor&, const at::Tensor&, const at::Tensor&, at::Tensor&, int64_t) { NO_MOE_CPU(); }
+#endif
 #endif
