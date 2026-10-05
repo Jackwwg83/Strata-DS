@@ -22,3 +22,18 @@ Only 3-bit mul1, single-row, narrow GEMV is instantiated.
 recover the unmodified vendor tree; verify against UPSTREAM.sha256. This makes
 the first commit reproducible without relying on an untracked temporary copy.
 The patch itself belongs to the subsequent adaptation commit.
+
+## K10-04 asynchronous packed-word adaptation
+
+The K10 raw-pointer adapter enables a guarded, warp-private double buffer of
+four raw K slices using four-byte `cp.async` copies. Each lane reads its own
+shared words before the original shuffle/decoder/MMA path. The four-slice FP16
+fold cadence, reduction and all activation/Hadamard paths are unchanged.
+The new flag defaults off for other configurations. The complete adaptation
+is recorded in `strata.patch`; reversing it still restores every upstream hash.
+
+`src/ds41/kernels/k10/check_host.py` checks provenance, exact allowed scheduling
+edits, mutation-sensitive arithmetic preservation and the actual C++ schedule
+under eager and delayed symbolic copy completion. The manifest and scripts are
+CPU validation tools, not kernel runtime dependencies. Compilation and source
+checks do not establish GPU numerical parity, race safety or speed.

@@ -14,6 +14,8 @@ import tempfile
 
 import numpy as np
 
+from check_async import normalized_kernel, preservation_and_mutations, native_schedule
+
 ROOT = Path(__file__).resolve().parents[4]
 VENDOR = ROOT / "third_party/exllamav3_gpu"
 CU = ROOT / "src/ds41/kernels/k10_exl3_moe.cu"
@@ -43,7 +45,7 @@ def provenance():
         assert sorted(changed) == ["quant/exl3_gemv.cu", "quant/exl3_gemv.cuh",
                                    "quant/exl3_gemv_kernel.cuh"]
         old = (restored / "quant/exl3_gemv_kernel.cuh").read_text()
-        new = (VENDOR / "quant/exl3_gemv_kernel.cuh").read_text()
+        new = normalized_kernel((VENDOR / "quant/exl3_gemv_kernel.cuh").read_text())
         for start, end in [
             ("namespace exl3_gemv_ns {", "}  // namespace exl3_gemv_ns"),
             ("    static_assert(HALF", "    auto grid = cooperative_groups::this_grid();"),
@@ -58,7 +60,7 @@ def provenance():
         for rel in manifest:
             assert (restored / rel).read_bytes() == (VENDOR / rel).read_bytes(), rel
         print(f"PASS provenance: {len(manifest)} pristine SHA-256 hashes; reverse/forward patch round trip")
-        print("PASS preservation: GEMV helpers, constants, decode/MMA/fold/reduction core byte-identical")
+        print("PASS preservation: GEMV helpers, constants, decode/MMA/fold/reduction core byte-identical after exact schedule normalization")
 
 
 def include_and_scope_checks():
@@ -123,7 +125,7 @@ def indexing():
         for token in range(m):
             assert [slot // 6 for slot in range(token * 6, (token + 1) * 6)] == [token] * 6
         print(f"PASS workspace model m={m}: {offsets[-1]} bytes, aligned/disjoint, within 64 MiB")
-    print("PASS declared shared array bytes: GEMV 2052; activation 1280; output 512 (not ptxas measurements)")
+    print("PASS declared shared array bytes: GEMV 26628; activation 1280; output 512 (not ptxas measurements)")
 
 
 def scale_rounding():
@@ -186,6 +188,8 @@ int main() {
 
 
 def main():
+    preservation_and_mutations()
+    native_schedule()
     provenance()
     include_and_scope_checks()
     indexing()

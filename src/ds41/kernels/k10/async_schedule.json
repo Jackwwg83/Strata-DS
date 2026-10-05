@@ -1,0 +1,26 @@
+[
+  [
+    "template <int bits, bool c_fp32, int cb, int MMODE, int CFG, bool SMEM_STAGE, bool HALF = false>\n__global__ __launch_bounds__(CFG == 0 ? 512 : 256, HALF && CFG == 0 ? 2 : 1)",
+    "// K10-04: only the narrow 3-bit mul1 instance enables asynchronous raw-word\n// staging. A two-block bound permits 64 registers per thread on all targets.\ntemplate <int bits, bool c_fp32, int cb, int MMODE, int CFG, bool SMEM_STAGE, bool HALF = false,\n          bool ASYNC_STAGE = false>\n__global__ __launch_bounds__(CFG == 0 ? 512 : 256, CFG == 0 && (HALF || ASYNC_STAGE) ? 2 : 1)"
+  ],
+  [
+    "    // A is already in the Hadamard basis.",
+    "    static_assert(!ASYNC_STAGE || (bits == 3 && cb == 2 && MMODE == 0 && CFG == 0 &&\n                                  !HALF && !SMEM_STAGE), \"K10 async staging is narrow mul1 only\");\n    // A is already in the Hadamard basis."
+  ],
+  [
+    "    for (int group = blockIdx.x; group < num_groups; group += gridDim.x)",
+    "    // Two warp-private buffers of four slices, 24 KiB for the K10 instance.\n    // Each lane copies and reads its own word; the upstream shuffles remain.\n    // No extra alignment requirement: copies are the original 4-byte words.\n    __shared__ uint32_t sh_async[ASYNC_STAGE ? 2 : 1][ASYNC_STAGE ? WK : 1]\n                               [ASYNC_STAGE ? PF : 1][ASYNC_STAGE ? LOADS * LSTRIDE : 1];\n\n    for (int group = blockIdx.x; group < num_groups; group += gridDim.x)"
+  ],
+  [
+    "        uint32_t pf[PF][LOADS];\n        #pragma unroll\n        for (int d = 0; d < PF; ++d)\n            if (d < myn)\n                #pragma unroll\n                for (int l = 0; l < LOADS; ++l)\n                    pf[d][l] = ld_b(d, l);\n",
+    "        // A committed group contains at most four slices. The next group is\n        // issued before decoding this one, into the other warp-private buffer.\n        auto stage_b = [&] (int first, int stage)\n        {\n            if constexpr (ASYNC_STAGE)\n            {\n                #pragma unroll\n                for (int d = 0; d < PF; ++d)\n                    if (first + d < myn)\n                        #pragma unroll\n                        for (int l = 0; l < LOADS; ++l)\n                            if (lane < LSTRIDE)\n                            {\n                                const uint32_t* src = bp + (size_t) (first + d) * slice_stride + l * LSTRIDE;\n                                const unsigned dst = static_cast<unsigned>(__cvta_generic_to_shared(\n                                    &sh_async[stage][warp][d][l * LSTRIDE + lane]));\n                                asm volatile(\"cp.async.ca.shared.global [%0], [%1], 4;\\n\"\n                                             :: \"r\"(dst), \"l\"(src) : \"memory\");\n                            }\n                asm volatile(\"cp.async.commit_group;\\n\" ::: \"memory\");\n            }\n        };\n\n        uint32_t pf[PF][LOADS];\n        if constexpr (ASYNC_STAGE)\n            stage_b(0, 0);\n        else\n        {\n            #pragma unroll\n            for (int d = 0; d < PF; ++d)\n                if (d < myn)\n                    #pragma unroll\n                    for (int l = 0; l < LOADS; ++l)\n                        pf[d][l] = ld_b(d, l);\n        }\n"
+  ],
+  [
+    "        for (int ib = 0; ib < myn; ib += PF)\n        {\n        #pragma unroll",
+    "        for (int ib = 0; ib < myn; ib += PF)\n        {\n        if constexpr (ASYNC_STAGE)\n        {\n            // Wait for our own raw-word copies before any shared read. The\n            // warp barrier also retires the previous buffer's consumers before\n            // its storage can be reused. No block-wide pipeline barrier.\n            asm volatile(\"cp.async.wait_group 0;\\n\" ::: \"memory\");\n            __syncwarp();\n            if (ib + PF < myn)\n                stage_b(ib + PF, ((ib / PF) + 1) & 1);\n        }\n        #pragma unroll"
+  ],
+  [
+    "            for (int l = 0; l < LOADS; ++l)\n                bw[l] = pf[d][l];\n\n            if (i + PF < myn)\n            {\n                #pragma unroll\n                for (int l = 0; l < LOADS; ++l)\n                    pf[d][l] = ld_b(i + PF, l);\n            }",
+    "            for (int l = 0; l < LOADS; ++l)\n            {\n                if constexpr (ASYNC_STAGE)\n                    bw[l] = lane < LSTRIDE ? sh_async[(ib / PF) & 1][warp][d][l * LSTRIDE + lane] : 0;\n                else\n                    bw[l] = pf[d][l];\n            }\n\n            if constexpr (!ASYNC_STAGE)\n                if (i + PF < myn)\n                {\n                    #pragma unroll\n                    for (int l = 0; l < LOADS; ++l)\n                        pf[d][l] = ld_b(i + PF, l);\n                }"
+  ]
+]

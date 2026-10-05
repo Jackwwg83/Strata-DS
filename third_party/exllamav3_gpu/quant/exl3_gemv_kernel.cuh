@@ -182,10 +182,15 @@ __device__ __forceinline__ void dq8_regs_half(uint32_t a7, uint32_t b7, int s7, 
 // ptxas spends 81-85 registers on them on sm_86/sm_89 (one 512-thread block per SM instead of two, measured
 // 18-28% slower at attention-projection shapes on the 3090). They are packed into one register (see x_pack) and
 // the bound keeps the compiler at the integer instances' 64
-template <int bits, bool c_fp32, int cb, int MMODE, int CFG, bool SMEM_STAGE, bool HALF = false>
-__global__ __launch_bounds__(CFG == 0 ? 512 : 256, HALF && CFG == 0 ? 2 : 1)
+// K10-04: only the narrow 3-bit mul1 instance enables asynchronous raw-word
+// staging. A two-block bound permits 64 registers per thread on all targets.
+template <int bits, bool c_fp32, int cb, int MMODE, int CFG, bool SMEM_STAGE, bool HALF = false,
+          bool ASYNC_STAGE = false>
+__global__ __launch_bounds__(CFG == 0 ? 512 : 256, CFG == 0 && (HALF || ASYNC_STAGE) ? 2 : 1)
 void exl3_gemv_kernel(const strata_exl3::GemvJob* jobs)
 {
+    static_assert(!ASYNC_STAGE || (bits == 3 && cb == 2 && MMODE == 0 && CFG == 0 &&
+                                  !HALF && !SMEM_STAGE), "K10 async staging is narrow mul1 only");
     // A is already in the Hadamard basis. A null trellis marks an empty slot.
     const strata_exl3::GemvJob job = jobs[blockIdx.y];
     if (!job.B) return;  // uniform for the whole block, before any barrier
@@ -270,6 +275,12 @@ void exl3_gemv_kernel(const strata_exl3::GemvJob* jobs)
     __shared__ float sh_red[WK][ROWS][COLS];
     [[maybe_unused]] __shared__ uint32_t sh_stage[SMEM_STAGE ? WK : 1][SMEM_STAGE ? LOADS * LSTRIDE : 1];
 
+    // Two warp-private buffers of four slices, 24 KiB for the K10 instance.
+    // Each lane copies and reads its own word; the upstream shuffles remain.
+    // No extra alignment requirement: copies are the original 4-byte words.
+    __shared__ uint32_t sh_async[ASYNC_STAGE ? 2 : 1][ASYNC_STAGE ? WK : 1]
+                               [ASYNC_STAGE ? PF : 1][ASYNC_STAGE ? LOADS * LSTRIDE : 1];
+
     for (int group = blockIdx.x; group < num_groups; group += gridDim.x)
     {
         const uint32_t* bp = B32 + (size_t) ks0 * slice_stride + group * WNT * TWORDS + lane;
@@ -283,19 +294,57 @@ void exl3_gemv_kernel(const strata_exl3::GemvJob* jobs)
                 return __ldcs(bp + (size_t) i * slice_stride + l * LSTRIDE);
         };
 
-        uint32_t pf[PF][LOADS];
-        #pragma unroll
-        for (int d = 0; d < PF; ++d)
-            if (d < myn)
+        // A committed group contains at most four slices. The next group is
+        // issued before decoding this one, into the other warp-private buffer.
+        auto stage_b = [&] (int first, int stage)
+        {
+            if constexpr (ASYNC_STAGE)
+            {
                 #pragma unroll
-                for (int l = 0; l < LOADS; ++l)
-                    pf[d][l] = ld_b(d, l);
+                for (int d = 0; d < PF; ++d)
+                    if (first + d < myn)
+                        #pragma unroll
+                        for (int l = 0; l < LOADS; ++l)
+                            if (lane < LSTRIDE)
+                            {
+                                const uint32_t* src = bp + (size_t) (first + d) * slice_stride + l * LSTRIDE;
+                                const unsigned dst = static_cast<unsigned>(__cvta_generic_to_shared(
+                                    &sh_async[stage][warp][d][l * LSTRIDE + lane]));
+                                asm volatile("cp.async.ca.shared.global [%0], [%1], 4;\n"
+                                             :: "r"(dst), "l"(src) : "memory");
+                            }
+                asm volatile("cp.async.commit_group;\n" ::: "memory");
+            }
+        };
+
+        uint32_t pf[PF][LOADS];
+        if constexpr (ASYNC_STAGE)
+            stage_b(0, 0);
+        else
+        {
+            #pragma unroll
+            for (int d = 0; d < PF; ++d)
+                if (d < myn)
+                    #pragma unroll
+                    for (int l = 0; l < LOADS; ++l)
+                        pf[d][l] = ld_b(d, l);
+        }
 
         FragC_h ch[WNT][2] = {};
         float2 acc0[WNT][2] = {};
 
         for (int ib = 0; ib < myn; ib += PF)
         {
+        if constexpr (ASYNC_STAGE)
+        {
+            // Wait for our own raw-word copies before any shared read. The
+            // warp barrier also retires the previous buffer's consumers before
+            // its storage can be reused. No block-wide pipeline barrier.
+            asm volatile("cp.async.wait_group 0;\n" ::: "memory");
+            __syncwarp();
+            if (ib + PF < myn)
+                stage_b(ib + PF, ((ib / PF) + 1) & 1);
+        }
         #pragma unroll
         for (int d = 0; d < PF; ++d)
         {
@@ -305,14 +354,20 @@ void exl3_gemv_kernel(const strata_exl3::GemvJob* jobs)
             uint32_t bw[LOADS];
             #pragma unroll
             for (int l = 0; l < LOADS; ++l)
-                bw[l] = pf[d][l];
-
-            if (i + PF < myn)
             {
-                #pragma unroll
-                for (int l = 0; l < LOADS; ++l)
-                    pf[d][l] = ld_b(i + PF, l);
+                if constexpr (ASYNC_STAGE)
+                    bw[l] = lane < LSTRIDE ? sh_async[(ib / PF) & 1][warp][d][l * LSTRIDE + lane] : 0;
+                else
+                    bw[l] = pf[d][l];
             }
+
+            if constexpr (!ASYNC_STAGE)
+                if (i + PF < myn)
+                {
+                    #pragma unroll
+                    for (int l = 0; l < LOADS; ++l)
+                        pf[d][l] = ld_b(i + PF, l);
+                }
 
             if constexpr (SMEM_STAGE)
             {
