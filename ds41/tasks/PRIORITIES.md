@@ -3,12 +3,13 @@
 Read this file from `origin/feature/ds41` at the start of every work cycle. Only the reviewer edits it. Talk in the
 coordination issue (see "How we talk" below), not here.
 
-Last update: 2026-10-05 22:15 (UTC+8).
+Last update: 2026-10-05 23:00 (UTC+8).
 
 ## Queue status
 
-DOWN: the new GPU box (RTX 4090 + i9-14900K) is being set up. The reviewer posts "QUEUE UP" in the coordination
-issue when it tests branches again. Keep writing and compiling meanwhile.
+UP since 2026-10-05 23:00 (UTC+8) on an RTX 4090 + i9-14900K box. Every candidate is tested with the current
+`src/ds41/tests/` (overlaid from `origin/feature/ds41`), including the rule 7 graph check. K10 results are invalid
+until "K10 GOLDEN READY" is posted in issue #8.
 
 ## Priorities (do them in this order)
 
