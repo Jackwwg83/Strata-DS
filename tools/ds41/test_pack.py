@@ -132,5 +132,61 @@ class PackTest(unittest.TestCase):
             self.assertTrue(os.path.exists(os.path.join(self.out, f)))
 
 
+class FakeBackend:
+    """Just enough of a tokenizers backend for build_compressed_token_map."""
+
+    def __init__(self, words):
+        self.words = words
+
+    def decode(self, ids, skip_special_tokens=False):
+        return "".join(self.words[i] for i in ids)
+
+    def id_to_token(self, i):
+        return self.words[i]
+
+
+class FakeTokenizer:
+    def __init__(self, words):
+        self.backend_tokenizer = FakeBackend(words)
+        self.words = words
+
+    def __len__(self):
+        return len(self.words)
+
+
+class EngramHashTest(unittest.TestCase):
+    """The exported tables plus engram_hash_reference must reproduce DeepSeek's NgramHashState exactly."""
+
+    def test_export_reproduces_official_hashes(self):
+        sys.path.insert(0, os.path.join(HERE, "..", "..", "ds41", "proto", "ref"))
+        import engram as EG
+        words = ["<pad>", " The", "the", "THE", " cat", "Cat", "\n", "  ", "猫", "貓", "ｃａｔ", "x"] * 3
+        tok = FakeTokenizer(words)
+        _, vocab = EG.build_compressed_token_map(tok)
+
+        class Args:
+            engram_layer_ids = (1, 14)
+            engram_num_embeddings = (1000003, 1000033)
+            engram_max_ngram_size = 4
+            engram_vocab_size = 10007
+            engram_n_heads = 8
+            engram_head_dim = 256
+            engram_pad_id = 0
+            engram_compressed_vocab_size = vocab
+            max_batch_size = 1
+            max_seq_len = 64
+
+        layout = EG.EngramLayout.from_args(Args)
+        official = EG.NgramHashState(Args, layout, tok)
+        with tempfile.TemporaryDirectory() as d:
+            P.write_engram_hash(Args, tok, d)
+            tables = P.read_engram_hash(d)
+        g = torch.Generator().manual_seed(0)
+        ids = torch.randint(0, len(words), (1, 40), generator=g)
+        want = official(ids, 0)[0].numpy()                       # [L, n_engram_layers, 24]
+        got = P.engram_hash_reference(ids[0].tolist(), tables)
+        np.testing.assert_array_equal(got, want)
+
+
 if __name__ == "__main__":
     unittest.main()

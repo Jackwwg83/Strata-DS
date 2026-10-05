@@ -18,6 +18,8 @@ once, the engine never re-derives it):
   experts.txt    one line per expert: layer expert offset bytes w1_bits w3_bits w2_bits, then 12 entries
                  component:offset:bytes (offset inside the slot). Bitrates may differ per expert (SAGE).
   engram.txt     one line per Engram layer: layer rows dim weight_offset scale_offset path (tables are not copied)
+  engram_hash.txt, engram_tokenmap.bin   the n-gram hash tables, computed here with DeepSeek's own engram.py
+                 (the compressed token map needs the tokenizer's normalizer; the engine needs only integers)
   config.json, tokenizer.json, tokenizer_config.json   copied
   pack_info.txt  written last; "finished 1" marks a complete pack
 """
@@ -188,6 +190,86 @@ def write_engram(src, out):
     return len(lines)
 
 
+REF_DIR = os.path.join(os.path.dirname(os.path.abspath(__file__)), "..", "..", "ds41", "proto", "ref")
+
+
+def write_engram_hash(args, tokenizer, out):
+    """Export what NgramHashState computes from the tokenizer: compressed token map, primes, offsets,
+    multipliers and the pad id. `args` has the inference config's engram_* fields."""
+    import sys
+    sys.path.insert(0, REF_DIR)
+    import engram as EG
+    token_map, vocab = EG.build_compressed_token_map(tokenizer)
+    if vocab != args.engram_compressed_vocab_size:
+        raise SystemExit(f"compressed vocab {vocab} != config {args.engram_compressed_vocab_size}: "
+                         "wrong tokenizer, every hash would differ")
+    layout = EG.EngramLayout.from_args(args)
+    mult = EG.compute_hash_multipliers(layout.layer_ids, layout.max_ngram_size, vocab)
+    np.array(token_map, dtype="<i4").tofile(os.path.join(out, "engram_tokenmap.bin"))
+    with open(os.path.join(out, "engram_hash.txt"), "w") as f:
+        f.write("# ds41 engram hash v1. Per engram layer: multipliers [max_ngram], then primes and offsets\n"
+                "# [ (max_ngram-1) * n_heads ], ngram size major, head minor. token map: engram_tokenmap.bin\n")
+        f.write(f"max_ngram {layout.max_ngram_size}\nn_heads {layout.n_heads}\n")
+        f.write(f"pad {token_map[args.engram_pad_id]}\nvocab {vocab}\n")
+        f.write("layers " + " ".join(map(str, layout.layer_ids)) + "\n")
+        for li, layer in enumerate(layout.primes):
+            flat = [p for per in layer for p in per]
+            offs = np.cumsum([0, *flat[:-1]])
+            f.write(f"multipliers {li} " + " ".join(str(int(m)) for m in mult[li]) + "\n")
+            f.write(f"primes {li} " + " ".join(map(str, flat)) + "\n")
+            f.write(f"offsets {li} " + " ".join(str(int(o)) for o in offs) + "\n")
+
+
+def read_engram_hash(d):
+    t = {"multipliers": {}, "primes": {}, "offsets": {}}
+    for line in open(os.path.join(d, "engram_hash.txt")):
+        if line.startswith("#") or not line.strip():
+            continue
+        f = line.split()
+        if f[0] in ("max_ngram", "n_heads", "pad", "vocab"):
+            t[f[0]] = int(f[1])
+        elif f[0] == "layers":
+            t["layers"] = [int(x) for x in f[1:]]
+        else:
+            t[f[0]][int(f[1])] = [int(x) for x in f[2:]]
+    t["token_map"] = np.fromfile(os.path.join(d, "engram_tokenmap.bin"), dtype="<i4")
+    return t
+
+
+def engram_hash_reference(ids, t):
+    """Plain re-statement of NgramHashState.forward for text-only input: what the C++ engine implements.
+    Returns int64 [len(ids), n_engram_layers, (max_ngram-1) * n_heads]."""
+    n, nh, nl = t["max_ngram"], t["n_heads"], len(t["layers"])
+    comp = [int(t["token_map"][i]) for i in ids]
+    out = np.zeros((len(ids), nl, (n - 1) * nh), dtype=np.int64)
+    for pos in range(len(ids)):
+        toks = [comp[pos - s] if pos - s >= 0 else t["pad"] for s in range(n)]
+        for li in range(nl):
+            prod = [toks[s] * t["multipliers"][li][s] for s in range(n)]
+            rolling = prod[0]
+            for i in range(1, n):
+                rolling ^= prod[i]
+                for h in range(nh):
+                    c = (i - 1) * nh + h
+                    out[pos, li, c] = rolling % t["primes"][li][c] + t["offsets"][li][c]
+    return out
+
+
+class EngramArgs:
+    """The inference config's engram_* fields, read from the checkpoint's HF config.json."""
+
+    def __init__(self, cfg):
+        tc = cfg.get("text_config", cfg)
+        self.engram_layer_ids = tuple(tc["engram_layer_ids"])
+        self.engram_num_embeddings = tuple(tc["engram_num_embeddings"])
+        self.engram_max_ngram_size = tc["engram_max_ngram_size"]
+        self.engram_vocab_size = tc["engram_vocab_size"]
+        self.engram_n_heads = tc["engram_n_heads"]
+        self.engram_head_dim = tc["engram_head_dim"]
+        self.engram_pad_id = tc.get("engram_pad_token_id", tc.get("engram_pad_id"))
+        self.engram_compressed_vocab_size = tc["engram_compressed_vocab_size"]
+
+
 def build_pack(src, out, n_layers=40, n_experts=384):
     os.makedirs(out, exist_ok=True)
     info = os.path.join(out, "pack_info.txt")
@@ -197,6 +279,10 @@ def build_pack(src, out, n_layers=40, n_experts=384):
     n_dense, dense_bytes = write_dense(srcs, out)
     expert_bytes = write_experts(srcs, out, n_layers, n_experts)
     n_engram = write_engram(src, out)
+    cfg = json.load(open(os.path.join(src, "config.json")))
+    if "engram_layer_ids" in cfg.get("text_config", cfg):
+        from transformers import AutoTokenizer
+        write_engram_hash(EngramArgs(cfg), AutoTokenizer.from_pretrained(src), out)
     for f in ("config.json", "tokenizer.json", "tokenizer_config.json"):
         shutil.copyfile(os.path.join(src, f), os.path.join(out, f))
     with open(info, "w") as f:
