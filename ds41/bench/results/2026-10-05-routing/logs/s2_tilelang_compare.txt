@@ -1,0 +1,1 @@
+TILELANG_COMPARE {"act_quant_inplace": 0.0, "fp4_e4m3_g16": 0.0, "fp4_e8m0_g32": 0.0, "fp8_gemm": 0.002723333425819874, "sparse_attn": "tilelang failed: InternalError: Failed to set the allowed dynamic shared memory size to 141312", "hc_sinkhorn": 9.25855374589446e-08}

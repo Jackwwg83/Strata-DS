@@ -1,0 +1,44 @@
+<section class="summary">
+<h2 style="margin-top:4px">结论（2026-10-05，Vast 实例 54264985，开机约 30 分钟）</h2>
+<p>机器：RTX 4090 24 GB（PCIe 4.0 x16）+ Ryzen 9 7950X（Zen 4，AVX-512 VNNI/VBMI）+ 124 GiB 内存（容器内可见）+ overlay 磁盘。
+专家数据：coolbho3k DeepSeek-V4.1-Flash-EXL3-3bpw，revision <code>650cae2c</code>，第 10 层全部 384 个专家（每个 13,315,596 B）。
+Kernel：exllamav3 v1.5.4（<code>16a49792</code>）。</p>
+
+<h3>实测关键数字</h3>
+<div class="tw"><table><thead><tr><th>项目</th><th>实测</th><th>含义</th></tr></thead><tbody>
+<tr><td>内存读带宽</td><td>约 48 GB/s（2–4 线程最好）</td><td>4 条内存插满后的双通道 DDR5。比我之前估的 60–80 低</td></tr>
+<tr><td>CPU 专家 kernel（AVX-512）</td><td><b>约 44–46 GB/s，每个 3bpw 专家约 300 µs</b></td><td>达到内存带宽的 92–95%，已经跑满，<b>瓶颈就是内存带宽</b>。8 线程最快</td></tr>
+<tr><td>CPU 专家 kernel（只用 AVX2）</td><td>32 线程 36 GB/s；16 线程 33；8 线程 21</td><td>Intel 消费级 CPU 没有 AVX-512，走这一档。核多可以追回大部分</td></tr>
+<tr><td>CPU 算专家 + 同时 DMA 到 GPU</td><td>CPU 掉到 24.7 GB/s，DMA 25.9 GB/s，合计约 50.6</td><td>两者抢同一条内存带宽，<b>合计不超过约 50 GB/s</b></td></tr>
+<tr><td>同一批专家被多个 token 共用</td><td>4 个 token 共用 6 个专家：2.1 ms（1 个 token 是 1.8 ms）；8 个 token：3.3 ms</td><td>验证窗口超过 4 个 token 时，CPU 要再过一遍权重</td></tr>
+<tr><td>CPU 与 GPU 结果一致性</td><td>相对 L2 误差 1.84%，余弦 0.99983</td><td>CPU kernel 把激活量化成 int8 造成的。对质量有没有影响还要验证</td></tr>
+<tr><td>GPU 单专家单 token（未融合）</td><td>40 µs</td><td>包含 5 次以上 kernel 启动。还没测融合多专家 kernel 和 CUDA graph</td></tr>
+<tr><td>GPU prefill GEMM</td><td>4096 行时 170–180 TFLOPS</td><td>prefill 的计算不是瓶颈</td></tr>
+<tr><td>显存读带宽</td><td>954 GB/s</td><td>每次前向读约 8.5 GB 稠密权重，至少要约 9 ms</td></tr>
+<tr><td>PCIe H2D</td><td>26.8 GB/s（按专家大小一块块传也能跑满）</td><td></td></tr>
+<tr><td>NVMe，13 MiB 读</td><td>6.1–6.8 GB/s，一次读约 2.2 ms</td><td><b>从 SSD 取一个专家的耗时，约等于 CPU 算 7 个专家</b></td></tr>
+<tr><td>NVMe，4 KiB 随机读</td><td>队列深度 1：54 µs，1.85 万 IOPS；队列深度 32：26.5 万 IOPS</td><td>Engram 每 token 读 48 页，完全不是问题</td></tr>
+<tr><td>pinned 内存</td><td>64 GiB 一次申请成功，耗时 30 s</td><td>上游"全部专家锁在内存"的做法在容器里可行</td></tr>
+</tbody></table></div>
+
+<h3>推算：decode 速度上限（只算 CPU 侧，不含 MTP）</h3>
+<p class="note">公式：上限 tok/s = 44 GB/s ÷（每 token 专家字节 ×（1 − GPU 命中率））。每 token 访问 40 层 × 6 个专家。
+GPU 命中率还没测，下面取 0 / 0.3 / 0.5 三档。这是 CPU 侧的上限：GPU 侧每 token 至少要 9 ms，两边同时干活，取慢的那个。</p>
+<div class="tw"><table><thead><tr><th>量化</th><th>每 token 专家字节</th><th>命中率 0</th><th>命中率 0.3</th><th>命中率 0.5</th><th>128 GB 能否全进内存</th></tr></thead><tbody>
+<tr><td>EXL3 3bpw</td><td>3.20 GB</td><td>13.8</td><td>19.6</td><td>27.5</td><td>不能，约 73 GiB 要放 SSD（代价见表下说明）</td></tr>
+<tr><td>EXL3 2.5bpw</td><td>2.66 GB</td><td>16.5</td><td>23.6</td><td>33.1</td><td>不能，约 41 GiB 要放 SSD</td></tr>
+<tr><td>EXL3 2bpw</td><td>2.13 GB</td><td>20.7</td><td>29.5</td><td>41.3</td><td>差不多，约 10 GiB 要放 SSD</td></tr>
+<tr><td>SAGE 1.59bpw</td><td>1.70 GB</td><td>25.9</td><td>37.0</td><td>51.8</td><td>能</td></tr>
+</tbody></table></div>
+<p class="note">3bpw 放 SSD 的额外代价：每个落到 SSD 的专家约 2.05 ms。如果 5% 的访问落到 SSD，每 token 多约 25 ms；15% 就多约 74 ms。这一项会把 3bpw 的速度直接压到个位数。</p>
+
+<h3>对设计的含义</h3>
+<ol>
+<li><b>在这类台式机上，decode 速度由内存带宽决定。</b>CPU kernel 已经跑到带宽的 92% 以上，能调的只剩两样：每 token 要搬的专家字节（由量化位宽决定），以及 GPU 命中率。</li>
+<li><b>位宽直接换速度。</b>2bpw 比 3bpw 快约 1.5 倍，而且基本不用 SSD。这和上游选 Q2_0（2.25bpw）当最快档是同一个道理。代价是质量，需要单独评估。</li>
+<li><b>上游"一部分未命中专家用 DMA 送到 GPU 算"的机制（pcie_frac），在支持 AVX-512 的机器上不会提高总吞吐</b>，因为它和 CPU 抢同一条内存带宽。在只有 AVX2、核少、CPU 算不满带宽的机器上才有用。这和上游论文的发现一致。</li>
+<li><b>MTP 或 DSpark 的收益会比上游小。</b>CPU 的开销跟着"不同专家的个数"线性增长。窗口里的 token 共用专家时，超过 4 个 token 还会再多一遍。DeepSeek 的专家比 Qwen 大 9 倍，所以 CPU 侧占大头。</li>
+<li><b>GPU 命中率是下一步最关键的未知数。</b>要拿到它，得用整模型跑真实路由。</li>
+<li>待办：① 测 exllamav3 的融合多专家 GPU kernel，加上 CUDA graph；② CPU int8 激活误差（1.84%）对输出质量的影响，以及 15-bit 高精度模式的速度代价；③ 4 条内存插满时的实际内存频率（容器里读不到 dmidecode）。</li>
+</ol>
+</section>

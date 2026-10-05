@@ -1,0 +1,5 @@
+{"seconds": 23.68, "moe_s": 20.77, "expert_gb": 147.17, "expert_read_thread_s": 30.37, "mean_nll": NaN, "ppl": NaN, "id": "code_py_0", "kind": "code_py", "tokens": 3844}
+{"seconds": 19.7, "moe_s": 17.55, "expert_gb": 135.32, "expert_read_thread_s": 24.72, "mean_nll": NaN, "ppl": NaN, "id": "code_py_1", "kind": "code_py", "tokens": 3810}
+{"seconds": 20.94, "moe_s": 18.63, "expert_gb": 143.16, "expert_read_thread_s": 26.58, "mean_nll": NaN, "ppl": NaN, "id": "code_py_2", "kind": "code_py", "tokens": 4031}
+{"seconds": 20.8, "moe_s": 18.36, "expert_gb": 145.07, "expert_read_thread_s": 26.49, "mean_nll": NaN, "ppl": NaN, "id": "code_py_3", "kind": "code_py", "tokens": 3607}
+{"seconds": 21.42, "moe_s": 18.81, "expert_gb": 145.43, "expert_read_thread_s": 28.36, "mean_nll": NaN, "ppl": NaN, "id": "code_py_4", "kind": "code_py", "tokens": 3973}

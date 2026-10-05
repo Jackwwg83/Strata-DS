@@ -1,0 +1,5 @@
+layer 10: 384 experts, 13315596 bytes each
+{'threads': 16, 'tokens': 1, 'experts_per_token': 6, 'mode': 'distinct', 'unique_experts': 6, 'ms': 3.236, 'expert_gbps': 24.69, 'us_per_unique_expert': 539.3}
+{'threads': 16, 'tokens': 4, 'experts_per_token': 6, 'mode': 'distinct', 'unique_experts': 24, 'ms': 12.736, 'expert_gbps': 25.09, 'us_per_unique_expert': 530.6}
+{'threads': 32, 'tokens': 1, 'experts_per_token': 6, 'mode': 'distinct', 'unique_experts': 6, 'ms': 3.274, 'expert_gbps': 24.4, 'us_per_unique_expert': 545.7}
+{'threads': 32, 'tokens': 4, 'experts_per_token': 6, 'mode': 'distinct', 'unique_experts': 24, 'ms': 19.496, 'expert_gbps': 16.39, 'us_per_unique_expert': 812.3}

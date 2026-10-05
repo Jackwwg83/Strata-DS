@@ -1,0 +1,52 @@
++ EXL3_COMMIT=16a49792
++ MODEL_REPO=coolbho3k/DeepSeek-V4.1-Flash-EXL3-3bpw
++ MODEL_REV=650cae2c13aaaec303871a35301503570889c0be
++ SHARDS='model-00004-of-00051.safetensors model-00005-of-00051.safetensors'
++ apt-get update -qq
++ apt-get install -y -qq fio numactl dmidecode git build-essential
+perl: warning: Setting locale failed.
+perl: warning: Please check that your locale settings:
+	LANGUAGE = (unset),
+	LC_ALL = (unset),
+	LANG = "en_US.UTF-8"
+    are supported and installed on your system.
+perl: warning: Falling back to the standard locale ("C").
+debconf: delaying package configuration, since apt-utils is not installed
++ pip install -q huggingface_hub hf_transfer safetensors ninja
+WARNING: Running pip as the 'root' user can result in broken permissions and conflicting behaviour with the system package manager, possibly rendering your system unusable. It is recommended to use a virtual environment instead: https://pip.pypa.io/warnings/venv. Use the --root-user-action option if you know what you are doing and want to suppress this warning.
++ DL=995
++ cd /workspace
++ '[' -d exllamav3 ']'
++ git clone -q https://github.com/turboderp-org/exllamav3
++ cd exllamav3
++ git checkout -q 16a49792
+++ python -c 'import torch;m,n=torch.cuda.get_device_capability(0);print(f'\''{m}.{n}'\'')'
++ cap=8.9
++ TORCH_CUDA_ARCH_LIST=8.9
+++ nproc
++ MAX_JOBS=32
++ pip install --no-build-isolation --no-deps .
++ pip install -q -r requirements.txt
+WARNING: Running pip as the 'root' user can result in broken permissions and conflicting behaviour with the system package manager, possibly rendering your system unusable. It is recommended to use a virtual environment instead: https://pip.pypa.io/warnings/venv. Use the --root-user-action option if you know what you are doing and want to suppress this warning.
++ python -c 'from exllamav3.ext import exllamav3_ext as e; print('\''avx2'\'', e.exl3_moe_cpu_has_avx2(), '\''vnni'\'', e.exl3_moe_cpu_has_avx512_vnni(), '\''vbmi'\'', e.exl3_moe_cpu_has_avx512_vbmi())'
+avx2 True vnni True vbmi True
++ wait 995
++ cat /workspace/download.log
++ export HF_HUB_ENABLE_HF_TRANSFER=1
++ HF_HUB_ENABLE_HF_TRANSFER=1
++ python -
+/opt/conda/lib/python3.11/site-packages/huggingface_hub/constants.py:302: FutureWarning: The `HF_HUB_ENABLE_HF_TRANSFER` environment variable is deprecated as 'hf_transfer' is not used anymore. Please use `HF_XET_HIGH_PERFORMANCE` instead to enable high performance transfer with Xet. Visit https://huggingface.co/docs/huggingface_hub/package_reference/environment_variables#hfxethighperformance for more details.
+  warnings.warn(
+Warning: You are sending unauthenticated requests to the HF Hub. Please set a HF_TOKEN to enable higher rate limits and faster downloads.
+download done in 83 s
++ ls -la /workspace/model
+total 8400344
+drwxr-xr-x 3 root root        155 Oct  5 05:57 .
+drwxr-xr-x 1 root root        160 Oct  5 05:56 ..
+drwxr-xr-x 3 root root         25 Oct  5 05:56 .cache
+-rw-r--r-- 1 root root       3661 Oct  5 05:56 config.json
+-rw-r--r-- 1 root root 4293847940 Oct  5 05:57 model-00004-of-00051.safetensors
+-rw-r--r-- 1 root root 4293847988 Oct  5 05:57 model-00005-of-00051.safetensors
+-rw-r--r-- 1 root root   14248544 Oct  5 05:56 model.safetensors.index.json
++ echo SETUP_OK
+SETUP_OK

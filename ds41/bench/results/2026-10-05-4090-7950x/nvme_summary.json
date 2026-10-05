@@ -1,0 +1,56 @@
+{
+ "prep_write": {
+  "gbps": 4.933,
+  "iops": 294,
+  "lat_mean_us": 27160.5,
+  "lat_p99_us": 33423.4
+ },
+ "rand_13m_qd1": {
+  "gbps": 6.104,
+  "iops": 448,
+  "lat_mean_us": 2232.6,
+  "lat_p99_us": 1892.4
+ },
+ "rand_13m_qd16": {
+  "gbps": 6.787,
+  "iops": 498,
+  "lat_mean_us": 32065.6,
+  "lat_p99_us": 33423.4
+ },
+ "rand_13m_qd4": {
+  "gbps": 6.759,
+  "iops": 496,
+  "lat_mean_us": 8061.9,
+  "lat_p99_us": 8093.7
+ },
+ "rand_4k_qd1": {
+  "gbps": 0.076,
+  "iops": 18540,
+  "lat_mean_us": 53.6,
+  "lat_p99_us": 60.7
+ },
+ "rand_4k_qd32": {
+  "gbps": 1.087,
+  "iops": 265307,
+  "lat_mean_us": 120.4,
+  "lat_p99_us": 146.4
+ },
+ "rand_4k_qd64x4": {
+  "gbps": 3.71,
+  "iops": 905684,
+  "lat_mean_us": 282.4,
+  "lat_p99_us": 464.9
+ },
+ "seq_13m_qd1": {
+  "gbps": 6.282,
+  "iops": 461,
+  "lat_mean_us": 2169.5,
+  "lat_p99_us": 1810.4
+ },
+ "seq_13m_qd4": {
+  "gbps": 6.749,
+  "iops": 495,
+  "lat_mean_us": 8069.1,
+  "lat_p99_us": 8093.7
+ }
+}

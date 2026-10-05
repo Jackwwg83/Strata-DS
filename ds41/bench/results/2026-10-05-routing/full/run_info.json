@@ -1,0 +1,7 @@
+{
+ "kernels": "torch",
+ "load_s": 4.3,
+ "gpu_alloc_gib_after_load": 10.56,
+ "expert_act_fp8": true,
+ "max_tokens": 4096
+}
