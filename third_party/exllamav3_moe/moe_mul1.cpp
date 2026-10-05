@@ -1,5 +1,7 @@
 #if (defined(__x86_64__) || defined(__i386__) || defined(_M_X64) || defined(_M_IX86))
 #include "moe_mul1.h"
+// Strata-DS K11-05: static-home tail stealing for eligible AVX2-family phases.
+#include "strata_tail_schedule.h"
 #ifdef EXL3_MOE_WITH_TORCH
 #include <c10/util/Half.h>
 #include <torch/extension.h>
@@ -2241,10 +2243,14 @@ struct ForwardCtx
     std::vector<PreparedIn> prep_g, prep_u, prep_d;
 
     int phase = 0;
+    strata_moe::TailRange* tail_ranges = nullptr;  // invocation-local use of caller arena
 };
 
 struct ForwardArena
 {
+    // Strata-DS: only the coordinator grows/reset these, outside pool dispatch.
+    std::unique_ptr<strata_moe::TailRange[]> tail_ranges;
+    int tail_capacity = 0;
     std::vector<float> tin_g, tin_u, tin_d;
     std::vector<int32_t> splat_g, splat_u, splat_d;
     std::vector<int32_t> splat_dup_g, splat_dup_u, splat_dup_d;
@@ -2362,6 +2368,16 @@ inline void assign_gemvs(int worker, int num_workers, int total, int tiles_n, Ge
         gemv(j, std::max(f0 - j * tiles_n, 0), std::min(f1 - j * tiles_n, tiles_n));
 }
 
+// Strata-DS: numeric callbacks and full phase barriers remain unchanged.
+template <typename Gemv>
+inline void assign_tail_gemvs(ForwardCtx& c, int worker, int num_workers, int total, int tiles_n, Gemv gemv)
+{
+    if (c.tail_ranges && strata_moe::tail_eligible(c.m_total, num_workers, total, tiles_n))
+        strata_moe::tail_assign(c.tail_ranges, worker, num_workers, total, tiles_n, gemv);
+    else
+        assign_gemvs(worker, num_workers, total, tiles_n, gemv);
+}
+
 void forward_phase(void* vctx, int worker, int num_workers)
 {
     ForwardCtx& c = *static_cast<ForwardCtx*>(vctx);
@@ -2391,7 +2407,7 @@ void forward_phase(void* vctx, int worker, int num_workers)
         {
             // Gate + up GEMVs (see assign_gemvs)
             const int gu = L.gates.empty() ? 1 : 2;
-            assign_gemvs(worker, num_workers, nc * gu, I / 16, [&](int j, int t0, int t1)
+            assign_tail_gemvs(c, worker, num_workers, nc * gu, I / 16, [&](int j, int t0, int t1)
             {
                 const Chunk& ch = c.chunks[j / gu];
                 const bool up = gu == 1 || (j % gu);
@@ -2475,7 +2491,7 @@ void forward_phase(void* vctx, int worker, int num_workers)
         case 3:
         {
             // Down GEMVs
-            assign_gemvs(worker, num_workers, nc, H / 16, [&](int j, int t0, int t1)
+            assign_tail_gemvs(c, worker, num_workers, nc, H / 16, [&](int j, int t0, int t1)
             {
                 const Chunk& ch = c.chunks[j];
                 float* tout = c.tout_d + static_cast<size_t>(j) * MAX_SLOTS * H;
@@ -2962,6 +2978,19 @@ void exl3_moe_cpu_forward_raw(
     }();
     const int n_run = nc <= 2 ? small_cap : 0;
 
+    // Strata-DS K11-05: unchanged pool participant count; only AVX2-family
+    // small-token flat ranges are eligible. Scalar and AVX512 use the old path.
+    const int participants = n_run > 0 && n_run < g_pool.num_workers ? n_run : g_pool.num_workers;
+    if ((g_isa == Isa::Avx2 || g_isa == Isa::AvxVnni) &&
+        (strata_moe::tail_eligible(rows, participants, nc, H / 16) ||
+         strata_moe::tail_eligible(rows, participants, nc * (layer->gates.empty() ? 1 : 2), I / 16))) {
+        if (ar.tail_capacity < participants) {
+            ar.tail_ranges.reset(new strata_moe::TailRange[participants]);
+            ar.tail_capacity = participants;
+        }
+        ctx.tail_ranges = ar.tail_ranges.get();
+    }
+
     // Per-phase wall time, reported every 512 jobs; enabled once at worker startup via
     // exl3_moe_cpu_set_prof (MoeCpuTuning.cpu_prof in moe_cpu_host.py, EXL3_MOE_CPU_PROF env)
     const bool prof = g_prof_enabled.load(std::memory_order_relaxed);
@@ -2971,6 +3000,12 @@ void exl3_moe_cpu_forward_raw(
     const int num_phases = rows == 1 ? 5 : 6;
     for (int phase = 0; phase < num_phases; ++phase) {
         ctx.phase = phase;
+        if (ctx.tail_ranges && (phase == 1 || phase == 3)) {
+            const int total = phase == 1 ? nc * (layer->gates.empty() ? 1 : 2) : nc;
+            const int tiles_n = (phase == 1 ? I : H) / 16;
+            if (strata_moe::tail_eligible(rows, participants, total, tiles_n))
+                strata_moe::tail_reset(ctx.tail_ranges, participants, total, tiles_n);
+        }
         if (prof)
         {
             const auto t0 = std::chrono::steady_clock::now();
