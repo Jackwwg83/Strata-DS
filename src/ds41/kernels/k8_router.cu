@@ -2,7 +2,6 @@
 // No device workspace, allocator, host readback, or inter-CTA synchronization.
 #include "strata/ds41/kernels/k8_router.hpp"
 
-#include <cfloat>
 #include <cmath>
 
 namespace strata::ds41::kernels {
@@ -17,33 +16,16 @@ constexpr int kExpertGroups = kThreads / kExpertThreads;
 constexpr unsigned kWarpMask = 0xffffffffu;
 
 // The acceptance reference applies this transform in double to FP32 GEMV logits.
-// It is needed for only the winners and any genuinely close ranking comparisons.
+// Compute it once for every expert; ranking never uses a rounded FP32 score.
 __device__ __noinline__ double reference_score(float logit) {
     const double z = static_cast<double>(logit);
     return sqrt(z > 20.0 ? z : log1p(exp(z)));
 }
 
-__device__ __forceinline__ bool better(int a, int b, const float* logits,
-                                      const float* score, const float* bias) {
+__device__ __forceinline__ bool better(int a, int b, const double* biased) {
     if (a < 0) return false;
     if (b < 0) return true;
-    const float za = logits[a], zb = logits[b];
-    const float ba = bias[a], bb = bias[b];
-    // Exact duplicate inputs are a frequent tie (including an all-zero router).
-    if (za == zb && ba == bb) return a < b;
-    const float sa = score[a], sb = score[b];
-    const float approx_a = sa + ba, approx_b = sb + bb;
-    // A conservative bound on FP32 exp/log1p/sqrt and the biased additions.
-    // Close, underflowed, cancelled and non-finite comparisons take the precise
-    // path. In particular, rounding a biased score to FP32 cannot create a tie.
-    const float radius = 8.0f * FLT_EPSILON *
-                         (fabsf(sa) + fabsf(sb) + fabsf(ba) + fabsf(bb)) +
-                         32.0f * FLT_MIN;
-    if (approx_a - approx_b > radius) return true;
-    if (approx_b - approx_a > radius) return false;
-    const double exact_a = reference_score(za) + static_cast<double>(ba);
-    const double exact_b = reference_score(zb) + static_cast<double>(bb);
-    return exact_a > exact_b || (exact_a == exact_b && a < b);
+    return biased[a] > biased[b] || (biased[a] == biased[b] && a < b);
 }
 
 // Packed loads are an optimization, not an extra interface alignment contract.
@@ -61,15 +43,14 @@ void fused_router(const __nv_bfloat16* __restrict__ x,
                   int32_t* __restrict__ ids, float* __restrict__ weights) {
     __shared__ __nv_bfloat162 sx[kDim / 2];
     __shared__ float logits[kExperts];
-    __shared__ float score[kExperts];
-    __shared__ float sbias[kExperts];
+    __shared__ double score[kExperts];
+    __shared__ double biased[kExperts];
     __shared__ double selected[kTopK];
 
     const int tid = threadIdx.x;
     const int token = blockIdx.x;
     const auto* xp = x + token * kDim;
     for (int i = tid; i < kDim / 2; i += kThreads) sx[i] = load_pair<Aligned>(xp, i);
-    if (tid < kExperts) sbias[tid] = bias[tid];
     __syncthreads();
 
     const int group = tid / kExpertThreads;
@@ -97,8 +78,17 @@ void fused_router(const __nv_bfloat16* __restrict__ x,
         if (lane == 0) {
             const float z = even + odd;
             logits[e] = z;
-            score[e] = sqrtf(z > 20.0f ? z : log1pf(expf(z)));
         }
+    }
+    __syncthreads();
+
+    // expf can become subnormal or zero while sqrt(softplus(z)) is still a
+    // substantial nonzero score. Transform in double before adding the bias;
+    // never use an FP32 approximation to discard a ranking candidate.
+    if (tid < kExperts) {
+        const double s = reference_score(logits[tid]);
+        score[tid] = s;
+        biased[tid] = s + static_cast<double>(bias[tid]);
     }
     __syncthreads();
 
@@ -112,18 +102,18 @@ void fused_router(const __nv_bfloat16* __restrict__ x,
 #pragma unroll
         for (int i = 0; i < kExperts / 32; ++i) {
             const int e = tid + i * 32;
-            if (!(removed & (1u << i)) && better(e, best, logits, score, sbias)) best = e;
+            if (!(removed & (1u << i)) && better(e, best, biased)) best = e;
         }
 #pragma unroll
         for (int off = 16; off > 0; off >>= 1) {
             const int other = __shfl_down_sync(kWarpMask, best, off);
-            if (tid + off < 32 && better(other, best, logits, score, sbias)) best = other;
+            if (tid + off < 32 && better(other, best, biased)) best = other;
         }
         const int winner = __shfl_sync(kWarpMask, best, 0);
         if ((winner & 31) == tid) removed |= 1u << (winner >> 5);
         if (tid == rank) {
             ids[token * kTopK + rank] = winner;
-            selected[rank] = reference_score(logits[winner]);
+            selected[rank] = score[winner];
         }
     }
     __syncwarp(kWarpMask);
