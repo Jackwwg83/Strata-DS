@@ -1,7 +1,7 @@
-// K3-11: 128-key online softmax with ping-pong 64-dimension KV slices.
+// K3-21: register-resident Q with the K3-11 ping-pong 64-dimension KV slices.
 // Eight heads and 128 output dimensions share each CTA. While one 128x64
 // buffer feeds QK, cp.async fills the other; the last two slices feed PV.
-// XOR-swizzled KV storage needs 32 KiB; the entire CTA uses 45,792 bytes.
+// XOR-swizzled KV storage needs 32 KiB; the entire CTA uses 37,472 bytes.
 // Scores and BF16 probabilities share storage after an explicit read barrier.
 #include "strata/ds41/kernels/k3_sparse_attn.hpp"
 
@@ -19,7 +19,6 @@ constexpr int kHeadTile = 8;
 constexpr int kRows = 128;
 constexpr int kSlice = 64;
 constexpr int kOutputDim = 128;
-constexpr int kQueryStride = kDim + 8;
 constexpr int kProbStride = kRows + 8;
 constexpr int kWarps = 4;
 constexpr int kThreads = 32 * kWarps;
@@ -28,7 +27,6 @@ constexpr int kOutputFragments = kOutputDim / (16 * kWarps);
 constexpr unsigned kWarpMask = 0xffffffffu;
 
 struct __align__(32) TileStorage {
-    bf16 q[kHeadTile * kQueryStride];
     bf16 kv[2][kRows * kSlice];
     union {
         float scores[kHeadTile][kRows];
@@ -39,7 +37,7 @@ struct __align__(32) TileStorage {
     float sum[kHeadTile];
     float rescale[kHeadTile];
 };
-static_assert(sizeof(TileStorage) == 45792, "shared-memory layout changed");
+static_assert(sizeof(TileStorage) == 37472, "shared-memory layout changed");
 static_assert(sizeof(TileStorage) <= 48 * 1024, "no shared-memory opt-in required");
 static_assert(kRows == kThreads, "one thread gathers each index");
 
@@ -83,7 +81,9 @@ __device__ __forceinline__ int kv_offset(int row, int dimension) {
 __device__ __forceinline__ void gather_slice(TileStorage& tile, int buffer,
                                              const bf16* window, const bf16* comp,
                                              int dimension) {
-#pragma unroll
+// Keep gather temporaries short-lived while all 64 Q registers are live.
+    // Packet addresses, issue order, commit, and waits are unchanged.
+#pragma unroll 1
     for (int i = threadIdx.x; i < kRows * kSlice / 8; i += kThreads) {
         const int r = i / (kSlice / 8);
         const int d = (i % (kSlice / 8)) * 8;
@@ -108,8 +108,9 @@ __device__ __forceinline__ void wait_slice() {
     __syncthreads();
 }
 
-// Bound register allocation; actual residency is limited by shared memory.
-__global__ __launch_bounds__(kThreads, 6) void attention_online(
+// Bound register allocation; the rolled gather avoids spilling Q fragments.
+// Shared memory remains the two-CTA residency limit on a 100-KiB-SMEM SM.
+__global__ __maxnreg__(112) void attention_online(
         const bf16* __restrict__ q, const bf16* __restrict__ window,
         const bf16* __restrict__ comp, const int32_t* __restrict__ idx,
         int n_idx, const float* __restrict__ sink, float scale,
@@ -127,11 +128,23 @@ __global__ __launch_bounds__(kThreads, 6) void attention_online(
     const int32_t* indices = idx + static_cast<size_t>(query) * n_idx;
     const bf16* queries = q + (static_cast<size_t>(query) * kHeads + head) * kDim;
 
-    for (int i = threadIdx.x; i < kHeadTile * kDim / 8; i += kThreads) {
-        const int h = i / (kDim / 8);
-        const int d = (i % (kDim / 8)) * 8;
-        *reinterpret_cast<uint4*>(tile.q + h * kQueryStride + d) =
-            *reinterpret_cast<const uint4*>(queries + h * kDim + d);
+    // MMA B ownership: lane 4*h+t holds head h and K pairs 2*t, 2*t+8.
+    // Across a warp each of the 8*512 query values has exactly one owner.
+    // The four key-owning warps each need the same tile; no lane holds a
+    // complete query (128 BF16 values per lane, packed into 64 registers).
+    // Pre-rotate fragments to preserve K3-11's cyclic FP32 reduction order.
+    const int first_dimension = (output_dimension + kOutputDim) & (kDim - 1);
+    unsigned query_fragments[kDim / kSlice][kSlice / 16][2];
+#pragma unroll
+    for (int slice = 0; slice < kDim / kSlice; ++slice) {
+        const int dimension = (first_dimension + slice * kSlice) & (kDim - 1);
+#pragma unroll
+        for (int d = 0; d < kSlice / 16; ++d) {
+            const bf16* pair = queries + (lane / 4) * kDim
+                                      + dimension + d * 16 + (lane % 4) * 2;
+            query_fragments[slice][d][0] = *reinterpret_cast<const unsigned*>(pair);
+            query_fragments[slice][d][1] = *reinterpret_cast<const unsigned*>(pair + 8);
+        }
     }
     if (threadIdx.x < kHeadTile) {
         tile.maximum[threadIdx.x] = -1.0e30f;
@@ -147,9 +160,10 @@ __global__ __launch_bounds__(kThreads, 6) void attention_online(
         float score[kFragments][4] = {};
         // A cyclic dimension order keeps the same FP32 accumulation order
         // as 128-dimension slices, ending at this CTA's two output slices.
-        const int first_dimension = (output_dimension + kOutputDim) & (kDim - 1);
         gather_slice(tile, 0, window, comp, first_dimension);
         wait_slice();
+        // Constant fragment indices keep all Q fragments in registers.
+#pragma unroll
         for (int slice = 0; slice < kDim / kSlice; ++slice) {
             const int buffer = slice & 1;
             const int dimension = (first_dimension + slice * kSlice) & (kDim - 1);
@@ -162,16 +176,13 @@ __global__ __launch_bounds__(kThreads, 6) void attention_online(
             }
 #pragma unroll
             for (int d = 0; d < kSlice; d += 16) {
-                unsigned query_fragment[2];
-                load_b(query_fragment, tile.q + (lane % 8) * kQueryStride
-                                                  + dimension + d + ((lane / 8) & 1) * 8);
 #pragma unroll
                 for (int v = 0; v < kFragments; ++v) {
                     const int key_tile = (warp * kFragments + v) * 16;
                     unsigned keys[4];
                     load_a(keys, tile.kv[buffer] + kv_offset(key_tile + (lane % 16),
                                                            d + (lane / 16) * 8));
-                    mma(score[v], keys, query_fragment);
+                    mma(score[v], keys, query_fragments[slice][d / 16]);
                 }
             }
             // This wait is AFTER current-slice MMA, overlapping all four
