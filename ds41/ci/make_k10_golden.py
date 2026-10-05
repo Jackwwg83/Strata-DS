@@ -2,7 +2,11 @@
 with the prototype's GPU expert math (ds41/proto/ds41_proto.py moe_forward, GPU path).
 
 Usage (on the GPU box with exllamav3 installed):
-  python make_k10_golden.py --pack /workspace/pack-3bpw --out /workspace/ci/golden/k10
+  EXL3_INT8_GEMV=0 python make_k10_golden.py --pack /workspace/pack-3bpw --out /workspace/ci/golden/k10
+
+EXL3_INT8_GEMV=0 is required. exllamav3 v1.5.4 defaults to mode 2: its small-row path quantizes the activations
+to int8 (about 0.9% output deviation per projection, 2.1-2.4% on a whole expert). The golden must be the FP16
+path, the exact math; the script refuses to run otherwise.
 
 Writes, per case m in {1, 4, 8}: x_<m>.bin (fp16 [m][5120], already FP8-quantized), sel_<m>.bin (int32 [m][6],
 slot indices into the 32 experts), w_<m>.bin (f32 [m][6]), out_<m>.bin (f32 [m][5120]); and experts.txt (the 32
@@ -45,6 +49,8 @@ def linears(blob, row, device="cuda"):
 
 
 def main():
+    if os.environ.get("EXL3_INT8_GEMV") != "0":
+        raise SystemExit("set EXL3_INT8_GEMV=0: the golden is exllamav3's FP16 path, not its int8-activation path")
     ap = argparse.ArgumentParser()
     ap.add_argument("--pack", required=True)
     ap.add_argument("--out", required=True)
