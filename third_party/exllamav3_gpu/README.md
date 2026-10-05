@@ -39,3 +39,33 @@ input and codebook loads, decode arithmetic, FP16 folds and reductions remain
 unchanged. The host check normalizes exactly this explicit policy block before
 its whole-loop comparison; the reversible patch and all pristine hashes are
 rechecked. Timing and GPU acceptance remain pending.
+
+## K10-09 cooperative asynchronous packed-word staging
+
+K10-09 starts from current feature and transplants the exact K10-04 async
+schedule at `69cd9335938b531adca1acc5470ccd6c5ec4e57e`. It retains the narrow
+3-bit mul1 kernel, original slice order and four-slice FP16 folds. Two
+warp-private four-slice buffers overlap packed-word movement with unchanged
+upstream decoding and MMA. Other template instances retain their register path.
+
+The proven address mapping is `B32 + ks * ntiles * 24 + group * 48 +
+load * 24 + lane`. Four adjacent words are contiguous, all non-lane byte
+offsets are multiples of 16, and 24 is divisible by four. When the source base
+is 16-byte aligned, lanes 0, 4, 8, 12, 16 and 20 each issue one 16-byte
+`cp.async.cg` for four lanes. The destination has explicit 16-byte alignment.
+Four-byte-aligned offset views use the original per-lane four-byte
+`cp.async.ca`. Merely uint16-aligned views use two natural uint16 reads; the
+public descriptor has no stronger source alignment contract.
+
+All lanes commit. Leaders wait for their own copies, then a full warp barrier
+publishes copied words to their peers. That same barrier retires the previous
+buffer's consumers before any eager overwrite. A nonleader's own wait is not
+used as a substitute for publication. The following decode shuffles, MMA,
+FP16 folds, FP32 reduction, activation and all Hadamards are unchanged.
+
+`CXX=g++ python3 src/ds41/kernels/k10/check_host.py` checks exact schedule
+normalization to K10-04 and then the pristine arithmetic, the extracted
+cooperative copy lambda with independent byte/ownership oracles, a temporal
+publication/retirement model, tail/alignment/canary cases, mutations and the
+reversible patch. These checks and three-architecture compilation do not
+establish GPU correctness or speed. Exact-head GPU results remain pending.

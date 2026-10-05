@@ -1,0 +1,14 @@
+[
+  [
+    "    // Two warp-private buffers of four slices, 24 KiB for the K10 instance.\n    // Each lane copies and reads its own word; the upstream shuffles remain.\n    // No extra alignment requirement: copies are the original 4-byte words.\n    __shared__ uint32_t sh_async",
+    "    // K10-09: four adjacent lanes own four contiguous packed words. For an\n    // aligned source, their leader copies 16 bytes with the L2-only policy.\n    // All 24-word tile, 48-word group, and slice strides preserve alignment.\n    // Keep four-byte async and natural uint16 fallbacks for offset views.\n    const bool copy16 = (reinterpret_cast<uintptr_t>(B) & 15u) == 0;\n    const bool copy4 = (reinterpret_cast<uintptr_t>(B) & 3u) == 0;\n    static_assert(!ASYNC_STAGE || (TWORDS % 4 == 0 && LSTRIDE % 4 == 0),\n                  \"cooperative copies must not cross a packed tile\");\n    __shared__ __align__(16) uint32_t sh_async"
+  ],
+  [
+    "                                asm volatile(\"cp.async.ca.shared.global [%0], [%1], 4;\\n\"\n                                             :: \"r\"(dst), \"l\"(src) : \"memory\");",
+    "                                if (copy16)\n                                {\n                                    if ((lane & 3) == 0)\n                                        asm volatile(\"cp.async.cg.shared.global [%0], [%1], 16;\\n\"\n                                                     :: \"r\"(dst), \"l\"(src) : \"memory\");\n                                }\n                                else if (copy4)\n                                    asm volatile(\"cp.async.ca.shared.global [%0], [%1], 4;\\n\"\n                                                 :: \"r\"(dst), \"l\"(src) : \"memory\");\n                                else\n                                {\n                                    // The public trellis element is uint16. Do not\n                                    // widen its natural alignment on offset views.\n                                    const uint16_t* src16 = reinterpret_cast<const uint16_t*>(src);\n                                    sh_async[stage][warp][d][l * LSTRIDE + lane] =\n                                        uint32_t(src16[0]) | (uint32_t(src16[1]) << 16);\n                                }"
+  ],
+  [
+    "            // Wait for our own raw-word copies before any shared read. The\n            // warp barrier also retires the previous buffer's consumers before\n            // its storage can be reused. No block-wide pipeline barrier.",
+    "            // Leaders wait for their copies before all lanes publish them at\n            // the warp barrier; a nonleader's wait alone is not sufficient.\n            // The same barrier retires every previous-buffer consumer before\n            // that storage is reused by an eager copy. No block-wide barrier."
+  ]
+]

@@ -4,8 +4,8 @@
 // qtip-kernels/src/inference.cu) on the unmodified EXL3 format:
 //
 // - warps split k and never synchronize during the main loop: no block-wide pipeline barriers;
-//   B streams straight to registers behind the original register prefetch ring; narrow
-//   integer loads use ld.global.cg (L2-only), other configurations retain ld.global.cs
+//   B streams straight to registers with ld.global.cs (evict-first; B is single-use) behind a
+//   register prefetch ring
 // - the two-word bit windows of the trellis stream are resolved in-warp: with SMEM_STAGE = false
 //   via lane shuffles (the extraction helpers in exl3_dq.cuh read exactly two words per lane, at
 //   lane-computable indices), with SMEM_STAGE = true by staging the tile words through
@@ -182,15 +182,15 @@ __device__ __forceinline__ void dq8_regs_half(uint32_t a7, uint32_t b7, int s7, 
 // ptxas spends 81-85 registers on them on sm_86/sm_89 (one 512-thread block per SM instead of two, measured
 // 18-28% slower at attention-projection shapes on the 3090). They are packed into one register (see x_pack) and
 // the bound keeps the compiler at the integer instances' 64
-// Strata K10: the raw-job integer instance reaches 79 registers on CUDA 12.8
-// sm_89 without the two-block bound, leaving only 16 resident warps. Apply the
-// same bound to narrow integer GEMV: ptxas uses 63 registers without spills,
-// allowing 32 resident warps to cover the streaming trellis-load latency.
-// This changes register allocation only; keep the prefetch/MMA/fold body intact.
-template <int bits, bool c_fp32, int cb, int MMODE, int CFG, bool SMEM_STAGE, bool HALF = false>
-__global__ __launch_bounds__(CFG == 0 ? 512 : 256, CFG == 0 ? 2 : 1)
+// K10-04: only the narrow 3-bit mul1 instance enables asynchronous raw-word
+// staging. A two-block bound permits 64 registers per thread on all targets.
+template <int bits, bool c_fp32, int cb, int MMODE, int CFG, bool SMEM_STAGE, bool HALF = false,
+          bool ASYNC_STAGE = false>
+__global__ __launch_bounds__(CFG == 0 ? 512 : 256, CFG == 0 && (HALF || ASYNC_STAGE) ? 2 : 1)
 void exl3_gemv_kernel(const strata_exl3::GemvJob* jobs)
 {
+    static_assert(!ASYNC_STAGE || (bits == 3 && cb == 2 && MMODE == 0 && CFG == 0 &&
+                                  !HALF && !SMEM_STAGE), "K10 async staging is narrow mul1 only");
     // A is already in the Hadamard basis. A null trellis marks an empty slot.
     const strata_exl3::GemvJob job = jobs[blockIdx.y];
     if (!job.B) return;  // uniform for the whole block, before any barrier
@@ -275,6 +275,17 @@ void exl3_gemv_kernel(const strata_exl3::GemvJob* jobs)
     __shared__ float sh_red[WK][ROWS][COLS];
     [[maybe_unused]] __shared__ uint32_t sh_stage[SMEM_STAGE ? WK : 1][SMEM_STAGE ? LOADS * LSTRIDE : 1];
 
+    // K10-09: four adjacent lanes own four contiguous packed words. For an
+    // aligned source, their leader copies 16 bytes with the L2-only policy.
+    // All 24-word tile, 48-word group, and slice strides preserve alignment.
+    // Keep four-byte async and natural uint16 fallbacks for offset views.
+    const bool copy16 = (reinterpret_cast<uintptr_t>(B) & 15u) == 0;
+    const bool copy4 = (reinterpret_cast<uintptr_t>(B) & 3u) == 0;
+    static_assert(!ASYNC_STAGE || (TWORDS % 4 == 0 && LSTRIDE % 4 == 0),
+                  "cooperative copies must not cross a packed tile");
+    __shared__ __align__(16) uint32_t sh_async[ASYNC_STAGE ? 2 : 1][ASYNC_STAGE ? WK : 1]
+                               [ASYNC_STAGE ? PF : 1][ASYNC_STAGE ? LOADS * LSTRIDE : 1];
+
     for (int group = blockIdx.x; group < num_groups; group += gridDim.x)
     {
         const uint32_t* bp = B32 + (size_t) ks0 * slice_stride + group * WNT * TWORDS + lane;
@@ -282,38 +293,79 @@ void exl3_gemv_kernel(const strata_exl3::GemvJob* jobs)
         // Prefetch ring (indices must be compile-time or pf lands in local memory)
         auto ld_b = [&] (int i, int l) -> uint32_t
         {
-            // Keep the same scalar uint32 load, alignment, lane guard and address.
-            // Narrow integer weights stream through L2 without filling L1; other
-            // configurations retain the upstream streaming/evict-first policy.
-            if constexpr (CFG == 0 && !HALF)
-            {
-                if constexpr (LSTRIDE < 32)
-                    return lane < LSTRIDE ? __ldcg(bp + (size_t) i * slice_stride + l * LSTRIDE) : 0;
-                else
-                    return __ldcg(bp + (size_t) i * slice_stride + l * LSTRIDE);
-            }
+            if constexpr (LSTRIDE < 32)
+                return lane < LSTRIDE ? __ldcs(bp + (size_t) i * slice_stride + l * LSTRIDE) : 0;
             else
+                return __ldcs(bp + (size_t) i * slice_stride + l * LSTRIDE);
+        };
+
+        // A committed group contains at most four slices. The next group is
+        // issued before decoding this one, into the other warp-private buffer.
+        auto stage_b = [&] (int first, int stage)
+        {
+            if constexpr (ASYNC_STAGE)
             {
-                if constexpr (LSTRIDE < 32)
-                    return lane < LSTRIDE ? __ldcs(bp + (size_t) i * slice_stride + l * LSTRIDE) : 0;
-                else
-                    return __ldcs(bp + (size_t) i * slice_stride + l * LSTRIDE);
+                #pragma unroll
+                for (int d = 0; d < PF; ++d)
+                    if (first + d < myn)
+                        #pragma unroll
+                        for (int l = 0; l < LOADS; ++l)
+                            if (lane < LSTRIDE)
+                            {
+                                const uint32_t* src = bp + (size_t) (first + d) * slice_stride + l * LSTRIDE;
+                                const unsigned dst = static_cast<unsigned>(__cvta_generic_to_shared(
+                                    &sh_async[stage][warp][d][l * LSTRIDE + lane]));
+                                if (copy16)
+                                {
+                                    if ((lane & 3) == 0)
+                                        asm volatile("cp.async.cg.shared.global [%0], [%1], 16;\n"
+                                                     :: "r"(dst), "l"(src) : "memory");
+                                }
+                                else if (copy4)
+                                    asm volatile("cp.async.ca.shared.global [%0], [%1], 4;\n"
+                                                 :: "r"(dst), "l"(src) : "memory");
+                                else
+                                {
+                                    // The public trellis element is uint16. Do not
+                                    // widen its natural alignment on offset views.
+                                    const uint16_t* src16 = reinterpret_cast<const uint16_t*>(src);
+                                    sh_async[stage][warp][d][l * LSTRIDE + lane] =
+                                        uint32_t(src16[0]) | (uint32_t(src16[1]) << 16);
+                                }
+                            }
+                asm volatile("cp.async.commit_group;\n" ::: "memory");
             }
         };
 
         uint32_t pf[PF][LOADS];
-        #pragma unroll
-        for (int d = 0; d < PF; ++d)
-            if (d < myn)
-                #pragma unroll
-                for (int l = 0; l < LOADS; ++l)
-                    pf[d][l] = ld_b(d, l);
+        if constexpr (ASYNC_STAGE)
+            stage_b(0, 0);
+        else
+        {
+            #pragma unroll
+            for (int d = 0; d < PF; ++d)
+                if (d < myn)
+                    #pragma unroll
+                    for (int l = 0; l < LOADS; ++l)
+                        pf[d][l] = ld_b(d, l);
+        }
 
         FragC_h ch[WNT][2] = {};
         float2 acc0[WNT][2] = {};
 
         for (int ib = 0; ib < myn; ib += PF)
         {
+        if constexpr (ASYNC_STAGE)
+        {
+            // Leaders wait for their copies before all lanes publish them at
+            // the warp barrier; a nonleader's wait alone is not sufficient.
+            // The same barrier retires every previous-buffer consumer before
+            // that storage is reused by an eager copy. No block-wide barrier.
+            asm volatile("cp.async.wait_group 0;\n" ::: "memory");
+            __syncwarp();
+            if (ib + PF < myn)
+                stage_b(ib + PF, ((ib / PF) + 1) & 1);
+        }
         #pragma unroll
         for (int d = 0; d < PF; ++d)
         {
@@ -323,14 +375,20 @@ void exl3_gemv_kernel(const strata_exl3::GemvJob* jobs)
             uint32_t bw[LOADS];
             #pragma unroll
             for (int l = 0; l < LOADS; ++l)
-                bw[l] = pf[d][l];
-
-            if (i + PF < myn)
             {
-                #pragma unroll
-                for (int l = 0; l < LOADS; ++l)
-                    pf[d][l] = ld_b(i + PF, l);
+                if constexpr (ASYNC_STAGE)
+                    bw[l] = lane < LSTRIDE ? sh_async[(ib / PF) & 1][warp][d][l * LSTRIDE + lane] : 0;
+                else
+                    bw[l] = pf[d][l];
             }
+
+            if constexpr (!ASYNC_STAGE)
+                if (i + PF < myn)
+                {
+                    #pragma unroll
+                    for (int l = 0; l < LOADS; ++l)
+                        pf[d][l] = ld_b(i + PF, l);
+                }
 
             if constexpr (SMEM_STAGE)
             {
