@@ -75,7 +75,7 @@ static uint32_t next() { rng ^= rng << 13; rng ^= rng >> 17; rng ^= rng << 5; re
 static float sample() {
     // Mixed magnitudes, signs, zeros and subnormal inputs; avoid overflow so
     // bitwise equality does not depend on host-specific NaN payload selection.
-    const int exponent = int(next() % 90) - 65;
+    const int exponent = int(next() % 174) - 149;
     return std::ldexp(float(int(next() % 2049) - 1024), exponent);
 }
 static bool equal(float a, float b) { return __float_as_uint(a) == __float_as_uint(b); }
@@ -123,6 +123,7 @@ int main() {
         for (int i = 0; i < H; ++i) svh[e][i] = half(std::ldexp(float((i * 3 + e * 7) % 43 - 21), -4));
         experts[e].w2.svh = svh[e].data();
     }
+    for (int out_offset : {0, 4, 8, 12, 16, 20, 24, 28})
     for (int m : {1, 4, 8}) for (int topk : {1, 2, 6, 7, 17, 32}) {
         const int masks = topk == 6 ? 64 : 5;
         for (int mask = 0; mask < masks; ++mask) {
@@ -138,7 +139,16 @@ int main() {
             for (float& f : initial) f = sample();
             if (mask == 0) for (size_t i = 0; i < initial.size(); ++i)
                 initial[i] = __uint_as_float(i & 1 ? 0x80000000u : 0u);
-            auto want = initial, have = initial;
+            auto want = initial;
+            // Overallocate only the harness's storage, then place the logical
+            // output at each natural float offset modulo32. Guard both ends.
+            const float guard = __uint_as_float(0x4bac9731u);
+            std::vector<float> have(initial.size() + 24, guard);
+            const size_t pad = ((32 - (reinterpret_cast<uintptr_t>(have.data()) & 31u)) & 31u) / 4 +
+                               size_t(out_offset / 4) + 8;
+            float* have_out = have.data() + pad;
+            assert((reinterpret_cast<uintptr_t>(have_out) & 31u) == unsigned(out_offset));
+            std::copy(initial.begin(), initial.end(), have_out);
             for (int j = 0; j < topk; ++j) {
                 const bool live = topk == 6 ? ((mask >> j) & 1) :
                     (mask == 0 ? false : mask == 1 ? true : mask == 2 ? j == topk - 1 :
@@ -152,12 +162,14 @@ int main() {
                 warp([&](int) { had_ff_r_128_inner<false, true>(d, old.data(), experts[sel[slot]].w2.svh, HAD_SCALE); });
                 for (int i = 0; i < 128; ++i) want[size_t(token) * H + chunk * 128 + i] += old[i];
             }
-            warp([&](int) { output_had_add(sel.data(), topk, experts.data(), down.data(), have.data()); });
-            equal_vector(want, have);  // includes other tokens/chunks and guard tail
+            warp([&](int) { output_had_add(sel.data(), topk, experts.data(), down.data(), have_out); });
+            equal_vector(want, std::vector<float>(have_out, have_out + want.size()));
+            for (size_t i = 0; i < pad; ++i) assert(equal(have[i], guard));
+            for (size_t i = pad + initial.size(); i < have.size(); ++i) assert(equal(have[i], guard));
             ++cases;
         }
     }
-    std::printf("PASS %zu actual-kernel cases / %zu live slots: m1/4/8, topk1/2/6/7/17/32, all64 six-slot masks, duplicate IDs, negative IDs, arbitrary initial output and poisoned scratch\n", cases, active);
+    std::printf("PASS %zu actual-kernel cases / %zu live slots: m1/4/8, topk1/2/6/7/17/32, all64 six-slot masks, duplicate IDs, negative IDs, arbitrary initial output, poisoned scratch, output offsets0/4/8/12/16/20/24/28, guards on both ends\n", cases, active);
 
     // Witnesses make order, output preservation, and the no-FMA boundary
     // meaningful checks rather than tests which happen to be insensitive.

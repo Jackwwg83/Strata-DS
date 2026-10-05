@@ -127,7 +127,14 @@ __global__ void output_had_add(const int32_t* sel, int topk, const Exl3Expert* e
     // The upstream helper writes 4*lane + {0,1,2,3}. Keep that ownership
     // through the final add to avoid the old shared-memory transpose.
     float* dst = out + size_t(token) * H + off + 4 * lane;
-    float4 acc{dst[0], dst[1], dst[2], dst[3]};
+    // Caller out may be only float-aligned. All row/chunk/lane offsets are
+    // multiples of 16 bytes, so this base-pointer test is uniform for the warp.
+    const bool vector_out = (reinterpret_cast<uintptr_t>(out) & 15u) == 0;
+    float4 acc;
+    if (vector_out)
+        acc = *reinterpret_cast<const float4*>(dst);
+    else
+        acc = float4{dst[0], dst[1], dst[2], dst[3]};
     for (int j = 0; j < topk; ++j) {
         const int slot = token * topk + j;
         const int id = sel[slot];
@@ -142,10 +149,14 @@ __global__ void output_had_add(const int32_t* sel, int topk, const Exl3Expert* e
         acc.z = __fadd_rn(acc.z, v.z);
         acc.w = __fadd_rn(acc.w, v.w);
     }
-    dst[0] = acc.x;
-    dst[1] = acc.y;
-    dst[2] = acc.z;
-    dst[3] = acc.w;
+    if (vector_out)
+        *reinterpret_cast<float4*>(dst) = acc;
+    else {
+        dst[0] = acc.x;
+        dst[1] = acc.y;
+        dst[2] = acc.z;
+        dst[3] = acc.w;
+    }
 }
 
 }  // namespace strata::ds41::kernels::k10

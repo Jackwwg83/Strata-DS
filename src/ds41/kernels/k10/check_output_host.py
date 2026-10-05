@@ -48,6 +48,9 @@ def main():
     for c in "xyzw":
         assert f"acc.{c} = __fadd_rn(acc.{c}, v.{c});" in kernel, "FP32 rounding barrier changed"
     assert "__shared__" not in kernel and "__syncwarp" not in kernel
+    assert "const bool vector_out = (reinterpret_cast<uintptr_t>(out) & 15u) == 0;" in kernel, "output alignment guard changed"
+    assert "acc = *reinterpret_cast<const float4*>(dst);" in kernel, "vector load changed"
+    assert "*reinterpret_cast<float4*>(dst) = acc;" in kernel, "vector store changed"
     for m in range(1, 9):
         for topk in range(1, 32767 // m + 1):
             last_slot = (m - 1) * topk + topk - 1
