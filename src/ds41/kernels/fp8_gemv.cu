@@ -50,21 +50,27 @@ __global__ void quantize(const uint16_t* __restrict__ x, int64_t blocks,
 // SPLIT warps cooperate on ROWS output rows. Small N gets more independent K slices;
 // adjacent output rows reuse each float4 activation load and have independent accumulators.
 // Every weight vector is loaded and decoded once for all M activation rows.
-template<int M, int ROWS, int SPLIT, bool WIDE>
-__global__ void gemv(const float* __restrict__ x, const uint8_t* __restrict__ w,
+// Verify windows use one packed word per lane: less live decoded weight and
+// activation state lets the split-K warps keep more blocks resident. Single-token
+// decode retains 16-byte weight loads to maximize bytes in flight.
+template<int M, int ROWS, int SPLIT, bool WIDE, int CTA_THREADS>
+__device__ __forceinline__ void gemv_body(const float* __restrict__ x, const uint8_t* __restrict__ w,
                      const uint8_t* __restrict__ scales, uint16_t* __restrict__ y,
                      int64_t k, int64_t n) {
-    constexpr int GROUPS = THREADS / (32 * SPLIT);
+    constexpr int GROUPS = CTA_THREADS / (32 * SPLIT);
+    static_assert(CTA_THREADS % (32 * SPLIT) == 0, "whole split groups per CTA");
+    constexpr int BYTES = M == 1 ? 16 : 4;
     const int lane = threadIdx.x & 31;
     const int warp = threadIdx.x / 32;
     const int split = warp % SPLIT;
     const int group = warp / SPLIT;
-    __shared__ float partial[THREADS / 32][ROWS][M];
+    __shared__ float partial[CTA_THREADS / 32][ROWS][M];
     for (int64_t base = int64_t(blockIdx.x) * GROUPS * ROWS;
          base < n; base += int64_t(gridDim.x) * GROUPS * ROWS) {
         const int64_t row = base + group * ROWS;
         float acc[ROWS][M] = {};
-        for (int64_t col = int64_t(split * 32 + lane) * 16; col < k; col += SPLIT * 512) {
+        for (int64_t col = int64_t(split * 32 + lane) * BYTES;
+             col < k; col += SPLIT * 32 * BYTES) {
             uint4 packed[ROWS];
             // ROWS is 1 or 2 and row is a multiple of ROWS, so the group never crosses a scale row.
             const float sw = row < n ? detail::decode_e8m0(scales[(row / 32) * (k / 32) + col / 32]) : 0;
@@ -74,17 +80,20 @@ __global__ void gemv(const float* __restrict__ x, const uint8_t* __restrict__ w,
                 if (row + r < n) {
                     const uint8_t* p = w + (row + r) * k + col;
                     if constexpr (WIDE) {
-                        packed[r] = *reinterpret_cast<const uint4*>(p);
+                        if constexpr (BYTES == 16)
+                            packed[r] = *reinterpret_cast<const uint4*>(p);
+                        else
+                            packed[r].x = *reinterpret_cast<const uint32_t*>(p);
                     } else {
                         uint32_t words[4] = {};
                         #pragma unroll
-                        for (int j = 0; j < 16; ++j) words[j / 4] |= uint32_t(p[j]) << ((j % 4) * 8);
+                        for (int j = 0; j < BYTES; ++j) words[j / 4] |= uint32_t(p[j]) << ((j % 4) * 8);
                         packed[r] = make_uint4(words[0], words[1], words[2], words[3]);
                     }
                 }
             }
             #pragma unroll
-            for (int j = 0; j < 4; ++j) {
+            for (int j = 0; j < BYTES / 4; ++j) {
                 float4 weight[ROWS];
                 #pragma unroll
                 for (int r = 0; r < ROWS; ++r) {
@@ -145,6 +154,30 @@ __global__ void gemv(const float* __restrict__ x, const uint8_t* __restrict__ w,
     }
 }
 
+// Preserve the unbounded single-token kernel and its original register policy.
+template<int M, int ROWS, int SPLIT, bool WIDE>
+__global__ void gemv(const float* __restrict__ x, const uint8_t* __restrict__ w,
+                     const uint8_t* __restrict__ scales, uint16_t* __restrict__ y,
+                     int64_t k, int64_t n) {
+    gemv_body<M, ROWS, SPLIT, WIDE, THREADS>(x, w, scales, y, k, n);
+}
+
+// sm_86 admits at most 16 CTAs per SM. Clamp only the compile-time residency
+// hint there; the lane layout and supplied stream are identical on every target.
+#if defined(__CUDA_ARCH__) && __CUDA_ARCH__ < 890
+constexpr int MAX_BLOCKS_HINT = 16;
+#else
+constexpr int MAX_BLOCKS_HINT = 24;
+#endif
+
+template<int M, int ROWS, int SPLIT, bool WIDE, int CTA_THREADS, int MIN_BLOCKS>
+__global__ __launch_bounds__(CTA_THREADS, MIN_BLOCKS < MAX_BLOCKS_HINT ? MIN_BLOCKS : MAX_BLOCKS_HINT)
+void gemv_resident(const float* __restrict__ x, const uint8_t* __restrict__ w,
+                   const uint8_t* __restrict__ scales, uint16_t* __restrict__ y,
+                   int64_t k, int64_t n) {
+    gemv_body<M, ROWS, SPLIT, WIDE, CTA_THREADS>(x, w, scales, y, k, n);
+}
+
 unsigned grid_for(int64_t rows) {
     const int64_t grid = (rows - 1) / (THREADS / 32) + 1;
     return unsigned(grid < 65535 ? grid : 65535);
@@ -153,13 +186,30 @@ unsigned grid_for(int64_t rows) {
 template<int M, int ROWS, int SPLIT>
 void launch_layout(const float* x, const uint8_t* w, const uint8_t* scales, uint16_t* y,
                    int64_t k, int64_t n, cudaStream_t stream) {
-    constexpr int ROWS_PER_BLOCK = (THREADS / 32 / SPLIT) * ROWS;
+    // Large verify windows carry 2*M accumulators. Smaller CTAs and a bounded
+    // register budget increase independently schedulable row groups; every lane
+    // retains the original K slice, FMA order, and weight ownership. Single-warp
+    // slices get a looser bound to keep their address state out of local memory.
+    constexpr bool RESIDENT = M >= 5 && ROWS == 2;
+    constexpr int CTA_THREADS = RESIDENT && SPLIT < 4 ? 64 : THREADS;
+    constexpr int MIN_BLOCKS = SPLIT == 1 ? 18 : 1280 / CTA_THREADS;
+    constexpr int ROWS_PER_BLOCK = (CTA_THREADS / 32 / SPLIT) * ROWS;
     const int64_t blocks = (n - 1) / ROWS_PER_BLOCK + 1;
     const unsigned grid = unsigned(blocks < 65535 ? blocks : 65535);
-    if (((reinterpret_cast<uintptr_t>(w) | reinterpret_cast<uintptr_t>(x)) & 15u) == 0)
-        gemv<M, ROWS, SPLIT, true><<<grid, THREADS, 0, stream>>>(x, w, scales, y, k, n);
-    else
-        gemv<M, ROWS, SPLIT, false><<<grid, THREADS, 0, stream>>>(x, w, scales, y, k, n);
+    const bool aligned = ((reinterpret_cast<uintptr_t>(w) | reinterpret_cast<uintptr_t>(x)) & 15u) == 0;
+    if constexpr (RESIDENT) {
+        if (aligned)
+            gemv_resident<M, ROWS, SPLIT, true, CTA_THREADS, MIN_BLOCKS>
+                <<<grid, CTA_THREADS, 0, stream>>>(x, w, scales, y, k, n);
+        else
+            gemv_resident<M, ROWS, SPLIT, false, CTA_THREADS, MIN_BLOCKS>
+                <<<grid, CTA_THREADS, 0, stream>>>(x, w, scales, y, k, n);
+    } else {
+        if (aligned)
+            gemv<M, ROWS, SPLIT, true><<<grid, THREADS, 0, stream>>>(x, w, scales, y, k, n);
+        else
+            gemv<M, ROWS, SPLIT, false><<<grid, THREADS, 0, stream>>>(x, w, scales, y, k, n);
+    }
 }
 
 template<int M, int ROWS>
