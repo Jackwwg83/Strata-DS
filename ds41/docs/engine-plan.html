@@ -101,7 +101,8 @@ ol li,ul li{margin:4px 0}
 <tr><td>D10</td><td>所有数值以原型为准：逐层隐藏状态、逐 token 输出、困惑度</td><td>原型已在 4090 上验证（生成正确，困惑度正常）</td></tr>
 </tbody></table></div>
 
-<h2 id="quant">4. 2bpw 量化路线（独立于引擎开发，可并行）</h2>
+<h2 id="quant">4. 2bpw 量化路线（可选：引擎实测后再决定）</h2>
+<p class="warn">2026-10-05 更新：先不自己做量化。引擎开发用现成的 SAGE 1.59bpw（最快）和 coolbho3k 3bpw（质量最好）；引擎不绑位宽，有更好的 2bpw 时直接换权重包。下面是需要时的做法。</p>
 <p>没有现成的 DeepSeek V4.1 2bpw TP1 量化；coolbho3k 没有公开量化工具；exllamav3 的转换脚本只支持 V4 架构。我们只量化路由专家（其余权重保持官方 FP8/BF16），步骤：</p>
 <ol>
 <li><b>量化源：</b>官方原版 FP4 专家（基座仓库，475 GiB，含 Engram）。不从 3bpw 再压缩，避免误差叠加。</li>
@@ -120,7 +121,7 @@ ol li,ul li{margin:4px 0}
 <tr><td><b>M2</b> decode 性能</td><td>自适应显存缓存 + profile、doorbell 并行、CUDA graph、融合 GPU 专家 kernel、FP8 GEMV；用现成的 3bpw 和 SAGE 1.59bpw 实测</td><td>SAGE 1.59bpw / 24 GB 实测 ≥ 45 tok/s；与推算偏差有解释</td><td>约 10–20 小时</td></tr>
 <tr><td><b>M3</b> prefill</td><td>pinned ring 流式、自动 chunk、注意力/indexer 的 prefill kernel</td><td>8K prompt 实测 tok/s；28 篇文档困惑度与原型偏差 &lt; 1%</td><td>约 8 小时</td></tr>
 <tr><td><b>M4</b> 128 GB 真约束</td><td>SSD 专家层（resident budget + RouterLookahead）、Engram O_DIRECT 直读、16 GB 档；用 cgroup / 内存占位把机器限到 128 GB</td><td>128 GB 限制下 3bpw 与 2bpw 实测 tok/s；无 OOM</td><td>约 6 小时</td></tr>
-<tr><td><b>M5</b> 2bpw 量化</td><td>试点 1 层 → 报成本 → 整模型量化 → 质量评估</td><td>KL / top-1 / 困惑度对比表；2bpw / 24 GB 实测 ≥ 35 tok/s</td><td>试点后确定</td></tr>
+<tr><td><b>M5</b> 2bpw 量化（可选）</td><td>引擎实测后决定是否做：试点 1 层 → 报成本 → 整模型量化 → 质量评估；或请 SAGE 作者出约 2.2bpw 版本</td><td>KL / top-1 / 困惑度对比表；2bpw / 24 GB 实测 ≥ 35 tok/s</td><td>试点后确定</td></tr>
 <tr><td><b>M6</b> 可用产品</td><td>服务层（OpenAI / Anthropic / Responses API）、DeepSeek 模板与 DSML 工具调用、setup 档位</td><td>Codex CLI 真实工具循环跑通</td><td>约 4 小时</td></tr>
 <tr><td><b>M7</b> 扩展</td><td>AVX2（Intel 消费级）调优、双卡层切分、DSpark 评估、CED 快速 prefill</td><td>各项实测对比</td><td>按需</td></tr>
 </tbody></table></div>
