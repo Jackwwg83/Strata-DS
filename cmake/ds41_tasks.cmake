@@ -12,6 +12,12 @@ endforeach()
 target_link_libraries(strata_ds41_engine PUBLIC ds41_k3_sparse_attn ds41_k5_indexer ds41_k7_hc ds41_k8_router
                       ds41_k10_exl3_moe)
 
+# K11: the CPU expert kernel (third_party/exllamav3_moe, inside strata_ds41_engine) is the replaceable file
+add_executable(k11_cpu_moe_test src/ds41/tests/k11_cpu_moe_test.cpp)
+target_link_libraries(k11_cpu_moe_test PRIVATE strata_ds41_engine)
+add_test(NAME k11_cpu_moe_test COMMAND k11_cpu_moe_test)
+set_tests_properties(k11_cpu_moe_test PROPERTIES SKIP_RETURN_CODE 77 TIMEOUT 900)
+
 # K1c: the decode GEMV itself (src/ds41/kernels/fp8_gemv.cu, library strata_ds41) is the replaceable file
 add_executable(k1c_fp8_gemv_test src/ds41/tests/k1c_fp8_gemv_test.cu)
 target_link_libraries(k1c_fp8_gemv_test PRIVATE strata_ds41 strata_ds41_engine)
