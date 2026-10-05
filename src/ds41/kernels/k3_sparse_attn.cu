@@ -1,6 +1,7 @@
-// K3-10: 128-key online softmax with streamed 128-dimension KV slices.
-// Eight heads share each CTA, and four output partitions expose 32 CTAs per
-// query. The selected output slice is consumed last by QK, then reused by PV.
+// K3-11: 128-key online softmax with ping-pong 64-dimension KV slices.
+// Eight heads and 128 output dimensions share each CTA. While one 128x64
+// buffer feeds QK, cp.async fills the other; the last two slices feed PV.
+// XOR-swizzled KV storage needs 32 KiB; the entire CTA uses 45,792 bytes.
 // Scores and BF16 probabilities share storage after an explicit read barrier.
 #include "strata/ds41/kernels/k3_sparse_attn.hpp"
 
@@ -16,19 +17,19 @@ constexpr int kDim = 512;
 constexpr int kWindow = 128;
 constexpr int kHeadTile = 8;
 constexpr int kRows = 128;
-constexpr int kSlice = 128;
+constexpr int kSlice = 64;
+constexpr int kOutputDim = 128;
 constexpr int kQueryStride = kDim + 8;
-constexpr int kSliceStride = kSlice + 8;
 constexpr int kProbStride = kRows + 8;
 constexpr int kWarps = 4;
 constexpr int kThreads = 32 * kWarps;
 constexpr int kFragments = kRows / (16 * kWarps);
-constexpr int kOutputFragments = kSlice / (16 * kWarps);
+constexpr int kOutputFragments = kOutputDim / (16 * kWarps);
 constexpr unsigned kWarpMask = 0xffffffffu;
 
 struct __align__(32) TileStorage {
     bf16 q[kHeadTile * kQueryStride];
-    bf16 kv[kRows * kSliceStride];
+    bf16 kv[2][kRows * kSlice];
     union {
         float scores[kHeadTile][kRows];
         bf16 probabilities[kHeadTile * kProbStride];
@@ -38,7 +39,7 @@ struct __align__(32) TileStorage {
     float sum[kHeadTile];
     float rescale[kHeadTile];
 };
-static_assert(sizeof(TileStorage) == 47840, "shared-memory layout changed");
+static_assert(sizeof(TileStorage) == 45792, "shared-memory layout changed");
 static_assert(sizeof(TileStorage) <= 48 * 1024, "no shared-memory opt-in required");
 static_assert(kRows == kThreads, "one thread gathers each index");
 
@@ -70,10 +71,18 @@ __device__ __forceinline__ void mma(float (&c)[4], const unsigned (&a)[4], const
                  : "r"(a[0]), "r"(a[1]), "r"(a[2]), "r"(a[3]), "r"(b[0]), "r"(b[1]));
 }
 
-// Zero-fill negative indices without forming an address from them. The
-// 128x512 KV tile is never resident: only one 128x128 slice is staged.
-__device__ __forceinline__ void gather_slice(TileStorage& tile, const bf16* window,
-                                             const bf16* comp, int dimension) {
+// XOR complete 16-byte chunks, leaving the eight BF16 values in each
+// chunk contiguous and aligned. Eight adjacent rows use distinct banks.
+__device__ __forceinline__ int kv_offset(int row, int dimension) {
+    return row * kSlice + (dimension ^ ((row & 7) * 8));
+}
+
+// Issue only: the caller overlaps these copies with MMA on the other
+// buffer and waits immediately before the destination's first read.
+// Negative indices use a safe base with src-size zero, never a bad address.
+__device__ __forceinline__ void gather_slice(TileStorage& tile, int buffer,
+                                             const bf16* window, const bf16* comp,
+                                             int dimension) {
 #pragma unroll
     for (int i = threadIdx.x; i < kRows * kSlice / 8; i += kThreads) {
         const int r = i / (kSlice / 8);
@@ -86,14 +95,21 @@ __device__ __forceinline__ void gather_slice(TileStorage& tile, const bf16* wind
             source += dimension + d;
         }
         asm volatile("cp.async.cg.shared.global [%0], [%1], 16, %2;\n"
-                     :: "r"(shared_address(tile.kv + r * kSliceStride + d)),
+                     :: "r"(shared_address(tile.kv[buffer] + kv_offset(r, d))),
                         "l"(source), "r"(j >= 0 ? 16 : 0) : "memory");
     }
-    asm volatile("cp.async.commit_group;\ncp.async.wait_group 0;\n" ::: "memory");
+    asm volatile("cp.async.commit_group;\n" ::: "memory");
+}
+
+__device__ __forceinline__ void wait_slice() {
+    asm volatile("cp.async.wait_group 0;\n" ::: "memory");
+    // Each thread waits for its own writes, then the CTA publishes all
+    // completed copies and finishes all readers of the other buffer.
     __syncthreads();
 }
 
-__global__ __launch_bounds__(kThreads) void attention_online(
+// Bound register allocation; actual residency is limited by shared memory.
+__global__ __launch_bounds__(kThreads, 6) void attention_online(
         const bf16* __restrict__ q, const bf16* __restrict__ window,
         const bf16* __restrict__ comp, const int32_t* __restrict__ idx,
         int n_idx, const float* __restrict__ sink, float scale,
@@ -103,7 +119,7 @@ __global__ __launch_bounds__(kThreads) void attention_online(
     const int warp = threadIdx.x >> 5;
     const int query = blockIdx.z;
     const int output_group = blockIdx.y;
-    const int output_dimension = output_group * kSlice;
+    const int output_dimension = output_group * kOutputDim;
     const int head = blockIdx.x * kHeadTile;
     const int head0 = (lane & 3) * 2;
     const int head1 = head0 + 1;
@@ -129,11 +145,21 @@ __global__ __launch_bounds__(kThreads) void attention_online(
         tile.indices[threadIdx.x] = position < n_idx ? indices[position] : -1;
         __syncthreads();
         float score[kFragments][4] = {};
-        // Cyclic slice order ends at the output partition. This saves a
-        // fifth gather for PV while retaining FP32 score accumulation.
+        // A cyclic dimension order keeps the same FP32 accumulation order
+        // as 128-dimension slices, ending at this CTA's two output slices.
+        const int first_dimension = (output_dimension + kOutputDim) & (kDim - 1);
+        gather_slice(tile, 0, window, comp, first_dimension);
+        wait_slice();
         for (int slice = 0; slice < kDim / kSlice; ++slice) {
-            const int dimension = ((output_group + 1 + slice) & 3) * kSlice;
-            gather_slice(tile, window, comp, dimension);
+            const int buffer = slice & 1;
+            const int dimension = (first_dimension + slice * kSlice) & (kDim - 1);
+            if (slice + 1 < kDim / kSlice) {
+                // On slice zero the other buffer has no readers. Later,
+                // the preceding wait_slice barrier retired every reader
+                // of that buffer before this overwrite can be issued.
+                const int next_dimension = (dimension + kSlice) & (kDim - 1);
+                gather_slice(tile, buffer ^ 1, window, comp, next_dimension);
+            }
 #pragma unroll
             for (int d = 0; d < kSlice; d += 16) {
                 unsigned query_fragment[2];
@@ -143,12 +169,17 @@ __global__ __launch_bounds__(kThreads) void attention_online(
                 for (int v = 0; v < kFragments; ++v) {
                     const int key_tile = (warp * kFragments + v) * 16;
                     unsigned keys[4];
-                    load_a(keys, tile.kv + (key_tile + (lane % 16)) * kSliceStride
-                                           + d + (lane / 16) * 8);
+                    load_a(keys, tile.kv[buffer] + kv_offset(key_tile + (lane % 16),
+                                                           d + (lane / 16) * 8));
                     mma(score[v], keys, query_fragment);
                 }
             }
-            __syncthreads();  // readers finish before this slice is reused
+            // This wait is AFTER current-slice MMA, overlapping all four
+            // K=16 steps with the next gather. It publishes the next slice
+            // and protects current-buffer reuse with one CTA barrier.
+            // The final slice has no outstanding copies; the score barrier
+            // below retires its readers without another empty wait.
+            if (slice + 1 < kDim / kSlice) wait_slice();
         }
 #pragma unroll
         for (int v = 0; v < kFragments; ++v) {
@@ -212,8 +243,10 @@ __global__ __launch_bounds__(kThreads) void attention_online(
             for (int v = 0; v < kOutputFragments; ++v) {
                 const int d = (warp * kOutputFragments + v) * 16;
                 unsigned values[4];
-                load_a_transposed(values, tile.kv + (r + (lane % 8) + (lane / 16) * 8) * kSliceStride
-                                                     + d + ((lane / 8) & 1) * 8);
+                // The final even/odd slices remain in buffers zero/one.
+                load_a_transposed(values, tile.kv[d / kSlice] +
+                    kv_offset(r + (lane % 8) + (lane / 16) * 8,
+                              (d % kSlice) + ((lane / 8) & 1) * 8));
                 mma(result[v], values, probabilities);
             }
         }
@@ -245,7 +278,7 @@ void sparse_attn_decode(const bf16* q, const bf16* window, const bf16* comp,
         std::fprintf(stderr, "sparse_attn_decode: invalid shape m=%d n_idx=%d\n", m, n_idx);
         std::abort();
     }
-    attention_online<<<dim3(kHeads / kHeadTile, kDim / kSlice, m), kThreads, 0, stream>>>(
+    attention_online<<<dim3(kHeads / kHeadTile, kDim / kOutputDim, m), kThreads, 0, stream>>>(
         q, window, comp, idx, n_idx, sink, scale, o);
 }
 }  // namespace strata::ds41::kernels
