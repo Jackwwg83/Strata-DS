@@ -40,13 +40,31 @@ __global__ void quantize_activations(const bf16* x, bf16* quantized, int64_t ele
     quantized[index] = __float2bfloat16_rn(float(q) * scale);
 }
 
+// E4M3 normals have three fraction bits, so applying an E8M0 power-of-two
+// scale is just an exponent adjustment when the result is normal BF16.
+// Keep the reference conversion for subnormal/overflow/NaN cases: this fast
+// path is exact over the full input domain, not a restriction on the scales.
+__device__ __forceinline__ bf16 dequantize_weight(uint8_t bits, uint8_t scale) {
+    const unsigned magnitude = bits & 0x7fu;
+    const int exponent = int(magnitude >> 3) + int(scale) - 7;
+    if (scale != 255 && magnitude >= 8 && magnitude < 127 && exponent > 0 && exponent < 255) {
+        const unsigned packed = (unsigned(bits & 0x80u) << 8) |
+                                (unsigned(exponent) << 7) | ((magnitude & 7u) << 4);
+        return __ushort_as_bfloat16(static_cast<unsigned short>(packed));
+    }
+    __nv_fp8_e4m3 q;
+    q.__x = bits;
+    return __float2bfloat16_rn(float(q) * ldexpf(1.0f, int(scale) - 127));
+}
+
 // One CTA computes 128x128 output values. Its eight warps each own a 32x64
 // rectangle, held as eight 16x16 FP32 accumulator fragments. W is [N][K],
 // which is precisely a column-major KxN operand when viewed by WMMA.
+template <bool SplitK>
 __global__ __launch_bounds__(kThreads) void gemm_bf16_tiles(
     const bf16* __restrict__ activation, const uint8_t* __restrict__ weight,
     const uint8_t* __restrict__ scales, bf16* __restrict__ output,
-    int64_t M, int64_t N, int64_t K) {
+    int64_t M, int64_t N, int64_t K, float* __restrict__ partial) {
     __shared__ __align__(32) bf16 a_tile[kTileM * kStride];
     __shared__ __align__(32) bf16 b_tile[kTileN * kStride];
     // A warp-private 16x16 tile lets us store BF16, including arbitrary M/N
@@ -70,10 +88,17 @@ __global__ __launch_bounds__(kThreads) void gemm_bf16_tiles(
         for (int j = 0; j < 4; ++j) wmma::fill_fragment(accum[i][j], 0.0f);
     }
 
-    for (int64_t k_base = 0; k_base < K; k_base += kTileK) {
+    // Split only on quantization-block boundaries. Partial sums stay FP32
+    // until the final reduction, so there is still just one BF16 output round.
+    int64_t k_begin = 0, k_end = K;
+    if constexpr (SplitK) {
+        k_begin = ((K / kTileK) * blockIdx.z / gridDim.z) * kTileK;
+        k_end = ((K / kTileK) * (blockIdx.z + 1) / gridDim.z) * kTileK;
+    }
+    for (int64_t k_base = k_begin; k_base < k_end; k_base += kTileK) {
         // Consecutive lanes load consecutive K values. A complete warp sees
         // the same weight scale, as required by the 32x32 block layout.
-#pragma unroll
+#pragma unroll 4
         for (int index = threadIdx.x; index < kTileM * kTileK; index += kThreads) {
             const int row = index / kTileK;
             const int k = index % kTileK;
@@ -81,17 +106,16 @@ __global__ __launch_bounds__(kThreads) void gemm_bf16_tiles(
             a_tile[row * kStride + k] = global_row < M
                 ? activation[global_row * K + k_base + k] : __float2bfloat16_rn(0.0f);
         }
-#pragma unroll
+#pragma unroll 4
         for (int index = threadIdx.x; index < kTileN * kTileK; index += kThreads) {
             const int col = index / kTileK;
             const int k = index % kTileK;
             const int64_t global_col = col_base + col;
             bf16 value = __float2bfloat16_rn(0.0f);
             if (global_col < N) {
-                __nv_fp8_e4m3 q;
-                q.__x = weight[global_col * K + k_base + k];
+                const uint8_t bits = weight[global_col * K + k_base + k];
                 const uint8_t scale = scales[(global_col / 32) * scale_stride + k_base / 32];
-                value = __float2bfloat16_rn(float(q) * ldexpf(1.0f, int(scale) - 127));
+                value = dequantize_weight(bits, scale);
             }
             b_tile[col * kStride + k] = value;
         }
@@ -127,12 +151,24 @@ __global__ __launch_bounds__(kThreads) void gemm_bf16_tiles(
             for (int index = lane; index < 16 * 16; index += 32) {
                 const int64_t row = row_base + warp_m + i * 16 + index / 16;
                 const int64_t col = col_base + warp_n + j * 16 + index % 16;
-                if (row < M && col < N)
-                    output[row * N + col] = __float2bfloat16_rn(warp_store[index]);
+                if (row < M && col < N) {
+                    if constexpr (SplitK)
+                        partial[(static_cast<int64_t>(blockIdx.z) * M + row) * N + col] = warp_store[index];
+                    else
+                        output[row * N + col] = __float2bfloat16_rn(warp_store[index]);
+                }
             }
             __syncwarp();
         }
     }
+}
+
+__global__ void finish_split_k(const float* partial, bf16* output, int64_t elements, int splits) {
+    const int64_t index = static_cast<int64_t>(blockIdx.x) * blockDim.x + threadIdx.x;
+    if (index >= elements) return;
+    float sum = 0.0f;
+    for (int split = 0; split < splits; ++split) sum += partial[split * elements + index];
+    output[index] = __float2bfloat16_rn(sum);
 }
 
 }  // namespace
@@ -140,15 +176,37 @@ __global__ __launch_bounds__(kThreads) void gemm_bf16_tiles(
 void fp8_block_gemm(const bf16* x, int64_t M, int64_t K, const uint8_t* w, const uint8_t* w_scale,
                     int64_t N, bf16* y, void* workspace, cudaStream_t stream) {
     if (M <= 0 || N <= 0) return;
-    // Only M*K*2 of the guaranteed M*K*4 workspace bytes are needed.
+    // The first M*K*2 workspace bytes hold the exact BF16 activations.
     auto* activation = static_cast<bf16*>(workspace);
     const int64_t elements = M * K;
     if (elements > 0)
         quantize_activations<<<static_cast<unsigned>((elements + kThreads - 1) / kThreads),
                                kThreads, 0, stream>>>(x, activation, elements);
-    const dim3 grid(static_cast<unsigned>((N + kTileN - 1) / kTileN),
-                    static_cast<unsigned>((M + kTileM - 1) / kTileM));
-    gemm_bf16_tiles<<<grid, kThreads, 0, stream>>>(activation, w, w_scale, y, M, N, K);
+    const unsigned tiles_n = static_cast<unsigned>((N + kTileN - 1) / kTileN);
+    const unsigned tiles_m = static_cast<unsigned>((M + kTileM - 1) / kTileM);
+    const int64_t tiles = static_cast<int64_t>(tiles_m) * tiles_n;
+    int splits = 1;
+    if (tiles < 128 && K >= 256) {
+        // Remaining workspace is M*K*2 bytes; each FP32 partial needs M*N*4.
+        // Shape-derived limits retain the same 128x128 kernel while adding
+        // independent CTAs when a small output otherwise leaves most SMs idle.
+        const int64_t capacity = K / (2 * N);
+        const int64_t wanted = (128 + tiles - 1) / tiles;
+        int64_t count = capacity < wanted ? capacity : wanted;
+        if (count > 8) count = 8;
+        if (count > K / kTileK) count = K / kTileK;
+        if (count > 1) splits = static_cast<int>(count);
+    }
+    const dim3 grid(tiles_n, tiles_m, splits);
+    if (splits == 1) {
+        gemm_bf16_tiles<false><<<grid, kThreads, 0, stream>>>(activation, w, w_scale, y, M, N, K, nullptr);
+    } else {
+        float* partial = reinterpret_cast<float*>(activation + elements);
+        gemm_bf16_tiles<true><<<grid, kThreads, 0, stream>>>(activation, w, w_scale, y, M, N, K, partial);
+        const int64_t outputs = M * N;
+        finish_split_k<<<static_cast<unsigned>((outputs + kThreads - 1) / kThreads),
+                         kThreads, 0, stream>>>(partial, y, outputs, splits);
+    }
 }
 
 }  // namespace strata::ds41::kernels
