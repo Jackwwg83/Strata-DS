@@ -1,6 +1,7 @@
 // src/ds41/ds41_generate.cpp - run the M1 engine on token ids: greedy generation, timings, optional dump.
 //
 //   ds41_generate --pack DIR --ids 0,128000,... [--gen 32] [--threads 8] [--dump steps.bin] [--force-ids FILE]
+//                 [--expert-profile ds41/data/expert-profile.bin [--vram-slots N] [--adapt-every 4] [--adapt-swaps 96]]
 //
 // --force-ids feeds a fixed token sequence (from the oracle) instead of the engine's own predictions, so a
 // per-layer comparison stays aligned even after the first differing token. Tokenization stays in Python.
@@ -28,15 +29,20 @@ static std::vector<int> parse_ids(const std::string& s) {
 
 int main(int argc, char** argv) {
     std::string pack, ids_s, dump_path, force_path;
-    int gen = 32, threads = 8, max_seq = 4096;
+    int gen = 32;
+    EngineOptions opt;
     for (int i = 1; i < argc; ++i) {
         const std::string a = argv[i];
         auto next = [&]() { if (i + 1 >= argc) { std::fprintf(stderr, "missing value for %s\n", a.c_str()); std::exit(2); } return std::string(argv[++i]); };
         if (a == "--pack") pack = next();
         else if (a == "--ids") ids_s = next();
         else if (a == "--gen") gen = std::stoi(next());
-        else if (a == "--threads") threads = std::stoi(next());
-        else if (a == "--max-seq") max_seq = std::stoi(next());
+        else if (a == "--threads") opt.cpu_threads = std::stoi(next());
+        else if (a == "--max-seq") opt.max_seq = std::stoi(next());
+        else if (a == "--expert-profile") opt.expert_profile = next();
+        else if (a == "--vram-slots") opt.vram_expert_slots = std::stoll(next());
+        else if (a == "--adapt-every") opt.adapt_every = std::stoi(next());
+        else if (a == "--adapt-swaps") opt.adapt_swaps = std::stoi(next());
         else if (a == "--dump") dump_path = next();
         else if (a == "--force-ids") force_path = next();
         else { std::fprintf(stderr, "unknown argument %s\n", a.c_str()); return 2; }
@@ -52,13 +58,14 @@ int main(int argc, char** argv) {
         forced = parse_ids(all);
     }
     try {
-        Engine engine(pack, max_seq, threads);
+        Engine engine(pack, opt);
         std::FILE* dump = dump_path.empty() ? nullptr : std::fopen(dump_path.c_str(), "wb");
         StepDump sd;
         const int total = forced.empty() ? (int) prompt.size() + gen : (int) forced.size();
         int next = -1;
         std::vector<int> out;
-        double decode_ms = 0, nll_sum = 0;
+        double decode_ms = 0, nll_sum = 0, cpu_ms = 0;
+        long long hits = 0, routed = 0;
         int decode_steps = 0, nll_n = 0;
         for (int pos = 0; pos < total; ++pos) {
             const int tok = !forced.empty() ? forced[pos] : pos < (int) prompt.size() ? prompt[pos] : next;
@@ -72,10 +79,15 @@ int main(int argc, char** argv) {
                 nll_sum += mx + std::log(se) - lg[forced[pos + 1]];
                 ++nll_n;
             }
-            if (pos >= (int) prompt.size() - 1) { decode_ms += t.total_ms; ++decode_steps; }
+            if (pos >= (int) prompt.size() - 1) { decode_ms += t.total_ms; cpu_ms += t.cpu_experts_ms; ++decode_steps; }
+            hits += t.expert_hits;
+            routed += t.expert_total;
             if (pos >= (int) prompt.size() - 1 && forced.empty()) out.push_back(next);
-            std::fprintf(stderr, "pos %d tok %d -> %d  total %.1f ms (engram reads %.1f, layers %.1f, of which cpu experts %.1f)\n",
-                         pos, tok, next, t.total_ms, t.engram_ms, t.gpu_ms, t.cpu_experts_ms);
+            std::fprintf(stderr,
+                         "pos %d tok %d -> %d  total %.1f ms (engram reads %.1f, layers %.1f, of which cpu experts %.1f)"
+                         "  vram hits %d/%d swaps %d\n",
+                         pos, tok, next, t.total_ms, t.engram_ms, t.gpu_ms, t.cpu_experts_ms, t.expert_hits,
+                         t.expert_total, t.vram_swaps);
             if (dump) {
                 const int32_t hdr[2] = {tok, next};
                 std::fwrite(hdr, 4, 2, dump);
@@ -91,8 +103,11 @@ int main(int argc, char** argv) {
         for (int v : out) std::printf(" %d", v);
         if (nll_n) std::printf("\nteacher_forced_mean_nll %.6f ppl %.4f over %d tokens", nll_sum / nll_n,
                                std::exp(nll_sum / nll_n), nll_n);
-        std::printf("\ndecode_ms_per_token %.1f over %d steps\n", decode_steps ? decode_ms / decode_steps : 0.0,
-                    decode_steps);
+        std::printf("\ndecode_ms_per_token %.1f over %d steps (cpu experts %.1f)\n",
+                    decode_steps ? decode_ms / decode_steps : 0.0, decode_steps,
+                    decode_steps ? cpu_ms / decode_steps : 0.0);
+        std::printf("vram_expert_slots %d hit_rate %.4f\n", engine.vram_expert_slots(),
+                    routed ? (double) hits / routed : 0.0);
     } catch (const std::exception& ex) {
         std::fprintf(stderr, "error: %s\n", ex.what());
         return 1;

@@ -12,6 +12,7 @@
 #include "strata/ds41/kernels/k5_indexer.hpp"
 #include "strata/ds41/kernels/k8_router.hpp"
 #include "strata/ds41/ops.hpp"
+#include "strata/ds41/vram_experts.hpp"
 
 #include "moe_mul1.h"   // third_party/exllamav3_moe
 
@@ -88,6 +89,7 @@ std::vector<float> rope_table(int seqlen, bool yarn) {
 
 struct Engine::Impl {
     Pack pack;
+    EngineOptions opt;
     int max_seq;
     int cpu_threads;
 
@@ -130,6 +132,9 @@ struct Engine::Impl {
     uint64_t go = 0;                   // steps released to the worker
     std::atomic<bool> stop{false};
     std::atomic<int64_t> worker_us{0}; // CPU expert time of the current step
+    std::atomic<int> worker_misses{0}; // routed experts the CPU computed in the current step
+    std::unique_ptr<VramExperts> vram;  // the VRAM tier (null: none)
+    int32_t* gpu_sel = nullptr;        // [6] this layer's resident slots (-1: CPU)
     int32_t* routes_dev = nullptr;     // [40][6]
     float* weights_dev = nullptr;      // [40][6]
     uint8_t* cand_dev = nullptr;       // [max_seq] candidate mask of the candidate layer
@@ -156,7 +161,8 @@ struct Engine::Impl {
     const bf16* cur_index_k = nullptr;
     std::vector<float> lg;             // logits of the last step
 
-    Impl(const std::string& dir, int max_seq_, int threads) : pack(dir), max_seq(max_seq_), cpu_threads(threads) {}
+    Impl(const std::string& dir, const EngineOptions& o)
+        : pack(dir), opt(o), max_seq(o.max_seq), cpu_threads(o.cpu_threads) {}
     ~Impl() {
         {
             std::lock_guard<std::mutex> lk(mu);
@@ -304,6 +310,18 @@ struct Engine::Impl {
         cand_dev = dalloc<uint8_t>(max_seq + 1);
         history.reserve(max_seq);
         db = std::make_unique<ExpertDoorbell>(1, kTopK, kDim);
+        gpu_sel = dalloc<int32_t>(kTopK);
+        // the VRAM expert tier last: an automatic slot count takes what the rest left free
+        if (!opt.expert_profile.empty() && opt.vram_expert_slots != 0) {
+            VramExperts::Adapt ad;
+            ad.every = opt.adapt_every;
+            ad.decay = opt.adapt_decay;
+            ad.max_swaps = opt.adapt_swaps;
+            vram = std::make_unique<VramExperts>(pack, opt.expert_profile, opt.vram_expert_slots,
+                                                 opt.vram_reserve_bytes, ad);
+            std::fprintf(stderr, "ds41: %d VRAM expert slots (%.2f GiB)\n", vram->slots(),
+                         vram->slots() * (double) vram->slot_bytes() / (1ull << 30));
+        }
         worker = std::thread([this] { worker_loop(); });
         if (const char* p = std::getenv("DS41_DEBUG")) dbg = std::fopen(p, "wb");
     }
@@ -355,6 +373,9 @@ struct Engine::Impl {
                     const __half hv = __float2half_rn(db->w()[i]);
                     wh[i] = c10::Half(__half_as_ushort(hv), c10::Half::from_bits());
                 }
+                int misses = 0;
+                for (int i = 0; i < kTopK; ++i) misses += db->ids()[i] >= 0;
+                worker_misses += misses;
                 exl3_moe_cpu_forward_raw(L[l].moe_handle, (const at::Half*) db->x(), db->ids(), wh, db->y(), 1, kTopK,
                                          cpu_threads);
                 worker_us += (int64_t) ((now_ms() - t0) * 1000.0);
@@ -490,15 +511,20 @@ struct Engine::Impl {
         int32_t* ids = routes_dev + l * kTopK;
         float* w = weights_dev + l * kTopK;
         kernels::router_topk(xf, 1, y.gate_w, y.gate_bias, ids, w, 0);
-        // routed experts: hand the input to the CPU thread, which reads the mmap'ed pack
+        // routed experts: the misses go to the CPU thread (which reads the mmap'ed pack), the hits to K10
         ops::to_half_fp8q(xf, x_half_dev, kDim);
-        db->publish(x_half_dev, ids, w, 1, nullptr, nullptr, (uint32_t) (l + 1), 0);
+        const bool tier = vram && vram->slots() > 0;
+        db->publish(x_half_dev, ids, w, 1, tier ? vram->res_dev() + (size_t) l * kExperts : nullptr, gpu_sel,
+                    (uint32_t) (l + 1), 0);
+        ck(cudaMemsetAsync(routed, 0, kDim * sizeof(float), 0), "routed");
+        if (tier)
+            kernels::exl3_moe_decode((const __half*) x_half_dev, 1, gpu_sel, w, kTopK, vram->experts_dev(), routed,
+                                     vram->workspace(), VramExperts::kWorkspaceBytes, 0);
         // shared expert, while the CPU works
         fp8_linear(xf, y.sh_w1, g);
         fp8_linear(xf, y.sh_w3, u);
         ops::swiglu(g, u, kSwigluLimit, sh_h, kMoeInter);
         fp8_linear(sh_h, y.sh_w2, sh_out);
-        ck(cudaMemsetAsync(routed, 0, kDim * sizeof(float), 0), "routed");
         db->wait_add(routed, 1, (uint32_t) (l + 1), 0);
         ops::add_f32_bf16(routed, sh_out, ffn_out, kDim);
     }
@@ -517,8 +543,10 @@ struct Engine::Impl {
                 if (is_engram_layer(l)) engram_read(l, li++, pos);
             tm.engram_ms = now_ms() - t0;
         }
+        if (vram) tm.vram_swaps = vram->between_steps();   // the device is idle: the last step ended in a sync
         db->reset();
         worker_us = 0;
+        worker_misses = 0;
         {
             std::lock_guard<std::mutex> lk(mu);
             ++go;
@@ -569,10 +597,11 @@ struct Engine::Impl {
         lg.resize(kVocab);
         ck(cudaMemcpy(lg.data(), logits, kVocab * 4, cudaMemcpyDeviceToHost), "logits");
         const int best = (int) (std::max_element(lg.begin(), lg.end()) - lg.begin());
+        int32_t r[kLayers * kTopK];
+        ck(cudaMemcpy(r, routes_dev, sizeof r, cudaMemcpyDeviceToHost), "routes");
+        if (vram) vram->count(r, kTopK);
         if (dump) {
-            int32_t r[kLayers * kTopK];
             float wv[kLayers * kTopK];
-            ck(cudaMemcpy(r, routes_dev, sizeof r, cudaMemcpyDeviceToHost), "dump routes");
             ck(cudaMemcpy(wv, weights_dev, sizeof wv, cudaMemcpyDeviceToHost), "dump weights");
             for (int l = 0; l < kLayers; ++l)
                 for (int i = 0; i < kTopK; ++i) {
@@ -587,15 +616,26 @@ struct Engine::Impl {
         }
         tm.total_ms = now_ms() - t_start;
         tm.cpu_experts_ms = worker_us.load() / 1000.0;
+        tm.expert_total = kLayers * kTopK;
+        tm.expert_hits = tm.expert_total - worker_misses.load();
         tm.gpu_ms = tm.total_ms - tm.engram_ms;
         return best;
     }
 };
 
-Engine::Engine(const std::string& pack_dir, int max_seq, int cpu_threads)
-    : impl_(new Impl(pack_dir, max_seq, cpu_threads)) {
+Engine::Engine(const std::string& pack_dir, const EngineOptions& opt) : impl_(new Impl(pack_dir, opt)) {
     impl_->init();
 }
+
+Engine::Engine(const std::string& pack_dir, int max_seq, int cpu_threads)
+    : Engine(pack_dir, [&] {
+          EngineOptions o;
+          o.max_seq = max_seq;
+          o.cpu_threads = cpu_threads;
+          return o;
+      }()) {}
+
+int Engine::vram_expert_slots() const { return impl_->vram ? impl_->vram->slots() : 0; }
 
 Engine::~Engine() = default;
 
