@@ -352,12 +352,20 @@
  #include "../ptx.cuh"
  #include "exl3_dq.cuh"
  #include "exl3_kernel_map.cuh"
-@@ -185,8 +184,17 @@
+@@ -183,10 +182,24 @@
+ // ptxas spends 81-85 registers on them on sm_86/sm_89 (one 512-thread block per SM instead of two, measured
+ // 18-28% slower at attention-projection shapes on the 3090). They are packed into one register (see x_pack) and
  // the bound keeps the compiler at the integer instances' 64
++// Strata K10: the raw-job integer instance reaches 79 registers on CUDA 12.8
++// sm_89 without the two-block bound, leaving only 16 resident warps. Apply the
++// same bound to narrow integer GEMV: ptxas uses 63 registers without spills,
++// allowing 32 resident warps to cover the streaming trellis-load latency.
++// This changes register allocation only; keep the prefetch/MMA/fold body intact.
  template <int bits, bool c_fp32, int cb, int MMODE, int CFG, bool SMEM_STAGE, bool HALF = false>
- __global__ __launch_bounds__(CFG == 0 ? 512 : 256, HALF && CFG == 0 ? 2 : 1)
+-__global__ __launch_bounds__(CFG == 0 ? 512 : 256, HALF && CFG == 0 ? 2 : 1)
 -void exl3_gemv_kernel(EXL3_GEMM_ARGS)
 -{
++__global__ __launch_bounds__(CFG == 0 ? 512 : 256, CFG == 0 ? 2 : 1)
 +void exl3_gemv_kernel(const strata_exl3::GemvJob* jobs)
 +{
 +    // A is already in the Hadamard basis. A null trellis marks an empty slot.
@@ -372,7 +380,7 @@
      static_assert(HALF ? (bits >= 1 && bits <= 3 && cb == 2) : (bits == 2 || bits == 3 || bits == 4),
                    "exl3_gemv_kernel supports 2, 3 and 4 bpw, and 1.5, 2.5 and 3.5 bpw with mul1");
      constexpr int WK   = CFG == 0 ? 16 : 8;     // k-split (warps per block)
-@@ -202,27 +210,6 @@
+@@ -202,27 +215,6 @@
      constexpr int LOADS = TWO_PER_LOAD ? WNT / 2 : WNT;                       // warp loads per k-slice
      constexpr int LSTRIDE = TWO_PER_LOAD ? 2 * TWORDS : (TWORDS < 32 ? TWORDS : 32);   // uint32 per load (lanes < LSTRIDE load)
      static_assert(!TWO_PER_LOAD || WNT % 2 == 0, "two tiles per warp load needs an even tile count per warp");
@@ -400,7 +408,7 @@
  
      const int warp = threadIdx.x / 32;
      const int lane = threadIdx.x % 32;
-@@ -451,32 +438,5 @@
+@@ -451,32 +443,5 @@
  
      #undef XP
  

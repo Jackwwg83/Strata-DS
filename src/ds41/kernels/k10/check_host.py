@@ -123,7 +123,7 @@ def indexing():
         for token in range(m):
             assert [slot // 6 for slot in range(token * 6, (token + 1) * 6)] == [token] * 6
         print(f"PASS workspace model m={m}: {offsets[-1]} bytes, aligned/disjoint, within 64 MiB")
-    print("PASS declared shared array bytes: GEMV 2052; activation 1280; output 512 (not ptxas measurements)")
+    print("PASS declared shared array bytes: GEMV 2052; activation 1280; output 0 (not ptxas measurements)")
 
 
 def scale_rounding():

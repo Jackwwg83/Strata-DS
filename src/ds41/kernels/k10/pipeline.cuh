@@ -4,6 +4,7 @@
 #include <cuda_fp8.h>
 #include <cassert>
 #include <stdexcept>
+#include "output_hadamard.cuh"
 
 namespace strata::ds41::kernels::k10 {
 
@@ -123,23 +124,28 @@ __global__ void output_had_add(const int32_t* sel, int topk, const Exl3Expert* e
     const int token = blockIdx.x;
     const int off = blockIdx.y * 128;
     const int lane = threadIdx.x;
-    __shared__ __align__(16) float result[128];
-    float acc[4];
-    #pragma unroll
-    for (int i = 0; i < 4; ++i) acc[i] = out[size_t(token) * H + off + lane + 32 * i];
+    // The upstream helper writes 4*lane + {0,1,2,3}. Keep that ownership
+    // through the final add to avoid the old shared-memory transpose.
+    float* dst = out + size_t(token) * H + off + 4 * lane;
+    float4 acc{dst[0], dst[1], dst[2], dst[3]};
     for (int j = 0; j < topk; ++j) {
         const int slot = token * topk + j;
         const int id = sel[slot];
         if (id < 0) continue;
-        had_ff_r_128_inner<false, true>(down + size_t(slot) * H + off,
-                                       result, experts[id].w2.svh, HAD_SCALE);
-        __syncwarp();
-        #pragma unroll
-        for (int i = 0; i < 4; ++i) acc[i] += result[lane + 32 * i];
-        __syncwarp();  // Every lane finishes reading before the next slot writes.
+        const float4 v = had_ff_r_128_registers<false, true>(
+            down + size_t(slot) * H + off, experts[id].w2.svh, HAD_SCALE);
+        // A shared FP32 store/load separated the post-scale multiplication
+        // from the add before. Explicit rn adds retain that rounding boundary
+        // and prevent the compiler from contracting the two into an FMA.
+        acc.x = __fadd_rn(acc.x, v.x);
+        acc.y = __fadd_rn(acc.y, v.y);
+        acc.z = __fadd_rn(acc.z, v.z);
+        acc.w = __fadd_rn(acc.w, v.w);
     }
-    #pragma unroll
-    for (int i = 0; i < 4; ++i) out[size_t(token) * H + off + lane + 32 * i] = acc[i];
+    dst[0] = acc.x;
+    dst[1] = acc.y;
+    dst[2] = acc.z;
+    dst[3] = acc.w;
 }
 
 }  // namespace strata::ds41::kernels::k10

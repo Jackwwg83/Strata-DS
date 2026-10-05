@@ -182,8 +182,13 @@ __device__ __forceinline__ void dq8_regs_half(uint32_t a7, uint32_t b7, int s7, 
 // ptxas spends 81-85 registers on them on sm_86/sm_89 (one 512-thread block per SM instead of two, measured
 // 18-28% slower at attention-projection shapes on the 3090). They are packed into one register (see x_pack) and
 // the bound keeps the compiler at the integer instances' 64
+// Strata K10: the raw-job integer instance reaches 79 registers on CUDA 12.8
+// sm_89 without the two-block bound, leaving only 16 resident warps. Apply the
+// same bound to narrow integer GEMV: ptxas uses 63 registers without spills,
+// allowing 32 resident warps to cover the streaming trellis-load latency.
+// This changes register allocation only; keep the prefetch/MMA/fold body intact.
 template <int bits, bool c_fp32, int cb, int MMODE, int CFG, bool SMEM_STAGE, bool HALF = false>
-__global__ __launch_bounds__(CFG == 0 ? 512 : 256, HALF && CFG == 0 ? 2 : 1)
+__global__ __launch_bounds__(CFG == 0 ? 512 : 256, CFG == 0 ? 2 : 1)
 void exl3_gemv_kernel(const strata_exl3::GemvJob* jobs)
 {
     // A is already in the Hadamard basis. A null trellis marks an empty slot.
