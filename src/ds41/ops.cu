@@ -430,6 +430,14 @@ __global__ void compress_pool_k(const float* kv, const float* sc, int ratio, bf1
     out[d] = tobf(acc);
 }
 
+__global__ void window_index_k(int pos, int32_t* idx) {
+    const int i = threadIdx.x;
+    if (i >= kWindow) return;
+    const int oldest = pos % kWindow + 1;
+    const int slot = i < kWindow - oldest ? oldest + i : i - (kWindow - oldest);
+    idx[i] = slot > pos ? -1 : slot;
+}
+
 int grid(int64_t n, int per_block) { return (int) ((n + per_block - 1) / per_block); }
 
 }  // namespace
@@ -515,6 +523,10 @@ void compress_pool(const float* kv_state, const float* score_state, int ratio, b
 void engram_apply(bf16* h, const bf16* kv, const bf16* qw, const bf16* kw, float eps) {
     engram_apply_k<<<kHc, 1024>>>(h, kv, qw, kw, eps);
     LAUNCH_CHECK("engram_apply");
+}
+void window_index(int pos, int32_t* idx) {
+    window_index_k<<<1, kWindow>>>(pos, idx);
+    LAUNCH_CHECK("window_index");
 }
 void engram_dequant(const uint8_t* w, const uint8_t* s, int rows, bf16* out) {
     engram_dequant_k<<<grid((int64_t) rows * 256, 256), 256>>>(w, s, rows, out);

@@ -43,6 +43,8 @@ void fp4_quant_inplace(bf16* v, int n, int block, bool e4m3_scale);
 /// idx -1 is empty. Softmax with a per-head sink in the denominator; output o [64][512].
 void sparse_attn(const bf16* q, const bf16* window, const bf16* compressed, const int32_t* idx, int n_idx,
                  const float* sink, float scale, bf16* o);
+/// The 128 sliding-window entries of the attention index list at position pos, oldest slot first; -1 = empty
+void window_index(int pos, int32_t* idx);
 /// Grouped low-rank output projection: o [8][4096] x wo_a [8][1024][4096] -> y [8*1024] (BF16, FP32 accumulate)
 void wo_a_grouped(const bf16* o, const bf16* wo_a, bf16* y);
 
