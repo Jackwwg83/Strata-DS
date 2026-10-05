@@ -1,0 +1,19 @@
+== code_py_0
+teacher_forced_mean_nll 1.056031 ppl 2.8749 over 199 tokens
+decode_ms_per_token 578.5 over 200 steps (cpu experts 552.6)
+M1: teacher_forced_mean_nll 1.059282 ppl 2.8843 over 199 tokens
+DUMP_DIFFERS
+ "hidden_rel_l2_median_by_layer": [
+ "route_agreement": 0.66775,
+ "route_agreement_layer0": 0.99,
+ "next_token_agreement": 0.96
+== zh_0
+teacher_forced_mean_nll 3.647609 ppl 38.3828 over 199 tokens
+decode_ms_per_token 546.9 over 200 steps (cpu experts 519.6)
+M1: teacher_forced_mean_nll 3.581346 ppl 35.9219 over 199 tokens
+DUMP_DIFFERS
+ "hidden_rel_l2_median_by_layer": [
+ "route_agreement": 0.51425,
+ "route_agreement_layer0": 0.995,
+ "next_token_agreement": 0.875
+M2C_DONE
