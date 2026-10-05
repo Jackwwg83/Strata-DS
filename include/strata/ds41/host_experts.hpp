@@ -47,7 +47,8 @@ public:
     int32_t slot_of(int layer, int expert) const { return slot_[(size_t) layer * n_experts_ + expert]; }
     uint8_t* slot_ptr(int slot) const { return arena_ + (size_t) slot * slot_bytes_; }
 
-    /// Point the CPU kernel's (layer, expert) at its bytes in the file (the mapped experts.bin).
+    /// Point the CPU kernel's (layer, expert) at its bytes in the file (the mapped experts.bin). It leaves the RAM
+    /// tier's table; its slot stays reserved for the next assign.
     void point_to_file(int layer, int expert);
     /// Record that `slot` now holds (layer, expert) and point the CPU kernel at it. The slot's previous expert
     /// must already point elsewhere (point_to_file) and leaves the RAM tier.

@@ -2,6 +2,7 @@
 #include "strata/ds41/vram_experts.hpp"
 
 #include "strata/ds41/config.hpp"
+#include "strata/ds41/host_experts.hpp"
 
 #include <algorithm>
 #include <cstdio>
@@ -124,6 +125,7 @@ VramExperts::VramExperts(const Pack& pack, const std::string& profile_path, int6
 
 VramExperts::~VramExperts() {
     if (copier_.joinable()) copier_.join();
+    if (staging_) cudaFreeHost(staging_);
     cudaStreamDestroy(copy_stream_);
     cudaFree(arena_);
     cudaFree(res_dev_);
@@ -165,17 +167,36 @@ void VramExperts::count(const int32_t* routes, int topk) {
         }
 }
 
-void VramExperts::copy_worker(std::vector<ExpertSwap> swaps, std::vector<int32_t> slots) {
+void VramExperts::set_host(HostExperts* host) {
+    host_ = host;
+    if (host_ && host_->slots() > 0 && !staging_)
+        ck(cudaMallocHost((void**) &staging_, slot_bytes_), "swap staging");
+}
+
+void VramExperts::copy_worker(std::vector<Pending> work) {
     bool ok = cudaSetDevice(device_) == cudaSuccess;
     const uint8_t* base = pack_.expert_base();
-    for (size_t i = 0; ok && i < swaps.size(); ++i) {
-        const ExpertSwap& s = swaps[i];
-        const ExpertSlot& x = pack_.expert(s.layer, s.in);
-        // pageable source: the call returns once the bytes are staged; the stream then finishes the DMA
-        ok = cudaMemcpyAsync(arena_ + (size_t) slots[i] * slot_bytes_, base + x.offset, x.bytes,
-                             cudaMemcpyHostToDevice, copy_stream_) == cudaSuccess &&
-             cudaMemcpyAsync(experts_dev_ + slots[i], &desc_host_[slots[i]], sizeof(kernels::Exl3Expert),
-                             cudaMemcpyHostToDevice, copy_stream_) == cudaSuccess;
+    for (size_t i = 0; ok && i < work.size(); ++i) {
+        const Pending& w = work[i];
+        uint8_t* vslot = arena_ + (size_t) w.vram_slot * slot_bytes_;
+        const ExpertSlot& xin = pack_.expert(w.layer, w.in);
+        if (w.ram_slot >= 0) {
+            // out: VRAM -> staging; in: its RAM slot -> VRAM; then out: staging -> the RAM slot
+            const ExpertSlot& xout = pack_.expert(w.layer, w.out);
+            uint8_t* rslot = host_->slot_ptr(w.ram_slot);
+            ok = cudaMemcpyAsync(staging_, vslot, xout.bytes, cudaMemcpyDeviceToHost, copy_stream_) == cudaSuccess &&
+                 cudaMemcpyAsync(vslot, rslot, xin.bytes, cudaMemcpyHostToDevice, copy_stream_) == cudaSuccess &&
+                 cudaMemcpyAsync(experts_dev_ + w.vram_slot, &desc_host_[w.vram_slot], sizeof(kernels::Exl3Expert),
+                                 cudaMemcpyHostToDevice, copy_stream_) == cudaSuccess &&
+                 cudaStreamSynchronize(copy_stream_) == cudaSuccess;
+            if (ok) std::memcpy(rslot, staging_, xout.bytes);
+        } else {
+            // pageable source: the call returns once the bytes are staged; the stream then finishes the DMA
+            ok = cudaMemcpyAsync(vslot, base + xin.offset, xin.bytes, cudaMemcpyHostToDevice, copy_stream_) ==
+                     cudaSuccess &&
+                 cudaMemcpyAsync(experts_dev_ + w.vram_slot, &desc_host_[w.vram_slot], sizeof(kernels::Exl3Expert),
+                                 cudaMemcpyHostToDevice, copy_stream_) == cudaSuccess;
+        }
     }
     ok = ok && cudaStreamSynchronize(copy_stream_) == cudaSuccess;
     copy_error_ = !ok;
@@ -190,7 +211,10 @@ int VramExperts::between_steps() {
         if (!copies_done_.load(std::memory_order_acquire)) return 0;   // still copying: the next step checks again
         copier_.join();
         if (copy_error_) throw std::runtime_error("ds41 vram experts: an adaptive expert copy failed");
-        for (const auto& [i, slot] : pending_) res_host_[(size_t) i] = slot;
+        for (const Pending& w : pending_) {
+            res_host_[(size_t) w.layer * E + w.in] = w.vram_slot;
+            if (w.ram_slot >= 0) host_->assign(w.ram_slot, w.layer, w.out);   // the CPU now reads `out` from RAM
+        }
         committed = (int) pending_.size();
         swaps_total_ += committed;
         pending_.clear();
@@ -200,18 +224,18 @@ int VramExperts::between_steps() {
     const auto swaps = plan_expert_swaps(usage_, res_host_, L, E, adapt_.max_swaps);
     for (float& v : usage_) v *= adapt_.decay;
     if (swaps.empty()) return committed;
-    std::vector<int32_t> slots;
     for (const ExpertSwap& s : swaps) {
         const size_t out = (size_t) s.layer * E + s.out;
         const int32_t slot = res_host_[out];
-        res_host_[out] = -1;   // evicted now: the CPU computes it from the next step on
+        res_host_[out] = -1;   // evicted now: the CPU computes it (from the file) from the next step on
         desc_host_[slot] = describe(s.layer, s.in, slot);
-        slots.push_back(slot);
-        pending_.emplace_back((int32_t) ((size_t) s.layer * E + s.in), slot);
+        const int32_t ram = host_ ? host_->slot_of(s.layer, s.in) : -1;
+        if (ram >= 0) host_->point_to_file(s.layer, s.in);   // its RAM slot is about to be overwritten
+        pending_.push_back(Pending{s.layer, s.in, s.out, slot, ram});
     }
     upload_res();   // before the copies start: no step reads a slot that is being overwritten
     copies_done_.store(false, std::memory_order_relaxed);
-    copier_ = std::thread(&VramExperts::copy_worker, this, swaps, std::move(slots));
+    copier_ = std::thread(&VramExperts::copy_worker, this, pending_);
     return committed;
 }
 

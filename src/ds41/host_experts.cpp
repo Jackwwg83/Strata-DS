@@ -141,6 +141,7 @@ void HostExperts::point(int layer, int expert, const uint8_t* bytes) {
 
 void HostExperts::point_to_file(int layer, int expert) {
     point(layer, expert, pack_.expert_base() + pack_.expert(layer, expert).offset);
+    slot_[(size_t) layer * n_experts_ + expert] = -1;   // read from the file now; its slot stays reserved until assign
 }
 
 void HostExperts::assign(int slot, int layer, int expert) {

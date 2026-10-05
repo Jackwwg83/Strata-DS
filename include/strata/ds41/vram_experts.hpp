@@ -27,6 +27,8 @@
 
 namespace strata::ds41 {
 
+class HostExperts;
+
 /// Reads a STRP profile: the ranked (layer, expert) pairs. Throws when the file is not a profile of this shape.
 std::vector<std::pair<int, int>> read_expert_profile(const std::string& path, int n_layers, int n_experts);
 
@@ -75,11 +77,19 @@ public:
     /// number of swaps committed now.
     int between_steps();
     int64_t swaps_total() const { return swaps_total_; }
+    /// With a RAM tier: an expert swapped out of VRAM takes the RAM slot of the one swapped in (upstream), so swaps
+    /// read nothing from the file. Set before the first step.
+    void set_host(HostExperts* host);
 
 private:
     kernels::Exl3Expert describe(int layer, int expert, int slot) const;
     void upload_res();
-    void copy_worker(std::vector<ExpertSwap> swaps, std::vector<int32_t> slots);
+    struct Pending {
+        int32_t layer, in, out;
+        int32_t vram_slot;   ///< the slot `out` leaves and `in` takes
+        int32_t ram_slot;    ///< `in`'s RAM slot, which `out` takes; -1: `in` came from the file
+    };
+    void copy_worker(std::vector<Pending> work);
 
     const Pack& pack_;
     Adapt adapt_;
@@ -99,7 +109,9 @@ private:
     std::thread copier_;
     std::atomic<bool> copies_done_{false};
     bool copy_error_ = false;
-    std::vector<std::pair<int32_t, int32_t>> pending_;   ///< (layer * n_experts + expert, slot) in flight
+    std::vector<Pending> pending_;     ///< swaps in flight
+    HostExperts* host_ = nullptr;
+    uint8_t* staging_ = nullptr;       ///< pinned, one slot: `out` on its way from VRAM to RAM
 };
 
 }  // namespace strata::ds41
