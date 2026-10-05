@@ -1,4 +1,4 @@
-// src/ds41/kernels/k7_hc.cu - vectorized row tiles with shared input reuse.
+// src/ds41/kernels/k7_hc.cu - reference-order dots with vectorized tile reuse.
 #include "strata/ds41/kernels/k7_hc.hpp"
 
 #include "strata/ds41/config.hpp"
@@ -13,20 +13,24 @@ namespace strata::ds41::kernels {
 namespace {
 
 constexpr int kThreads = 256;
-constexpr int kRowsPerBlock = 4;
+constexpr int kRowsPerBlock = 2;
 constexpr int kPartialThreads = 32 * kRowsPerBlock;
-constexpr int kChunk = 512;
+constexpr int kDotWarps = 8;     // The reference dot kernel has 256 threads.
+constexpr int kNormWarps = 32;   // The reference RMS kernel has 1024 threads.
+constexpr int kTileSteps = 16;
+constexpr int kTileValues = kTileSteps * 32;
 constexpr int kStreamSize = kHc * kDim;
-constexpr int kParts = kStreamSize / kChunk;
-constexpr int kReductionRows = kHcMix + 1;
+constexpr int kDotSteps = kStreamSize / 256;
 constexpr int kMaxTokens = 8;  // The fixed interface permits m in [1, 8].
 constexpr unsigned kWarpMask = 0xffffffffu;
 static_assert(kHc == 4 && kHcMix == 24);
-static_assert(kStreamSize % kChunk == 0 && kDim % kThreads == 0);
-static_assert(kHcMix % kRowsPerBlock == 0 && kChunk % (32 * 4) == 0);
+static_assert(kStreamSize % 1024 == 0 && kDim % kThreads == 0);
+static_assert(kHcMix % kRowsPerBlock == 0 && kDotSteps % kTileSteps == 0);
+static_assert(kTileSteps % 4 == 0);
 
 struct Workspace {
-    float partial[kMaxTokens][kReductionRows][kParts];
+    float dot[kMaxTokens][kHcMix][kDotWarps];
+    float norm[kMaxTokens][kNormWarps];
 };
 
 void check_cuda(cudaError_t status, const char* operation) {
@@ -65,13 +69,12 @@ __device__ __forceinline__ float warp_sum(float value) {
     return value;
 }
 
-// Each CTA caches one 512-column input tile for ALL tokens, then four
-// independent warps reuse it for four fn rows. Compared with one row per CTA,
-// this loads x from global memory 6 rather than 24 times. Each FP32 weight is
-// still loaded just once per call and reused across all Tokens in registers.
-// The 40*6 grid provides 240 CTAs; the largest shared tile is only 16 KiB.
-// Vector loads are used for aligned fn; the scalar fallback permits legal
-// float-aligned subviews too. No x alignment beyond BF16 is assumed.
+// Each CTA owns two weight rows and ONE original 32-lane dot warp. The
+// 12*8 grid gives 96 CTAs. Shared input tiles are reused by both row warps;
+// float4 fn loads are staged into shared memory and then consumed by the
+// original lanes. This changes data movement, not the FP32 reduction tree.
+// Scalar loading also supports float-aligned fn subviews; x needs only BF16
+// alignment. The largest shared allocation is 20 KiB (m=8).
 __device__ __forceinline__ float4 load_weights(const float* pointer, bool aligned) {
     if (aligned) return *reinterpret_cast<const float4*>(pointer);
     return make_float4(pointer[0], pointer[1], pointer[2], pointer[3]);
@@ -80,64 +83,76 @@ __device__ __forceinline__ float4 load_weights(const float* pointer, bool aligne
 template <int Tokens>
 __global__ void hc_partials(const __nv_bfloat16* __restrict__ x,
                             const float* __restrict__ fn, Workspace* workspace) {
-    __shared__ __align__(16) float cached_x[Tokens][kChunk];
-    __shared__ float warp_squares[Tokens][kRowsPerBlock];
+    __shared__ __align__(16) float cached_x[Tokens][kTileValues];
+    __shared__ __align__(16) float cached_fn[kRowsPerBlock][kTileValues];
     const int tid = threadIdx.x;
     const int lane = tid & 31;
-    const int warp = tid >> 5;
+    const int row_warp = tid >> 5;
     const int row_group = blockIdx.y;
-    const int row = row_group * kRowsPerBlock + warp;
-    const int part = blockIdx.x;
-    float squares[Tokens] = {};
-#pragma unroll
-    for (int offset = 0; offset < kChunk; offset += kPartialThreads) {
-        const int local = offset + tid;
-        const int column = part * kChunk + local;
-#pragma unroll
-        for (int token = 0; token < Tokens; ++token) {
-            const float value = __bfloat162float(x[token * kStreamSize + column]);
-            cached_x[token][local] = value;
-            // Norm ownership belongs to the input LOADER, not each row warp.
-            // Only group zero contributes: every (token,column) is squared
-            // exactly once across the entire grid, not once per fn row.
-            if (row_group == 0) squares[token] += value * value;
-        }
-    }
-    if (row_group == 0) {
-#pragma unroll
-        for (int token = 0; token < Tokens; ++token) {
-            const float square = warp_sum(squares[token]);
-            if (lane == 0) warp_squares[token][warp] = square;
-        }
-    }
-    __syncthreads();
-    if (row_group == 0 && tid < Tokens) {
-        float square = 0.0f;
-#pragma unroll
-        for (int w = 0; w < kRowsPerBlock; ++w)
-            square += warp_squares[tid][w];
-        workspace->partial[tid][kHcMix][part] = square;
-    }
-
-    float dots[Tokens] = {};
+    const int row = row_group * kRowsPerBlock + row_warp;
+    const int reference_warp = blockIdx.x;
     const bool aligned = (reinterpret_cast<std::uintptr_t>(fn) & 15u) == 0;
+    float dots[Tokens] = {};
+    float squares[2][Tokens] = {};
+
+    // These accumulators survive EVERY tile. Each dot lane sees exactly
+    // reference_warp*32 + lane + 256*step, step=0..79, in that order.
+    // Splitting the 80-term chain into separately rounded partial sums is
+    // invalid: large finite cancellation can exceed coefficient tolerance.
+#pragma unroll 1
+    for (int first_step = 0; first_step < kDotSteps; first_step += kTileSteps) {
 #pragma unroll
-    for (int offset = 0; offset < kChunk; offset += 32 * 4) {
-        const int local = offset + lane * 4;
-        const float4 weight = load_weights(fn + row * kStreamSize + part * kChunk + local, aligned);
+        for (int local = tid; local < kTileValues; local += kPartialThreads) {
+            const int column = reference_warp * 32 +
+                               (first_step + local / 32) * 256 + (local & 31);
 #pragma unroll
-        for (int token = 0; token < Tokens; ++token) {
-            const float4 value = *reinterpret_cast<const float4*>(&cached_x[token][local]);
-            dots[token] += value.x * weight.x;
-            dots[token] += value.y * weight.y;
-            dots[token] += value.z * weight.z;
-            dots[token] += value.w * weight.w;
+            for (int token = 0; token < Tokens; ++token)
+                cached_x[token][local] = __bfloat162float(x[token * kStreamSize + column]);
         }
+#pragma unroll
+        for (int local = lane * 4; local < kTileValues; local += 32 * 4) {
+            const int column = reference_warp * 32 +
+                               (first_step + local / 32) * 256 + (local & 31);
+            *reinterpret_cast<float4*>(&cached_fn[row_warp][local]) =
+                load_weights(fn + row * kStreamSize + column, aligned);
+        }
+        __syncthreads();
+
+#pragma unroll
+        for (int step = 0; step < kTileSteps; ++step) {
+            const int local = step * 32 + lane;
+            const float weight = cached_fn[row_warp][local];
+#pragma unroll
+            for (int token = 0; token < Tokens; ++token) {
+                const float value = cached_x[token][local];
+                dots[token] = __fmaf_rn(value, weight, dots[token]);
+                // Only row group zero owns RMS. Its two row warps each own
+                // two ORIGINAL norm warps. q=row_warp or row_warp+2 gives
+                // column=(q*8+reference_warp)*32+lane+1024*iteration.
+                // Each norm chain retains the reference's 20 FMA terms.
+                if (row_group == 0) {
+                    if ((step & 3) == row_warp)
+                        squares[0][token] = __fmaf_rn(value, value, squares[0][token]);
+                    if ((step & 3) == row_warp + 2)
+                        squares[1][token] = __fmaf_rn(value, value, squares[1][token]);
+                }
+            }
+        }
+        // All row warps must finish reading a tile before it is overwritten.
+        if (first_step + kTileSteps < kDotSteps) __syncthreads();
     }
 #pragma unroll
     for (int token = 0; token < Tokens; ++token) {
         const float dot = warp_sum(dots[token]);
-        if (lane == 0) workspace->partial[token][row][part] = dot;
+        if (lane == 0) workspace->dot[token][row][reference_warp] = dot;
+        if (row_group == 0) {
+#pragma unroll
+            for (int q = 0; q < 2; ++q) {
+                const float square = warp_sum(squares[q][token]);
+                if (lane == 0)
+                    workspace->norm[token][(row_warp + 2 * q) * 8 + reference_warp] = square;
+            }
+        }
     }
 }
 
@@ -215,15 +230,19 @@ __global__ void hc_finish(const __nv_bfloat16* __restrict__ x,
     y[token * kDim + d] = __float2bfloat16_rn(collapsed);
     if (blockIdx.x != 0) return;  // Uniform for the CTA, before any barrier.
 
-    if (tid < kReductionRows) {
+    if (tid < kHcMix) {
         float sum = 0.0f;
 #pragma unroll
-        for (int part = 0; part < kParts; ++part)
-            sum += workspace->partial[token][tid][part];
-        if (tid == kHcMix)
-            reciprocal_rms = rsqrtf(sum / static_cast<float>(kStreamSize) + kNormEps);
-        else
-            mixes[tid] = sum;
+        for (int warp = 0; warp < kDotWarps; ++warp)
+            sum += workspace->dot[token][tid][warp];
+        mixes[tid] = sum;
+    }
+    if (tid == kHcMix) {
+        float sum = 0.0f;
+#pragma unroll
+        for (int warp = 0; warp < kNormWarps; ++warp)
+            sum += workspace->norm[token][warp];
+        reciprocal_rms = rsqrtf(sum / static_cast<float>(kStreamSize) + kNormEps);
     }
     __syncthreads();
     if (tid < 32)
@@ -241,7 +260,7 @@ void hc_mixes_pre(const __nv_bfloat16* x, int m, const float* fn, const float* s
         std::abort();
     }
     Workspace* workspace = workspace_for_device();
-    const dim3 partial_grid(kParts, kHcMix / kRowsPerBlock);
+    const dim3 partial_grid(kDotWarps, kHcMix / kRowsPerBlock);
 #define K7_LAUNCH(TOKENS) \
     case TOKENS: \
         hc_partials<TOKENS><<<partial_grid, kPartialThreads, 0, stream>>>(x, fn, workspace); \
