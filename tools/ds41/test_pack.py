@@ -1,0 +1,136 @@
+"""Tests for tools/ds41/pack.py on small synthetic EXL3 checkpoints. No GPU, no downloads.
+
+Run: python tools/ds41/test_pack.py   (or python -m pytest tools/ds41/test_pack.py)
+"""
+import json
+import os
+import sys
+import tempfile
+import unittest
+
+import numpy as np
+import torch
+from safetensors.torch import save_file
+
+HERE = os.path.dirname(os.path.abspath(__file__))
+sys.path.insert(0, HERE)
+import pack as P  # noqa: E402
+
+SHAPES = {3: {"w1": ([320, 144, 48], [5120], [2304]), "w3": ([320, 144, 48], [5120], [2304]),
+              "w2": ([144, 320, 48], [2304], [5120])},
+          2: {"w1": ([320, 144, 32], [5120], [2304]), "w3": ([320, 144, 32], [5120], [2304]),
+              "w2": ([144, 320, 32], [2304], [5120])}}
+
+
+def write_checkpoint(d, layers=(0, 1), n_exp=3, bits_of=lambda L, e: 3):
+    """Two shards. Expert tensors are split across them; one expert per layer has another bitrate."""
+    shards, index, truth = [{}, {}], {}, {}
+
+    def put(name, t, k):
+        shards[k][name] = t
+        index[name] = f"model-0000{k + 1}-of-00002.safetensors"
+        truth[name] = t
+
+    for L in layers:
+        for e in range(n_exp):
+            for w, (tr, su, sv) in SHAPES[bits_of(L, e)].items():
+                base = f"layers.{L}.ffn.experts.{e}.{w}."
+                put(base + "trellis", torch.randint(-32768, 32767, tr, dtype=torch.int16), (e + L) % 2)
+                put(base + "suh", torch.randn(su).half(), e % 2)
+                put(base + "svh", torch.randn(sv).half(), (e + 1) % 2)
+                put(base + "mul1", torch.tensor(-2082680531, dtype=torch.int32), 0)
+        wo = (torch.randn(64, 96) * 8).clamp(-448, 448).to(torch.float8_e4m3fn)
+        put(f"layers.{L}.attn.wo_a.weight", wo, 1)
+        put(f"layers.{L}.attn.wo_a.scale",
+            (2.0 ** torch.randint(-4, 2, (2, 3)).float()).to(torch.float8_e8m0fnu), 1)
+        put(f"layers.{L}.attn.wq_a.weight", (torch.randn(64, 32)).to(torch.float8_e4m3fn), 0)
+        put(f"layers.{L}.attn.wq_a.scale", (torch.ones(2, 1)).to(torch.float8_e8m0fnu), 0)
+        put(f"layers.{L}.attn.attn_sink", torch.randn(64), 1)
+        put(f"layers.{L}.ffn.gate.weight", torch.randn(384, 32).bfloat16(), 0)
+    put("embed.weight", torch.randn(100, 32).bfloat16(), 0)
+    put("vision.blocks.0.attn.wo.weight", torch.randn(8, 8).bfloat16(), 1)
+    for k in range(2):
+        save_file(shards[k], os.path.join(d, f"model-0000{k + 1}-of-00002.safetensors"))
+    json.dump({"weight_map": index}, open(os.path.join(d, "model.safetensors.index.json"), "w"))
+    for f in ("config.json", "tokenizer.json", "tokenizer_config.json"):
+        open(os.path.join(d, f), "w").write("{}")
+    return truth
+
+
+def read_index(path):
+    rows = {}
+    for line in open(path):
+        if line.startswith("#") or not line.strip():
+            continue
+        f = line.split()
+        name, dtype, ndim = f[0], f[1], int(f[2])
+        dims = [int(x) for x in f[3:3 + ndim]]
+        off, nb = int(f[3 + ndim]), int(f[4 + ndim])
+        rows[name] = (dtype, dims, off, nb)
+    return rows
+
+
+class PackTest(unittest.TestCase):
+    def setUp(self):
+        self.tmp = tempfile.TemporaryDirectory()
+        self.src = os.path.join(self.tmp.name, "src")
+        self.out = os.path.join(self.tmp.name, "pack")
+        os.makedirs(self.src)
+        mixed = lambda L, e: 2 if (L, e) == (1, 2) else 3
+        self.truth = write_checkpoint(self.src, bits_of=mixed)
+        P.build_pack(self.src, self.out, n_layers=2, n_experts=3)
+
+    def tearDown(self):
+        self.tmp.cleanup()
+
+    def test_dense_bytes_round_trip_except_vision_and_experts(self):
+        idx = read_index(os.path.join(self.out, "index.txt"))
+        blob = np.fromfile(os.path.join(self.out, "dense.bin"), dtype=np.uint8)
+        self.assertNotIn("vision.blocks.0.attn.wo.weight", idx)
+        self.assertFalse(any(".ffn.experts." in n for n in idx))
+        for name in ("layers.0.attn.wq_a.weight", "layers.1.attn.wq_a.scale", "layers.0.attn.attn_sink",
+                     "layers.1.ffn.gate.weight", "embed.weight"):
+            dtype, dims, off, nb = idx[name]
+            want = self.truth[name].contiguous().view(torch.uint8).numpy().reshape(-1)
+            self.assertEqual(off % P.DENSE_ALIGN, 0, name)
+            self.assertEqual(dims, list(self.truth[name].shape), name)
+            np.testing.assert_array_equal(blob[off:off + nb], want, err_msg=name)
+
+    def test_wo_a_is_dequantized_to_bf16_like_convert_py(self):
+        idx = read_index(os.path.join(self.out, "index.txt"))
+        self.assertNotIn("layers.0.attn.wo_a.scale", idx)
+        dtype, dims, off, nb = idx["layers.0.attn.wo_a.weight"]
+        self.assertEqual((dtype, dims), ("bf16", [64, 96]))
+        blob = np.fromfile(os.path.join(self.out, "dense.bin"), dtype=np.uint8)
+        got = torch.from_numpy(blob[off:off + nb].copy()).view(torch.bfloat16).view(64, 96)
+        w = self.truth["layers.0.attn.wo_a.weight"].float()
+        s = self.truth["layers.0.attn.wo_a.scale"].float()
+        want = (w * s.repeat_interleave(32, 0).repeat_interleave(32, 1)).bfloat16()
+        self.assertTrue(torch.equal(got, want))
+
+    def test_every_expert_component_round_trips_and_is_aligned(self):
+        rows = P.read_experts_txt(os.path.join(self.out, "experts.txt"))
+        self.assertEqual(len(rows), 2 * 3)
+        blob = np.fromfile(os.path.join(self.out, "experts.bin"), dtype=np.uint8)
+        for (L, e), r in rows.items():
+            self.assertEqual(r["offset"] % P.EXPERT_ALIGN, 0)
+            self.assertEqual(r["bytes"] % P.EXPERT_ALIGN, 0)
+            for comp, (coff, cnb) in r["components"].items():
+                self.assertEqual(coff % P.COMPONENT_ALIGN, 0)
+                w, part = comp.split(".")
+                want = self.truth[f"layers.{L}.ffn.experts.{e}.{w}.{part}"].contiguous().reshape(-1).view(torch.uint8).numpy().reshape(-1)
+                a = r["offset"] + coff
+                np.testing.assert_array_equal(blob[a:a + cnb], want, err_msg=f"{L}.{e}.{comp}")
+        # the 2-bit expert is smaller than its 3-bit neighbours, and the file records that
+        self.assertLess(rows[(1, 2)]["bytes"], rows[(1, 1)]["bytes"])
+        self.assertEqual(rows[(1, 2)]["bits"], {"w1": 2, "w3": 2, "w2": 2})
+
+    def test_pack_is_marked_finished_last(self):
+        info = open(os.path.join(self.out, "pack_info.txt")).read()
+        self.assertIn("finished 1", info)
+        for f in ("tokenizer.json", "tokenizer_config.json", "config.json"):
+            self.assertTrue(os.path.exists(os.path.join(self.out, f)))
+
+
+if __name__ == "__main__":
+    unittest.main()
