@@ -145,6 +145,154 @@ __global__ void gemv(const float* __restrict__ x, const uint8_t* __restrict__ w,
     }
 }
 
+
+// A bounded activation tile is shared by every output-row group in the CTA. Weights
+// stay in registers and each decoded value is reused for all M tokens. M=1 and small
+// N keep the baseline path: they have little CTA reuse to repay the tile barriers.
+constexpr int ACT_TILE = 512;
+
+// Float4-vector swizzle: contiguous staging stores and strided warp reads both use
+// all shared-memory banks. It is a permutation inside each 32-vector/128-float span.
+__device__ __forceinline__ int activation_slot(int vector) {
+    return vector ^ ((vector >> 3) & 3);
+}
+
+template<int M, int ROWS, int SPLIT, bool WIDE>
+__global__ void gemv_shared_activation(const float* __restrict__ x,
+                                      const uint8_t* __restrict__ w,
+                                      const uint8_t* __restrict__ scales,
+                                      uint16_t* __restrict__ y, int64_t k, int64_t n) {
+    static_assert(SPLIT == 1 || SPLIT == 2, "bounded tile uses one or two K warps");
+    constexpr int GROUPS = THREADS / (32 * SPLIT);
+    constexpr int VALUES = ACT_TILE / (32 * SPLIT);
+    constexpr int WORDS = VALUES / 4;
+    const int lane = threadIdx.x & 31;
+    const int warp = threadIdx.x / 32;
+    const int split = warp % SPLIT;
+    const int group = warp / SPLIT;
+    __shared__ float4 activation[M][ACT_TILE / 4];
+    __shared__ float partial[THREADS / 32][ROWS][M];
+    for (int64_t base = int64_t(blockIdx.x) * GROUPS * ROWS;
+         base < n; base += int64_t(gridDim.x) * GROUPS * ROWS) {
+        const int64_t row = base + group * ROWS;
+        const int local_col = (split * 32 + lane) * VALUES;
+        float acc[ROWS][M] = {};
+        for (int64_t tile = 0; tile < k; tile += ACT_TILE) {
+            // Each thread copies one vector per token; the final K tile is guarded.
+            // No [M,K] workspace or host-side state is needed, including in capture.
+            const int vector = threadIdx.x;
+            const int64_t load_col = tile + vector * 4;
+            if (load_col < k) {
+                #pragma unroll
+                for (int t = 0; t < M; ++t) {
+                    const float* p = x + int64_t(t) * k + load_col;
+                    float4 a;
+                    if constexpr (WIDE) a = *reinterpret_cast<const float4*>(p);
+                    else a = make_float4(p[0], p[1], p[2], p[3]);
+                    activation[t][activation_slot(vector)] = a;
+                }
+            }
+            __syncthreads();
+            const int64_t col = tile + local_col;
+            if (col < k) {
+                uint4 packed[ROWS];
+                const float sw = row < n ?
+                    detail::decode_e8m0(scales[(row / 32) * (k / 32) + col / 32]) : 0;
+                #pragma unroll
+                for (int r = 0; r < ROWS; ++r) {
+                    packed[r] = make_uint4(0, 0, 0, 0);
+                    if (row + r < n) {
+                        const uint8_t* p = w + (row + r) * k + col;
+                        if constexpr (WIDE && SPLIT == 1) {
+                            packed[r] = *reinterpret_cast<const uint4*>(p);
+                        } else if constexpr (WIDE) {
+                            const uint2 v = *reinterpret_cast<const uint2*>(p);
+                            packed[r] = make_uint4(v.x, v.y, 0, 0);
+                        } else {
+                            uint32_t words[4] = {};
+                            #pragma unroll
+                            for (int j = 0; j < VALUES; ++j)
+                                words[j / 4] |= uint32_t(p[j]) << ((j % 4) * 8);
+                            packed[r] = make_uint4(words[0], words[1], words[2], words[3]);
+                        }
+                    }
+                }
+                #pragma unroll
+                for (int j = 0; j < WORDS; ++j) {
+                    float4 weight[ROWS];
+                    #pragma unroll
+                    for (int r = 0; r < ROWS; ++r) {
+                        const uint32_t word = j == 0 ? packed[r].x : j == 1 ? packed[r].y :
+                                              j == 2 ? packed[r].z : packed[r].w;
+                        weight[r] = make_float4(detail::decode_e4m3(uint8_t(word)) * sw,
+                                                detail::decode_e4m3(uint8_t(word >> 8)) * sw,
+                                                detail::decode_e4m3(uint8_t(word >> 16)) * sw,
+                                                detail::decode_e4m3(uint8_t(word >> 24)) * sw);
+                    }
+                    const int slot = activation_slot(local_col / 4 + j);
+                    #pragma unroll
+                    for (int t = 0; t < M; ++t) {
+                        const float4 a = activation[t][slot];
+                        #pragma unroll
+                        for (int r = 0; r < ROWS; ++r) {
+                            acc[r][t] = fmaf(a.x, weight[r].x, acc[r][t]);
+                            acc[r][t] = fmaf(a.y, weight[r].y, acc[r][t]);
+                            acc[r][t] = fmaf(a.z, weight[r].z, acc[r][t]);
+                            acc[r][t] = fmaf(a.w, weight[r].w, acc[r][t]);
+                        }
+                    }
+                }
+            }
+            // Every warp must finish the current tile before producers overwrite it.
+            __syncthreads();
+        }
+        #pragma unroll
+        for (int r = 0; r < ROWS; ++r) {
+            #pragma unroll
+            for (int t = 0; t < M; ++t) {
+                for (int d = 16; d; d >>= 1)
+                    acc[r][t] += __shfl_down_sync(0xffffffffu, acc[r][t], d);
+                if (lane == 0) {
+                    if constexpr (SPLIT == 1) {
+                        if (row + r < n)
+                            y[int64_t(t) * n + row + r] = strata::kernels::bf16_from_f32(acc[r][t]);
+                    } else {
+                        partial[warp][r][t] = acc[r][t];
+                    }
+                }
+            }
+        }
+        if constexpr (SPLIT > 1) {
+            __syncthreads();
+            if (split == 0 && lane == 0) {
+                #pragma unroll
+                for (int r = 0; r < ROWS; ++r) {
+                    #pragma unroll
+                    for (int t = 0; t < M; ++t) {
+                        const float sum = partial[warp][r][t] + partial[warp + 1][r][t];
+                        if (row + r < n)
+                            y[int64_t(t) * n + row + r] = strata::kernels::bf16_from_f32(sum);
+                    }
+                }
+            }
+            __syncthreads();
+        }
+    }
+}
+
+template<int M, int SPLIT>
+void launch_shared_activation(const float* x, const uint8_t* w, const uint8_t* scales,
+                              uint16_t* y, int64_t k, int64_t n, cudaStream_t stream) {
+    constexpr int ROWS = 2;
+    constexpr int ROWS_PER_BLOCK = THREADS / (32 * SPLIT) * ROWS;
+    const int64_t blocks = (n - 1) / ROWS_PER_BLOCK + 1;
+    const unsigned grid = unsigned(blocks < 65535 ? blocks : 65535);
+    if (((reinterpret_cast<uintptr_t>(w) | reinterpret_cast<uintptr_t>(x)) & 15u) == 0)
+        gemv_shared_activation<M, ROWS, SPLIT, true><<<grid, THREADS, 0, stream>>>(x, w, scales, y, k, n);
+    else
+        gemv_shared_activation<M, ROWS, SPLIT, false><<<grid, THREADS, 0, stream>>>(x, w, scales, y, k, n);
+}
+
 unsigned grid_for(int64_t rows) {
     const int64_t grid = (rows - 1) / (THREADS / 32) + 1;
     return unsigned(grid < 65535 ? grid : 65535);
@@ -175,6 +323,13 @@ void launch_split(const float* x, const uint8_t* w, const uint8_t* scales, uint1
 template<int M>
 void launch(const float* x, const uint8_t* w, const uint8_t* scales, uint16_t* y,
             int64_t k, int64_t n, cudaStream_t stream) {
+    if constexpr (M > 1) {
+        if (n > 2048) {
+            if (n <= 8192) launch_shared_activation<M, 2>(x, w, scales, y, k, n, stream);
+            else launch_shared_activation<M, 1>(x, w, scales, y, k, n, stream);
+            return;
+        }
+    }
     if (detail::gemv_rows_per_group(n) == 2)
         launch_split<M, 2>(x, w, scales, y, k, n, stream);
     else
