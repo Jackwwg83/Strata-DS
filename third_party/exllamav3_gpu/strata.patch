@@ -364,7 +364,14 @@
 +    const int size_m = 1;
 +    const int size_k = job.k;
 +    const int size_n = job.n;
-@@ -206,21 +218,0 @@
+@@ -194,2 +207,3 @@
+-    constexpr int PF   = CFG == 0 ? 4 : 2;      // prefetch ring depth
+-    constexpr int FOLD = CFG == 0 ? 4 : 2;      // fp16->fp32 fold cadence (divides PF)
++    constexpr int PF   = 2;                     // prefetch ring depth, independent of FOLD
++    constexpr int FOLD = CFG == 0 ? 4 : 2;      // upstream fp16->fp32 fold cadence
++    static_assert(FOLD % PF == 0, "prefetch ring must divide the arithmetic unroll");
+@@ -205,21 +218,0 @@
+-
 -    auto grid = cooperative_groups::this_grid();
 -
 -    // Input scales and Hadamard transform, same as exl3_gemm_kernel
@@ -385,8 +392,7 @@
 -        grid.sync();
 -        A = A_had;
 -    }
--
-@@ -293,2 +285,10 @@
+@@ -293,2 +286,10 @@
 -            if constexpr (LSTRIDE < 32)
 -                return lane < LSTRIDE ? __ldcs(bp + (size_t) i * slice_stride + l * LSTRIDE) : 0;
 +            // Keep the same scalar uint32 load, alignment, lane guard and address.
@@ -399,7 +405,7 @@
 +                else
 +                    return __ldcg(bp + (size_t) i * slice_stride + l * LSTRIDE);
 +            }
-@@ -296 +296,6 @@
+@@ -296 +297,6 @@
 -                return __ldcs(bp + (size_t) i * slice_stride + l * LSTRIDE);
 +            {
 +                if constexpr (LSTRIDE < 32)
@@ -407,7 +413,21 @@
 +                else
 +                    return __ldcs(bp + (size_t) i * slice_stride + l * LSTRIDE);
 +            }
-@@ -454,29 +459,2 @@
+@@ -310 +316,3 @@
+-        for (int ib = 0; ib < myn; ib += PF)
++        // Keep the upstream arithmetic unroll/fold boundaries. Ring slots repeat
++        // within each fold group and are refilled before their next use.
++        for (int ib = 0; ib < myn; ib += FOLD)
+@@ -313 +321 @@
+-        for (int d = 0; d < PF; ++d)
++        for (int d = 0; d < FOLD; ++d)
+@@ -321 +329 @@
+-                bw[l] = pf[d][l];
++                bw[l] = pf[d % PF][l];
+@@ -327 +335 @@
+-                    pf[d][l] = ld_b(i + PF, l);
++                    pf[d % PF][l] = ld_b(i + PF, l);
+@@ -454,29 +462,2 @@
 -    // Output scales and Hadamard transform, same semantics as the inner GEMM epilogue
 -    {
 -        grid.sync();

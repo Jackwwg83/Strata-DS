@@ -204,8 +204,9 @@ void exl3_gemv_kernel(const strata_exl3::GemvJob* jobs)
                   "exl3_gemv_kernel supports 2, 3 and 4 bpw, and 1.5, 2.5 and 3.5 bpw with mul1");
     constexpr int WK   = CFG == 0 ? 16 : 8;     // k-split (warps per block)
     constexpr int WNT  = CFG == 0 ? 2 : 4;      // adjacent n-tiles per warp
-    constexpr int PF   = CFG == 0 ? 4 : 2;      // prefetch ring depth
-    constexpr int FOLD = CFG == 0 ? 4 : 2;      // fp16->fp32 fold cadence (divides PF)
+    constexpr int PF   = 2;                     // prefetch ring depth, independent of FOLD
+    constexpr int FOLD = CFG == 0 ? 4 : 2;      // upstream fp16->fp32 fold cadence
+    static_assert(FOLD % PF == 0, "prefetch ring must divide the arithmetic unroll");
     constexpr int THREADS = WK * 32;
     constexpr int ROWS = MMODE == 0 ? 1 : EXL3_GEMV_MAX_M;
     constexpr int COLS = WNT * 16;
@@ -312,10 +313,12 @@ void exl3_gemv_kernel(const strata_exl3::GemvJob* jobs)
         FragC_h ch[WNT][2] = {};
         float2 acc0[WNT][2] = {};
 
-        for (int ib = 0; ib < myn; ib += PF)
+        // Keep the upstream arithmetic unroll/fold boundaries. Ring slots repeat
+        // within each fold group and are refilled before their next use.
+        for (int ib = 0; ib < myn; ib += FOLD)
         {
         #pragma unroll
-        for (int d = 0; d < PF; ++d)
+        for (int d = 0; d < FOLD; ++d)
         {
             const int i = ib + d;
             if (i >= myn) break;
@@ -323,13 +326,13 @@ void exl3_gemv_kernel(const strata_exl3::GemvJob* jobs)
             uint32_t bw[LOADS];
             #pragma unroll
             for (int l = 0; l < LOADS; ++l)
-                bw[l] = pf[d][l];
+                bw[l] = pf[d % PF][l];
 
             if (i + PF < myn)
             {
                 #pragma unroll
                 for (int l = 0; l < LOADS; ++l)
-                    pf[d][l] = ld_b(i + PF, l);
+                    pf[d % PF][l] = ld_b(i + PF, l);
             }
 
             if constexpr (SMEM_STAGE)
