@@ -167,23 +167,27 @@ def read_experts_txt(path):
 
 
 def write_engram(src, out):
-    lines = []
+    """The Engram tables stay in their files: engrams/*.safetensors (the 3bpw pack) or the index's shards that hold
+    them (SAGE 1.59bpw)."""
+    paths = []
     d = os.path.join(src, "engrams")
     if os.path.isdir(d):
-        for f in sorted(os.listdir(d)):
-            if not f.endswith(".safetensors"):
-                continue
-            path = os.path.abspath(os.path.join(d, f))
-            with open(path, "rb") as fh:
-                n = struct.unpack("<Q", fh.read(8))[0]
-                hdr = json.loads(fh.read(n))
-            hdr.pop("__metadata__", None)
-            for k, v in hdr.items():
-                if k.endswith(".engram.embed.weight"):
-                    L = int(k.split(".")[1])
-                    s = hdr[k.replace("weight", "scale")]
-                    lines.append(f"{L} {v['shape'][0]} {v['shape'][1]} {8 + n + v['data_offsets'][0]} "
-                                 f"{8 + n + s['data_offsets'][0]} {path}")
+        paths += [os.path.join(d, f) for f in sorted(os.listdir(d)) if f.endswith(".safetensors")]
+    idx = json.load(open(os.path.join(src, "model.safetensors.index.json")))["weight_map"]
+    paths += [os.path.join(src, f) for f in sorted({f for k, f in idx.items() if k.endswith(".engram.embed.weight")})]
+    tables = {}
+    for path in map(os.path.abspath, paths):
+        with open(path, "rb") as fh:
+            n = struct.unpack("<Q", fh.read(8))[0]
+            hdr = json.loads(fh.read(n))
+        hdr.pop("__metadata__", None)
+        for k, v in hdr.items():
+            if k.endswith(".engram.embed.weight"):
+                L = int(k.split(".")[1])
+                s = hdr[k.replace("weight", "scale")]
+                tables.setdefault(L, f"{L} {v['shape'][0]} {v['shape'][1]} {8 + n + v['data_offsets'][0]} "
+                                     f"{8 + n + s['data_offsets'][0]} {path}")
+    lines = [tables[L] for L in sorted(tables)]
     with open(os.path.join(out, "engram.txt"), "w") as f:
         f.write("# ds41 engram tables v1: layer rows dim weight_offset scale_offset path\n")
         f.write("".join(l + "\n" for l in lines))

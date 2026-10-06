@@ -132,6 +132,63 @@ class PackTest(unittest.TestCase):
             self.assertTrue(os.path.exists(os.path.join(self.out, f)))
 
 
+class EngramLocationTest(unittest.TestCase):
+    """Engram tables in engrams/*.safetensors (the 3bpw pack) or in a shard of the index (SAGE 1.59bpw)."""
+
+    def setUp(self):
+        self.tmp = tempfile.TemporaryDirectory()
+        self.src = os.path.join(self.tmp.name, "src")
+        self.out = os.path.join(self.tmp.name, "pack")
+        os.makedirs(self.src)
+        os.makedirs(self.out)
+        write_checkpoint(self.src)
+        self.tables = {L: (torch.randn(rows, 16).to(torch.float8_e4m3fn), torch.ones(rows, 1).to(torch.float8_e8m0fnu))
+                       for L, rows in ((1, 7), (14, 5))}
+
+    def tearDown(self):
+        self.tmp.cleanup()
+
+    def check(self, paths):
+        lines = [l.split() for l in open(os.path.join(self.out, "engram.txt")) if not l.startswith("#")]
+        self.assertEqual([int(f[0]) for f in lines], [1, 14])
+        for f in lines:
+            L, rows, dim, woff, soff, path = int(f[0]), int(f[1]), int(f[2]), int(f[3]), int(f[4]), f[5]
+            w, s = self.tables[L]
+            self.assertEqual((rows, dim), tuple(w.shape))
+            self.assertEqual(path, paths[L])
+            blob = open(path, "rb").read()
+            self.assertEqual(blob[woff:woff + w.numel()], w.view(torch.uint8).numpy().tobytes())
+            self.assertEqual(blob[soff:soff + s.numel()], s.view(torch.uint8).numpy().tobytes())
+
+    def test_tables_in_the_engrams_directory(self):
+        d = os.path.join(self.src, "engrams")
+        os.makedirs(d)
+        paths = {}
+        for L, (w, s) in self.tables.items():
+            paths[L] = os.path.abspath(os.path.join(d, f"engram-layer-{L:02d}.safetensors"))
+            save_file({f"layers.{L}.engram.embed.weight": w, f"layers.{L}.engram.embed.scale": s}, paths[L])
+        self.assertEqual(P.write_engram(self.src, self.out), 2)
+        self.check(paths)
+
+    def test_tables_in_index_shards(self):
+        idx_path = os.path.join(self.src, "model.safetensors.index.json")
+        idx = json.load(open(idx_path))
+        paths = {}
+        for k, (L, (w, s)) in enumerate(self.tables.items()):
+            fname = f"model-0000{k + 3}-of-00004.safetensors"
+            paths[L] = os.path.abspath(os.path.join(self.src, fname))
+            save_file({f"layers.{L}.engram.embed.weight": w, f"layers.{L}.engram.embed.scale": s}, paths[L])
+            idx["weight_map"][f"layers.{L}.engram.embed.weight"] = fname
+            idx["weight_map"][f"layers.{L}.engram.embed.scale"] = fname
+        json.dump(idx, open(idx_path, "w"))
+        self.assertEqual(P.write_engram(self.src, self.out), 2)
+        self.check(paths)
+        # the dense arena does not take the tables
+        P.build_pack(self.src, os.path.join(self.tmp.name, "pack2"), n_layers=2, n_experts=3)
+        names = read_index(os.path.join(self.tmp.name, "pack2", "index.txt"))
+        self.assertFalse(any(".engram.embed." in n for n in names))
+
+
 class FakeBackend:
     """Just enough of a tokenizers backend for build_compressed_token_map."""
 
