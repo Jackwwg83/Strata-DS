@@ -18,12 +18,20 @@
 #include <cstring>
 #include <fstream>
 #include <sstream>
+#include <stdexcept>
 #include <string>
 #include <vector>
 
 using namespace strata::ds41;
 
-static std::vector<int> parse_ids(const std::string& s) {
+/// comma-separated ids, or @FILE holding them (a 32K-token prompt is longer than one command-line argument may be)
+static std::vector<int> parse_ids(const std::string& arg) {
+    std::string s = arg;
+    if (!s.empty() && s[0] == '@') {
+        std::ifstream f(s.substr(1));
+        if (!f) throw std::runtime_error("cannot open " + s.substr(1));
+        s.assign(std::istreambuf_iterator<char>(f), std::istreambuf_iterator<char>());
+    }
     std::vector<int> v;
     std::stringstream ss(s);
     std::string tok;

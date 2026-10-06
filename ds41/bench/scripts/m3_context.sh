@@ -13,9 +13,10 @@ IDS=${IDS:-/workspace/long.ids}
 OUT=${OUT:-/workspace/results/m3_context_$M.tsv}
 mkdir -p "$(dirname "$OUT")"
 for n in $L; do
-  p=$(cut -d, -f1-"$n" "$IDS")
+  pf=/workspace/results/m3_prompt_$n.ids
+  cut -d, -f1-"$n" "$IDS" > "$pf"
   log=/workspace/results/m3_context_${M}_$n.log
-  "$G" --pack "$PACK" --threads ${THREADS:-8} --expert-profile "$PROF" --max-seq $((n + 256)) --ids "$p" --gen 65 \
+  "$G" --pack "$PACK" --threads ${THREADS:-8} --expert-profile "$PROF" --max-seq $((n + 256)) --ids "@$pf" --gen 65 \
        --prefill ${EXTRA:-} > "$log" 2> "$log.err"
   pre=$(grep prefill_tokens "$log")
   dec=$(grep -o "decode_ms_per_token [0-9.]*" "$log" | awk '{print $2}')
