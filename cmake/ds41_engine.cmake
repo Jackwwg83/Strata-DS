@@ -11,6 +11,7 @@ add_library(strata_ds41_engine STATIC
   src/ds41/host_experts.cpp
   src/ds41/lookahead.cpp
   src/ds41/expert_stream.cpp
+  src/ds41/wo_a_fp8.cu
   src/platform/direct_file.cpp
   src/ds41/engine.cu
   third_party/exllamav3_moe/moe_mul1.cpp)
@@ -32,6 +33,10 @@ if(STRATA_BUILD_TESTS)
   target_link_libraries(doorbell_test PRIVATE strata_ds41_engine)
   add_test(NAME doorbell_test COMMAND doorbell_test)
   set_tests_properties(doorbell_test PROPERTIES SKIP_RETURN_CODE 77 TIMEOUT 300)
+  add_executable(wo_a_fp8_test src/ds41/tests/wo_a_fp8_test.cu)
+  target_link_libraries(wo_a_fp8_test PRIVATE strata_ds41_engine)
+  add_test(NAME wo_a_fp8_test COMMAND wo_a_fp8_test)
+  set_tests_properties(wo_a_fp8_test PROPERTIES SKIP_RETURN_CODE 77 TIMEOUT 300)
   add_executable(lookahead_test src/ds41/tests/lookahead_test.cpp)
   target_link_libraries(lookahead_test PRIVATE strata_ds41_engine)
   add_test(NAME lookahead_test COMMAND lookahead_test)

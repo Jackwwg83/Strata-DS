@@ -27,6 +27,7 @@
 #include "strata/ds41/ops.hpp"
 #include "strata/ds41/prefill_ops.hpp"
 #include "strata/ds41/vram_experts.hpp"
+#include "strata/ds41/wo_a_fp8.hpp"
 
 #include "moe_mul1.h"   // third_party/exllamav3_moe
 
@@ -112,6 +113,7 @@ struct Engine::Impl {
     struct Fp8 { const uint8_t* w; const uint8_t* s; int64_t n, k; };
     struct Layer {
         Fp8 wq_a, wq_b, wkv, wo_b, sh_w1, sh_w2, sh_w3, idx_wq_b, eng_wkv;
+        Fp8 wo_a8{};   // wo_a as FP8 with block scales (packs from 2026-10-06); wo_a below is then null
         const bf16 *q_norm, *kv_norm, *wo_a, *attn_norm, *ffn_norm, *gate_w;
         const float *sink, *gate_bias, *hc_attn_fn, *hc_attn_base, *hc_attn_scale, *hc_ffn_fn, *hc_ffn_base,
             *hc_ffn_scale;
@@ -235,7 +237,8 @@ struct Engine::Impl {
             y.wo_b = fp8(p + "attn.wo_b");
             y.q_norm = bf(p + "attn.q_norm.weight");
             y.kv_norm = bf(p + "attn.kv_norm.weight");
-            y.wo_a = bf(p + "attn.wo_a.weight");
+            if (pack.has_dense(p + "attn.wo_a.scale")) y.wo_a8 = fp8(p + "attn.wo_a");
+            else y.wo_a = bf(p + "attn.wo_a.weight");
             y.sink = f32(p + "attn.attn_sink");
             y.attn_norm = bf(p + "attn_norm.weight");
             y.ffn_norm = bf(p + "ffn_norm.weight");
@@ -613,7 +616,8 @@ struct Engine::Impl {
         kernels::sparse_attn_decode(q, y.window, comp, idx_dev, 1, n_idx, y.sink, (float) std::pow(kHeadDim, -0.5), o,
                                     0);
         ops::rope(o, kHeads, kHeadDim, rope_at(yarn, pos), true);
-        ops::wo_a_grouped(o, y.wo_a, oa);
+        if (y.wo_a8.w) wo_a_grouped_fp8(o, y.wo_a8.w, y.wo_a8.s, oa);
+        else ops::wo_a_grouped(o, y.wo_a, oa);
         fp8_linear(oa, y.wo_b, attn_out);
     }
 
@@ -716,7 +720,7 @@ struct Engine::Impl {
         uint8_t* cand;
         // per sub-batch
         bf16 *xa, *qr, *q, *o, *oa, *attn_out, *kvv, *iq, *iw_raw, *iw, *g, *u, *sh_h, *sh_out, *ffn_out, *eng_vals,
-            *eng_kv, *final_x, *latent, *ik, *attn_kv;
+            *eng_kv, *final_x, *latent, *ik, *attn_kv, *wo_a_deq;
         float *attn_pre, *attn_post, *attn_comb, *ftmp, *router_logits, *ckv, *csc, *nll_logits;
         int32_t* idx;
         uint8_t* eng_dev;
@@ -803,6 +807,8 @@ struct Engine::Impl {
         p.attn_post = carve<float>(base, u, b * kHc);
         p.attn_comb = carve<float>(base, u, b * kHc * kHc);
         p.ftmp = carve<float>(base, u, b * kOGroups * kOLora);
+        // one layer's wo_a dequantized from FP8 (64 MiB), when the pack keeps it FP8
+        p.wo_a_deq = carve<bf16>(base, u, L[0].wo_a8.w ? (size_t) kOGroups * kOLora * (kHeads * kHeadDim / kOGroups) : 1);
         p.router_logits = carve<float>(base, u, b * kExperts);
         p.ckv = carve<float>(base, u, (b + 2) * kHeadDim);
         p.csc = carve<float>(base, u, (b + 2) * kHeadDim);
@@ -1062,7 +1068,12 @@ struct Engine::Impl {
                                      0);
         pfp.mark(PfProfile::kOut);
         prefill::rope_rows(pf.o, T, kHeads, kHeadDim, table, p0, 1, true);
-        prefill::wo_a_grouped_rows(pf.o, y.wo_a, T, pf.oa, pf.ftmp);
+        const bf16* wo_a = y.wo_a;
+        if (y.wo_a8.w) {   // FP8 pack: the BF16 weight convert.py would store, then the same GEMM
+            dequant_wo_a(y.wo_a8.w, y.wo_a8.s, pf.wo_a_deq);
+            wo_a = pf.wo_a_deq;
+        }
+        prefill::wo_a_grouped_rows(pf.o, wo_a, T, pf.oa, pf.ftmp);
         fp8_rows(pf.oa, T, y.wo_b, pf.attn_out);
     }
 
