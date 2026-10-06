@@ -38,6 +38,7 @@
 #include <unistd.h>
 
 #include <algorithm>
+#include <map>
 #include <atomic>
 #include <chrono>
 #include <cmath>
@@ -178,10 +179,28 @@ struct Engine::Impl {
     std::FILE* dbg = nullptr;
     void dbg_write(const bf16* dev, int n) {
         if (!dbg) return;
+        ck(cudaStreamSynchronize(st), "debug dump");
         std::vector<uint16_t> b(n);
         ck(cudaMemcpy(b.data(), dev, (size_t) n * 2, cudaMemcpyDeviceToHost), "debug dump");
         std::fwrite(b.data(), 2, n, dbg);
     }
+
+    // decode on its own stream, captured as CUDA graphs (upstream session_capture_token / Verifier): the position
+    // dependent values come from fixed pinned staging, copied to the device by the graph's first node
+    struct StepParams { int token, pos, t1, t2; };   // t1, t2: compressed lengths at ratio 1 and 2
+    cudaStream_t st = nullptr;
+    StepParams* hp = nullptr;          // pinned staging of the next replay
+    int* dp = nullptr;                 // device copy: dp[0] token, dp[1] pos, dp[2] t1, dp[3] t2
+    int* d_next = nullptr;             // device argmax of the logits
+    int* hp_next = nullptr;            // pinned: the argmax, the logits and the routes, after the step
+    float* lg_pinned = nullptr;
+    int32_t* routes_pinned = nullptr;
+    float* one_hot_dev = nullptr;      // {1, 0, 0, 0}: pre_mix at the first layer
+    bool use_graph = true;             // DS41_GRAPH=0: eager launches (also with a dump or DS41_DEBUG)
+    int parity = 0;                    // pos % 2 of the step being enqueued (the ratio-2 compressor's slot)
+    int64_t tcap1 = 1, tcap2 = 1;      // indexer capacities of the graph being enqueued
+    std::map<uint64_t, cudaGraphExec_t> graphs;
+    int graph_captures = 0;
 
     // shared attention state for the current token (SharedAttentionRuntime)
     const bf16* cur_comp = nullptr;
@@ -201,7 +220,13 @@ struct Engine::Impl {
         lookahead.reset();
         vram.reset();
         host.reset();
+        for (auto& [k, e] : graphs) cudaGraphExecDestroy(e);
         if (eng_host) cudaFreeHost(eng_host);
+        if (hp) cudaFreeHost(hp);
+        if (hp_next) cudaFreeHost(hp_next);
+        if (lg_pinned) cudaFreeHost(lg_pinned);
+        if (routes_pinned) cudaFreeHost(routes_pinned);
+        if (st) cudaStreamDestroy(st);
         if (pfh.base) cudaFreeHost(pfh.base);
     }
 
@@ -345,6 +370,22 @@ struct Engine::Impl {
         history.reserve(max_seq);
         db = std::make_unique<ExpertDoorbell>(1, kTopK, kDim);
         gpu_sel = dalloc<int32_t>(kTopK);
+        // decode stream, graph staging, outputs
+        ck(cudaStreamCreateWithFlags(&st, cudaStreamNonBlocking), "decode stream");
+        ck(cudaHostAlloc((void**) &hp, sizeof(StepParams), cudaHostAllocDefault), "step params");
+        ck(cudaHostAlloc((void**) &hp_next, sizeof(int), cudaHostAllocDefault), "next token");
+        ck(cudaHostAlloc((void**) &lg_pinned, (size_t) kVocab * 4, cudaHostAllocDefault), "logits");
+        ck(cudaHostAlloc((void**) &routes_pinned, kLayers * kTopK * 4, cudaHostAllocDefault), "routes");
+        dp = dalloc<int>(4);
+        d_next = dalloc<int>(1);
+        one_hot_dev = dalloc<float>(kHc);
+        {
+            const float oh[kHc] = {1, 0, 0, 0};
+            ck(cudaMemcpy(one_hot_dev, oh, sizeof oh, cudaMemcpyHostToDevice), "one hot");
+        }
+        kernels::hc_init();       // K7 / K8 scratch, allocated outside any capture
+        kernels::router_init();
+        if (const char* v = std::getenv("DS41_GRAPH")) use_graph = v[0] != '0';
         // the VRAM expert tier last: an automatic slot count takes what the rest left free
         if (!opt.expert_profile.empty() && opt.vram_expert_slots != 0) {
             VramExperts::Adapt ad;
@@ -440,8 +481,8 @@ struct Engine::Impl {
 
     /// model.py linear() for one token: K1's activation quantizer, then K1's GEMV (act holds up to 8192 floats)
     void fp8_linear(const bf16* x, const Fp8& w, bf16* y) {
-        fp8_quantize_activation_f32((const uint16_t*) x, 1, w.k, act, nullptr);
-        fp8_block_gemv_q(act, 1, w.k, w.w, w.s, w.n, (uint16_t*) y, nullptr);
+        fp8_quantize_activation_f32((const uint16_t*) x, 1, w.k, act, st);
+        fp8_block_gemv_q(act, 1, w.k, w.w, w.s, w.n, (uint16_t*) y, st);
     }
 
     // ------------------------------------------------------------------------------------- cpu experts
@@ -559,92 +600,92 @@ struct Engine::Impl {
         const auto& hs = pack.engram_hash();
         const int cols = (hs.max_ngram - 1) * hs.n_heads;
         const uint8_t* w = eng_dev + (size_t) li * kEngRows * (256 + 8);
-        ops::engram_dequant(w, w + kEngRows * 256, cols, eng_vals);
+        ops::engram_dequant(w, w + kEngRows * 256, cols, eng_vals, st);
         fp8_linear(eng_vals, L[l].eng_wkv, eng_kv);
-        ops::engram_apply(h, eng_kv, L[l].eng_qw, L[l].eng_kw, kNormEps);
+        ops::engram_apply(h, eng_kv, L[l].eng_qw, L[l].eng_kw, kNormEps, 1, st);
     }
 
     // ------------------------------------------------------------------------------------- indexer
     /// Top-k compressed positions for this layer (Indexer.forward, decode with one query), offset by kWindow,
     /// written after the window part of idx_dev.
-    void indexer(int l, int pos, bool have_latent) {
+    void indexer(int l, bool have_latent) {
         auto& y = L[l];
         const int ratio = y.ratio;
-        const int t = (pos + 1) / ratio;
+        const int64_t tcap = ratio == 1 ? tcap1 : tcap2;
         if (is_kv_source(l) && have_latent) {
-            ops::bf16_linear(latent, nullptr, y.idx_wk, kHeadDim, kIndexDim, ik, nullptr);
-            ops::rmsnorm(ik, y.idx_knorm, ik, kIndexDim, kNormEps);
-            ops::rope(ik, 1, kIndexDim, rope_at(true, pos + 1 - ratio), false);
-            ops::fp4_quant_inplace(ik, kIndexDim, 32, false);
-            ck(cudaMemcpy(y.idx_keys + (size_t) (pos / ratio) * kIndexDim, ik, kIndexDim * 2, cudaMemcpyDeviceToDevice),
-               "index key");
+            ops::bf16_linear(latent, nullptr, y.idx_wk, kHeadDim, kIndexDim, ik, nullptr, st);
+            ops::rmsnorm(ik, y.idx_knorm, ik, kIndexDim, kNormEps, 1, st);
+            ops::rope_device(ik, 1, kIndexDim, rope_yarn, dp + 1, 1 - ratio, false, st);
+            ops::fp4_quant_inplace(ik, kIndexDim, 32, false, st);
+            ops::row_copy_device(y.idx_keys, ik, kIndexDim * 2, dp + 1, ratio, max_seq + 1, st);   // row pos / ratio
         }
         if (is_kv_source(l)) cur_index_k = y.idx_keys;
         fp8_linear(qr, y.idx_wq_b, iq);
-        ops::rope(iq, kIndexHeads, kIndexDim, rope_at(true, pos), false);
-        ops::fp4_quant_inplace(iq, kIndexHeads * kIndexDim, 32, false);
-        ops::bf16_linear(xa, nullptr, y.idx_wp, kDim, kIndexHeads, iw_raw, nullptr);
-        ops::scale_bf16(iw_raw, (float) (std::pow(kIndexDim, -0.5) * std::pow(kIndexHeads, -0.5)), iw, kIndexHeads);
-        // the candidate layer selects blocks from its own unmasked scores; the layers after it mask with them
+        ops::rope_device(iq, kIndexHeads, kIndexDim, rope_yarn, dp + 1, 0, false, st);
+        ops::fp4_quant_inplace(iq, kIndexHeads * kIndexDim, 32, false, st);
+        ops::bf16_linear(xa, nullptr, y.idx_wp, kDim, kIndexHeads, iw_raw, nullptr, st);
+        ops::scale_bf16(iw_raw, (float) (std::pow(kIndexDim, -0.5) * std::pow(kIndexHeads, -0.5)), iw, kIndexHeads, st);
+        // the candidate layer selects blocks from its own unmasked scores; the layers after it mask with them.
+        // t = (pos + 1) / ratio on the device: no work while it is 0 (the first incomplete group)
         const uint8_t* cand = l > kCandidateLayer ? cand_dev : nullptr;
-        kernels::indexer_topk(iq, cur_index_k, t, iw, cand, std::min(kIndexTopK, t), kWindow, scores, idx_dev + kWindow,
-                              0);
-        if (l == kCandidateLayer) kernels::candidate_blocks(scores, t, kCandidateBlocks, kCandidateBlock, cand_dev, 0);
+        kernels::indexer_topk_device(iq, cur_index_k, dp + 1, ratio, tcap, iw, cand, kIndexTopK, kWindow, scores,
+                                     idx_dev + kWindow, st);
+        if (l == kCandidateLayer)
+            kernels::candidate_blocks_device(scores, dp + 1, ratio, tcap, kCandidateBlocks, kCandidateBlock, cand_dev, st);
     }
 
     // ------------------------------------------------------------------------------------- attention
-    void attention(int l, int pos) {
+    void attention(int l) {
         auto& y = L[l];
         const bool yarn = y.ratio > 0;
+        const float* rope = yarn ? rope_yarn : rope_plain;
         fp8_linear(xa, y.wq_a, qr);
-        ops::rmsnorm(qr, y.q_norm, qr, kQLora, kNormEps);
+        ops::rmsnorm(qr, y.q_norm, qr, kQLora, kNormEps, 1, st);
         fp8_linear(qr, y.wq_b, q);
-        ops::rope(q, kHeads, kHeadDim, rope_at(yarn, pos), false);
-        // sliding window
+        ops::rope_device(q, kHeads, kHeadDim, rope, dp + 1, 0, false, st);
+        // sliding window: row pos % 128
         fp8_linear(xa, y.wkv, kvv);
-        ops::rmsnorm(kvv, y.kv_norm, kvv, kHeadDim, kNormEps);
-        ops::rope(kvv, 1, kHeadDim, rope_at(yarn, pos), false);
-        ops::act_quant_inplace(kvv, kHeadDim);
-        ck(cudaMemcpy(y.window + (size_t) (pos % kWindow) * kHeadDim, kvv, kHeadDim * 2, cudaMemcpyDeviceToDevice),
-           "window");
-        int n_idx = kWindow;   // idx_dev holds the window part for the whole step (window_index at step start)
-        const bf16* comp = nullptr;
+        ops::rmsnorm(kvv, y.kv_norm, kvv, kHeadDim, kNormEps, 1, st);
+        ops::rope_device(kvv, 1, kHeadDim, rope, dp + 1, 0, false, st);
+        ops::act_quant_inplace(kvv, kHeadDim, st);
+        ops::row_copy_device(y.window, kvv, kHeadDim * 2, dp + 1, 1, kWindow, st);
+        // idx_dev holds the window part for the whole step (window_index_device at step start)
         if (y.ratio > 0) {
             const int ratio = y.ratio;
-            const int compress_len = (pos + 1) / ratio;
             bool have_latent = false;
             if (is_kv_source(l)) {
                 if (ratio == 1) {
-                    ops::bf16_linear(xa, nullptr, y.c_wkv, kDim, kHeadDim, latent, nullptr);
-                    ops::rmsnorm(latent, y.c_norm, latent, kHeadDim, kNormEps);
+                    ops::bf16_linear(xa, nullptr, y.c_wkv, kDim, kHeadDim, latent, nullptr, st);
+                    ops::rmsnorm(latent, y.c_norm, latent, kHeadDim, kNormEps, 1, st);
                     have_latent = true;
-                } else {
-                    const int slot = pos % ratio;
-                    ops::bf16_linear(xa, nullptr, y.c_wkv, kDim, kHeadDim, nullptr, y.kv_state + slot * kHeadDim);
-                    ops::bf16_linear(xa, nullptr, y.c_wgate, kDim, kHeadDim, nullptr, y.score_state + slot * kHeadDim);
-                    if ((pos + 1) % ratio == 0) {
-                        ops::compress_pool(y.kv_state, y.score_state, ratio, latent);
-                        ops::rmsnorm(latent, y.c_norm, latent, kHeadDim, kNormEps);
+                } else {   // ratio 2: slot pos % 2; a group completes at odd positions (one graph per parity)
+                    ops::bf16_linear(xa, nullptr, y.c_wkv, kDim, kHeadDim, nullptr, y.kv_state + parity * kHeadDim, st);
+                    ops::bf16_linear(xa, nullptr, y.c_wgate, kDim, kHeadDim, nullptr, y.score_state + parity * kHeadDim,
+                                     st);
+                    if (parity == ratio - 1) {
+                        ops::compress_pool(y.kv_state, y.score_state, ratio, latent, 1, st);
+                        ops::rmsnorm(latent, y.c_norm, latent, kHeadDim, kNormEps, 1, st);
                         have_latent = true;
                     }
                 }
                 cur_comp = y.comp;
             }
-            if (is_index_source(l) && compress_len > 0) indexer(l, pos, have_latent);
+            if (is_index_source(l)) indexer(l, have_latent);
             if (have_latent) {
-                ops::rope(latent, 1, kHeadDim, rope_at(true, pos + 1 - ratio), false);
-                ops::fp4_quant_inplace(latent, kHeadDim, 16, true);
-                ck(cudaMemcpy(y.comp + (size_t) (pos / ratio) * kHeadDim, latent, kHeadDim * 2,
-                              cudaMemcpyDeviceToDevice), "compressed kv");
+                ops::rope_device(latent, 1, kHeadDim, rope_yarn, dp + 1, 1 - ratio, false, st);
+                ops::fp4_quant_inplace(latent, kHeadDim, 16, true, st);
+                ops::row_copy_device(y.comp, latent, kHeadDim * 2, dp + 1, ratio, max_seq + 1, st);   // row pos / ratio
             }
-            n_idx += std::min(kIndexTopK, compress_len);   // this group's index source wrote them (none yet: 0)
-            comp = cur_comp;
+            // n_idx = 128 + min(512, (pos + 1) / ratio): this group's index source wrote them (none yet: 0)
+            kernels::sparse_attn_decode_device(q, y.window, cur_comp, idx_dev, ratio == 1 ? dp + 2 : dp + 3, y.sink,
+                                               (float) std::pow(kHeadDim, -0.5), o, st);
+        } else {
+            kernels::sparse_attn_decode(q, y.window, nullptr, idx_dev, 1, kWindow, y.sink,
+                                        (float) std::pow(kHeadDim, -0.5), o, st);
         }
-        kernels::sparse_attn_decode(q, y.window, comp, idx_dev, 1, n_idx, y.sink, (float) std::pow(kHeadDim, -0.5), o,
-                                    0);
-        ops::rope(o, kHeads, kHeadDim, rope_at(yarn, pos), true);
-        if (y.wo_a8.w) wo_a_grouped_fp8(o, y.wo_a8.w, y.wo_a8.s, oa);
-        else ops::wo_a_grouped(o, y.wo_a, oa);
+        ops::rope_device(o, kHeads, kHeadDim, rope, dp + 1, 0, true, st);
+        if (y.wo_a8.w) wo_a_grouped_fp8(o, y.wo_a8.w, y.wo_a8.s, oa, st);
+        else ops::wo_a_grouped(o, y.wo_a, oa, st);
         fp8_linear(oa, y.wo_b, attn_out);
     }
 
@@ -653,25 +694,25 @@ struct Engine::Impl {
         auto& y = L[l];
         int32_t* ids = routes_dev + l * kTopK;
         float* w = weights_dev + l * kTopK;
-        kernels::router_topk(xf, 1, y.gate_w, y.gate_bias, ids, w, 0);
-        // K10 computes VRAM hits and a quota of RAM misses while the CPU computes the rest.
-        ops::to_half_fp8q(xf, x_half_dev, kDim);
+        kernels::router_topk(xf, 1, y.gate_w, y.gate_bias, ids, w, st);
+        // K10 computes VRAM hits and a quota of RAM misses (read over PCIe) while the CPU computes the rest
+        ops::to_half_fp8q(xf, x_half_dev, kDim, st);
         const bool tier = vram && vram->slots() > 0;
         const auto* ram = host && host->experts_dev() ? host->experts_dev() + (size_t) l * kExperts : nullptr;
         db->publish(x_half_dev, ids, w, 1, tier ? vram->res_dev() + (size_t) l * kExperts : nullptr, gpu_sel,
-                    (uint32_t) (l + 1), 0, tier ? vram->experts_dev() : nullptr, ram,
+                    (uint32_t) (l + 1), st, tier ? vram->experts_dev() : nullptr, ram,
                     zc_quota ? zc_quota.get() + l : nullptr);
-        ck(cudaMemsetAsync(routed, 0, kDim * sizeof(float), 0), "routed");
+        ck(cudaMemsetAsync(routed, 0, kDim * sizeof(float), st), "routed");
         if (tier || ram)
             kernels::exl3_moe_decode((const __half*) x_half_dev, 1, gpu_sel, w, kTopK, db->gpu_experts(), routed,
-                                     vram ? vram->workspace() : zc_workspace.get(), VramExperts::kWorkspaceBytes, 0);
+                                     vram ? vram->workspace() : zc_workspace.get(), VramExperts::kWorkspaceBytes, st);
         // shared expert, while the CPU works
         fp8_linear(xf, y.sh_w1, g);
         fp8_linear(xf, y.sh_w3, u);
-        ops::swiglu(g, u, kSwigluLimit, sh_h, kMoeInter);
+        ops::swiglu(g, u, kSwigluLimit, sh_h, kMoeInter, st);
         fp8_linear(sh_h, y.sh_w2, sh_out);
-        db->wait_add(routed, 1, (uint32_t) (l + 1), 0);
-        ops::add_f32_bf16(routed, sh_out, ffn_out, kDim);
+        db->wait_add(routed, 1, (uint32_t) (l + 1), st);
+        ops::add_f32_bf16(routed, sh_out, ffn_out, kDim, st);
     }
 
     // ------------------------------------------------------------------------------------- prefill (M3)
@@ -1419,6 +1460,62 @@ struct Engine::Impl {
     }
 
     // ------------------------------------------------------------------------------------- step
+    /// The GPU work of one decode step on stream st: every position dependent value comes from dp (staged from hp
+    /// by the first node), so one capture serves every position with the same parity and indexer capacities.
+    /// dump: eager only (it reads the device between layers).
+    void enqueue_step(StepDump* dump) {
+        ck(cudaMemcpyAsync(dp, hp, sizeof(StepParams), cudaMemcpyHostToDevice, st), "step params");
+        if (n_eng)
+            ck(cudaMemcpyAsync(eng_dev, eng_host, (size_t) n_eng * kEngRows * (256 + 8), cudaMemcpyHostToDevice, st),
+               "engram rows");
+        ops::window_index_device(dp + 1, idx_dev, st);
+        ops::embed_device(embed, dp, h, st);
+        ck(cudaMemcpyAsync(pre_mix, one_hot_dev, kHc * 4, cudaMemcpyDeviceToDevice, st), "pre_mix");
+        int eng_i = 0;
+        for (int l = 0; l < kLayers; ++l) {
+            auto& y = L[l];
+            if (is_engram_layer(l)) engram(l, eng_i++);
+            const bool dbg_layer = dbg && (l == 1 || l == 2);
+            if (dbg_layer) dbg_write(h, kHc * kDim);                    // block input (after engram)
+            // attention sub-block: h -> h2
+            kernels::hc_mixes_pre(h, 1, y.hc_attn_fn, y.hc_attn_scale, y.hc_attn_base, pre_mix, xa, attn_pre, attn_post,
+                                  attn_comb, st);
+            ops::rmsnorm(xa, y.attn_norm, xa, kDim, kNormEps, 1, st);
+            if (dbg_layer) dbg_write(xa, kDim);                         // attention input
+            attention(l);
+            if (dbg_layer) dbg_write(attn_out, kDim);                   // attention output
+            ops::hc_post(attn_out, h, attn_post, attn_comb, h2, 1, st);
+            // ffn sub-block: h2 -> h
+            kernels::hc_mixes_pre(h2, 1, y.hc_ffn_fn, y.hc_ffn_scale, y.hc_ffn_base, attn_pre, xf, ffn_pre, ffn_post,
+                                  ffn_comb, st);
+            ops::rmsnorm(xf, y.ffn_norm, xf, kDim, kNormEps, 1, st);
+            if (dbg_layer) dbg_write(xf, kDim);                         // ffn input
+            moe(l);
+            if (dbg_layer) dbg_write(ffn_out, kDim);                    // ffn output
+            ops::hc_post(ffn_out, h2, ffn_post, ffn_comb, h, 1, st);
+            ck(cudaMemcpyAsync(pre_mix, ffn_pre, kHc * 4, cudaMemcpyDeviceToDevice, st), "pre_mix");
+            if (dump) {
+                ck(cudaStreamSynchronize(st), "dump hidden");
+                ck(cudaMemcpy(dump->hidden.data() + (size_t) l * kHc * kDim, h, kHc * kDim * 2, cudaMemcpyDeviceToHost),
+                   "dump hidden");
+            }
+        }
+        ops::hc_pre(h, pre_mix, final_x, 1, st);
+        ops::rmsnorm(final_x, final_norm, final_x, kDim, kNormEps, 1, st);
+        ops::bf16_linear(final_x, nullptr, head, kDim, kVocab, nullptr, logits, st);
+        ops::argmax_logits(logits, d_next, st);
+        ck(cudaMemcpyAsync(hp_next, d_next, sizeof(int), cudaMemcpyDeviceToHost, st), "next token");
+        ck(cudaMemcpyAsync(lg_pinned, logits, (size_t) kVocab * 4, cudaMemcpyDeviceToHost, st), "logits");
+        ck(cudaMemcpyAsync(routes_pinned, routes_dev, kLayers * kTopK * 4, cudaMemcpyDeviceToHost, st), "routes");
+    }
+
+    /// Indexer capacity of a graph: the next power of two of t (at least 1), at most the allocated rows
+    static int64_t cap_of(int64_t t, int64_t rows) {
+        int64_t c = 1;
+        while (c < t) c <<= 1;
+        return std::min(c, rows);
+    }
+
     int step(int token, int pos, StepDump* dump, Timing& tm) {
         if (pos != (int) history.size()) throw std::runtime_error("tokens must be fed in order from position 0");
         if (pos >= max_seq) throw std::runtime_error("position past max_seq");
@@ -1448,55 +1545,39 @@ struct Engine::Impl {
             dump->routes.assign(kLayers, {});
             dump->weights.assign(kLayers, {});
         }
-        if (n_eng)
-            ck(cudaMemcpyAsync(eng_dev, eng_host, (size_t) n_eng * kEngRows * (256 + 8), cudaMemcpyHostToDevice, 0),
-               "engram rows");
-        ops::window_index(pos, idx_dev);
-        ops::embed(embed, token, h);
-        const float one_hot[kHc] = {1, 0, 0, 0};
-        ck(cudaMemcpy(pre_mix, one_hot, sizeof one_hot, cudaMemcpyHostToDevice), "pre_mix");
-        int eng_i = 0;
-        for (int l = 0; l < kLayers; ++l) {
-            auto& y = L[l];
-            if (is_engram_layer(l)) engram(l, eng_i++);
-            const bool dbg_layer = dbg && (l == 1 || l == 2);
-            if (dbg_layer) dbg_write(h, kHc * kDim);                    // block input (after engram)
-            // attention sub-block: h -> h2
-            kernels::hc_mixes_pre(h, 1, y.hc_attn_fn, y.hc_attn_scale, y.hc_attn_base, pre_mix, xa, attn_pre, attn_post,
-                                  attn_comb, 0);
-            ops::rmsnorm(xa, y.attn_norm, xa, kDim, kNormEps);
-            if (dbg_layer) dbg_write(xa, kDim);                         // attention input
-            attention(l, pos);
-            if (dbg_layer) dbg_write(attn_out, kDim);                   // attention output
-            ops::hc_post(attn_out, h, attn_post, attn_comb, h2);
-            // ffn sub-block: h2 -> h
-            kernels::hc_mixes_pre(h2, 1, y.hc_ffn_fn, y.hc_ffn_scale, y.hc_ffn_base, attn_pre, xf, ffn_pre, ffn_post,
-                                  ffn_comb, 0);
-            ops::rmsnorm(xf, y.ffn_norm, xf, kDim, kNormEps);
-            if (dbg_layer) dbg_write(xf, kDim);                         // ffn input
-            moe(l);
-            if (dbg_layer) dbg_write(ffn_out, kDim);                    // ffn output
-            ops::hc_post(ffn_out, h2, ffn_post, ffn_comb, h);
-            ck(cudaMemcpy(pre_mix, ffn_pre, kHc * 4, cudaMemcpyDeviceToDevice), "pre_mix");
-            if (dump)
-                ck(cudaMemcpy(dump->hidden.data() + (size_t) l * kHc * kDim, h, kHc * kDim * 2, cudaMemcpyDeviceToHost),
-                   "dump hidden");
+        *hp = StepParams{token, pos, pos + 1, (pos + 1) / 2};
+        parity = pos & 1;
+        tcap1 = cap_of(pos + 1, max_seq + 1);
+        tcap2 = cap_of((pos + 1) / 2, max_seq / 2 + 1);
+        if (use_graph && !dump && !dbg) {
+            const uint64_t key = (uint64_t) parity | (uint64_t) tcap1 << 1 | (uint64_t) tcap2 << 33;
+            auto it = graphs.find(key);
+            if (it == graphs.end()) {
+                // relaxed: other threads (the tier's copier) keep using CUDA during the capture
+                ck(cudaStreamBeginCapture(st, cudaStreamCaptureModeRelaxed), "begin capture");
+                enqueue_step(nullptr);
+                cudaGraph_t gr;
+                ck(cudaStreamEndCapture(st, &gr), "end capture");
+                cudaGraphExec_t ex;
+                ck(cudaGraphInstantiate(&ex, gr, 0), "instantiate");
+                cudaGraphDestroy(gr);
+                it = graphs.emplace(key, ex).first;
+                ++graph_captures;
+            }
+            ck(cudaGraphLaunch(it->second, st), "graph launch");
+        } else {
+            enqueue_step(dump);
         }
-        ops::hc_pre(h, pre_mix, final_x);
-        ops::rmsnorm(final_x, final_norm, final_x, kDim, kNormEps);
-        ops::bf16_linear(final_x, nullptr, head, kDim, kVocab, nullptr, logits);
-        lg.resize(kVocab);
-        ck(cudaMemcpy(lg.data(), logits, kVocab * 4, cudaMemcpyDeviceToHost), "logits");
-        const int best = (int) (std::max_element(lg.begin(), lg.end()) - lg.begin());
-        int32_t r[kLayers * kTopK];
-        ck(cudaMemcpy(r, routes_dev, sizeof r, cudaMemcpyDeviceToHost), "routes");
-        if (vram) vram->count(r, kTopK);
+        ck(cudaStreamSynchronize(st), "step");
+        const int best = *hp_next;
+        lg.assign(lg_pinned, lg_pinned + kVocab);
+        if (vram) vram->count(routes_pinned, kTopK);
         if (dump) {
             float wv[kLayers * kTopK];
             ck(cudaMemcpy(wv, weights_dev, sizeof wv, cudaMemcpyDeviceToHost), "dump weights");
             for (int l = 0; l < kLayers; ++l)
                 for (int i = 0; i < kTopK; ++i) {
-                    dump->routes[l][i] = r[l * kTopK + i];
+                    dump->routes[l][i] = routes_pinned[l * kTopK + i];
                     dump->weights[l][i] = wv[l * kTopK + i];
                 }
             std::vector<int> order(kVocab);
@@ -1513,9 +1594,9 @@ struct Engine::Impl {
         tm.file_experts = worker_file.load();
         tm.ssd_experts = worker_ssd.load();
         if (lookahead) {
-            const auto st = lookahead->take_stats();
-            tm.warmed = (int) st.warmed;
-            tm.warmed_useful = (int) st.useful;
+            const auto st_ = lookahead->take_stats();
+            tm.warmed = (int) st_.warmed;
+            tm.warmed_useful = (int) st_.useful;
         }
         tm.gpu_ms = tm.total_ms - tm.engram_ms;
         return best;
