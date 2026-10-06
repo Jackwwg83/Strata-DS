@@ -152,14 +152,16 @@ struct Engine::Impl {
     uint64_t go = 0;                   // steps released to the worker
     std::atomic<bool> stop{false};
     std::atomic<int64_t> worker_us{0}; // CPU expert time of the current step
-    std::atomic<int> worker_misses{0}; // routed experts the CPU computed in the current step
+    std::atomic<int> worker_misses{0}; // routed uses outside VRAM (CPU plus zero-copy)
     std::unique_ptr<VramExperts> vram;  // the VRAM tier (null: none)
     std::unique_ptr<HostExperts> host;  // the RAM tier (null: none); the rest is read from the mapped file
     std::atomic<int> worker_ram{0}, worker_file{0}, worker_ssd{0};   // CPU experts of the step by tier
     std::vector<unsigned char> mincore_buf;
     std::unique_ptr<RouterLookahead> lookahead;   // warms the next layer's file-tier experts (DS41_LOOKAHEAD=0: off)
     bool fetch_now = true;             // ask for a layer's missing file pages before computing (DS41_FETCH_NOW=0: off)
-    int32_t* gpu_sel = nullptr;        // [6] this layer's resident slots (-1: CPU)
+    int32_t* gpu_sel = nullptr;        // [6] per-call descriptor indices (-1: CPU)
+    std::shared_ptr<int> zc_quota;      // [layers] device values; update only between steps
+    std::shared_ptr<void> zc_workspace; // used when there is no VRAM tier
     int32_t* routes_dev = nullptr;     // [40][6]
     float* weights_dev = nullptr;      // [40][6]
     uint8_t* cand_dev = nullptr;       // [max_seq] candidate mask of the candidate layer
@@ -369,6 +371,27 @@ struct Engine::Impl {
                          host->arena_bytes() / (double) (1ull << 30),
                          host->locked() ? "locked" : "not locked", (now_ms() - t0) / 1000.0);
         }
+        if (host && host->experts_dev()) {
+            // Four PCIe reads cost about 1.05 ms; two CPU experts cost about 1.0-1.2 ms.
+            // This is a starting quota for six misses, not a measured optimum.
+            int quota = 4;
+            if (const char* value = std::getenv("DS41_ZC_QUOTA")) {
+                char* end = nullptr;
+                const long parsed = std::strtol(value, &end, 10);
+                if (end == value || *end || parsed < 0 || parsed > kTopK)
+                    throw std::invalid_argument("DS41_ZC_QUOTA must be an integer in [0, 6]");
+                quota = (int) parsed;
+            }
+            zc_quota = std::shared_ptr<int>(dalloc<int>(kLayers), [](int* p) { cudaFree(p); });
+            const std::vector<int> quotas(kLayers, quota);
+            ck(cudaMemcpy(zc_quota.get(), quotas.data(), quotas.size() * sizeof(int), cudaMemcpyHostToDevice),
+               "zero-copy quotas");
+            if (!vram)
+                zc_workspace = std::shared_ptr<void>(dalloc<uint8_t>(VramExperts::kWorkspaceBytes),
+                                                     [](void* p) { cudaFree(p); });
+            ck(cudaStreamSynchronize(nullptr), "zero-copy initialization");
+            std::fprintf(stderr, "ds41: mapped RAM experts enabled, GPU quota %d per token per layer\n", quota);
+        }
         // the router lookahead: every expert outside the VRAM and RAM tiers is read from the file (upstream turns it
         // on with a RAM budget; here the file tier exists whenever the experts do not all fit in RAM)
         if (const char* f = std::getenv("DS41_FETCH_NOW")) fetch_now = f[0] != '0';
@@ -457,10 +480,14 @@ struct Engine::Impl {
                     }
                 }
                 if (lookahead) lookahead->observe(l, file_ids, n_file);
-                worker_misses += misses;
+                // Keep expert_hits as VRAM hits. Timing derives CPU and zero-copy counts from the partition.
+                worker_misses += misses + db->counts().zero_copy;
                 const double t0 = now_ms();
-                exl3_moe_cpu_forward_raw(L[l].moe_handle, (const at::Half*) db->x(), db->ids(), wh, db->y(), 1, kTopK,
-                                         cpu_threads);
+                if (misses)
+                    exl3_moe_cpu_forward_raw(L[l].moe_handle, (const at::Half*) db->x(), db->ids(), wh, db->y(), 1,
+                                             kTopK, cpu_threads);
+                else
+                    std::fill_n(db->y(), kDim, 0.0f);
                 worker_us += (int64_t) ((now_ms() - t0) * 1000.0);
                 db->mark_done(l + 1);
             }
@@ -627,15 +654,17 @@ struct Engine::Impl {
         int32_t* ids = routes_dev + l * kTopK;
         float* w = weights_dev + l * kTopK;
         kernels::router_topk(xf, 1, y.gate_w, y.gate_bias, ids, w, 0);
-        // routed experts: the misses go to the CPU thread (which reads the mmap'ed pack), the hits to K10
+        // K10 computes VRAM hits and a quota of RAM misses while the CPU computes the rest.
         ops::to_half_fp8q(xf, x_half_dev, kDim);
         const bool tier = vram && vram->slots() > 0;
+        const auto* ram = host && host->experts_dev() ? host->experts_dev() + (size_t) l * kExperts : nullptr;
         db->publish(x_half_dev, ids, w, 1, tier ? vram->res_dev() + (size_t) l * kExperts : nullptr, gpu_sel,
-                    (uint32_t) (l + 1), 0);
+                    (uint32_t) (l + 1), 0, tier ? vram->experts_dev() : nullptr, ram,
+                    zc_quota ? zc_quota.get() + l : nullptr);
         ck(cudaMemsetAsync(routed, 0, kDim * sizeof(float), 0), "routed");
-        if (tier)
-            kernels::exl3_moe_decode((const __half*) x_half_dev, 1, gpu_sel, w, kTopK, vram->experts_dev(), routed,
-                                     vram->workspace(), VramExperts::kWorkspaceBytes, 0);
+        if (tier || ram)
+            kernels::exl3_moe_decode((const __half*) x_half_dev, 1, gpu_sel, w, kTopK, db->gpu_experts(), routed,
+                                     vram ? vram->workspace() : zc_workspace.get(), VramExperts::kWorkspaceBytes, 0);
         // shared expert, while the CPU works
         fp8_linear(xf, y.sh_w1, g);
         fp8_linear(xf, y.sh_w3, u);

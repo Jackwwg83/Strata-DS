@@ -1,9 +1,8 @@
 // include/strata/ds41/engine.hpp - DeepSeek V4.1 Flash decode, one token at a time.
 //
-// GPU: everything except the routed experts. CPU: routed experts with exllamav3's moe_mul1, reading the
-// mmap'ed experts.bin in place (upstream Strata's "CPU computes the misses in RAM", with no VRAM cache yet).
-// A CPU thread serves the experts layer by layer through an ExpertDoorbell while the GPU runs the shared expert.
-// With a VRAM expert tier (VramExperts, task K10) the GPU computes the resident experts and the CPU the misses.
+// The GPU computes dense work, VRAM experts, and a quota of experts from mapped RAM (DS41_ZC_QUOTA, default 4).
+// The CPU computes the remaining RAM experts and all file experts with exllamav3's moe_mul1.
+// An ExpertDoorbell joins both results per layer. K10 uses the same math for VRAM and mapped RAM.
 // Token 0 runs the same path as every later token; the prototype's prefill of one token is equivalent.
 #pragma once
 
@@ -86,7 +85,9 @@ public:
     /// expert_hits: routed experts of the step computed from VRAM slots, of expert_total.
     struct Timing {
         double gpu_ms = 0, cpu_experts_ms = 0, engram_ms = 0, total_ms = 0;
-        int expert_hits = 0, expert_total = 0;
+        int expert_hits = 0, expert_total = 0;   ///< VRAM hits and all routed uses
+        int cpu_experts() const { return ram_experts + file_experts; }
+        int zero_copy_experts() const { return expert_total - expert_hits - cpu_experts(); }
         int vram_swaps = 0;   ///< adaptive swaps committed before this step
         /// the CPU's experts by tier: from the RAM copy, from the mapped file, and of those, the ones with pages
         /// missing from RAM when computed (read from the SSD)

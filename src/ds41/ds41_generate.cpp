@@ -141,10 +141,10 @@ int main(int argc, char** argv) {
             if (pos >= (int) prompt.size() - 1 && forced.empty()) out.push_back(next);
             std::fprintf(stderr,
                          "pos %d tok %d -> %d  total %.1f ms (engram reads %.1f, layers %.1f, of which cpu experts %.1f)"
-                         "  vram hits %d/%d swaps %d  cpu: ram %d file %d (ssd %d)  warmed %d useful %d\n",
+                         "  vram hits %d/%d swaps %d  zero-copy %d cpu %d: ram %d file %d (ssd %d)  warmed %d useful %d\n",
                          pos, tok, next, t.total_ms, t.engram_ms, t.gpu_ms, t.cpu_experts_ms, t.expert_hits,
-                         t.expert_total, t.vram_swaps, t.ram_experts, t.file_experts, t.ssd_experts, t.warmed,
-                         t.warmed_useful);
+                         t.expert_total, t.vram_swaps, t.zero_copy_experts(), t.cpu_experts(), t.ram_experts, t.file_experts,
+                         t.ssd_experts, t.warmed, t.warmed_useful);
             if (dump) {
                 const int32_t hdr[2] = {tok, next};
                 std::fwrite(hdr, 4, 2, dump);
