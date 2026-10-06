@@ -647,14 +647,15 @@ struct Engine::Impl {
     // carry over between chunks exactly as between decode steps.
     static constexpr int kStreamAll = 1024;   ///< from this many tokens, every expert of every layer is streamed
     static constexpr int kNllRows = 64;       ///< logits rows per head GEMM when measuring nll
-    static constexpr int kKeepSlots = 128;    ///< VRAM tier slots never lent (upstream)
+    static constexpr int kMinRing = 16;       ///< the ring shrinks to this many slots before the chunk shrinks
     static constexpr int kEngBatch = 128;     ///< tokens per engram read (its O_DIRECT buffers: 16 KiB per row)
 
     /// Device scratch of one prefill call, carved from one region (lent VRAM tier slots or cudaMalloc)
     struct Prefill {
         int cap = 0;
-        uint8_t* region = nullptr;
-        bool own = false;
+        uint8_t* lent = nullptr;                 // lent VRAM tier slots (scratch, ring or both)
+        uint8_t* own_scratch = nullptr;          // or cudaMalloc
+        uint8_t* own_ring = nullptr;
         size_t slot_bytes = 0;
         uint8_t* ring = nullptr;
         int ring_slots = 0;
@@ -693,7 +694,7 @@ struct Engine::Impl {
         return p;
     }
 
-    /// Lays the scratch for `cap` rows out from `base` (null: only counts). Returns the bytes.
+    /// Lays the scratch for `cap` rows out from `base` (null: only counts). Returns the bytes. The ring is separate.
     size_t layout(Prefill& p, uint8_t* base, int cap) {
         size_t u = 0;
         const size_t c = (size_t) cap;
@@ -756,12 +757,13 @@ struct Engine::Impl {
         p.k12_ws = carve<uint8_t>(base, u, p.k12_bytes);
         p.k14_bytes = kernels::indexer_topk_prefill_workspace_bytes(cap, max_seq);
         p.k14_ws = carve<uint8_t>(base, u, p.k14_bytes);
-        p.ring = carve<uint8_t>(base, u, (size_t) p.ring_slots * p.slot_bytes);
         return (u + 255) & ~(size_t) 255;
     }
 
-    /// Chooses the chunk size and gets the scratch: lent VRAM tier slots when the tier can spare them, else
-    /// cudaMalloc; halves the chunk until one fits.
+    /// Chooses the chunk size and gets the scratch and the ring: lent VRAM tier slots (up to 90% of the tier, as
+    /// upstream) and free VRAM, in that order of preference; when neither fits, the ring shrinks to 16 slots, then the
+    /// chunk halves. From about 1000 tokens on nearly every expert of every layer is streamed per chunk whatever
+    /// the tier holds, so the chunk size, not the tier, decides the prefill speed: lending most of the tier is cheap.
     void prefill_begin() {
         pf = Prefill{};
         pf.ring_slots = std::max(opt.prefill_ring, 4);
@@ -771,29 +773,39 @@ struct Engine::Impl {
                 for (int e = 0; e < kExperts; ++e) pf.slot_bytes = std::max<size_t>(pf.slot_bytes, pack.expert(l, e).bytes);
             pf.slot_bytes = (pf.slot_bytes + 255) & ~(size_t) 255;
         }
+        const int lendable = vram ? vram->slots() * 9 / 10 : 0;
+        size_t free_b = 0, total_b = 0;
+        ck(cudaMemGetInfo(&free_b, &total_b), "cudaMemGetInfo");
+        const size_t spare = free_b > (512ull << 20) ? free_b - (512ull << 20) : 0;   // cuBLAS and K13 scratch
+        auto slots_for = [&](size_t b) { return (int) ((b + pf.slot_bytes - 1) / pf.slot_bytes); };
         int cap = std::max(1, opt.prefill_chunk);
-        for (;;) {
-            const size_t need = layout(pf, nullptr, cap);
-            const int lendable = vram ? std::min(vram->slots() - kKeepSlots, vram->slots() * 9 / 10) : 0;
-            const int n_slots = (int) ((need + pf.slot_bytes - 1) / pf.slot_bytes);
-            if (vram && n_slots <= lendable) {
-                pf.region = vram->lend(n_slots);
-                break;
+        size_t scratch = 0, ring = 0;
+        int plan = -1;   // 0: both lent; 1: scratch lent, ring cudaMalloc; 2: ring lent, scratch cudaMalloc; 3: both cudaMalloc
+        for (; plan < 0; cap /= 2) {
+            if (cap < 16) throw std::runtime_error("ds41 prefill: not enough VRAM for a 16-token chunk");
+            scratch = layout(pf, nullptr, cap);
+            for (int r = std::max(opt.prefill_ring, kMinRing); plan < 0 && r >= kMinRing; r /= 2) {
+                pf.ring_slots = r;
+                ring = (size_t) r * pf.slot_bytes;
+                if (slots_for(scratch + ring) <= lendable) plan = 0;
+                else if (slots_for(scratch) <= lendable && ring <= spare) plan = 1;
+                else if (slots_for(ring) <= lendable && scratch <= spare) plan = 2;
+                else if (scratch + ring <= spare) plan = 3;
             }
-            size_t free_b = 0, total_b = 0;
-            ck(cudaMemGetInfo(&free_b, &total_b), "cudaMemGetInfo");
-            if (need + (256ull << 20) <= free_b && cudaMalloc(&pf.region, need) == cudaSuccess) {
-                pf.own = true;
-                break;
-            }
-            cudaGetLastError();
-            if (cap <= 16) throw std::runtime_error("ds41 prefill: not enough VRAM for a 16-token chunk");
-            cap /= 2;
+            if (plan >= 0) break;
         }
         pf.cap = cap;
-        const size_t bytes = layout(pf, pf.region, cap);
-        std::fprintf(stderr, "ds41 prefill: chunk %d tokens, scratch and ring %.2f GiB (%s), ring %d slots\n", cap,
-                     bytes / 1073741824.0, pf.own ? "cudaMalloc" : "lent VRAM tier slots", pf.ring_slots);
+        const size_t lend_bytes = plan == 0 ? scratch + ring : plan == 1 ? scratch : plan == 2 ? ring : 0;
+        if (lend_bytes) pf.lent = vram->lend(slots_for(lend_bytes));
+        uint8_t* scratch_base = plan <= 1 ? pf.lent : nullptr;
+        if (plan >= 2) ck(cudaMalloc((void**) &pf.own_scratch, scratch), "prefill scratch");
+        if (plan == 1 || plan == 3) ck(cudaMalloc((void**) &pf.own_ring, ring), "prefill ring");
+        if (!scratch_base) scratch_base = pf.own_scratch;
+        layout(pf, scratch_base, cap);
+        pf.ring = plan == 0 ? pf.lent + scratch : plan == 2 ? pf.lent : pf.own_ring;
+        std::fprintf(stderr, "ds41 prefill: chunk %d tokens; scratch %.2f GiB %s; ring %d slots %s; %d tier slots lent\n",
+                     cap, scratch / 1073741824.0, plan <= 1 ? "in lent slots" : "cudaMalloc", pf.ring_slots,
+                     plan == 0 || plan == 2 ? "in lent slots" : "cudaMalloc", lend_bytes ? slots_for(lend_bytes) : 0);
         // pinned host buffers
         if (pfh.cap < cap) {
             if (pfh.base) cudaFreeHost(pfh.base);
@@ -837,9 +849,10 @@ struct Engine::Impl {
     void prefill_end() {
         estream.reset();
         ck(cudaDeviceSynchronize(), "prefill end");
-        if (pf.own && pf.region) cudaFree(pf.region);
-        else if (pf.region && vram) vram->restore();
-        pf.region = nullptr;
+        if (pf.own_scratch) cudaFree(pf.own_scratch);
+        if (pf.own_ring) cudaFree(pf.own_ring);
+        if (pf.lent && vram) vram->restore();
+        pf.lent = pf.own_scratch = pf.own_ring = nullptr;
     }
 
     bool resident(int l, int e) const { return vram && vram->res_host()[(size_t) l * kExperts + e] >= 0; }
