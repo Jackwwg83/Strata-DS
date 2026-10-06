@@ -46,12 +46,15 @@ uint64_t read_number(const char* path) {
 }  // namespace
 
 std::vector<std::pair<int, int>> plan_ram_tier(const std::vector<std::pair<int, int>>& ranked,
-                                               const std::vector<int32_t>& vram_res, int n_experts, int64_t n_slots) {
+                                               const std::vector<int32_t>& vram_res, int n_experts,
+                                               const std::vector<uint64_t>& bytes, uint64_t budget) {
     std::vector<std::pair<int, int>> out;
+    uint64_t at = 0;
     for (const auto& [l, e] : ranked) {
-        if ((int64_t) out.size() >= n_slots) break;
-        if (vram_res[(size_t) l * n_experts + e] >= 0) continue;
+        const size_t i = (size_t) l * n_experts + e;
+        if (vram_res[i] >= 0 || bytes[i] > budget - at) continue;   // upstream: skip it, smaller ones may fit
         out.emplace_back(l, e);
+        at += bytes[i];
     }
     return out;
 }
@@ -79,13 +82,20 @@ HostExperts::HostExperts(const Pack& pack, const std::vector<std::pair<int, int>
     : pack_(pack), handles_(cpu_handles), n_experts_(pack.n_experts()) {
     const int L = pack.n_layers();
     slot_.assign((size_t) L * n_experts_, -1);
+    off_.assign(1, 0);
+    // each slot as large as its expert, 4 KiB aligned (a pack's experts are already)
+    std::vector<uint64_t> bytes((size_t) L * n_experts_);
     for (int l = 0; l < L; ++l)
-        for (int e = 0; e < n_experts_; ++e) slot_bytes_ = std::max<size_t>(slot_bytes_, pack.expert(l, e).bytes);
-    slot_bytes_ = (slot_bytes_ + 4095) / 4096 * 4096;
-    const auto plan = plan_ram_tier(ranked, vram_res, n_experts_, (int64_t) (budget / slot_bytes_));
+        for (int e = 0; e < n_experts_; ++e) bytes[(size_t) l * n_experts_ + e] = (pack.expert(l, e).bytes + 4095) / 4096 * 4096;
+    const auto plan = plan_ram_tier(ranked, vram_res, n_experts_, bytes, budget);
     slots_ = (int) plan.size();
     if (slots_ == 0) return;
-    arena_bytes_ = (size_t) slots_ * slot_bytes_;
+    for (const auto& [l, e] : plan) {
+        const uint64_t b = bytes[(size_t) l * n_experts_ + e];
+        off_.push_back(off_.back() + b);
+        max_slot_bytes_ = std::max<size_t>(max_slot_bytes_, b);
+    }
+    arena_bytes_ = off_.back();
     void* p = mmap(nullptr, arena_bytes_, PROT_READ | PROT_WRITE, MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
     if (p == MAP_FAILED) throw std::runtime_error("ds41 RAM tier: cannot reserve " + std::to_string(arena_bytes_) + " B");
     arena_ = (uint8_t*) p;
@@ -98,7 +108,7 @@ HostExperts::HostExperts(const Pack& pack, const std::vector<std::pair<int, int>
         pool.emplace_back([&] {
             for (int s; (s = next++) < slots_;) {
                 const ExpertSlot& x = pack.expert(holder_[s].first, holder_[s].second);
-                std::memcpy(arena_ + (size_t) s * slot_bytes_, base + x.offset, x.bytes);
+                std::memcpy(arena_ + off_[s], base + x.offset, x.bytes);
                 // the file pages are not needed any more: unmap them, so the OS reclaims them first
                 const uintptr_t a = ((uintptr_t) (base + x.offset)) & ~(uintptr_t) 4095;
                 madvise((void*) a, (uintptr_t) (base + x.offset + x.bytes) - a, MADV_DONTNEED);
@@ -129,6 +139,7 @@ HostExperts::~HostExperts() {
 }
 
 void HostExperts::point(int layer, int expert, const uint8_t* bytes) {
+    if (handles_.empty()) return;   // no CPU kernel (tests)
     const ExpertSlot& s = pack_.expert(layer, expert);
     auto desc = [&](int c0, int k_tiles, int n_tiles) {
         MoeCpuMatrixDesc d;
@@ -152,6 +163,8 @@ void HostExperts::point_to_file(int layer, int expert) {
 
 void HostExperts::assign(int slot, int layer, int expert) {
     if (slot < 0 || slot >= slots_) throw std::invalid_argument("HostExperts::assign: bad slot");
+    if (pack_.expert(layer, expert).bytes > slot_capacity(slot))
+        throw std::invalid_argument("HostExperts::assign: the expert is larger than the slot");
     const auto [ol, oe] = holder_[slot];
     slot_[(size_t) ol * n_experts_ + oe] = -1;
     holder_[slot] = {layer, expert};

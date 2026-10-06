@@ -21,7 +21,19 @@ constexpr int L = strata::ds41::kLayers, E = strata::ds41::kExperts;
 /// apart, so most do not start on a 4 KiB boundary (as in a real pack): O_DIRECT readers must cover them
 constexpr uint64_t kExpertBytes = 4096, kStride = kExpertBytes + 256;
 
-inline void write_fake_pack(const std::string& dir) {
+/// mixed packs (as SAGE 1.59bpw, whose experts differ in size): expert (l, e) is fake_mult(l, e) times larger, its
+/// components too; the experts follow each other 256 bytes apart
+inline int fake_mult(int l, int e) { return 1 + (l * E + e) % 3; }
+inline uint64_t fake_bytes(int l, int e, bool mixed) { return mixed ? kExpertBytes * fake_mult(l, e) : kExpertBytes; }
+inline uint64_t fake_offset(int l, int e, bool mixed) {
+    if (!mixed) return ((uint64_t) l * E + e) * kStride;
+    const uint64_t i = (uint64_t) l * E + e, cycles = i / 3;   // a cycle of 3 experts: 1 + 2 + 3 units, 3 gaps
+    uint64_t off = cycles * (6 * kExpertBytes + 3 * 256);
+    for (uint64_t j = 0; j < i % 3; ++j) off += kExpertBytes * (1 + j) + 256;
+    return off;
+}
+
+inline void write_fake_pack(const std::string& dir, bool mixed = false) {
     mkdir(dir.c_str(), 0755);
     {
         std::ofstream f(dir + "/index.txt");
@@ -40,13 +52,14 @@ inline void write_fake_pack(const std::string& dir) {
                                 "w3.svh",     "w3.mul1", "w2.trellis", "w2.suh", "w2.svh", "w2.mul1"};
         for (int l = 0; l < L; ++l)
             for (int e = 0; e < E; ++e) {
-                f << l << " " << e << " " << ((uint64_t) l * E + e) * kStride << " " << kExpertBytes << " 3 3 3";
-                for (int c = 0; c < 12; ++c) f << " " << comp[c] << ":" << c * 256 << ":256";
+                const int m = mixed ? fake_mult(l, e) : 1;
+                f << l << " " << e << " " << fake_offset(l, e, mixed) << " " << fake_bytes(l, e, mixed) << " 3 3 3";
+                for (int c = 0; c < 12; ++c) f << " " << comp[c] << ":" << c * 256 * m << ":" << 256 * m;
                 f << "\n";
             }
     }
     {
-        std::vector<uint8_t> b((size_t) L * E * kStride + 8192);
+        std::vector<uint8_t> b((size_t) (fake_offset(L - 1, E - 1, mixed) + fake_bytes(L - 1, E - 1, mixed)) + 8192);
         std::mt19937 g(1);
         for (auto& x : b) x = (uint8_t) g();
         std::ofstream f(dir + "/experts.bin", std::ios::binary);

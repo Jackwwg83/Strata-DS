@@ -363,7 +363,7 @@ struct Engine::Impl {
                 vram ? vram->res_host() : std::vector<int32_t>((size_t) kLayers * kExperts, -1), budget, handles, 8);
             if (vram) vram->set_host(host.get());
             std::fprintf(stderr, "ds41: RAM tier %d experts (%.1f GiB, %s), filled in %.1f s\n", host->slots(),
-                         host->slots() * (double) host->slot_bytes() / (1ull << 30),
+                         host->arena_bytes() / (double) (1ull << 30),
                          host->locked() ? "locked" : "not locked", (now_ms() - t0) / 1000.0);
         }
         // the router lookahead: every expert outside the VRAM and RAM tiers is read from the file (upstream turns it
