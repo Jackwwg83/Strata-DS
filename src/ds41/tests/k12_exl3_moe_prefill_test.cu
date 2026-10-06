@@ -42,18 +42,19 @@ size_t align256(size_t b) { return (b + 255) & ~(size_t) 255; }
 struct Experts {
     void* base = nullptr;
     std::vector<kk::Exl3Expert> host;
-    Experts() {
-        const size_t tb = (size_t) (H / 16) * (F / 16) * TILE_W * 2;  // trellis bytes, same for all three
+    Experts(int count = E, bool mixed = false) {
+        const size_t tb = (size_t) (H / 16) * (F / 16) * (mixed ? 96 : TILE_W) * 2;  // trellis bytes, same for all three
         const size_t per = 3 * align256(tb) + 2 * align256(H * 2) + 2 * align256(F * 2) + align256(F * 2) +
                            align256(H * 2);
-        ck(cudaMalloc(&base, per * E), "experts");
-        host.resize(E);
-        for (int e = 0; e < E; ++e) {
+        ck(cudaMalloc(&base, per * count), "experts");
+        host.resize(count);
+        for (int e = 0; e < count; ++e) {
             char* p = (char*) base + per * e;
-            auto proj = [&](int k, int n, float s_in, float s_out, uint32_t seed) {
+            auto proj = [&](int k, int n, float s_in, float s_out, uint32_t seed, int bits) {
                 kk::Exl3Proj q;
                 q.trellis = (const uint16_t*) p;
-                fill_u16<<<256, 256>>>((uint16_t*) p, tb / 2, seed);
+                const size_t packed_bytes = (size_t) (k / 16) * (n / 16) * 16 * bits * 2;
+                fill_u16<<<256, 256>>>((uint16_t*) p, packed_bytes / 2, seed);
                 p += align256(tb);
                 q.suh = (const __half*) p;
                 fill_scale<<<32, 256>>>((__half*) p, k, s_in, seed ^ 0x1111U);
@@ -63,13 +64,13 @@ struct Experts {
                 p += align256(n * 2);
                 q.k = k;
                 q.n = n;
-                q.tile_w = TILE_W;
+                q.tile_w = 16 * bits;
                 return q;
             };
             const uint32_t s = 0x9e3779b9U * (uint32_t) (e + 1);
-            host[e].w1 = proj(H, F, 1.0f, 0.02f, s ^ 1);
-            host[e].w3 = proj(H, F, 1.0f, 0.02f, s ^ 3);
-            host[e].w2 = proj(F, H, 1.0f, 0.05f, s ^ 2);
+            host[e].w1 = proj(H, F, 1.0f, 0.02f, s ^ 1, mixed ? e % 6 + 1 : 3);
+            host[e].w3 = proj(H, F, 1.0f, 0.02f, s ^ 3, mixed ? (e + 1) % 6 + 1 : 3);
+            host[e].w2 = proj(F, H, 1.0f, 0.05f, s ^ 2, mixed ? (e + 5) % 6 + 1 : 3);
         }
         ck(cudaDeviceSynchronize(), "fill experts");
     }
@@ -182,11 +183,45 @@ double delta_err(const std::vector<float>& got, const std::vector<float>& want, 
     return rel_l2(a, b);
 }
 
+void mixed_k(Verdict& v) {
+    Experts ex(6, true);
+    Dev<kk::Exl3Expert> experts(ex.host);
+    // Six unique choices from six experts select every K in every projection.
+    const Chunk c = make_chunk(37, 6, 0.0, 159, {5, 20});
+    const Run r(c, 3, 159);  // Second nonempty call has off[0] > 0.
+    Dev<uint8_t> ws(r.ws_bytes);
+    const auto init = rand_f32(size_t(c.T) * H, 0.5f, 159);
+    Dev<float> want(init), got(init);
+    reference(c, r, experts.p, want.p);
+    // Restrict empty trailing calls to the allocated descriptor array.
+    auto enqueue = [&](cudaStream_t st) {
+        for (size_t i = 0; i < 2; ++i)
+            kk::exl3_moe_prefill(r.x.p, r.tok.p, r.w.p, r.offs[i].data(), 3,
+                                 experts.p + i * 3, got.p, ws.p, r.ws_bytes, st);
+    };
+    enqueue(0);
+    ck(cudaDeviceSynchronize(), "mixed prefill");
+    const auto result = got.down();
+    const double err = delta_err(result, want.down(), init);
+    std::printf("mixed K1..K6 prefill T=37 rel_l2=%.6g\n", err);
+    v.check(err <= 1e-2, "mixed K prefill: relative L2 above 1e-2 against K10");
+    bool idle_same = true;
+    for (int t : {5, 20}) for (int i = 0; i < H; ++i)
+        idle_same &= result[size_t(t) * H + i] == init[size_t(t) * H + i];
+    v.check(idle_same, "mixed K prefill: idle row changed");
+    graph_check(v, "mixed K prefill T=37",
+                [&](cudaStream_t st) {
+                    ck(cudaMemsetAsync(got.p, 0, got.n * sizeof(float), st), "mixed reset");
+                    enqueue(st);
+                }, [&] { return as_doubles(got.down()); }, [&] { poison_dev(got); });
+}
+
 }  // namespace
 
 int main() {
     require_gpu();
     Verdict v;
+    mixed_k(v);
     Experts ex;
     Dev<kk::Exl3Expert> experts(ex.host);
 
