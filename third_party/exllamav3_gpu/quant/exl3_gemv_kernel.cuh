@@ -188,7 +188,7 @@ __device__ __forceinline__ void dq8_regs_half(uint32_t a7, uint32_t b7, int s7, 
 // allowing 32 resident warps to cover the streaming trellis-load latency.
 // This changes register allocation only; keep the prefetch/MMA/fold body intact.
 template <int bits, bool c_fp32, int cb, int MMODE, int CFG, bool SMEM_STAGE, bool HALF = false>
-__global__ __launch_bounds__(CFG == 0 ? 512 : 256, CFG == 0 ? 2 : 1)
+__device__ __forceinline__
 void exl3_gemv_kernel(const strata_exl3::GemvJob* jobs)
 {
     // A is already in the Hadamard basis. A null trellis marks an empty slot.
@@ -200,8 +200,8 @@ void exl3_gemv_kernel(const strata_exl3::GemvJob* jobs)
     const int size_m = 1;
     const int size_k = job.k;
     const int size_n = job.n;
-    static_assert(HALF ? (bits >= 1 && bits <= 3 && cb == 2) : (bits == 2 || bits == 3 || bits == 4),
-                  "exl3_gemv_kernel supports 2, 3 and 4 bpw, and 1.5, 2.5 and 3.5 bpw with mul1");
+    static_assert(HALF ? (bits >= 1 && bits <= 3 && cb == 2) : (bits >= 1 && bits <= 6 && cb == 2),
+                  "Strata GEMV supports integer K1..K6 and half-integer K1..K3 with mul1");
     constexpr int WK   = CFG == 0 ? 16 : 8;     // k-split (warps per block)
     constexpr int WNT  = CFG == 0 ? 2 : 4;      // adjacent n-tiles per warp
     constexpr int PF   = 2;                     // prefetch ring depth, independent of FOLD
@@ -213,8 +213,13 @@ void exl3_gemv_kernel(const strata_exl3::GemvJob* jobs)
 
     constexpr int TWORDS = HALF ? 4 * (2 * bits + 1) : 8 * bits;              // uint32 per 16x16 tile
     constexpr bool TWO_PER_LOAD = HALF ? bits == 1 : bits == 2;               // two tiles per warp load
-    constexpr int LOADS = TWO_PER_LOAD ? WNT / 2 : WNT;                       // warp loads per k-slice
-    constexpr int LSTRIDE = TWO_PER_LOAD ? 2 * TWORDS : (TWORDS < 32 ? TWORDS : 32);   // uint32 per load (lanes < LSTRIDE load)
+    // Strata: keep K2/K3/K4's register decoder and load schedule unchanged.
+    // Other integer rates use the upstream shared-memory dq_dispatch template.
+    constexpr bool GENERIC = !HALF && (bits == 1 || bits > 4);
+    constexpr int TILE_LOADS = (TWORDS + 31) / 32;
+    constexpr int STAGE_STRIDE = GENERIC ? TILE_LOADS * 32 : TWORDS;
+    constexpr int LOADS = GENERIC ? WNT * TILE_LOADS : (TWO_PER_LOAD ? WNT / 2 : WNT);                       // warp loads per k-slice
+    constexpr int LSTRIDE = GENERIC ? 32 : TWO_PER_LOAD ? 2 * TWORDS : (TWORDS < 32 ? TWORDS : 32);   // uint32 per load (lanes < LSTRIDE load)
     static_assert(!TWO_PER_LOAD || WNT % 2 == 0, "two tiles per warp load needs an even tile count per warp");
 
     const int warp = threadIdx.x / 32;
@@ -274,7 +279,7 @@ void exl3_gemv_kernel(const strata_exl3::GemvJob* jobs)
     }
 
     __shared__ float sh_red[WK][ROWS][COLS];
-    [[maybe_unused]] __shared__ uint32_t sh_stage[SMEM_STAGE ? WK : 1][SMEM_STAGE ? LOADS * LSTRIDE : 1];
+    [[maybe_unused]] __shared__ uint32_t sh_stage[(SMEM_STAGE || GENERIC) ? WK : 1][(SMEM_STAGE || GENERIC) ? LOADS * LSTRIDE : 1];
 
     for (int group = blockIdx.x; group < num_groups; group += gridDim.x)
     {
@@ -286,7 +291,13 @@ void exl3_gemv_kernel(const strata_exl3::GemvJob* jobs)
             // Keep the same scalar uint32 load, alignment, lane guard and address.
             // Narrow integer weights stream through L2 without filling L1; other
             // configurations retain the upstream streaming/evict-first policy.
-            if constexpr (CFG == 0 && !HALF)
+            if constexpr (GENERIC)
+            {
+                const int tile = l / TILE_LOADS;
+                const int word = (l % TILE_LOADS) * 32 + lane;
+                return word < TWORDS ? __ldcg(bp + (size_t) i * slice_stride + tile * TWORDS + word - lane) : 0;
+            }
+            else if constexpr (CFG == 0 && !HALF)
             {
                 if constexpr (LSTRIDE < 32)
                     return lane < LSTRIDE ? __ldcg(bp + (size_t) i * slice_stride + l * LSTRIDE) : 0;
@@ -335,7 +346,7 @@ void exl3_gemv_kernel(const strata_exl3::GemvJob* jobs)
                     pf[d % PF][l] = ld_b(i + PF, l);
             }
 
-            if constexpr (SMEM_STAGE)
+            if constexpr (SMEM_STAGE || GENERIC)
             {
                 __syncwarp();
                 #pragma unroll
@@ -357,10 +368,12 @@ void exl3_gemv_kernel(const strata_exl3::GemvJob* jobs)
             for (int t = 0; t < WNT; ++t)
             {
                 FragB f0, f1;
-                if constexpr (SMEM_STAGE)
+                if constexpr (SMEM_STAGE || GENERIC)
                 {
-                    const uint32_t* tp = &sh_stage[warp][t * TWORDS];
-                    if constexpr (HALF)
+                    const uint32_t* tp = &sh_stage[warp][t * STAGE_STRIDE];
+                    if constexpr (GENERIC)
+                        dq_dispatch<bits, cb, false>(tp, lane << 3, f0, f1);
+                    else if constexpr (HALF)
                         exl3_gemv_ns::dq8_regs_half<bits, cb>(tp[XP(0)], tp[XP(1)], XP(2), tp[XP(3)], tp[XP(4)], XP(5), f0, f1);
                     else if constexpr (bits == 4)
                         exl3_gemv_ns::dq8_regs_4bits<cb>(tp[(lane + 31) & 31], tp[lane], f0, f1);

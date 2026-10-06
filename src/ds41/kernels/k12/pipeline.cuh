@@ -9,7 +9,7 @@
 namespace strata::ds41::kernels::k12 {
 
 struct Workspace {
-    const uint16_t** trellis;
+    strata_exl3::ReconstructJob* trellis;
     half* matrices;
     half* input;
     float* gu;
@@ -19,7 +19,7 @@ struct Workspace {
 
     Workspace(void* p, const Layout& l) {
         char* base = reinterpret_cast<char*>((reinterpret_cast<uintptr_t>(p) + 255) & ~uintptr_t(255));
-        trellis = reinterpret_cast<const uint16_t**>(base + l.trellis);
+        trellis = reinterpret_cast<strata_exl3::ReconstructJob*>(base + l.trellis);
         matrices = reinterpret_cast<half*>(base + l.matrices);
         input = reinterpret_cast<half*>(base + l.input);
         gu = reinterpret_cast<float*>(base + l.gu);
@@ -30,18 +30,19 @@ struct Workspace {
 };
 
 __device__ inline void check_proj(const Exl3Proj& p, int k, int n) {
-    assert(p.k == k && p.n == n && p.tile_w == 48);
+    assert(p.k == k && p.n == n);
+    assert(p.tile_w % 16 == 0 && p.tile_w / 16 >= 1 && p.tile_w / 16 <= 6);
     assert(p.trellis && p.suh && p.svh);
 }
 
 // Expert descriptors live on the device; never read them back to the host.
-__global__ void prepare(const Exl3Expert* expert, const uint16_t** trellis) {
+__global__ void prepare(const Exl3Expert* expert, strata_exl3::ReconstructJob* trellis) {
     check_proj(expert->w1, H, F);
     check_proj(expert->w3, H, F);
     check_proj(expert->w2, F, H);
-    trellis[0] = expert->w1.trellis;
-    trellis[1] = expert->w3.trellis;
-    trellis[2] = expert->w2.trellis;
+    trellis[0] = {expert->w1.trellis, expert->w1.tile_w / 16};
+    trellis[1] = {expert->w3.trellis, expert->w3.tile_w / 16};
+    trellis[2] = {expert->w2.trellis, expert->w2.tile_w / 16};
 }
 
 // tok/weights are offset to the global row number by the host. Scratch uses

@@ -7,6 +7,8 @@
 #include "strata/ds41/pack.hpp"
 
 #include <fstream>
+#include <memory>
+#include "mixedk_fixture.hpp"
 
 using namespace ds41test;
 namespace sd = strata::ds41;
@@ -21,6 +23,54 @@ static std::vector<T> read_bin(const std::string& path, size_t n) {
         std::exit(1);
     }
     return v;
+}
+
+// Independent LinearEXL3 FP16 reference, as in the fixed 3-bit cases.
+static void mixed_k(Verdict& v) {
+    const auto data = mixedk::load();
+    std::vector<std::unique_ptr<Dev<uint16_t>>> packed, suh, svh;
+    packed.reserve(data.size()); suh.reserve(data.size()); svh.reserve(data.size());
+    std::vector<kk::Exl3Expert> host(mixedk::E);
+    for (size_t i = 0; i < data.size(); ++i) {
+        const auto& p = data[i];
+        packed.emplace_back(new Dev<uint16_t>(p.trellis));
+        suh.emplace_back(new Dev<uint16_t>(p.suh));
+        svh.emplace_back(new Dev<uint16_t>(p.svh));
+        kk::Exl3Proj q{packed.back()->p, reinterpret_cast<const __half*>(suh.back()->p),
+                       reinterpret_cast<const __half*>(svh.back()->p), p.k, p.n, 16 * p.bits};
+        auto& e = host[i / 3];
+        if (i % 3 == 0) e.w1 = q;
+        else if (i % 3 == 1) e.w3 = q;
+        else e.w2 = q;
+    }
+    Dev<kk::Exl3Expert> experts(host);
+    Dev<uint8_t> ws(64ull << 20);
+    for (int m : {1, 4, 8}) {
+        const auto suffix = "_" + std::to_string(m) + ".bin";
+        const auto dir = mixedk::directory() + "/";
+        Dev<__half> x(mixedk::read<__half>(dir + "x" + suffix, size_t(m) * 5120));
+        Dev<int32_t> sel(mixedk::read<int32_t>(dir + "sel" + suffix, m * 6));
+        Dev<float> w(mixedk::read<float>(dir + "w" + suffix, m * 6));
+        const auto want = mixedk::read<float>(dir + "out" + suffix, size_t(m) * 5120);
+        Dev<float> out(std::vector<float>(want.size(), 0));
+        auto run = [&](cudaStream_t st) {
+            ck(cudaMemsetAsync(out.p, 0, out.n * sizeof(float), st), "mixed reset");
+            kk::exl3_moe_decode(x.p, m, sel.p, w.p, 6, experts.p, out.p, ws.p, ws.n, st);
+        };
+        run(0);
+        ck(cudaDeviceSynchronize(), "mixed run");
+        const double err = rel_l2(out.down(), want);
+        std::printf("mixed K1..K6 m=%d rel_l2=%.6g\n", m, err);
+        // 1e-2, as K12 on the same fixture. exllamav3's small-row GEMV covers K2..K4 only; for K1, K5 and K6
+        // LinearEXL3 runs its regular kernel, which rounds differently. Measured on an RTX 4090, six experts of
+        // one K each: K2 and K3 match LinearEXL3 bit for bit, K4 at 4e-4, K1/K5/K6 at 5e-3..8e-3. Against an FP32
+        // reference (reconstructed weights, FP32 matmul) every K is at 4.7e-3..1.1e-2, and K3, the 3bpw path, is
+        // the largest (1.09e-2 at m=1). So K1/K5/K6 are as exact as K3; the 5e-3 of the 3-bit case does not apply.
+        v.check(err <= 1e-2, "mixed K: relative L2 above 1e-2 against LinearEXL3");
+        if (m == 8)
+            graph_check(v, "mixed K decode m=8", run,
+                        [&] { return as_doubles(out.down()); }, [&] { poison_dev(out); });
+    }
 }
 
 int main() {
@@ -93,5 +143,6 @@ int main() {
     v.metric("us_m1", us1);
     v.metric("us_m8", us8);
     v.metric("score_us", us1 + us8 / 8);
+    mixed_k(v);
     return v.finish();
 }

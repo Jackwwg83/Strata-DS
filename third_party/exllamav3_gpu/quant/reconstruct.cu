@@ -1,5 +1,6 @@
 // Strata K12: raw-pointer dispatch for upstream trellis-only reconstruction.
 #include "reconstruct.cuh"
+#include <cassert>
 #include "../util.cuh"
 #include "../ptx.cuh"
 #include "exl3_dq.cuh"
@@ -110,11 +111,24 @@ void reconstruct_batch_kernel
 
 namespace strata_exl3 {
 
-void reconstruct_mul1_3bit(half* unpacked, const uint16_t* const* packed_ptr,
-                           int k, int n, cudaStream_t stream) {
-    reconstruct_batch_kernel<3, 2, false>
-        <<<dim3(n / 128, k / 16, 1), 256, 0, stream>>>
-        (unpacked, packed_ptr, n / 16, size_t(k) * n);
+// K is uniform for the block. Each branch calls the upstream tile decoder.
+__global__ __launch_bounds__(256)
+void reconstruct_mul1_job(half* unpacked, const ReconstructJob* job, int blocks_n) {
+    const uint16_t* packed = job->packed;
+    switch (job->bits) {
+        case 1: reconstruct_tile<1, 2, false>(unpacked, packed, blocks_n, 0); break;
+        case 2: reconstruct_tile<2, 2, false>(unpacked, packed, blocks_n, 0); break;
+        case 3: reconstruct_tile<3, 2, false>(unpacked, packed, blocks_n, 0); break;
+        case 4: reconstruct_tile<4, 2, false>(unpacked, packed, blocks_n, 0); break;
+        case 5: reconstruct_tile<5, 2, false>(unpacked, packed, blocks_n, 0); break;
+        case 6: reconstruct_tile<6, 2, false>(unpacked, packed, blocks_n, 0); break;
+        default: assert(false && "K12: expected integer K1..K6");
+    }
+}
+
+void reconstruct_mul1(half* unpacked, const ReconstructJob* job,
+                       int k, int n, cudaStream_t stream) {
+    reconstruct_mul1_job<<<dim3(n / 128, k / 16), 256, 0, stream>>>(unpacked, job, n / 16);
 }
 
 }  // namespace strata_exl3

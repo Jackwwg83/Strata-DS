@@ -16,7 +16,8 @@ The adaptation replaces its PyTorch host dispatch with a raw device-job API,
 and moves the GEMV kernel's input/output Hadamards to surrounding launches.
 The trellis decoder, codebook, MMA loop, FP16-to-FP32 folds, and reduction
 remain upstream code. K10 calls the unchanged Hadamard helpers directly.
-Only 3-bit mul1, single-row, narrow GEMV is instantiated.
+The initial adapter instantiated only 3-bit mul1, single-row, narrow GEMV.
+The mixed-rate extension is described below.
 
 `strata.patch` records all changes to upstream files. Apply it in reverse to
 recover the unmodified vendor tree; verify against UPSTREAM.sha256. This makes
@@ -58,7 +59,7 @@ adaptation; their pristine digests are appended to UPSTREAM.sha256.
 The reviewer stages the pristine import separately, as described in
 `ds41/tasks/K12.COMMITS.md` (the agent cannot write .git).
 
-K12 uses the trellis-only `reconstruct_tile<3, 2, false>` and its upstream
+The initial K12 adapter used the trellis-only `reconstruct_tile<3, 2, false>` and its upstream
 batched wrapper, with a one-entry device pointer table per launch. It keeps
 the tile decoder, shuffle, layout and stores unchanged. The adapter removes
 Torch dispatch, unused reconstruct/Hadamard entry points and instance tables,
@@ -67,3 +68,25 @@ strata.patch. K10's existing sources and patch sections remain unchanged.
 K12 includes reconstruct.cu through its unity translation unit; no GEMM
 compilation units are needed for the cuBLAS path. Input/output Hadamards stay
 in the activation pipeline to retain K10's rounding locations.
+
+## Mixed integer rates (SAGE 1.59bpw)
+
+K10 now accepts K1..K6 in each device job. A single 512-thread launch switches
+on the job's rate before any barrier. K2/K3/K4 retain the narrow register
+codebook extraction, two-slot prefetch ring, four-step FP16 fold, L2 loads,
+and two-CTA launch bound. K1/K5/K6 instantiate the same GEMV template with
+padded shared-memory staging and the existing upstream `dq_dispatch<K, 2>`.
+Each warp loads two tiles. A tile uses one or two warp loads, with guarded
+padding. Decode, MMA, folds, and reduction use the existing templates.
+No new upstream files are needed. The public Strata interfaces are unchanged.
+
+K12 prepares three device jobs with independent rates. Each reconstruction
+launch switches on that job's K and calls `reconstruct_tile<K, 2, false>`.
+The upstream tile bodies remain byte-identical. The job table fits in the
+existing 256-byte workspace prefix. Neither path copies descriptors to the
+host, allocates, synchronizes with the host, or launches once per rate.
+
+`strata.patch` remains reversible against every `UPSTREAM.sha256` entry.
+Host checks audit the K3 source path and the new packed-load addresses.
+GPU compilation, numerical parity, register allocation, and 3-bit timing
+still require the reviewer box. Source preservation is not timing evidence.

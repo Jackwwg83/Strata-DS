@@ -14,6 +14,7 @@
 //      A mode whose state cannot be established is reported INVALID and not timed. Every forward is checked.
 //      They print metrics (and the storage MB read per forward, /proc/self/io), never the score.
 #include "moe_mul1.h"
+#include "mixedk_fixture.hpp"
 #include "strata/ds41/pack.hpp"
 
 #if defined(__linux__)
@@ -87,6 +88,58 @@ double read_bytes_mb() {
 
 double now_us() {
     return std::chrono::duration<double, std::micro>(std::chrono::steady_clock::now().time_since_epoch()).count();
+}
+
+// The same FP16 LinearEXL3 reference and tolerance as the fixed cases.
+void mixed_k(int threads) {
+    auto data = mixedk::load();
+    auto relocated = data;
+    auto desc = [](const mixedk::Projection& p) {
+        return MoeCpuMatrixDesc{p.trellis.data(), reinterpret_cast<const at::Half*>(p.suh.data()),
+                                reinterpret_cast<const at::Half*>(p.svh.data()), p.k / 16, p.n / 16, 16 * p.bits};
+    };
+    std::vector<MoeCpuMatrixDesc> gate, up, down;
+    for (int e = 0; e < mixedk::E; ++e) {
+        gate.push_back(desc(data[3 * e]));
+        up.push_back(desc(data[3 * e + 1]));
+        down.push_back(desc(data[3 * e + 2]));
+    }
+    const int64_t layer = exl3_moe_cpu_make_layer_raw(gate.data(), up.data(), down.data(), mixedk::E, 0, 10.0f, 0);
+    for (int m : {1, 4, 8}) {
+        const auto suffix = "_" + std::to_string(m) + ".bin";
+        const auto dir = mixedk::directory() + "/";
+        const auto x = mixedk::read<uint16_t>(dir + "x" + suffix, size_t(m) * H);
+        const auto sel = mixedk::read<int32_t>(dir + "sel" + suffix, m * K);
+        const auto wf = mixedk::read<float>(dir + "w" + suffix, m * K);
+        const auto want = mixedk::read<float>(dir + "out" + suffix, size_t(m) * H);
+        std::vector<at::Half> w;
+        for (float weight : wf) w.push_back(to_half(weight));
+        std::vector<float> initial;
+        for (int move = 0; move < 2; ++move) {
+            // Each projection keeps its own rate when its backing bytes move.
+            const auto& source = move ? relocated : data;
+            for (int e = 0; e < mixedk::E; ++e) {
+                const auto g = desc(source[3 * e]), u = desc(source[3 * e + 1]), d = desc(source[3 * e + 2]);
+                exl3_moe_cpu_set_expert_raw(layer, e, &g, &u, &d, 0);
+            }
+            std::vector<float> out(want.size(), std::nanf(""));
+            exl3_moe_cpu_forward_raw(layer, reinterpret_cast<const at::Half*>(x.data()), sel.data(),
+                                     w.data(), out.data(), m, K, threads);
+            double num = 0, den = 0;
+            bool finite = true;
+            for (size_t i = 0; i < out.size(); ++i) {
+                finite &= std::isfinite(out[i]);
+                num += (double(out[i]) - want[i]) * (double(out[i]) - want[i]);
+                den += double(want[i]) * want[i];
+            }
+            const double err = std::sqrt(num / std::max(den, 1e-300));
+            std::printf("mixed K1..K6 m=%d relocated=%d rel_l2=%.6g\n", m, move, err);
+            check(finite && err <= kMaxErr, "mixed K: relative L2 above 0.0325 against LinearEXL3");
+            if (!move) initial = out;
+            else check(out == initial, "mixed K: relocation changed output");
+        }
+    }
+    exl3_moe_cpu_free_layer(layer);
 }
 
 }  // namespace
@@ -317,6 +370,7 @@ int main() {
 #endif
     }
     exl3_moe_cpu_free_layer(layer);
+    mixed_k(threads);
     metric("us_m1", t1);
     metric("us_m8", t8);
     metric("score_us", t1 + t8 / 8);

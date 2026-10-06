@@ -21,3 +21,11 @@ After integration with the merged K11-01 control, AVX-VNNI remains the preferred
 non-AVX-512 tier when supported. K11-02 specializes only its plain-AVX2 fallback;
 `EXL3_MOE_CPU_MAX_ISA=avx2` can isolate that path for testing. The AVX-VNNI
 implementation and detection remain the merged K11-01 code.
+
+Mixed-K audit: `make_layer_raw` builds one `MoeCpuMatrix` per projection.
+`set_expert_raw` compares the replacement rate with that expert's projection,
+not with expert zero. AVX2, AVX-VNNI fallback, BW, VNNI, VBMI, and scalar
+band dispatch read `mat.bits` and `mat.hb`. Layers can already mix integer
+K1..K6 across experts and projections. No CPU math change is needed.
+The extended K11 acceptance test checks a mixed layer against the same
+LinearEXL3 FP16 reference, then relocates each expert through `set_expert_raw`.
