@@ -7,14 +7,17 @@
 #   ci:     a clean clone for the queue, then ds41/ci/runner.sh in the background
 # Expects the repository at /workspace/Strata-DS (branch feature/ds41). Logs: /workspace/s4_<step>.log
 # Env: CUDA_ARCH (default 89; 120 for RTX 50), SKIP_EXL3=1 (setup without exllamav3: only the K10 golden needs it)
+#      MODEL_REPO / MODEL_REV / M / P: another pack, for example SAGE 1.59bpw:
+#      MODEL_REPO=vcruz305/DSV4.1-Flash-SAGE-EXL3-1.59bpw MODEL_REV=eca94a388a70841858feed8f057a9862e897aba4
+#      M=/workspace/model-sage P=/workspace/pack-sage
 set -u
 W=/workspace
 R=$W/Strata-DS
-M=$W/model
-P=$W/pack-3bpw
+M=${M:-$W/model}
+P=${P:-$W/pack-3bpw}
 EXL3_COMMIT=16a49792
-MODEL_REPO=coolbho3k/DeepSeek-V4.1-Flash-EXL3-3bpw
-MODEL_REV=650cae2c13aaaec303871a35301503570889c0be
+MODEL_REPO=${MODEL_REPO:-coolbho3k/DeepSeek-V4.1-Flash-EXL3-3bpw}
+MODEL_REV=${MODEL_REV:-650cae2c13aaaec303871a35301503570889c0be}
 
 case "${1:?step}" in
 setup)
