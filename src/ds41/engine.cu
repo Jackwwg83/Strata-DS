@@ -863,32 +863,26 @@ struct Engine::Impl {
         }
         estream = std::make_unique<ExpertStream>(pack, host.get(), pf.ring, pf.ring_slots, pf.slot_bytes,
                                                  std::max(1, opt.prefill_threads), std::max(1, opt.prefill_host_buffers),
-                                                 file_cache_keep());
+                                                 prefill_unbuffered());
     }
 
 
-    /// The experts prefill leaves in the file cache: the hottest (profile order) that neither VRAM nor the RAM tier
-    /// holds, as many as the file cache can keep (the container's memory less its anonymous memory, less 8 GiB).
-    /// Every later prompt then reads them from RAM; the rest stream from the SSD and are dropped again. No profile:
-    /// none (every expert read from the SSD is dropped).
-    std::vector<uint8_t> file_cache_keep() {
-        std::vector<uint8_t> keep;
-        if (opt.expert_profile.empty()) return keep;
-        const size_t budget = auto_ram_budget(8ull << 30);
-        keep.assign((size_t) kLayers * kExperts, 0);
-        size_t used = 0;
-        int n = 0;
-        for (const auto& [l, e] : read_expert_profile(opt.expert_profile, kLayers, kExperts)) {
-            if (resident(l, e) || (host && host->slot_of(l, e) >= 0)) continue;
-            const size_t b = pack.expert(l, e).bytes;
-            if (used + b > budget) break;
-            keep[(size_t) l * kExperts + e] = 1;
-            used += b;
-            ++n;
-        }
-        std::fprintf(stderr, "ds41 prefill: the file cache keeps the %d hottest streamed experts (%.1f GiB)\n", n,
-                     used / 1073741824.0);
-        return keep;
+    /// Upstream's file-tier rule (v0.1.40 file_tier_unbuffered / file_cache_keeps, #577): the experts outside the
+    /// RAM tier are read with O_DIRECT when the file cache could not keep them anyway (available RAM, after the RAM
+    /// tier, less 4 GiB, below their bytes); otherwise through the file cache. The VRAM tier's experts count too:
+    /// prefill lends their slots and refills them. DS41_UNBUFFERED=0 / 1 forces it.
+    bool prefill_unbuffered() {
+        if (const char* v = std::getenv("DS41_UNBUFFERED"); v && v[0]) return v[0] != '0';
+        uint64_t read = 0;
+        for (int l = 0; l < kLayers; ++l)
+            for (int e = 0; e < kExperts; ++e)
+                if (!(host && host->slot_of(l, e) >= 0)) read += pack.expert(l, e).bytes;
+        const uint64_t avail = auto_ram_budget(0), margin = 4ull << 30;
+        const bool keeps = avail > margin && avail - margin >= read;
+        std::fprintf(stderr, "ds41 prefill: %.1f GiB available, %.1f GiB of experts read from the pack: %s\n",
+                     avail / 1073741824.0, read / 1073741824.0,
+                     keeps ? "through the file cache" : "unbuffered (O_DIRECT): the file cache could not keep them");
+        return !keeps;
     }
 
     /// Returns the lent slots (or frees the scratch). After an error the stream is stopped without draining (its

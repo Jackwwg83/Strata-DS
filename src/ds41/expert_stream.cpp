@@ -20,14 +20,18 @@ void ck(cudaError_t e, const char* what) {
 }  // namespace
 
 ExpertStream::ExpertStream(const Pack& pack, const HostExperts* host, uint8_t* ring, int slots, size_t slot_bytes,
-                           int readers, int host_buffers, std::vector<uint8_t> keep)
-    : pack_(pack), host_(host), keep_(std::move(keep)), ring_(ring), slots_(slots), n_host_(host_buffers),
-      slot_bytes_(slot_bytes) {
+                           int readers, int host_buffers, bool unbuffered)
+    : pack_(pack), host_(host), ring_(ring), slots_(slots), n_host_(host_buffers), slot_bytes_(slot_bytes) {
     if (slots < 1 || readers < 1 || host_buffers < 1)
         throw std::invalid_argument("ds41 expert stream: needs a slot, a reader and a host buffer");
     ck(cudaGetDevice(&device_), "cudaGetDevice");
     const std::string path = pack.dir() + "/experts.bin";
-    fd_ = open(path.c_str(), O_RDONLY);
+    if (unbuffered) {
+        fd_ = open(path.c_str(), O_RDONLY | O_DIRECT);
+        direct_ = fd_ >= 0;
+        if (!direct_) std::fprintf(stderr, "ds41 expert stream: %s refuses O_DIRECT; plain reads\n", path.c_str());
+    }
+    if (fd_ < 0) fd_ = open(path.c_str(), O_RDONLY);
     if (fd_ < 0) throw std::runtime_error("ds41 expert stream: cannot open " + path);
     ck(cudaStreamCreateWithFlags(&copy_, cudaStreamNonBlocking), "copy stream");
     auto events = [&](std::vector<cudaEvent_t>& v, size_t n) {
@@ -38,7 +42,8 @@ ExpertStream::ExpertStream(const Pack& pack, const HostExperts* host, uint8_t* r
     events(copied_, (size_t) slots_);
     events(used_, (size_t) slots_);
     host_buf_.assign((size_t) n_host_, nullptr);
-    for (auto& b : host_buf_) ck(cudaHostAlloc((void**) &b, slot_bytes_, cudaHostAllocDefault), "pinned staging");
+    // an O_DIRECT window starts up to 4 KiB before the expert and ends up to 4 KiB after it
+    for (auto& b : host_buf_) ck(cudaHostAlloc((void**) &b, slot_bytes_ + 8192, cudaHostAllocDefault), "pinned staging");
     for (int i = 0; i < readers; ++i) threads_.emplace_back([this] { reader(); });
     threads_.emplace_back([this] { issuer(); });
 }
@@ -152,22 +157,25 @@ void ExpertStream::reader() {
             } else {
                 uint8_t* buf = host_buf_[j % n_host_];
                 if (j >= n_host_) ck(cudaEventSynchronize(dma_done_[j % n_host_]), "wait for the host buffer");
-                // was every page cached? (the mapped file shares the page cache with pread)
-                const uintptr_t a = (uintptr_t) (pack_.expert_base() + x.offset) & ~(uintptr_t) 4095;
-                const size_t len = (uintptr_t) (pack_.expert_base() + x.offset + x.bytes) - a;
-                vec.resize((len + 4095) / 4096);
-                bool cached = mincore((void*) a, len, vec.data()) == 0;
-                for (size_t i = 0; cached && i < vec.size(); ++i) cached = vec[i] & 1;
+                // the window read: the expert itself, or with O_DIRECT its 4 KiB-aligned cover
+                const uint64_t a0 = direct_ ? x.offset & ~(uint64_t) 4095 : x.offset;
+                const uint64_t a1 = direct_ ? (x.offset + x.bytes + 4095) & ~(uint64_t) 4095 : x.offset + x.bytes;
+                bool cached = false;
+                if (!direct_) {   // was every page cached? (the mapped file shares the page cache with pread)
+                    const uintptr_t a = (uintptr_t) (pack_.expert_base() + x.offset) & ~(uintptr_t) 4095;
+                    const size_t len = (uintptr_t) (pack_.expert_base() + x.offset + x.bytes) - a;
+                    vec.resize((len + 4095) / 4096);
+                    cached = mincore((void*) a, len, vec.data()) == 0;
+                    for (size_t i = 0; cached && i < vec.size(); ++i) cached = vec[i] & 1;
+                }
                 uint64_t got = 0;
-                while (got < x.bytes) {
-                    const ssize_t r = pread(fd_, buf + got, x.bytes - got, (off_t) (x.offset + got));
+                while (got < a1 - a0) {
+                    const ssize_t r = pread(fd_, buf + got, a1 - a0 - got, (off_t) (a0 + got));
                     if (r <= 0) throw std::runtime_error("ds41 expert stream: short read of experts.bin");
                     got += (uint64_t) r;
                 }
-                const bool kept = !keep_.empty() && keep_[(size_t) job.first * pack_.n_experts() + job.second];
-                if (!cached && !kept) posix_fadvise(fd_, (off_t) x.offset, (off_t) x.bytes, POSIX_FADV_DONTNEED);
                 ++(cached ? n_cache_ : n_ssd_);
-                src = buf;
+                src = buf + (x.offset - a0);
             }
             std::lock_guard<std::mutex> lk(mu_);
             src_[j] = src;

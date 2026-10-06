@@ -12,12 +12,10 @@
 //   - the consumer waits on the host only until job j's copy is issued, and makes its stream wait for the copy on
 //     the GPU (wait); release records that its stream is done with the slot.
 //
-// File cache: an expert whose pages were all cached before the read stays cached, and so does every expert of the
-// `keep` set (the hottest experts the file cache can hold: they are cached once and then read from RAM by every
-// later prompt and by decode). Any other expert read (at least in part) from the SSD is dropped from the cache after
-// the copy (posix_fadvise DONTNEED): one prefill streams the whole 190 GB file, more than the RAM holds, and keeping
-// it would push out the hot set. Upstream's resident budget plays the same role with a RAM copy; here the file cache
-// is the copy.
+// File cache, as upstream's file tier (v0.1.40, #286 / #577 / #773): the hottest experts have a RAM copy (the RAM
+// tier, HostExperts: no read at all); the rest are read through the OS file cache, or - when the cache could not
+// keep them anyway (unbuffered) - with O_DIRECT, so a 190 GB stream does not push the RAM copy's neighbours and
+// decode's pages out of RAM for nothing.
 #pragma once
 
 #include "strata/ds41/pack.hpp"
@@ -41,9 +39,10 @@ class ExpertStream {
 public:
     /// ring: `slots` device slots of `slot_bytes` each. host: the RAM tier or null. readers: reader threads.
     /// host_buffers: pinned staging buffers of slot_bytes each (how far the reads can run ahead of the copies).
-    /// keep: [layers][experts] 1 = stays in the file cache after an SSD read; empty: none.
+    /// unbuffered: read the pack with O_DIRECT (4 KiB-aligned windows); false, or O_DIRECT refused: plain reads.
     ExpertStream(const Pack& pack, const HostExperts* host, uint8_t* ring, int slots, size_t slot_bytes, int readers,
-                 int host_buffers, std::vector<uint8_t> keep = {});
+                 int host_buffers, bool unbuffered = false);
+    bool unbuffered() const { return direct_; }
     ~ExpertStream();
     ExpertStream(const ExpertStream&) = delete;
     ExpertStream& operator=(const ExpertStream&) = delete;
@@ -60,7 +59,8 @@ public:
     void drain();
 
     struct Stats {
-        int64_t jobs = 0, from_ram = 0, from_cache = 0, from_ssd = 0;   ///< experts by source
+        /// experts by source; unbuffered reads all count as from_ssd (they read the drive whatever the cache holds)
+        int64_t jobs = 0, from_ram = 0, from_cache = 0, from_ssd = 0;
         double consumer_wait_ms = 0;                                     ///< time wait() blocked
     };
     Stats take_stats();
@@ -73,7 +73,7 @@ private:
 
     const Pack& pack_;
     const HostExperts* host_;
-    std::vector<uint8_t> keep_;
+    bool direct_ = false;
     uint8_t* ring_;
     int slots_, n_host_;
     size_t slot_bytes_;

@@ -1,6 +1,7 @@
 // src/ds41/tests/expert_stream_test.cu - prefill's expert stream on a fake pack: every job's slot holds the right
 // expert's bytes when wait() returns, a slot is not overwritten before the consumer's work on it has run (the
-// consumer is made slow with a spin kernel before it copies the slot out), drain() restarts the job numbers.
+// consumer is made slow with a spin kernel before it copies the slot out), drain() restarts the job numbers; with
+// plain reads and with O_DIRECT (experts that do not start on a 4 KiB boundary).
 #include "strata/ds41/expert_stream.hpp"
 
 #include "bench_util.hpp"
@@ -21,14 +22,16 @@ __global__ void spin(long long cycles) {
 int main() {
     require_gpu();
     Verdict v;
-    const std::string dir = "/tmp/ds41_fake_pack";
+    const std::string dir = "ds41_fake_pack";   // the working directory: /tmp may refuse O_DIRECT
     write_fake_pack(dir);
     sd::Pack pack(dir);
     pack.map_experts();
     constexpr int kSlots = 8, kJobs = 300;
     const size_t slot_bytes = kExpertBytes;
     Dev<uint8_t> ring((size_t) kSlots * slot_bytes), check((size_t) kJobs * slot_bytes);
-    sd::ExpertStream stream(pack, nullptr, ring.p, kSlots, slot_bytes, 3, 5);   // fewer host buffers than slots too
+    for (int direct = 0; direct < 2; ++direct) {
+    sd::ExpertStream stream(pack, nullptr, ring.p, kSlots, slot_bytes, 3, 5, direct);   // fewer host buffers than slots
+    std::printf("%s\n", stream.unbuffered() ? "O_DIRECT reads" : "plain reads");
     for (int round = 0; round < 2; ++round) {
         std::vector<std::pair<int, int>> jobs;
         for (int j = 0; j < kJobs; ++j) jobs.push_back({(j * 3 + round) % L, (j * 37 + 5 * round) % E});
@@ -56,6 +59,7 @@ int main() {
                     (long long) st.from_ram, st.consumer_wait_ms);
         v.check(bad == 0, "a slot held other bytes than its job's expert");
         v.check(st.jobs == kJobs, "every job counted once");
+    }
     }
     return v.finish();
 }

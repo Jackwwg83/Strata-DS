@@ -17,8 +17,9 @@
 namespace ds41test {
 
 constexpr int L = strata::ds41::kLayers, E = strata::ds41::kExperts;
-/// every fake expert has this size: 12 components of 256 bytes, 4 KiB in all
-constexpr uint64_t kExpertBytes = 4096;
+/// every fake expert has this size: 12 components of 256 bytes, 4 KiB in all; consecutive experts are kStride
+/// apart, so most do not start on a 4 KiB boundary (as in a real pack): O_DIRECT readers must cover them
+constexpr uint64_t kExpertBytes = 4096, kStride = kExpertBytes + 256;
 
 inline void write_fake_pack(const std::string& dir) {
     mkdir(dir.c_str(), 0755);
@@ -39,13 +40,13 @@ inline void write_fake_pack(const std::string& dir) {
                                 "w3.svh",     "w3.mul1", "w2.trellis", "w2.suh", "w2.svh", "w2.mul1"};
         for (int l = 0; l < L; ++l)
             for (int e = 0; e < E; ++e) {
-                f << l << " " << e << " " << ((uint64_t) l * E + e) * kExpertBytes << " " << kExpertBytes << " 3 3 3";
+                f << l << " " << e << " " << ((uint64_t) l * E + e) * kStride << " " << kExpertBytes << " 3 3 3";
                 for (int c = 0; c < 12; ++c) f << " " << comp[c] << ":" << c * 256 << ":256";
                 f << "\n";
             }
     }
     {
-        std::vector<uint8_t> b((size_t) L * E * kExpertBytes);
+        std::vector<uint8_t> b((size_t) L * E * kStride + 8192);
         std::mt19937 g(1);
         for (auto& x : b) x = (uint8_t) g();
         std::ofstream f(dir + "/experts.bin", std::ios::binary);
