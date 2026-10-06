@@ -81,9 +81,22 @@ public:
     /// read nothing from the file. Set before the first step.
     void set_host(HostExperts* host);
 
+    /// Prefill borrows cache slots, as upstream does for its expert ring and scratch: the last n slots (contiguous)
+    /// leave the residency table and their memory goes to the caller until restore(). Call between steps; adaptive
+    /// copies in flight are finished and committed first. Returns the first lent byte.
+    uint8_t* lend(int n);
+    /// Copies the lent slots' experts back from the pack and enters them in the table again.
+    void restore();
+    int lent() const { return lent_; }
+    /// The descriptor of slot s (valid while the slot is not lent)
+    const kernels::Exl3Expert& desc(int slot) const { return desc_host_[slot]; }
+    /// The descriptor of (layer, expert) whose pack bytes sit at `dev` in device memory
+    static kernels::Exl3Expert describe_at(const Pack& pack, int layer, int expert, const uint8_t* dev);
+
 private:
     kernels::Exl3Expert describe(int layer, int expert, int slot) const;
     void upload_res();
+    int commit_pending(bool wait);   ///< commits finished adaptive copies (waits for them when `wait`); returns count
     struct Pending {
         int32_t layer, in, out;
         int32_t vram_slot;   ///< the slot `out` leaves and `in` takes
@@ -112,6 +125,8 @@ private:
     std::vector<Pending> pending_;     ///< swaps in flight
     HostExperts* host_ = nullptr;
     uint8_t* staging_ = nullptr;       ///< pinned, one slot: `out` on its way from VRAM to RAM
+    int lent_ = 0;                     ///< slots lent to prefill: the last lent_ slots
+    std::vector<std::pair<int, int>> lent_owner_;   ///< (layer, expert) of each lent slot, -1 for an empty slot
 };
 
 }  // namespace strata::ds41

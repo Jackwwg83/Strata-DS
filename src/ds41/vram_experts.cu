@@ -134,8 +134,11 @@ VramExperts::~VramExperts() {
 }
 
 kernels::Exl3Expert VramExperts::describe(int layer, int expert, int slot) const {
-    const ExpertSlot& x = pack_.expert(layer, expert);
-    const uint8_t* dst = arena_ + (size_t) slot * slot_bytes_;
+    return describe_at(pack_, layer, expert, arena_ + (size_t) slot * slot_bytes_);
+}
+
+kernels::Exl3Expert VramExperts::describe_at(const Pack& pack, int layer, int expert, const uint8_t* dst) {
+    const ExpertSlot& x = pack.expert(layer, expert);
     auto proj = [&](int c0, int k, int n) {
         kernels::Exl3Proj p;
         p.trellis = (const uint16_t*) (dst + x.comp_off[c0]);
@@ -203,23 +206,30 @@ void VramExperts::copy_worker(std::vector<Pending> work) {
     copies_done_.store(true, std::memory_order_release);
 }
 
+int VramExperts::commit_pending(bool wait) {
+    if (pending_.empty()) return 0;
+    if (!wait && !copies_done_.load(std::memory_order_acquire)) return 0;   // still copying: the next step checks again
+    const int E = pack_.n_experts();
+    copier_.join();
+    if (copy_error_) throw std::runtime_error("ds41 vram experts: an adaptive expert copy failed");
+    for (const Pending& w : pending_) {
+        res_host_[(size_t) w.layer * E + w.in] = w.vram_slot;
+        if (w.ram_slot >= 0) host_->assign(w.ram_slot, w.layer, w.out);   // the CPU now reads `out` from RAM
+    }
+    const int committed = (int) pending_.size();
+    swaps_total_ += committed;
+    pending_.clear();
+    upload_res();
+    return committed;
+}
+
 int VramExperts::between_steps() {
     if (slots_ == 0 || adapt_.every <= 0) return 0;
+    if (lent_) throw std::logic_error("ds41 vram experts: a step while slots are lent to prefill");
     const int L = pack_.n_layers(), E = pack_.n_experts();
-    int committed = 0;
-    if (!pending_.empty()) {
-        if (!copies_done_.load(std::memory_order_acquire)) return 0;   // still copying: the next step checks again
-        copier_.join();
-        if (copy_error_) throw std::runtime_error("ds41 vram experts: an adaptive expert copy failed");
-        for (const Pending& w : pending_) {
-            res_host_[(size_t) w.layer * E + w.in] = w.vram_slot;
-            if (w.ram_slot >= 0) host_->assign(w.ram_slot, w.layer, w.out);   // the CPU now reads `out` from RAM
-        }
-        committed = (int) pending_.size();
-        swaps_total_ += committed;
-        pending_.clear();
-        upload_res();
-    }
+    const bool was_pending = !pending_.empty();
+    const int committed = commit_pending(false);
+    if (was_pending && !pending_.empty()) return 0;   // still copying
     if (++calls_ % adapt_.every != 0) return committed;
     const auto swaps = plan_expert_swaps(usage_, res_host_, L, E, adapt_.max_swaps);
     for (float& v : usage_) v *= adapt_.decay;
@@ -237,6 +247,42 @@ int VramExperts::between_steps() {
     copies_done_.store(false, std::memory_order_relaxed);
     copier_ = std::thread(&VramExperts::copy_worker, this, pending_);
     return committed;
+}
+
+uint8_t* VramExperts::lend(int n) {
+    if (lent_) throw std::logic_error("ds41 vram experts: slots already lent");
+    if (n < 0 || n > slots_) throw std::invalid_argument("ds41 vram experts: cannot lend that many slots");
+    commit_pending(true);
+    const int E = pack_.n_experts();
+    lent_owner_.assign(n, {-1, -1});
+    for (size_t i = 0; i < res_host_.size(); ++i) {
+        const int32_t s = res_host_[i];
+        if (s >= slots_ - n) {
+            lent_owner_[s - (slots_ - n)] = {(int) (i / E), (int) (i % E)};
+            res_host_[i] = -1;
+        }
+    }
+    lent_ = n;
+    upload_res();
+    return arena_ + (size_t) (slots_ - n) * slot_bytes_;
+}
+
+void VramExperts::restore() {
+    if (!lent_) return;
+    const int E = pack_.n_experts();
+    const uint8_t* base = pack_.expert_base();
+    for (int i = 0; i < lent_; ++i) {
+        const auto [l, e] = lent_owner_[i];
+        if (l < 0) continue;
+        const int s = slots_ - lent_ + i;
+        const ExpertSlot& x = pack_.expert(l, e);
+        ck(cudaMemcpy(arena_ + (size_t) s * slot_bytes_, base + x.offset, x.bytes, cudaMemcpyHostToDevice),
+           "restore lent slot");
+        res_host_[(size_t) l * E + e] = s;   // desc_host_ and experts_dev_ still describe (l, e) at slot s
+    }
+    lent_ = 0;
+    lent_owner_.clear();
+    upload_res();
 }
 
 }  // namespace strata::ds41
