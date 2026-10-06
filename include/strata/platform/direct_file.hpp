@@ -27,6 +27,9 @@ public:
     DirectFile(const DirectFile&) = delete;
     DirectFile& operator=(const DirectFile&) = delete;
 
+    /// Issuing threads (the queue depth on Linux) for the next open(): 0 = the default, 16 on Linux, 4 on Windows.
+    /// STRATA_IO_THREADS overrides both; at most 64.
+    void set_threads(int n);
     bool open(const std::string& path, std::string& err);
     void close();
     bool is_open() const;
