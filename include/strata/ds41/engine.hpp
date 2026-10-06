@@ -37,9 +37,10 @@ struct EngineOptions {
     /// less 4 GB. Measured in a 64 GiB container (2026-10-06): a static RAM tier starves the file cache, which
     /// follows the text better; 0 was fastest for documents, 16 GiB for chat generation.
     double ram_budget_gib = 0;
-    /// Batched prefill (M3): tokens per chunk at most (halved until the scratch fits); 0 = prefill() runs step()
-    /// token by token. Scratch and the expert ring come from VRAM tier slots lent for the call (upstream).
-    int prefill_chunk = 2048;
+    /// Batched prefill (M3): tokens per chunk at most (halved until the scratch fits; upstream's chunk is 8192);
+    /// 0 = prefill() runs step() token by token. Scratch and the expert ring come from VRAM tier slots lent for the
+    /// call (upstream), else from cudaMalloc.
+    int prefill_chunk = 8192;
     int prefill_ring = 64;      ///< expert ring slots
     int prefill_threads = 8;    ///< expert stream readers
 };

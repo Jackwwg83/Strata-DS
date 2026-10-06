@@ -791,7 +791,9 @@ struct Engine::Impl {
             cap /= 2;
         }
         pf.cap = cap;
-        layout(pf, pf.region, cap);
+        const size_t bytes = layout(pf, pf.region, cap);
+        std::fprintf(stderr, "ds41 prefill: chunk %d tokens, scratch and ring %.2f GiB (%s), ring %d slots\n", cap,
+                     bytes / 1073741824.0, pf.own ? "cudaMalloc" : "lent VRAM tier slots", pf.ring_slots);
         // pinned host buffers
         if (pfh.cap < cap) {
             if (pfh.base) cudaFreeHost(pfh.base);
