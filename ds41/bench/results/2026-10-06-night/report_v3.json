@@ -1,0 +1,174 @@
+{
+ "title": "Strata-DS 夜间报告：decode 提速（CUDA Graph + 混合流式）与 SAGE 1.59bpw",
+ "short_title": "Strata-DS 夜间报告",
+ "date": "2026-10-07（凌晨）",
+ "subtitle": "DeepSeek V4.1 Flash · SAGE 1.59bpw（专家 101.4 GiB）· RTX 4090 + 128 GB 内存模拟 · feature/ds41 56929a3",
+ "summary": [
+  "<b>Decode 快了约一倍：</b>同一段 200 token 的代码文本，8 线程 81.4 → 42.3 ms/token（12 → 24 tok/s），16 线程 62.2 → 40.3 ms（16 → 25 tok/s）。来自：落空专家一部分经 PCIe 送进 GPU 算（混合流式，你批准的偏离上游的设计）、整步 CUDA Graph、wo_a 改 FP8。",
+  "<b>Decode 速度取决于显存命中率：</b>代码文本命中 72% 时 40 ms；在扫描用的仓库文本上连续生成，命中只有 52%，是 52–77 ms（13–19 tok/s）。上游 Qwen 是 46–93 tok/s，我们还差 2–4 倍。",
+  "<b>Prefill 长上下文到上游同一水平：</b>32K 1,100、64K 1,159、128K 1,263、256K 967 tok/s（上游 Qwen：RTX 5070 2,107–2,171，Strix Halo 1,320–1,370）。",
+  "<b>1.59 的质量损失是真的，不是引擎 bug：</b>5 篇文档平均 nll 比 3bpw 高 0.29（困惑度高约 34%），通用中英文损失最大；FP16 原型对同一个包算出 2.513，我们的引擎 2.509，一致。",
+  "<b>今晚试过但没合并的：</b>新的 CPU 调度（开了混合流式后反而慢 5–15%）、跨层预取（预测准确率 53%，浪费 PCIe 带宽，反而慢 20–30%）。数据都在下面。",
+  "<b>等你拍板：</b>是否合并到 main / 发版；DSpark（官方 MTP 草稿网络，7.9 GB）放哪；3bpw 测试机怎么办（旧机器宿主坏了）。"
+ ],
+ "machines": [
+  {
+   "label": "我们：SAGE 1.59 · 4090 + 128 GB 模拟（今晚：Graph + 混合流式）",
+   "machine_json": "ds41/bench/results/2026-10-06-night/epyc7742-4090-sage159/machine.json",
+   "context_tsv": "ds41/bench/results/2026-10-06-night/epyc7742-4090-sage159/m3_context.tsv",
+   "ram": "压到 119.9 GiB（宿主 1 TB）",
+   "color": "#2563eb",
+   "notes": [
+    "16 线程（接近 7950X 的核数）。专家 101.4 GiB：显存 1,615 个、内存 13,745 个，全部常驻，不读 SSD。decode 是 prefill 后连续生成 64 个 token，显存命中约 52%。CPU 是服务器 EPYC 7742（无 AVX-512）。"
+   ]
+  },
+  {
+   "label": "我们：3bpw · 4090 + 120 GiB（昨晚 v2）",
+   "machine_json": "ds41/bench/results/2026-10-06-m3/epyc7b13-4090-fastssd/machine.json",
+   "context_tsv": "ds41/bench/results/2026-10-06-m3/epyc7b13-4090-fastssd/m3_context.tsv",
+   "ram": "压到 119.9 GiB",
+   "color": "#93c5fd",
+   "notes": [
+    "对照：v2 报告，没有 Graph 和混合流式。3bpw 专家 190.5 GiB，约一半要从 SSD 读。今晚没能在 3bpw 上复测：那台机器的宿主在 Vast 上离线（见文末）。"
+   ]
+  },
+  {
+   "label": "上游 Qwen Q2_0 · RTX 5070 + 64 GB",
+   "static": {
+    "cpu": "Ryzen 5 7600",
+    "gpu": "RTX 5070 12 GB",
+    "ram": "64 GB（模型装得下）"
+   },
+   "dashed": true,
+   "color": "#dc2626",
+   "rows": [
+    [
+     1024,
+     536,
+     87.3
+    ],
+    [
+     4096,
+     1299,
+     93.0
+    ],
+    [
+     32768,
+     2171,
+     81.8
+    ],
+    [
+     65536,
+     2126,
+     76.2
+    ],
+    [
+     131072,
+     2107,
+     73.7
+    ],
+    [
+     259943,
+     1304,
+     60.3
+    ]
+   ]
+  },
+  {
+   "label": "上游 Qwen IQ3_S · RTX 5070 + 64 GB",
+   "static": {
+    "cpu": "Ryzen 5 7600",
+    "gpu": "RTX 5070 12 GB",
+    "ram": "64 GB（模型装得下）"
+   },
+   "dashed": true,
+   "color": "#f97316",
+   "rows": [
+    [
+     1024,
+     427,
+     52.4
+    ],
+    [
+     4096,
+     913,
+     53.3
+    ],
+    [
+     32768,
+     1624,
+     48.3
+    ],
+    [
+     65536,
+     1640,
+     46.3
+    ],
+    [
+     131072,
+     1443,
+     45.5
+    ]
+   ]
+  },
+  {
+   "label": "上游 v0.1.40 UD-IQ4_XS · Strix Halo 128 GB",
+   "static": {
+    "cpu": "Ryzen AI Max+ 395",
+    "gpu": "Radeon 8060S（统一内存）",
+    "ram": "128 GB 统一内存"
+   },
+   "dashed": true,
+   "color": "#059669",
+   "rows": [
+    [
+     8192,
+     1293,
+     53.8
+    ],
+    [
+     65536,
+     1370,
+     46.6
+    ],
+    [
+     131072,
+     1320,
+     51.4
+    ]
+   ]
+  }
+ ],
+ "decode_title": "Decode 速度（越高越好；我们：prefill 后生成 64 个 token）",
+ "sections": [
+  {
+   "title": "Decode：今晚每一步的提升（实测）",
+   "html": "<p>同一篇 200 token 的代码文档逐 token 喂入，SAGE 1.59 包，所有专家常驻显存或内存（不读 SSD），显存命中约 72%。单位：毫秒/token（越低越好），括号里是 tok/s。</p><div class=\"tablewrap\"><table><tr><th>做法</th><th>8 线程</th><th>16 线程</th><th>30 线程</th></tr><tr><td>今晚之前：落空专家全部 CPU 算</td><td>81.4（12.3）</td><td>62.2（16.1）</td><td>52.4（19.1）</td></tr><tr><td>+ 整步 CUDA Graph（结果逐位相同）</td><td>短上下文无变化</td><td>短上下文无变化</td><td>32K 上下文 81.8 → 65.2</td></tr><tr><td>+ 混合流式 v1：GPU 直接经 PCIe 读内存里的专家（配额 3）</td><td>47.1</td><td>44.9</td><td>43.9</td></tr><tr><td>+ 先整块拷进显存再算（暂存拷贝，配额 4）</td><td><b>42.3（23.6）</b></td><td><b>40.3（24.8）</b></td><td><b>41.2（24.3）</b></td></tr></table></div><p><b>wo_a 改 FP8</b>（每层 73.1 → 38.5 µs，约省 1.4 ms/token，结果逐位相同）在上面所有行里都已包含。</p><p><b>为什么 CPU 少了线程反而受益最大：</b>混合流式把每 token 约 60 个落空专家交给 GPU（每个经 PCIe 约 0.26 ms），CPU 只剩约 5 个。CPU 核越少的机器，原来越慢，提速越大。</p><p><b>现在的瓶颈：</b>nsys 时间线（16 线程）每步：把专家拷进显存 19.3 ms、稠密 GEMV 7.3 ms、等 CPU 5.1 ms、GPU 空闲 7.4 ms。PCIe 4.0 实测 26.3 GB/s 已跑满。下一步能动的：提高显存命中率（每少一个落空专家省 0.26 ms）、投机解码（一次前向出多个 token）、稠密 GEMV（dots 在做）。</p>"
+  },
+  {
+   "title": "Decode 速度取决于显存命中率",
+   "html": "<div class=\"tablewrap\"><table><tr><th>测试</th><th>显存命中</th><th>16 线程 decode</th></tr><tr><td>200 token 代码文档（强制逐 token）</td><td>72%</td><td>40.3 ms（24.8 tok/s）</td></tr><tr><td>仓库文本 prefill 512 后连续生成 200 个</td><td>约 52%</td><td>53.6 ms（18.7 tok/s）</td></tr><tr><td>报告曲线：各上下文长度 prefill 后生成 64 个</td><td>约 52%</td><td>55–77 ms（13–18 tok/s）</td></tr></table></div><p>显存里预放的是按路由统计最热的专家，统计用的文本和这段仓库文本不同。命中率每差 20 个百分点，每 token 多约 48 个专家走 PCIe（约 12 ms）。真实对话的命中率还没测。</p>"
+  },
+  {
+   "title": "1.59 的质量（对 FP16 原型和 3bpw）",
+   "html": "<p>5 篇各 200 token 的文档（代码、中文、英文），teacher-forced nll，越低越好。FP16 原型是我们的 Python 参考实现，专家用 exllamav3 精确解压。</p><div class=\"tablewrap\"><table><tr><th>文档</th><th>3bpw（原型）</th><th>1.59（原型）</th><th>1.59（我们的引擎）</th><th>1.59 − 3bpw</th></tr><tr><td>code_py_0</td><td>1.077</td><td>1.216</td><td>1.223</td><td>+0.14</td></tr><tr><td>zh_0</td><td>3.644</td><td>3.905</td><td>3.957</td><td>+0.26</td></tr><tr><td>en_0</td><td>1.943</td><td>2.217</td><td>2.203</td><td>+0.27</td></tr><tr><td>code_cpp_1</td><td>2.146</td><td>2.453</td><td>2.438</td><td>+0.31</td></tr><tr><td>zh_2</td><td>2.326</td><td>2.772</td><td>2.725</td><td>+0.45</td></tr><tr><td><b>平均</b></td><td><b>2.228</b></td><td><b>2.513</b></td><td><b>2.509</b></td><td><b>+0.29</b></td></tr></table></div><p>引擎和原型一致（2.509 对 2.513），所以损失来自 1.59 量化本身。损失约为困惑度高 34%，通用中英文最大，代码最小，和作者的结论方向一致。生成样例（代码、英文、数学）读起来正常。</p>"
+  },
+  {
+   "title": "今晚试过、没有合并的（附数据）",
+   "html": "<div class=\"tablewrap\"><table><tr><th>尝试</th><th>结果</th><th>决定</th></tr><tr><td>CPU 专家调度改成上游 ExpertPool 的切法（Codex）</td><td>正确性全过；但开混合流式后 decode 反而慢 5–15%（16 线程配额 3：50.4 对 43.8 ms）。CPU 时间里约 37 of 46 ms 是 EXL3 解码本身，调度救不回来。</td><td>不合并，分支 feature/ds41-cpu-experts 保留（含 5–8 行的修复，验证器以后可能用）</td></tr><tr><td>跨层预取：用下一层路由器提前预测并拷贝专家（Codex）</td><td>结果逐位相同；但预测准确率只有 53%，浪费 PCIe 带宽，还占了显存槽：16 线程 52 → 65 ms。</td><td>不合并，分支保留</td></tr><tr><td>dots：K1c-09 小矩阵 GEMV、K7-11 hc 混合</td><td>K1c-09 快 1.8–2.5%（未到 3% 合并线）；K7-11 慢 12%。</td><td>不合并；已给 dots 明确目标（小矩阵 m=1 提速 25–30%）</td></tr></table></div>"
+  },
+  {
+   "title": "各部分的真实状态",
+   "html": "<div class=\"tablewrap\"><table><tr><th>部分</th><th>代码</th><th>GPU 测试</th><th>真实数据</th><th>说明</th></tr><tr><td>混合位宽 kernel（K10/K11/K12，K1–K6）</td><td>✅</td><td>✅</td><td>✅</td><td>真实 SAGE 专家误差在门槛内</td></tr><tr><td>内存层、显存层紧凑布局</td><td>✅</td><td>✅</td><td>✅</td><td>15,360 个专家全部常驻</td></tr><tr><td>wo_a FP8</td><td>✅</td><td>✅</td><td>✅</td><td>逐位相同</td></tr><tr><td>整步 CUDA Graph</td><td>✅</td><td>✅</td><td>✅</td><td>逐位相同；32K decode 快 20%</td></tr><tr><td>混合流式 + 暂存拷贝（默认配额 4）</td><td>✅</td><td>✅</td><td>✅</td><td>DS41_ZC_QUOTA=0 退回原路径，逐位相同</td></tr><tr><td>短提示词（< 16 token）prefill 报错</td><td>✅ 已修</td><td>✅</td><td>✅</td><td></td></tr><tr><td>多 token 验证器 + 后缀投机（Codex）</td><td>✅</td><td>进行中</td><td>待测</td><td>T=1–4 行逐位相同已过；其余测试在跑，见下一节</td></tr><tr><td>DSpark（官方 MTP 草稿网络）</td><td>—</td><td>—</td><td>—</td><td>等你决定放在哪（下文）</td></tr><tr><td>3bpw 用新代码复测</td><td>—</td><td>—</td><td>❌</td><td>旧机器宿主离线（下文）</td></tr><tr><td>安装程序 / 服务端支持 DS4.1</td><td>❌</td><td>—</td><td>—</td><td>还没做；上游的 setup.py、serve/ 仍只认 Qwen</td></tr></table></div>"
+  },
+  {
+   "title": "等你决定的事",
+   "html": "<h3>1. 发版</h3><p>feature/ds41 已推送（56929a3 + 本报告）。我没有合并到 main、没有打 tag。建议：先开 PR 到 main 做一次完整评审，安装程序和服务端支持 DS4.1 之后再正式发版。</p><h3>2. DSpark 放哪</h3><p>1.59 包里带了 DSpark：3 层草稿网络，每层 128 个专家（MXFP4，共 7.2 GB），加上注意力等共 7.9 GB。一次草稿要跑 5 个位置 × 3 层。</p><div class=\"tablewrap\"><table><tr><th>方案</th><th>好处</th><th>代价</th></tr><tr><td>A. 全部放显存</td><td>草稿最快</td><td>24 GB 卡上主模型的显存层从约 11.5 GiB 降到约 3.5 GiB，命中率大跌，每个 token 多走很多 PCIe</td></tr><tr><td>B. 专家放内存，经混合流式算</td><td>不占显存</td><td>一次草稿最多约 45 个专家 × 18 MB，走 PCIe 约 30 ms，比省下的还多</td></tr><tr><td>C. 只放最热的 DSpark 专家进显存，其余 CPU 算</td><td>折中</td><td>要写 MXFP4 的 CPU kernel</td></tr><tr><td><b>D. 先只用后缀投机（不用 DSpark），实测接受率后再定（推荐）</b></td><td>不占显存、不多读内存；代码和重复文本接受率高</td><td>普通对话接受率低</td></tr></table></div><h3>3. 3bpw 测试机</h3><p>旧的 3bpw 机器（54438962）宿主在 Vast 上一直显示离线，容器里还有卡死的进程占着 GPU，开机后无法使用，已再次停机（磁盘保留，约 $0.30/h）。选项：等 Vast 恢复；或另租一台（约 $0.4/h + 下载 3bpw 约 390 GB × $0.003 ≈ $1.2）。按你的规矩，租机器要你点头。</p>"
+  }
+ ],
+ "notes": [
+  "<b>怎么测的：</b>速度曲线：每个上下文长度跑一次 ds41_generate，批量 prefill 前 L 个 token，再生成 64 个 token；文本是本仓库文档和源码拼成的固定长文本。decode 对比表：同一篇 200 token 的代码文档逐 token 喂入（teacher forced），取 200 步平均。",
+  "<b>内存：</b>宿主 1 TB，用占内存的进程把容器压到 119.9 GiB，模拟 128 GB 的 PC；测完立即释放。",
+  "<b>数据状态：</b>我们的数字都是真实运行的实测输出，原始数据在 ds41/bench/results/2026-10-06-night/；上游的数字引自上游文档，不是我们复测的。"
+ ]
+}
