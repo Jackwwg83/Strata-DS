@@ -6,6 +6,7 @@
 #   golden: the K10 golden data (exllamav3's FP16 path)
 #   ci:     a clean clone for the queue, then ds41/ci/runner.sh in the background
 # Expects the repository at /workspace/Strata-DS (branch feature/ds41). Logs: /workspace/s4_<step>.log
+# Env: CUDA_ARCH (default 89; 120 for RTX 50), SKIP_EXL3=1 (setup without exllamav3: only the K10 golden needs it)
 set -u
 W=/workspace
 R=$W/Strata-DS
@@ -30,6 +31,7 @@ snapshot_download("$MODEL_REPO", revision="$MODEL_REV", local_dir="$M", max_work
 print(f"DOWNLOAD_DONE {time.time() - t0:.0f} s")
 EOF
   ) > $W/s4_download.log 2>&1 &
+  [ "${SKIP_EXL3:-0}" = 1 ] && { echo SETUP_DONE; exit 0; }
   [ -d $W/exllamav3 ] || git clone -q https://github.com/turboderp-org/exllamav3 $W/exllamav3
   cd $W/exllamav3 && git checkout -q $EXL3_COMMIT
   cap=$(python -c "import torch;m,n=torch.cuda.get_device_capability(0);print(f'{m}.{n}')")
@@ -39,7 +41,7 @@ EOF
   ;;
 build)
   G=""; [ -d $W/llama.cpp ] && G="-DSTRATA_GGML_DIR=$W/llama.cpp"
-  cd $R && cmake -S . -B build $G -DSTRATA_ENABLE_CUDA=ON -DCMAKE_CUDA_ARCHITECTURES=89 -DSTRATA_BUILD_TESTS=ON \
+  cd $R && cmake -S . -B build $G -DSTRATA_ENABLE_CUDA=ON -DCMAKE_CUDA_ARCHITECTURES=${CUDA_ARCH:-89} -DSTRATA_BUILD_TESTS=ON \
       -DCMAKE_BUILD_TYPE=Release -DCMAKE_CUDA_COMPILER_LAUNCHER=ccache -DCMAKE_CXX_COMPILER_LAUNCHER=ccache \
       > $W/s4_cmake.log 2>&1 || { tail -30 $W/s4_cmake.log; exit 1; }
   cmake --build build -j"$(nproc)" > $W/s4_build.log 2>&1 || { grep -E "error|Error" $W/s4_build.log | head -40; exit 1; }

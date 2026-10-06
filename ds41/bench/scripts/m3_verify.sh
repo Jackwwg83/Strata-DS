@@ -3,17 +3,21 @@
 #   1. nll of 5 documents (teacher forced): step() token by token, one prefill, prefill in chunks of 61 tokens
 #      (odd chunk ends exercise the compressor state and the window ring between chunks). The prototype's FP16 nll
 #      per document is the reference ($O/fp16/<doc>.npz from the M2 accuracy run).
-#   2. generation: a prompt prefilled, then 32 greedy tokens, against the same prompt fed with step().
-# Usage: bash m3_verify.sh   (env: G ds41_generate, PACK, PROF expert profile, O accuracy dir)
+#   2. a long text (3000 tokens of tools/ds41/make_long_ids.py output): one chunk against 999-token chunks.
+#   3. generation: a prompt prefilled, then 32 greedy tokens, against the same prompt fed with step().
+# Usage: bash m3_verify.sh   (env: G ds41_generate, PACK, PROF expert profile, O prototype references, LONG ids)
 set -u
 G=${G:-/workspace/Strata-DS/build/ds41_generate}
 PACK=${PACK:-/workspace/pack-3bpw}
 PROF=${PROF:-/workspace/Strata-DS/ds41/data/expert-profile.bin}
-O=${O:-/workspace/results/m2b_acc}
+O=${O:-/workspace/m2b_acc}   # fp16/<doc>.npz from the M2 accuracy run (not in git: copy it there)
+LONG=${LONG:-/workspace/long.ids}
+W=${W:-/workspace/results/m3}
+mkdir -p "$W"
 run() { "$G" --pack "$PACK" --threads 8 --expert-profile "$PROF" "$@"; }
 nll() { grep -o "teacher_forced_mean_nll [0-9.]*" | awk '{print $2}'; }
 for id in code_py_0 zh_0 en_0 code_cpp_1 zh_2; do
-  ids=$O/$id.ids
+  ids=$W/$id.ids
   [ -f "$ids" ] || python -c "import numpy as np; print(','.join(map(str, np.load('$O/fp16/$id.npz')['ids'].tolist())))" > "$ids"
   ref=$(python -c "import numpy as np; print(round(float(np.load('$O/fp16/$id.npz')['nll'].mean()), 6))")
   n=$(tr ',' '\n' < "$ids" | wc -l)
@@ -24,7 +28,13 @@ for id in code_py_0 zh_0 en_0 code_cpp_1 zh_2; do
   echo "    prefill: $(echo "$b_out" | grep prefill_tokens)"
   echo "    chunk61: $(echo "$c_out" | grep prefill_tokens)"
 done
-p=$(cut -d, -f1-300 "$O/code_py_0.ids")
+cut -d, -f1-3000 "$LONG" > "$W/long3000.ids"
+one=$(run --force-ids "$W/long3000.ids" --prefill --max-seq 4096 2>/dev/null)
+chk=$(run --force-ids "$W/long3000.ids" --prefill --prefill-chunk 999 --max-seq 4096 2>/dev/null)
+echo "LONG 3000 tokens | one chunk $(echo "$one" | nll) | chunks of 999 $(echo "$chk" | nll)"
+echo "    one:   $(echo "$one" | grep prefill_tokens)"
+echo "    chunk: $(echo "$chk" | grep prefill_tokens)"
+p=$(cut -d, -f1-300 "$LONG")
 s=$(run --ids "$p" --gen 32 2>/dev/null | grep generated)
 b=$(run --ids "$p" --gen 32 --prefill 2>/dev/null | grep -E "generated|prefill_tokens|decode_ms")
 echo "GEN step:    $s"
