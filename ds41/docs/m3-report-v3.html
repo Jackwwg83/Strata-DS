@@ -81,5 +81,5 @@ ul{padding-left:20px}
 <tr><td>259,943</td><td>326</td><td>797</td><td>202</td><td>4.96</td><td>16384</td><td>243696</td><td>119744</td><td>22.6</td></tr>
 </table></div>
 <p class="meta">对照：v2 报告，没有 Graph 和混合流式。3bpw 专家 190.5 GiB，约一半要从 SSD 读。今晚没能在 3bpw 上复测：那台机器的宿主在 Vast 上离线（见文末）。</p>
-<h2>说明</h2><ul><li><b>怎么测的：</b>速度曲线：每个上下文长度跑一次 ds41_generate，批量 prefill 前 L 个 token，再生成 64 个 token；文本是本仓库文档和源码拼成的固定长文本。decode 对比表：同一篇 200 token 的代码文档逐 token 喂入（teacher forced），取 200 步平均。</li><li><b>内存：</b>宿主 1 TB，用占内存的进程把容器压到 119.9 GiB，模拟 128 GB 的 PC；测完立即释放。</li><li><b>数据状态：</b>我们的数字都是真实运行的实测输出，原始数据在 ds41/bench/results/2026-10-06-night/；上游的数字引自上游文档，不是我们复测的。</li></ul>
+<h2>说明</h2><ul><li><b>怎么测的：</b>速度曲线：每个上下文长度跑一次 ds41_generate，批量 prefill 前 L 个 token，再生成 64 个 token；文本是本仓库文档和源码拼成的固定长文本。decode 对比表：同一篇 200 token 的代码文档逐 token 喂入（teacher forced），取 200 步平均。</li><li><b>内存：</b>宿主 1 TB，用占内存的进程把容器压到 119.9 GiB，模拟 128 GB 的 PC；测完立即释放。</li><li><b>全部测试（RTX 4090 机器，最终代码 39a3524）：</b>106 个里 97 个通过，8 个跳过（6 个验证器测试要带 --pack 单独跑，已单独跑过 12/12 通过；2 个缺测试数据），3 个失败都来自上游 Qwen 的测试和测试机环境：ple_parity 缺 Qwen 的 GGUF 文件；platform_memory_test 是容器的锁页上限只有 8 MB；expert_multi_test 要 AVX-512，而 EPYC 7742 没有。我们对上游代码的唯一改动（DirectFile 线程数）默认值不变。</li><li><b>数据状态：</b>我们的数字都是真实运行的实测输出，原始数据在 ds41/bench/results/2026-10-06-night/；上游的数字引自上游文档，不是我们复测的。</li></ul>
 </main></body></html>
