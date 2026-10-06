@@ -92,7 +92,8 @@ __device__ float block_max(float v, float* sh) {
 
 // ------------------------------------------------------------------------------------------- basics
 
-__global__ void embed_k(const bf16* table, int token, bf16* h) {
+__global__ void embed_k(const bf16* table, int token, bf16* h, const int* token_dev = nullptr) {
+    if (token_dev) token = *token_dev;
     const int d = blockIdx.x * blockDim.x + threadIdx.x;
     if (d >= kDim) return;
     const bf16 v = table[(int64_t) token * kDim + d];
@@ -243,7 +244,12 @@ __global__ void bf16_gemv_k(const bf16* x, const float* xf, const bf16* w, int64
 
 // ------------------------------------------------------------------------------------------- rope, quant
 
-__global__ void rope_k(bf16* v, int n_vec, int stride, const float* cs, bool inverse) {
+__global__ void rope_k(bf16* v, int n_vec, int stride, const float* cs, bool inverse, const int* pos_dev = nullptr, int offset = 0) {
+    if (pos_dev) {
+        const int64_t row = int64_t(*pos_dev) + offset;
+        if (row < 0) return;
+        cs += row * kRopeDim;
+    }
     const int i = blockIdx.x * blockDim.x + threadIdx.x;      // one complex pair
     if (i >= n_vec * (kRopeDim / 2)) return;
     const int vec = i / (kRopeDim / 2), p = i % (kRopeDim / 2);
@@ -445,7 +451,8 @@ __global__ void compress_pool_k(const float* kv, const float* sc, int ratio, bf1
     out[d] = tobf(acc);
 }
 
-__global__ void window_index_k(int pos, int32_t* idx) {
+__global__ void window_index_k(int pos, int32_t* idx, const int* pos_dev = nullptr) {
+    if (pos_dev) pos = *pos_dev;
     const int i = threadIdx.x;
     if (i >= kWindow) return;
     const int oldest = pos % kWindow + 1;
@@ -453,99 +460,162 @@ __global__ void window_index_k(int pos, int32_t* idx) {
     idx[i] = slot > pos ? -1 : slot;
 }
 
+__global__ void row_copy_k(uint8_t* dst, const uint8_t* src, size_t bytes,
+                           const int* pos, int div, int mod) {
+    dst += (size_t(*pos / div) % size_t(mod)) * bytes;
+    for (size_t i = size_t(blockIdx.x) * blockDim.x + threadIdx.x; i < bytes;
+         i += size_t(gridDim.x) * blockDim.x) dst[i] = src[i];
+}
+
+__global__ void argmax_k(const float* logits, int* token) {
+    __shared__ float values[256];
+    __shared__ int ids[256];
+    if (isnan(logits[0])) {
+        if (threadIdx.x == 0) *token = 0;
+        return;
+    }
+    float best = -INFINITY;
+    int id = kVocab;
+    for (int i = threadIdx.x; i < kVocab; i += blockDim.x) {
+        const float value = logits[i];
+        if (value > best || (value == best && i < id)) { best = value; id = i; }
+    }
+    values[threadIdx.x] = best;
+    ids[threadIdx.x] = id;
+    __syncthreads();
+    for (int stride = 128; stride > 0; stride >>= 1) {
+        if (threadIdx.x < stride) {
+            const int other = threadIdx.x + stride;
+            if (values[other] > values[threadIdx.x] ||
+                (values[other] == values[threadIdx.x] && ids[other] < ids[threadIdx.x])) {
+                values[threadIdx.x] = values[other];
+                ids[threadIdx.x] = ids[other];
+            }
+        }
+        __syncthreads();
+    }
+    if (threadIdx.x == 0) *token = ids[0];
+}
+
 int grid(int64_t n, int per_block) { return (int) ((n + per_block - 1) / per_block); }
 
 }  // namespace
 
-void embed(const bf16* table, int token, bf16* h) {
-    embed_k<<<grid(kDim, 256), 256>>>(table, token, h);
+void embed(const bf16* table, int token, bf16* h, cudaStream_t stream) {
+    embed_k<<<grid(kDim, 256), 256, 0, stream>>>(table, token, h);
     LAUNCH_CHECK("embed");
 }
-void rmsnorm(const bf16* x, const bf16* w, bf16* y, int n, float eps, int rows) {
-    if (rows > 0) rmsnorm_k<<<rows, 1024>>>(x, w, y, n, eps);
+void rmsnorm(const bf16* x, const bf16* w, bf16* y, int n, float eps, int rows, cudaStream_t stream) {
+    if (rows > 0) rmsnorm_k<<<rows, 1024, 0, stream>>>(x, w, y, n, eps);
     LAUNCH_CHECK("rmsnorm");
 }
 void hc_mixes(const bf16* x, const float* fn, const float* scale, const float* base, float* pre, float* post,
-              float* comb, float* scratch) {
-    hc_rsqrt_k<<<1, 1024>>>(x, scratch);
-    hc_dot_k<<<kHcMix, 256>>>(x, fn, scratch, scratch + 1);
-    hc_sinkhorn_k<<<1, 32>>>(scratch + 1, scale, base, pre, post, comb);
+              float* comb, float* scratch, cudaStream_t stream) {
+    hc_rsqrt_k<<<1, 1024, 0, stream>>>(x, scratch);
+    hc_dot_k<<<kHcMix, 256, 0, stream>>>(x, fn, scratch, scratch + 1);
+    hc_sinkhorn_k<<<1, 32, 0, stream>>>(scratch + 1, scale, base, pre, post, comb);
     LAUNCH_CHECK("hc_mixes");
 }
-void hc_pre(const bf16* x, const float* pre, bf16* y, int rows) {
-    if (rows > 0) hc_pre_k<<<dim3(grid(kDim, 256), rows), 256>>>(x, pre, y);
+void hc_pre(const bf16* x, const float* pre, bf16* y, int rows, cudaStream_t stream) {
+    if (rows > 0) hc_pre_k<<<dim3(grid(kDim, 256), rows), 256, 0, stream>>>(x, pre, y);
     LAUNCH_CHECK("hc_pre");
 }
-void hc_post(const bf16* out, const bf16* res, const float* post, const float* comb, bf16* y, int rows) {
-    if (rows > 0) hc_post_k<<<dim3(grid(kDim, 256), rows), 256>>>(out, res, post, comb, y);
+void hc_post(const bf16* out, const bf16* res, const float* post, const float* comb, bf16* y, int rows, cudaStream_t stream) {
+    if (rows > 0) hc_post_k<<<dim3(grid(kDim, 256), rows), 256, 0, stream>>>(out, res, post, comb, y);
     LAUNCH_CHECK("hc_post");
 }
-void fp8_linear(const bf16* x, int64_t k, const uint8_t* w, const uint8_t* w_scale, int64_t n, bf16* y, float* act) {
-    act_quant_to_f32_k<<<grid(k / 32, 8), 256>>>(x, k, act);
-    fp8_gemv_k<<<grid(n, 8), 256>>>(act, k, w, w_scale, n, y);
+void fp8_linear(const bf16* x, int64_t k, const uint8_t* w, const uint8_t* w_scale, int64_t n, bf16* y, float* act, cudaStream_t stream) {
+    act_quant_to_f32_k<<<grid(k / 32, 8), 256, 0, stream>>>(x, k, act);
+    fp8_gemv_k<<<grid(n, 8), 256, 0, stream>>>(act, k, w, w_scale, n, y);
     LAUNCH_CHECK("fp8_linear");
 }
-void bf16_linear(const bf16* x, const float* x_f32, const bf16* w, int64_t k, int64_t n, bf16* yb, float* yf) {
-    bf16_gemv_k<<<grid(n, 8), 256>>>(x, x_f32, w, k, n, yb, yf);
+void bf16_linear(const bf16* x, const float* x_f32, const bf16* w, int64_t k, int64_t n, bf16* yb, float* yf, cudaStream_t stream) {
+    bf16_gemv_k<<<grid(n, 8), 256, 0, stream>>>(x, x_f32, w, k, n, yb, yf);
     LAUNCH_CHECK("bf16_linear");
 }
-void rope(bf16* v, int n_vec, int stride, const float* cs, bool inverse) {
-    rope_k<<<grid((int64_t) n_vec * (kRopeDim / 2), 256), 256>>>(v, n_vec, stride, cs, inverse);
+void rope(bf16* v, int n_vec, int stride, const float* cs, bool inverse, cudaStream_t stream) {
+    rope_k<<<grid((int64_t) n_vec * (kRopeDim / 2), 256), 256, 0, stream>>>(v, n_vec, stride, cs, inverse);
     LAUNCH_CHECK("rope");
 }
-void act_quant_inplace(bf16* v, int n) {
-    act_quant_inplace_k<<<grid(n / 32, 8), 256>>>(v, n);
+void act_quant_inplace(bf16* v, int n, cudaStream_t stream) {
+    act_quant_inplace_k<<<grid(n / 32, 8), 256, 0, stream>>>(v, n);
     LAUNCH_CHECK("act_quant_inplace");
 }
-void fp4_quant_inplace(bf16* v, int n, int block, bool e4m3_scale) {
-    fp4_quant_inplace_k<<<grid(n / block, 8), 256>>>(v, n, block, e4m3_scale);
+void fp4_quant_inplace(bf16* v, int n, int block, bool e4m3_scale, cudaStream_t stream) {
+    fp4_quant_inplace_k<<<grid(n / block, 8), 256, 0, stream>>>(v, n, block, e4m3_scale);
     LAUNCH_CHECK("fp4_quant_inplace");
 }
 void sparse_attn(const bf16* q, const bf16* window, const bf16* compressed, const int32_t* idx, int n_idx,
-                 const float* sink, float scale, bf16* o) {
+                 const float* sink, float scale, bf16* o, cudaStream_t stream) {
     if (n_idx > 1024) { std::fprintf(stderr, "sparse_attn: n_idx %d > 1024\n", n_idx); std::abort(); }
-    sparse_attn_k<<<kHeads, 256>>>(q, window, compressed, idx, n_idx, sink, scale, o);
+    sparse_attn_k<<<kHeads, 256, 0, stream>>>(q, window, compressed, idx, n_idx, sink, scale, o);
     LAUNCH_CHECK("sparse_attn");
 }
-void wo_a_grouped(const bf16* o, const bf16* wo_a, bf16* y) {
-    wo_a_k<<<grid(kOGroups * kOLora, 8), 256>>>(o, wo_a, y);
+void wo_a_grouped(const bf16* o, const bf16* wo_a, bf16* y, cudaStream_t stream) {
+    wo_a_k<<<grid(kOGroups * kOLora, 8), 256, 0, stream>>>(o, wo_a, y);
     LAUNCH_CHECK("wo_a");
 }
-void indexer_scores(const bf16* q, const bf16* keys, int64_t t, const bf16* w, float* score) {
-    if (t > 0) indexer_scores_k<<<grid(t, 8), 256>>>(q, keys, t, w, score);
+void indexer_scores(const bf16* q, const bf16* keys, int64_t t, const bf16* w, float* score, cudaStream_t stream) {
+    if (t > 0) indexer_scores_k<<<grid(t, 8), 256, 0, stream>>>(q, keys, t, w, score);
     LAUNCH_CHECK("indexer_scores");
 }
-void scale_bf16(const bf16* wp, float scale, bf16* w, int n) {
-    scale_bf16_k<<<grid(n, 256), 256>>>(wp, scale, w, n);
+void scale_bf16(const bf16* wp, float scale, bf16* w, int n, cudaStream_t stream) {
+    scale_bf16_k<<<grid(n, 256), 256, 0, stream>>>(wp, scale, w, n);
     LAUNCH_CHECK("scale_bf16");
 }
-void swiglu(const bf16* g, const bf16* u, float lim, bf16* h, int n) {
-    swiglu_k<<<grid(n, 256), 256>>>(g, u, lim, h, n);
+void swiglu(const bf16* g, const bf16* u, float lim, bf16* h, int n, cudaStream_t stream) {
+    swiglu_k<<<grid(n, 256), 256, 0, stream>>>(g, u, lim, h, n);
     LAUNCH_CHECK("swiglu");
 }
-void add_f32_bf16(const float* a, const bf16* b, bf16* y, int n) {
-    add_f32_bf16_k<<<grid(n, 256), 256>>>(a, b, y, n);
+void add_f32_bf16(const float* a, const bf16* b, bf16* y, int n, cudaStream_t stream) {
+    add_f32_bf16_k<<<grid(n, 256), 256, 0, stream>>>(a, b, y, n);
     LAUNCH_CHECK("add_f32_bf16");
 }
-void to_half_fp8q(const bf16* x, uint16_t* x_half, int n) {
-    to_half_fp8q_k<<<grid(n / 32, 8), 256>>>(x, x_half, n);
+void to_half_fp8q(const bf16* x, uint16_t* x_half, int n, cudaStream_t stream) {
+    to_half_fp8q_k<<<grid(n / 32, 8), 256, 0, stream>>>(x, x_half, n);
     LAUNCH_CHECK("to_half_fp8q");
 }
-void compress_pool(const float* kv_state, const float* score_state, int ratio, bf16* out, int groups) {
-    if (groups > 0) compress_pool_k<<<dim3(grid(kHeadDim, 256), groups), 256>>>(kv_state, score_state, ratio, out);
+void compress_pool(const float* kv_state, const float* score_state, int ratio, bf16* out, int groups, cudaStream_t stream) {
+    if (groups > 0) compress_pool_k<<<dim3(grid(kHeadDim, 256), groups), 256, 0, stream>>>(kv_state, score_state, ratio, out);
     LAUNCH_CHECK("compress_pool");
 }
-void engram_apply(bf16* h, const bf16* kv, const bf16* qw, const bf16* kw, float eps, int rows) {
-    if (rows > 0) engram_apply_k<<<dim3(kHc, rows), 1024>>>(h, kv, qw, kw, eps);
+void engram_apply(bf16* h, const bf16* kv, const bf16* qw, const bf16* kw, float eps, int rows, cudaStream_t stream) {
+    if (rows > 0) engram_apply_k<<<dim3(kHc, rows), 1024, 0, stream>>>(h, kv, qw, kw, eps);
     LAUNCH_CHECK("engram_apply");
 }
-void window_index(int pos, int32_t* idx) {
-    window_index_k<<<1, kWindow>>>(pos, idx);
+void window_index(int pos, int32_t* idx, cudaStream_t stream) {
+    window_index_k<<<1, kWindow, 0, stream>>>(pos, idx);
     LAUNCH_CHECK("window_index");
 }
-void engram_dequant(const uint8_t* w, const uint8_t* s, int rows, bf16* out) {
-    engram_dequant_k<<<grid((int64_t) rows * 256, 256), 256>>>(w, s, rows, out);
+void engram_dequant(const uint8_t* w, const uint8_t* s, int rows, bf16* out, cudaStream_t stream) {
+    engram_dequant_k<<<grid((int64_t) rows * 256, 256), 256, 0, stream>>>(w, s, rows, out);
     LAUNCH_CHECK("engram_dequant");
+}
+
+void embed_device(const bf16* table, const int* token_dev, bf16* h, cudaStream_t stream) {
+    embed_k<<<grid(kDim, 256), 256, 0, stream>>>(table, 0, h, token_dev);
+    LAUNCH_CHECK("embed_device");
+}
+void window_index_device(const int* pos_dev, int32_t* idx, cudaStream_t stream) {
+    window_index_k<<<1, kWindow, 0, stream>>>(0, idx, pos_dev);
+    LAUNCH_CHECK("window_index_device");
+}
+void rope_device(bf16* v, int n_vec, int stride, const float* cs_table, const int* pos_dev,
+                 int offset, bool inverse, cudaStream_t stream) {
+    rope_k<<<grid(int64_t(n_vec) * (kRopeDim / 2), 256), 256, 0, stream>>>(
+        v, n_vec, stride, cs_table, inverse, pos_dev, offset);
+    LAUNCH_CHECK("rope_device");
+}
+void row_copy_device(void* dst, const void* src, size_t row_bytes, const int* pos_dev,
+                     int div, int mod, cudaStream_t stream) {
+    if (div <= 0 || mod <= 0) { std::fprintf(stderr, "row_copy_device: invalid divisor or modulus\n"); std::abort(); }
+    if (row_bytes) row_copy_k<<<grid(row_bytes, 256), 256, 0, stream>>>(
+        static_cast<uint8_t*>(dst), static_cast<const uint8_t*>(src), row_bytes, pos_dev, div, mod);
+    LAUNCH_CHECK("row_copy_device");
+}
+void argmax_logits(const float* logits, int* token_dev, cudaStream_t stream) {
+    argmax_k<<<1, 256, 0, stream>>>(logits, token_dev);
+    LAUNCH_CHECK("argmax_logits");
 }
 
 }  // namespace strata::ds41::ops

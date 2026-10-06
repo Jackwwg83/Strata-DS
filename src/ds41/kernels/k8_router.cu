@@ -177,6 +177,8 @@ void launch_tile(const __nv_bfloat16* x, const __nv_bfloat16* w, double* scores,
 
 }  // namespace
 
+void router_init() { (void) workspace(); }
+
 void router_topk(const __nv_bfloat16* x, int m, const __nv_bfloat16* w, const float* bias,
                  int32_t* ids, float* weights, cudaStream_t stream) {
     if (m < 1 || m > kMaxTokens) return;

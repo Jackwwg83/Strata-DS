@@ -7,6 +7,10 @@
 
 namespace strata::ds41::kernels {
 
+/// Allocate maximum scratch for the current device. Call before capture.
+/// Idempotent. Scratch lives until process exit. Calls/replays on one device must not overlap.
+void hc_init();
+
 /// For m tokens (1..8):
 ///   x [m][4][5120] bf16 (the hc stream), fn [24][20480] f32, scale [3] f32, base [24] f32, pre_in [m][4] f32
 ///   y    [m][5120] bf16 = bf16(sum_j pre_in[j] * x[j])                      (ops::hc_pre)

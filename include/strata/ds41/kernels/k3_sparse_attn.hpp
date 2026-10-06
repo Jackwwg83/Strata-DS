@@ -17,4 +17,11 @@ void sparse_attn_decode(const __nv_bfloat16* q, const __nv_bfloat16* window, con
                         const int32_t* idx, int m, int n_idx, const float* sink, float scale,
                         __nv_bfloat16* o, cudaStream_t stream);
 
+/// One decode query. Read t >= 0 from device memory at each execution.
+/// n_idx = kWindow + min(kIndexTopK, *t_dev). idx has capacity kWindow + kIndexTopK.
+/// Keep pointers and launch dimensions fixed across replays. Unused indices are never read.
+void sparse_attn_decode_device(const __nv_bfloat16* q, const __nv_bfloat16* window,
+                               const __nv_bfloat16* comp, const int32_t* idx, const int* t_dev,
+                               const float* sink, float scale, __nv_bfloat16* o, cudaStream_t stream);
+
 }  // namespace strata::ds41::kernels
