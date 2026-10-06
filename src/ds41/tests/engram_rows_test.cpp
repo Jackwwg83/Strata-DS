@@ -40,9 +40,9 @@ bool run(const std::string& dir, const char* name) {
         paths.push_back(p);
         data.push_back(std::move(d));
     }
-    {
-        EngramRows er({{paths[0], w_off, s_off}, {paths[1], w_off, s_off}}, R);
-        std::printf("%s: %s\n", name, er.direct() ? "O_DIRECT" : "plain pread fallback");
+    for (int threads : {0, 64}) {   // the default queue depth and prefill's
+        EngramRows er({{paths[0], w_off, s_off}, {paths[1], w_off, s_off}}, R, 256, 8, threads);
+        std::printf("%s, %d threads: %s\n", name, threads, er.direct() ? "O_DIRECT" : "plain pread fallback");
         std::mt19937 g(5);
         for (int round = 0; round < 20; ++round) {
             std::vector<std::vector<int64_t>> ids(2, std::vector<int64_t>(R));

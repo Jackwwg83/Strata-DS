@@ -653,6 +653,9 @@ struct Engine::Impl {
     static constexpr int kNllRows = 64;       ///< logits rows per head GEMM when measuring nll
     static constexpr int kMinRing = 16;       ///< the ring shrinks to this many slots before the pass shrinks
     static constexpr int kEngBatch = 256;     ///< tokens per engram read (its O_DIRECT buffers: 16 KiB per row)
+    /// engram reads in flight per table: the rows are small random reads, an NVMe needs a deep queue. Measured on
+    /// the 7950X + 4090 box, 32K prompt: 16 (the decode default) 14.9 s of GPU wait, 64 2.6 s (1,148 tok/s).
+    static constexpr int kEngIoThreads = 64;
 
     /// Device scratch of one prefill call: per-pass arrays ([cap] tokens) and per-sub-batch arrays ([sub] tokens),
     /// carved from lent VRAM tier slots or cudaMalloc; the ring separately
@@ -852,7 +855,8 @@ struct Engine::Impl {
         if (n_eng && eng_rows_pf.empty())
             for (const auto& t : pack.engram_tables())
                 eng_rows_pf.push_back(std::make_unique<EngramRows>(
-                    std::vector<EngramRows::Table>{{t.path, t.weight_offset, t.scale_offset}}, kEngBatch * kEngRows));
+                    std::vector<EngramRows::Table>{{t.path, t.weight_offset, t.scale_offset}}, kEngBatch * kEngRows,
+                    256, 8, kEngIoThreads));
         if (n_eng && eng_rows_pf_cap < cap) {
             eng_rows_pf_cap = cap;
             eng_ids_pf.assign(n_eng, std::vector<int64_t>((size_t) cap * kEngRows, 0));

@@ -15,12 +15,13 @@ constexpr uint64_t kAlign = platform::DirectFile::alignment();
 constexpr uint32_t kBlock = 2 * kAlign;   // a row of at most 4 KiB spans at most two aligned blocks
 }  // namespace
 
-EngramRows::EngramRows(const std::vector<Table>& tables, int max_rows, int row_bytes, int scale_bytes)
+EngramRows::EngramRows(const std::vector<Table>& tables, int max_rows, int row_bytes, int scale_bytes, int io_threads)
     : tables_(tables), max_rows_(max_rows), row_bytes_(row_bytes), scale_bytes_(scale_bytes) {
     if (max_rows < 1 || row_bytes < 1 || scale_bytes < 1 || (uint64_t) row_bytes > kAlign)
         throw std::invalid_argument("EngramRows: bad shape");
     for (const Table& t : tables_) {
         auto f = std::make_unique<platform::DirectFile>();
+        f->set_threads(io_threads);
         std::string err;
         if (f->open(t.path, err)) {
             files_.push_back(std::move(f));

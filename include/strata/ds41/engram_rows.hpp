@@ -23,8 +23,10 @@ public:
         uint64_t weight_offset = 0;   ///< byte offset of row 0's weights; each row has `row_bytes` bytes
         uint64_t scale_offset = 0;    ///< byte offset of row 0's scales; each row has `scale_bytes` bytes
     };
-    /// Opens every table. `max_rows` rows per table per call at most.
-    EngramRows(const std::vector<Table>& tables, int max_rows, int row_bytes = 256, int scale_bytes = 8);
+    /// Opens every table. `max_rows` rows per table per call at most. io_threads: reads in flight per table
+    /// (platform::DirectFile::set_threads; 0 = its default of 16). Prefill reads many rows and uses 64.
+    EngramRows(const std::vector<Table>& tables, int max_rows, int row_bytes = 256, int scale_bytes = 8,
+               int io_threads = 0);
     ~EngramRows();
     EngramRows(const EngramRows&) = delete;
     EngramRows& operator=(const EngramRows&) = delete;
