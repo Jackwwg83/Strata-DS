@@ -37,6 +37,19 @@ struct EngineOptions {
     /// less 4 GB. Measured in a 64 GiB container (2026-10-06): a static RAM tier starves the file cache, which
     /// follows the text better; 0 was fastest for documents, 16 GiB for chat generation.
     double ram_budget_gib = 0;
+    /// Batched prefill (M3): tokens per chunk at most (halved until the scratch fits); 0 = prefill() runs step()
+    /// token by token. Scratch and the expert ring come from VRAM tier slots lent for the call (upstream).
+    int prefill_chunk = 2048;
+    int prefill_ring = 64;      ///< expert ring slots
+    int prefill_threads = 8;    ///< expert stream readers
+};
+
+/// What one prefill() call did
+struct PrefillTiming {
+    double total_ms = 0, engram_ms = 0, stream_wait_ms = 0;   ///< stream_wait: the GPU side waited for expert copies
+    int chunks = 0, chunk_tokens = 0;                          ///< chunk_tokens: rows per chunk used
+    int64_t vram_experts = 0;                                  ///< (layer, expert) pairs computed from VRAM slots
+    int64_t streamed = 0, from_ram = 0, from_cache = 0, from_ssd = 0;   ///< pairs copied through the ring, by source
 };
 
 class Engine {
@@ -50,6 +63,13 @@ public:
     /// Run token `token` at position `pos` (0, 1, 2, ... in order). Returns the greedy next token.
     /// With `dump` non-null, fills it for this step.
     int step(int token, int pos, StepDump* dump = nullptr);
+
+    /// Feed tokens at positions pos, pos + 1, ... (pos = the tokens fed so far) in batched chunks: every layer on the
+    /// GPU, all routed experts on the GPU (VRAM tier slots, the rest streamed through a ring). Returns the greedy
+    /// token after the last one; last_logits() holds its logits. Decode continues with step(next, pos + n).
+    /// nll non-null: (*nll)[i] = -log p(tokens[i + 1] | tokens[0..i]) for i < n - 1.
+    int prefill(const std::vector<int>& tokens, int pos, std::vector<float>* nll = nullptr);
+    const PrefillTiming& last_prefill() const { return prefill_timing_; }
 
     /// FP32 logits of the last step (all 129280)
     const std::vector<float>& last_logits() const;
@@ -74,6 +94,7 @@ private:
     struct Impl;
     std::unique_ptr<Impl> impl_;
     Timing timing_;
+    PrefillTiming prefill_timing_;
 };
 
 }  // namespace strata::ds41

@@ -3,7 +3,10 @@
 //   ds41_generate --pack DIR --ids 0,128000,... [--gen 32] [--threads 8] [--dump steps.bin] [--force-ids FILE]
 //                 [--expert-profile ds41/data/expert-profile.bin [--vram-slots N] [--adapt-every 4] [--adapt-swaps 96]
 //                  [--ram-budget-gib N (0 none: default, -1 available RAM less 4 GB)]]
+//                 [--prefill [--prefill-chunk 2048] [--prefill-ring 64] [--prefill-threads 8]]
 //
+// --prefill runs the prompt (or, with --force-ids, the whole forced sequence for its nll) through the batched
+// prefill (M3) instead of step() token by token; generation then continues with step().
 // --force-ids feeds a fixed token sequence (from the oracle) instead of the engine's own predictions, so a
 // per-layer comparison stays aligned even after the first differing token. Tokenization stays in Python.
 #include "strata/ds41/config.hpp"
@@ -31,6 +34,7 @@ static std::vector<int> parse_ids(const std::string& s) {
 int main(int argc, char** argv) {
     std::string pack, ids_s, dump_path, force_path;
     int gen = 32;
+    bool batched = false;
     EngineOptions opt;
     for (int i = 1; i < argc; ++i) {
         const std::string a = argv[i];
@@ -45,6 +49,10 @@ int main(int argc, char** argv) {
         else if (a == "--adapt-every") opt.adapt_every = std::stoi(next());
         else if (a == "--adapt-swaps") opt.adapt_swaps = std::stoi(next());
         else if (a == "--ram-budget-gib") opt.ram_budget_gib = std::stod(next());
+        else if (a == "--prefill") batched = true;
+        else if (a == "--prefill-chunk") opt.prefill_chunk = std::stoi(next());
+        else if (a == "--prefill-ring") opt.prefill_ring = std::stoi(next());
+        else if (a == "--prefill-threads") opt.prefill_threads = std::stoi(next());
         else if (a == "--dump") dump_path = next();
         else if (a == "--force-ids") force_path = next();
         else { std::fprintf(stderr, "unknown argument %s\n", a.c_str()); return 2; }
@@ -61,6 +69,36 @@ int main(int argc, char** argv) {
     }
     try {
         Engine engine(pack, opt);
+        if (batched) {   // prefill the prompt (or the forced sequence) in one call, then decode with step()
+            const std::vector<int>& pre = forced.empty() ? prompt : forced;
+            std::vector<float> nll;
+            int next = engine.prefill(pre, 0, forced.empty() ? nullptr : &nll);
+            const auto& p = engine.last_prefill();
+            std::printf("prefill_tokens %zu ms %.1f tok_s %.1f chunks %d chunk_tokens %d engram_ms %.1f stream_wait_ms %.1f"
+                        " vram_experts %lld streamed %lld (ram %lld cache %lld ssd %lld)\n",
+                        pre.size(), p.total_ms, pre.size() / (p.total_ms / 1000.0), p.chunks, p.chunk_tokens, p.engram_ms,
+                        p.stream_wait_ms, (long long) p.vram_experts, (long long) p.streamed, (long long) p.from_ram,
+                        (long long) p.from_cache, (long long) p.from_ssd);
+            if (!nll.empty()) {
+                double sum = 0;
+                for (float v : nll) sum += v;
+                std::printf("teacher_forced_mean_nll %.6f ppl %.4f over %zu tokens\n", sum / nll.size(),
+                            std::exp(sum / nll.size()), nll.size());
+            }
+            if (forced.empty()) {
+                std::vector<int> out = {next};
+                double ms = 0;
+                for (int i = 1; i < gen; ++i) {
+                    next = engine.step(next, (int) prompt.size() + i - 1);
+                    ms += engine.last_timing().total_ms;
+                    out.push_back(next);
+                }
+                std::printf("generated:");
+                for (int v : out) std::printf(" %d", v);
+                std::printf("\ndecode_ms_per_token %.1f over %d steps\n", gen > 1 ? ms / (gen - 1) : 0.0, gen - 1);
+            }
+            return 0;
+        }
         std::FILE* dump = dump_path.empty() ? nullptr : std::fopen(dump_path.c_str(), "wb");
         StepDump sd;
         const int total = forced.empty() ? (int) prompt.size() + gen : (int) forced.size();

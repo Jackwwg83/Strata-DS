@@ -11,14 +11,20 @@
 #include "strata/ds41/config.hpp"
 #include "strata/ds41/doorbell.hpp"
 #include "strata/ds41/engram_rows.hpp"
+#include "strata/ds41/expert_stream.hpp"
 #include "strata/ds41/host_experts.hpp"
 #include "strata/ds41/lookahead.hpp"
 #include "strata/ds41/fp8_gemv.hpp"
+#include "strata/ds41/kernels/k12_exl3_moe_prefill.hpp"
+#include "strata/ds41/kernels/k13_sparse_attn_prefill.hpp"
+#include "strata/ds41/kernels/k14_indexer_prefill.hpp"
+#include "strata/ds41/kernels/k2_fp8_gemm.hpp"
 #include "strata/ds41/kernels/k3_sparse_attn.hpp"
 #include "strata/ds41/kernels/k5_indexer.hpp"
 #include "strata/ds41/kernels/k7_hc.hpp"
 #include "strata/ds41/kernels/k8_router.hpp"
 #include "strata/ds41/ops.hpp"
+#include "strata/ds41/prefill_ops.hpp"
 #include "strata/ds41/vram_experts.hpp"
 
 #include "moe_mul1.h"   // third_party/exllamav3_moe
@@ -190,6 +196,7 @@ struct Engine::Impl {
         vram.reset();
         host.reset();
         if (eng_host) cudaFreeHost(eng_host);
+        if (pfh.base) cudaFreeHost(pfh.base);
     }
 
     Fp8 fp8(const std::string& name) {
@@ -632,6 +639,556 @@ struct Engine::Impl {
         ops::add_f32_bf16(routed, sh_out, ffn_out, kDim);
     }
 
+    // ------------------------------------------------------------------------------------- prefill (M3)
+    // A chunk of T tokens (positions p0 .. p0 + T - 1) runs through every layer at once. Each block below is the
+    // batched form of the decode code above: the same ops per token, with GEMMs (K2, cuBLAS) instead of GEMVs and
+    // the prefill task kernels (K12 experts, K13 attention, K14 indexer). It is defined to equal decode token by
+    // token (ds41/docs/m3-plan.html, section 0): the window, the compressor state and the indexer's causal limit
+    // carry over between chunks exactly as between decode steps.
+    static constexpr int kStreamAll = 1024;   ///< from this many tokens, every expert of every layer is streamed
+    static constexpr int kNllRows = 64;       ///< logits rows per head GEMM when measuring nll
+    static constexpr int kKeepSlots = 128;    ///< VRAM tier slots never lent (upstream)
+    static constexpr int kEngBatch = 128;     ///< tokens per engram read (its O_DIRECT buffers: 16 KiB per row)
+
+    /// Device scratch of one prefill call, carved from one region (lent VRAM tier slots or cudaMalloc)
+    struct Prefill {
+        int cap = 0;
+        uint8_t* region = nullptr;
+        bool own = false;
+        size_t slot_bytes = 0;
+        uint8_t* ring = nullptr;
+        int ring_slots = 0;
+        bf16 *h, *h2, *xa, *xf, *qr, *q, *o, *oa, *attn_out, *kvv, *iq, *iw_raw, *iw, *g, *u, *sh_h, *sh_out, *ffn_out,
+            *eng_vals, *eng_kv, *final_x, *latent, *ik, *attn_kv;
+        float *pre_mix, *attn_pre, *attn_post, *attn_comb, *ffn_pre, *ffn_post, *ffn_comb, *ftmp, *router_logits,
+            *routed, *ckv, *csc, *wts, *rows_w, *nll_logits, *nll_out;
+        uint16_t* x_half;
+        int32_t *tok, *ids, *idx, *topk, *rows_tok, *targets;
+        uint8_t *cand, *eng_dev;
+        kernels::Exl3Expert* desc;
+        void *k2_ws, *k12_ws, *k14_ws;
+        size_t k12_bytes = 0, k14_bytes = 0;
+    } pf;
+    /// Pinned host buffers of prefill, kept between calls (sized for the largest chunk so far)
+    struct PrefillHost {
+        uint8_t* base = nullptr;
+        int cap = 0;
+        int32_t *tok, *ids, *rows_tok, *targets;
+        float *wts, *rows_w, *pre, *nll;
+        kernels::Exl3Expert* desc;
+        uint8_t* eng;   // per engram table: cap * kEngRows * 256 weight bytes, then cap * kEngRows * 8 scale bytes
+    } pfh;
+    std::unique_ptr<EngramRows> eng_rows_pf;
+    int eng_rows_pf_cap = 0;
+    std::vector<std::vector<int64_t>> eng_ids_pf;
+    std::unique_ptr<ExpertStream> estream;
+    std::vector<int64_t> layer_first_job;   ///< stream-all mode: first job of each layer
+    PrefillTiming* ptm = nullptr;
+
+    template <typename T>
+    static T* carve(uint8_t* base, size_t& used, size_t n) {
+        used = (used + 255) & ~(size_t) 255;
+        T* p = base ? (T*) (base + used) : nullptr;
+        used += n * sizeof(T);
+        return p;
+    }
+
+    /// Lays the scratch for `cap` rows out from `base` (null: only counts). Returns the bytes.
+    size_t layout(Prefill& p, uint8_t* base, int cap) {
+        size_t u = 0;
+        const size_t c = (size_t) cap;
+        int64_t max_k = 0;
+        for (const auto& y : L)
+            for (const Fp8* f : {&y.wq_a, &y.wq_b, &y.wkv, &y.wo_b, &y.sh_w1, &y.sh_w2, &y.sh_w3, &y.idx_wq_b, &y.eng_wkv})
+                if (f->w) max_k = std::max(max_k, f->k);
+        p.h = carve<bf16>(base, u, c * kHc * kDim);
+        p.h2 = carve<bf16>(base, u, c * kHc * kDim);
+        p.xa = carve<bf16>(base, u, c * kDim);
+        p.xf = carve<bf16>(base, u, c * kDim);
+        p.qr = carve<bf16>(base, u, c * kQLora);
+        p.q = carve<bf16>(base, u, c * kHeads * kHeadDim);
+        p.o = carve<bf16>(base, u, c * kHeads * kHeadDim);
+        p.oa = carve<bf16>(base, u, c * kOGroups * kOLora);
+        p.attn_out = carve<bf16>(base, u, c * kDim);
+        p.kvv = carve<bf16>(base, u, c * kHeadDim);
+        p.iq = carve<bf16>(base, u, c * kIndexHeads * kIndexDim);
+        p.iw_raw = carve<bf16>(base, u, c * kIndexHeads);
+        p.iw = carve<bf16>(base, u, c * kIndexHeads);
+        p.g = carve<bf16>(base, u, c * kMoeInter);
+        p.u = carve<bf16>(base, u, c * kMoeInter);
+        p.sh_h = carve<bf16>(base, u, c * kMoeInter);
+        p.sh_out = carve<bf16>(base, u, c * kDim);
+        p.ffn_out = carve<bf16>(base, u, c * kDim);
+        p.eng_vals = carve<bf16>(base, u, c * kEngRows * 256);
+        p.eng_kv = carve<bf16>(base, u, c * (kHc + 1) * kDim);
+        p.final_x = carve<bf16>(base, u, c * kDim);
+        p.latent = carve<bf16>(base, u, (c + 1) * kHeadDim);
+        p.ik = carve<bf16>(base, u, (c + 1) * kIndexDim);
+        p.attn_kv = carve<bf16>(base, u, ((size_t) max_seq + kWindow + c) * kHeadDim);
+        p.pre_mix = carve<float>(base, u, c * kHc);
+        p.attn_pre = carve<float>(base, u, c * kHc);
+        p.attn_post = carve<float>(base, u, c * kHc);
+        p.attn_comb = carve<float>(base, u, c * kHc * kHc);
+        p.ffn_pre = carve<float>(base, u, c * kHc);
+        p.ffn_post = carve<float>(base, u, c * kHc);
+        p.ffn_comb = carve<float>(base, u, c * kHc * kHc);
+        p.ftmp = carve<float>(base, u, c * kOGroups * kOLora);
+        p.router_logits = carve<float>(base, u, c * kExperts);
+        p.routed = carve<float>(base, u, c * kDim);
+        p.ckv = carve<float>(base, u, (c + 2) * kHeadDim);
+        p.csc = carve<float>(base, u, (c + 2) * kHeadDim);
+        p.wts = carve<float>(base, u, c * kTopK);
+        p.rows_w = carve<float>(base, u, c * kTopK);
+        p.nll_logits = carve<float>(base, u, (size_t) kNllRows * kVocab);
+        p.nll_out = carve<float>(base, u, c);
+        p.x_half = carve<uint16_t>(base, u, c * kDim);
+        p.tok = carve<int32_t>(base, u, c);
+        p.ids = carve<int32_t>(base, u, c * kTopK);
+        p.idx = carve<int32_t>(base, u, c * (kWindow + kIndexTopK));
+        p.topk = carve<int32_t>(base, u, c * kIndexTopK);
+        p.rows_tok = carve<int32_t>(base, u, c * kTopK);
+        p.targets = carve<int32_t>(base, u, c);
+        p.cand = carve<uint8_t>(base, u, c * (size_t) max_seq);
+        p.eng_dev = carve<uint8_t>(base, u, std::max<size_t>((size_t) n_eng * c * kEngRows * (256 + 8), 1));
+        p.desc = carve<kernels::Exl3Expert>(base, u, 2 * kExperts);
+        p.k2_ws = carve<uint8_t>(base, u, c * (size_t) max_k * 4);
+        p.k12_bytes = kernels::exl3_moe_prefill_workspace_bytes(cap * kTopK, kExperts);
+        p.k12_ws = carve<uint8_t>(base, u, p.k12_bytes);
+        p.k14_bytes = kernels::indexer_topk_prefill_workspace_bytes(cap, max_seq);
+        p.k14_ws = carve<uint8_t>(base, u, p.k14_bytes);
+        p.ring = carve<uint8_t>(base, u, (size_t) p.ring_slots * p.slot_bytes);
+        return (u + 255) & ~(size_t) 255;
+    }
+
+    /// Chooses the chunk size and gets the scratch: lent VRAM tier slots when the tier can spare them, else
+    /// cudaMalloc; halves the chunk until one fits.
+    void prefill_begin() {
+        pf = Prefill{};
+        pf.ring_slots = std::max(opt.prefill_ring, 4);
+        if (vram) pf.slot_bytes = vram->slot_bytes();
+        else {
+            for (int l = 0; l < kLayers; ++l)
+                for (int e = 0; e < kExperts; ++e) pf.slot_bytes = std::max<size_t>(pf.slot_bytes, pack.expert(l, e).bytes);
+            pf.slot_bytes = (pf.slot_bytes + 255) & ~(size_t) 255;
+        }
+        int cap = std::max(1, opt.prefill_chunk);
+        for (;;) {
+            const size_t need = layout(pf, nullptr, cap);
+            const int lendable = vram ? std::min(vram->slots() - kKeepSlots, vram->slots() * 9 / 10) : 0;
+            const int n_slots = (int) ((need + pf.slot_bytes - 1) / pf.slot_bytes);
+            if (vram && n_slots <= lendable) {
+                pf.region = vram->lend(n_slots);
+                break;
+            }
+            size_t free_b = 0, total_b = 0;
+            ck(cudaMemGetInfo(&free_b, &total_b), "cudaMemGetInfo");
+            if (need + (256ull << 20) <= free_b && cudaMalloc(&pf.region, need) == cudaSuccess) {
+                pf.own = true;
+                break;
+            }
+            cudaGetLastError();
+            if (cap <= 16) throw std::runtime_error("ds41 prefill: not enough VRAM for a 16-token chunk");
+            cap /= 2;
+        }
+        pf.cap = cap;
+        layout(pf, pf.region, cap);
+        // pinned host buffers
+        if (pfh.cap < cap) {
+            if (pfh.base) cudaFreeHost(pfh.base);
+            size_t u = 0;
+            auto lay = [&](uint8_t* b) {
+                u = 0;
+                const size_t c = (size_t) cap;
+                pfh.tok = carve<int32_t>(b, u, c);
+                pfh.ids = carve<int32_t>(b, u, c * kTopK);
+                pfh.rows_tok = carve<int32_t>(b, u, c * kTopK);
+                pfh.targets = carve<int32_t>(b, u, c);
+                pfh.wts = carve<float>(b, u, c * kTopK);
+                pfh.rows_w = carve<float>(b, u, c * kTopK);
+                pfh.pre = carve<float>(b, u, c * kHc);
+                pfh.nll = carve<float>(b, u, c);
+                pfh.desc = carve<kernels::Exl3Expert>(b, u, 2 * kExperts);
+                pfh.eng = carve<uint8_t>(b, u, std::max<size_t>((size_t) n_eng * c * kEngRows * (256 + 8), 1));
+            };
+            lay(nullptr);
+            ck(cudaHostAlloc((void**) &pfh.base, u, cudaHostAllocDefault), "prefill pinned buffers");
+            lay(pfh.base);
+            pfh.cap = cap;
+            for (int i = 0; i < cap; ++i)
+                for (int j = 0; j < kHc; ++j) pfh.pre[i * kHc + j] = j == 0 ? 1.0f : 0.0f;
+        }
+        if (n_eng && !eng_rows_pf) {
+            std::vector<EngramRows::Table> tabs;
+            for (const auto& t : pack.engram_tables()) tabs.push_back({t.path, t.weight_offset, t.scale_offset});
+            eng_rows_pf = std::make_unique<EngramRows>(tabs, kEngBatch * kEngRows);
+        }
+        if (n_eng && eng_rows_pf_cap < cap) {
+            eng_rows_pf_cap = cap;
+            eng_ids_pf.assign(n_eng, std::vector<int64_t>((size_t) cap * kEngRows, 0));
+        }
+        estream = std::make_unique<ExpertStream>(pack, host.get(), pf.ring, pf.ring_slots, pf.slot_bytes,
+                                                 std::max(1, opt.prefill_threads));
+    }
+
+    /// Returns the lent slots (or frees the scratch). After an error the stream is stopped without draining (its
+    /// unreleased jobs would never complete).
+    void prefill_end() {
+        estream.reset();
+        ck(cudaDeviceSynchronize(), "prefill end");
+        if (pf.own && pf.region) cudaFree(pf.region);
+        else if (pf.region && vram) vram->restore();
+        pf.region = nullptr;
+    }
+
+    bool resident(int l, int e) const { return vram && vram->res_host()[(size_t) l * kExperts + e] >= 0; }
+
+    /// model.py linear() for T rows (K2)
+    void fp8_rows(const bf16* x, int T, const Fp8& w, bf16* y) {
+        kernels::fp8_block_gemm(x, T, w.k, w.w, w.s, w.n, y, pf.k2_ws, 0);
+    }
+
+    /// K7 for T rows, 8 per call
+    void hc_rows(const bf16* x, int T, const float* fn, const float* scale, const float* base, const float* pre_in,
+                 bf16* y, float* pre, float* post, float* comb) {
+        for (int t = 0; t < T; t += 8)
+            kernels::hc_mixes_pre(x + (size_t) t * kHc * kDim, std::min(8, T - t), fn, scale, base, pre_in + t * kHc,
+                                  y + (size_t) t * kDim, pre + t * kHc, post + t * kHc, comb + t * kHc * kHc, 0);
+    }
+
+    /// The compressed entries of kv source l completed in this chunk (decode: attention(), compressor part), their
+    /// indexer keys, and the compressor state left for decode.
+    void compress_rows(int l, int T, int p0) {
+        auto& y = L[l];
+        const int r = y.ratio;
+        int G, g0;
+        if (r == 1) {
+            prefill::bf16_gemm(pf.xa, y.c_wkv, T, kDim, kHeadDim, pf.latent, nullptr, pf.ftmp);
+            ops::rmsnorm(pf.latent, y.c_norm, pf.latent, kHeadDim, kNormEps, T);
+            G = T;
+            g0 = p0;
+        } else {
+            // the rows of the group in progress (decode's state slots 0 .. carry-1), then this chunk's rows
+            const int carry = p0 % r;
+            if (carry) {
+                ck(cudaMemcpyAsync(pf.ckv, y.kv_state, (size_t) carry * kHeadDim * 4, cudaMemcpyDeviceToDevice, 0), "carry");
+                ck(cudaMemcpyAsync(pf.csc, y.score_state, (size_t) carry * kHeadDim * 4, cudaMemcpyDeviceToDevice, 0),
+                   "carry");
+            }
+            prefill::bf16_gemm(pf.xa, y.c_wkv, T, kDim, kHeadDim, nullptr, pf.ckv + (size_t) carry * kHeadDim);
+            prefill::bf16_gemm(pf.xa, y.c_wgate, T, kDim, kHeadDim, nullptr, pf.csc + (size_t) carry * kHeadDim);
+            G = (carry + T) / r;
+            g0 = (p0 - carry) / r;
+            ops::compress_pool(pf.ckv, pf.csc, r, pf.latent, G);
+            ops::rmsnorm(pf.latent, y.c_norm, pf.latent, kHeadDim, kNormEps, G);
+            const int rem = (carry + T) % r;   // the next group's first rows: decode's state slots 0 .. rem-1
+            if (rem) {
+                ck(cudaMemcpyAsync(y.kv_state, pf.ckv + (size_t) G * r * kHeadDim, (size_t) rem * kHeadDim * 4,
+                                   cudaMemcpyDeviceToDevice, 0), "state");
+                ck(cudaMemcpyAsync(y.score_state, pf.csc + (size_t) G * r * kHeadDim, (size_t) rem * kHeadDim * 4,
+                                   cudaMemcpyDeviceToDevice, 0), "state");
+            }
+        }
+        if (G > 0) {
+            // indexer keys (decode: indexer(), have_latent), from the latent before its RoPE
+            prefill::bf16_gemm(pf.latent, y.idx_wk, G, kHeadDim, kIndexDim, pf.ik, nullptr, pf.ftmp);
+            ops::rmsnorm(pf.ik, y.idx_knorm, pf.ik, kIndexDim, kNormEps, G);
+            prefill::rope_rows(pf.ik, G, 1, kIndexDim, rope_yarn, g0 * r, r, false);
+            ops::fp4_quant_inplace(pf.ik, G * kIndexDim, 32, false);
+            ck(cudaMemcpyAsync(y.idx_keys + (size_t) g0 * kIndexDim, pf.ik, (size_t) G * kIndexDim * 2,
+                               cudaMemcpyDeviceToDevice, 0), "index keys");
+            prefill::rope_rows(pf.latent, G, 1, kHeadDim, rope_yarn, g0 * r, r, false);
+            ops::fp4_quant_inplace(pf.latent, G * kHeadDim, 16, true);
+            ck(cudaMemcpyAsync(y.comp + (size_t) g0 * kHeadDim, pf.latent, (size_t) G * kHeadDim * 2,
+                               cudaMemcpyDeviceToDevice, 0), "compressed kv");
+        }
+        cur_comp = y.comp;
+        cur_index_k = y.idx_keys;
+    }
+
+    /// Indexer of index source l for the T queries (decode: indexer()): their top-512 compressed rows into pf.topk;
+    /// the candidate layer writes each query's candidate mask, the later layers mask with it.
+    void indexer_rows(int l, int T, int p0) {
+        auto& y = L[l];
+        fp8_rows(pf.qr, T, y.idx_wq_b, pf.iq);
+        prefill::rope_rows(pf.iq, T, kIndexHeads, kIndexDim, rope_yarn, p0, 1, false);
+        ops::fp4_quant_inplace(pf.iq, T * kIndexHeads * kIndexDim, 32, false);
+        prefill::bf16_gemm(pf.xa, y.idx_wp, T, kDim, kIndexHeads, pf.iw_raw, nullptr, pf.ftmp);
+        ops::scale_bf16(pf.iw_raw, (float) (std::pow(kIndexDim, -0.5) * std::pow(kIndexHeads, -0.5)), pf.iw,
+                        T * kIndexHeads);
+        kernels::indexer_topk_prefill(pf.iq, cur_index_k, pf.iw, T, p0, y.ratio, l > kCandidateLayer ? pf.cand : nullptr,
+                                      l == kCandidateLayer ? pf.cand : nullptr, max_seq, kIndexTopK, 0,
+                                      kCandidateBlocks, kCandidateBlock, pf.topk, pf.k14_ws, pf.k14_bytes, 0);
+    }
+
+    /// decode: attention(), for T rows. One KV buffer per layer: [compressed rows][window rows for positions
+    /// p0 - 127 .. p0 + T - 1] (K13's layout).
+    void attention_rows(int l, int T, int p0) {
+        auto& y = L[l];
+        const bool yarn = y.ratio > 0;
+        const float* table = yarn ? rope_yarn : rope_plain;
+        fp8_rows(pf.xa, T, y.wq_a, pf.qr);
+        ops::rmsnorm(pf.qr, y.q_norm, pf.qr, kQLora, kNormEps, T);
+        fp8_rows(pf.qr, T, y.wq_b, pf.q);
+        prefill::rope_rows(pf.q, T, kHeads, kHeadDim, table, p0, 1, false);
+        fp8_rows(pf.xa, T, y.wkv, pf.kvv);
+        ops::rmsnorm(pf.kvv, y.kv_norm, pf.kvv, kHeadDim, kNormEps, T);
+        prefill::rope_rows(pf.kvv, T, 1, kHeadDim, table, p0, 1, false);
+        ops::act_quant_inplace(pf.kvv, T * kHeadDim);
+        int win_base = 0, n_idx = kWindow;
+        const int32_t* topk = nullptr;
+        if (y.ratio > 0) {
+            if (is_kv_source(l)) compress_rows(l, T, p0);
+            if (is_index_source(l)) indexer_rows(l, T, p0);
+            const int c_end = (p0 + T) / y.ratio;   // compressed rows any query of the chunk may see
+            if (c_end)
+                ck(cudaMemcpyAsync(pf.attn_kv, cur_comp, (size_t) c_end * kHeadDim * 2, cudaMemcpyDeviceToDevice, 0),
+                   "attention kv: compressed rows");
+            win_base = c_end;
+            n_idx = kWindow + kIndexTopK;
+            topk = pf.topk;
+        }
+        // window rows: the ring's positions before the chunk, then the chunk's own; then the ring for decode
+        const int prev = std::min(p0, kWindow - 1);
+        prefill::window_gather(y.window, p0, prev, pf.attn_kv + (size_t) (win_base + kWindow - 1 - prev) * kHeadDim);
+        ck(cudaMemcpyAsync(pf.attn_kv + (size_t) (win_base + kWindow - 1) * kHeadDim, pf.kvv, (size_t) T * kHeadDim * 2,
+                           cudaMemcpyDeviceToDevice, 0), "attention kv: window rows");
+        prefill::window_scatter(y.window, pf.kvv, p0, T);
+        prefill::attn_index_rows(T, p0, win_base, topk, kIndexTopK, pf.idx, n_idx);
+        kernels::sparse_attn_prefill(pf.q, pf.attn_kv, pf.idx, T, n_idx, y.sink, (float) std::pow(kHeadDim, -0.5), pf.o,
+                                     0);
+        prefill::rope_rows(pf.o, T, kHeads, kHeadDim, table, p0, 1, true);
+        prefill::wo_a_grouped_rows(pf.o, y.wo_a, T, pf.oa, pf.ftmp);
+        fp8_rows(pf.oa, T, y.wo_b, pf.attn_out);
+    }
+
+    /// decode: moe(), for T rows. Routing on the GPU, then the host sorts the (token, expert) rows by expert:
+    /// VRAM tier experts first (one K12 call from their slots), then the streamed experts in job order (one K12 call
+    /// per group of ring slots, each released when its call has run).
+    void moe_rows(int l, int T) {
+        auto& y = L[l];
+        prefill::bf16_gemm(pf.xf, y.gate_w, T, kDim, kExperts, nullptr, pf.router_logits);
+        prefill::route_rows(pf.router_logits, y.gate_bias, T, pf.ids, pf.wts);
+        ck(cudaMemcpyAsync(pfh.ids, pf.ids, (size_t) T * kTopK * 4, cudaMemcpyDeviceToHost, 0), "routes down");
+        ck(cudaMemcpyAsync(pfh.wts, pf.wts, (size_t) T * kTopK * 4, cudaMemcpyDeviceToHost, 0), "weights down");
+        cudaEvent_t routed_ev;
+        ck(cudaEventCreateWithFlags(&routed_ev, cudaEventDisableTiming), "event");
+        ck(cudaEventRecord(routed_ev, 0), "event");
+        // the shared expert and the expert input while the host sorts
+        ops::to_half_fp8q(pf.xf, pf.x_half, T * kDim);
+        ck(cudaMemsetAsync(pf.routed, 0, (size_t) T * kDim * 4, 0), "routed");
+        fp8_rows(pf.xf, T, y.sh_w1, pf.g);
+        fp8_rows(pf.xf, T, y.sh_w3, pf.u);
+        ops::swiglu(pf.g, pf.u, kSwigluLimit, pf.sh_h, T * kMoeInter);
+        fp8_rows(pf.sh_h, T, y.sh_w2, pf.sh_out);
+        ck(cudaEventSynchronize(routed_ev), "routes");
+        cudaEventDestroy(routed_ev);
+
+        // expert order: VRAM tier experts (id order), then this layer's streamed jobs
+        std::vector<int> count(kExperts, 0);
+        for (int i = 0; i < T * kTopK; ++i) count[pfh.ids[i]]++;
+        std::vector<int> order;
+        for (int e = 0; e < kExperts; ++e)
+            if (count[e] && resident(l, e)) order.push_back(e);
+        const int n_res = (int) order.size();
+        int64_t first_job;
+        int n_jobs = 0;
+        if (T >= kStreamAll) {
+            first_job = layer_first_job[l];
+            n_jobs = (int) (layer_first_job[l + 1] - first_job);
+            for (int e = 0; e < kExperts; ++e)
+                if (!resident(l, e)) order.push_back(e);
+        } else {
+            std::vector<std::pair<int, int>> jobs;
+            for (int e = 0; e < kExperts; ++e)
+                if (count[e] && !resident(l, e)) {
+                    jobs.push_back({l, e});
+                    order.push_back(e);
+                }
+            n_jobs = (int) jobs.size();
+            first_job = n_jobs ? estream->push(jobs) : 0;
+        }
+        std::vector<int> start(kExperts, 0), fill(kExperts, 0);
+        std::vector<int32_t> off(order.size() + 1, 0);
+        for (size_t i = 0; i < order.size(); ++i) {
+            start[order[i]] = off[i];
+            off[i + 1] = off[i] + count[order[i]];
+        }
+        for (int t = 0; t < T; ++t)
+            for (int j = 0; j < kTopK; ++j) {
+                const int e = pfh.ids[t * kTopK + j];
+                const int r = start[e] + fill[e]++;
+                pfh.rows_tok[r] = t;
+                pfh.rows_w[r] = pfh.wts[t * kTopK + j];
+            }
+        ck(cudaMemcpyAsync(pf.rows_tok, pfh.rows_tok, (size_t) T * kTopK * 4, cudaMemcpyHostToDevice, 0), "rows up");
+        ck(cudaMemcpyAsync(pf.rows_w, pfh.rows_w, (size_t) T * kTopK * 4, cudaMemcpyHostToDevice, 0), "rows up");
+        const auto* xh = (const __half*) pf.x_half;
+        if (n_res) {
+            for (int i = 0; i < n_res; ++i) pfh.desc[i] = vram->desc(vram->res_host()[(size_t) l * kExperts + order[i]]);
+            ck(cudaMemcpyAsync(pf.desc, pfh.desc, n_res * sizeof(kernels::Exl3Expert), cudaMemcpyHostToDevice, 0),
+               "descriptors up");
+            kernels::exl3_moe_prefill(xh, pf.rows_tok, pf.rows_w, off.data(), n_res, pf.desc, pf.routed, pf.k12_ws,
+                                      pf.k12_bytes, 0);
+            ptm->vram_experts += n_res;
+        }
+        const int group = std::max(1, pf.ring_slots / 4);
+        for (int g0 = 0; g0 < n_jobs; g0 += group) {
+            const int n = std::min(group, n_jobs - g0);
+            for (int i = 0; i < n; ++i) {
+                uint8_t* slot = estream->wait(first_job + g0 + i);
+                pfh.desc[kExperts + g0 + i] = VramExperts::describe_at(pack, l, order[n_res + g0 + i], slot);
+            }
+            ck(cudaMemcpyAsync(pf.desc + kExperts + g0, pfh.desc + kExperts + g0, n * sizeof(kernels::Exl3Expert),
+                               cudaMemcpyHostToDevice, 0), "descriptors up");
+            kernels::exl3_moe_prefill(xh, pf.rows_tok, pf.rows_w, off.data() + n_res + g0, n, pf.desc + kExperts + g0,
+                                      pf.routed, pf.k12_ws, pf.k12_bytes, 0);
+            for (int i = 0; i < n; ++i) estream->release(first_job + g0 + i, 0);
+        }
+        ptm->streamed += n_jobs;
+        ops::add_f32_bf16(pf.routed, pf.sh_out, pf.ffn_out, T * kDim);
+    }
+
+    /// One chunk: tokens[c0 .. c0 + T) at positions p0 ..; with nll, the nll of every next token inside `tokens`.
+    void prefill_chunk(const std::vector<int>& tokens, int c0, int T, int p0, std::vector<float>* nll) {
+        for (int i = 0; i < T; ++i) history.push_back(pack.engram_hash().token_map[tokens[c0 + i]]);
+        if (n_eng) {
+            const double t0 = now_ms();
+            const auto& hs = pack.engram_hash();
+            const int cols = (hs.max_ngram - 1) * hs.n_heads;
+            if (cols != kEngRows) throw std::runtime_error("engram: the prefill buffers assume 24 rows per token");
+            int li = 0;
+            for (int l = 0; l < kLayers; ++l) {
+                if (!is_engram_layer(l)) continue;
+                for (int i = 0; i < T; ++i) {
+                    engram_ids(l, li, p0 + i);
+                    std::copy(eng_ids[li].begin(), eng_ids[li].begin() + cols, eng_ids_pf[li].begin() + (size_t) i * cols);
+                }
+                ++li;
+            }
+            for (int b0 = 0; b0 < T; b0 += kEngBatch) {
+                const size_t r0 = (size_t) b0 * cols;
+                std::vector<const int64_t*> ids;
+                std::vector<uint8_t*> w, s;
+                for (int t = 0; t < n_eng; ++t) {
+                    uint8_t* base = pfh.eng + (size_t) t * pf.cap * kEngRows * (256 + 8);
+                    ids.push_back(eng_ids_pf[t].data() + r0);
+                    w.push_back(base + r0 * 256);
+                    s.push_back(base + (size_t) pf.cap * kEngRows * 256 + r0 * 8);
+                }
+                eng_rows_pf->read(ids, std::min(kEngBatch, T - b0) * cols, w, s);
+            }
+            ck(cudaMemcpyAsync(pf.eng_dev, pfh.eng, (size_t) n_eng * pf.cap * kEngRows * (256 + 8), cudaMemcpyHostToDevice,
+                               0), "engram rows");
+            ptm->engram_ms += now_ms() - t0;
+        }
+        for (int i = 0; i < T; ++i) pfh.tok[i] = tokens[c0 + i];
+        ck(cudaMemcpyAsync(pf.tok, pfh.tok, (size_t) T * 4, cudaMemcpyHostToDevice, 0), "tokens up");
+        ck(cudaMemcpyAsync(pf.pre_mix, pfh.pre, (size_t) T * kHc * 4, cudaMemcpyHostToDevice, 0), "pre_mix");
+        prefill::embed_rows(embed, pf.tok, T, pf.h);
+        // stream mode: with this many tokens nearly every expert is routed in every layer, so the stream starts
+        // with all non-resident experts of all layers before any routing is known (upstream's stream_all)
+        if (T >= kStreamAll) {
+            layer_first_job.assign(kLayers + 1, 0);
+            std::vector<std::pair<int, int>> jobs;
+            for (int l = 0; l < kLayers; ++l) {
+                for (int e = 0; e < kExperts; ++e)
+                    if (!resident(l, e)) jobs.push_back({l, e});
+                layer_first_job[l + 1] = (int64_t) jobs.size();
+            }
+            const int64_t first = estream->push(jobs);
+            for (auto& j : layer_first_job) j += first;
+        }
+        int eng_i = 0;
+        for (int l = 0; l < kLayers; ++l) {
+            auto& y = L[l];
+            if (is_engram_layer(l)) {
+                const uint8_t* w = pf.eng_dev + (size_t) eng_i * pf.cap * kEngRows * (256 + 8);
+                ops::engram_dequant(w, w + (size_t) pf.cap * kEngRows * 256, T * kEngRows, pf.eng_vals);
+                fp8_rows(pf.eng_vals, T, y.eng_wkv, pf.eng_kv);
+                ops::engram_apply(pf.h, pf.eng_kv, y.eng_qw, y.eng_kw, kNormEps, T);
+                ++eng_i;
+            }
+            hc_rows(pf.h, T, y.hc_attn_fn, y.hc_attn_scale, y.hc_attn_base, pf.pre_mix, pf.xa, pf.attn_pre, pf.attn_post,
+                    pf.attn_comb);
+            ops::rmsnorm(pf.xa, y.attn_norm, pf.xa, kDim, kNormEps, T);
+            attention_rows(l, T, p0);
+            ops::hc_post(pf.attn_out, pf.h, pf.attn_post, pf.attn_comb, pf.h2, T);
+            hc_rows(pf.h2, T, y.hc_ffn_fn, y.hc_ffn_scale, y.hc_ffn_base, pf.attn_pre, pf.xf, pf.ffn_pre, pf.ffn_post,
+                    pf.ffn_comb);
+            ops::rmsnorm(pf.xf, y.ffn_norm, pf.xf, kDim, kNormEps, T);
+            moe_rows(l, T);
+            ops::hc_post(pf.ffn_out, pf.h2, pf.ffn_post, pf.ffn_comb, pf.h, T);
+            ck(cudaMemcpyAsync(pf.pre_mix, pf.ffn_pre, (size_t) T * kHc * 4, cudaMemcpyDeviceToDevice, 0), "pre_mix");
+        }
+        ops::hc_pre(pf.h, pf.pre_mix, pf.final_x, T);
+        ops::rmsnorm(pf.final_x, final_norm, pf.final_x, kDim, kNormEps, T);
+        const int n = (int) tokens.size();
+        if (nll) {
+            for (int i = 0; i < T; ++i) pfh.targets[i] = c0 + i + 1 < n ? tokens[c0 + i + 1] : -1;
+            ck(cudaMemcpyAsync(pf.targets, pfh.targets, (size_t) T * 4, cudaMemcpyHostToDevice, 0), "targets up");
+            for (int r0 = 0; r0 < T; r0 += kNllRows) {
+                const int nb = std::min(kNllRows, T - r0);
+                prefill::bf16_gemm(pf.final_x + (size_t) r0 * kDim, head, nb, kDim, kVocab, nullptr, pf.nll_logits);
+                prefill::nll_rows(pf.nll_logits, nb, kVocab, pf.targets + r0, pf.nll_out + r0);
+            }
+            ck(cudaMemcpy(pfh.nll, pf.nll_out, (size_t) T * 4, cudaMemcpyDeviceToHost), "nll down");
+            for (int i = 0; i < T; ++i)
+                if (c0 + i + 1 < n) (*nll)[c0 + i] = pfh.nll[i];
+        }
+        if (c0 + T == n) {   // the last token's logits, as step() computes them
+            ops::bf16_linear(pf.final_x + (size_t) (T - 1) * kDim, nullptr, head, kDim, kVocab, nullptr, logits);
+            lg.resize(kVocab);
+            ck(cudaMemcpy(lg.data(), logits, kVocab * 4, cudaMemcpyDeviceToHost), "logits");
+        }
+        if (T >= kStreamAll) estream->drain();   // every job of the chunk was consumed
+    }
+
+    int prefill(const std::vector<int>& tokens, int pos, std::vector<float>* nll, PrefillTiming& pt) {
+        if (pos != (int) history.size()) throw std::runtime_error("prefill must continue at the tokens fed so far");
+        const int n = (int) tokens.size();
+        if (n == 0) throw std::runtime_error("prefill of no tokens");
+        if (pos + n > max_seq) throw std::runtime_error("prefill past max_seq");
+        pt = PrefillTiming{};
+        ptm = &pt;
+        const double t0 = now_ms();
+        if (nll) nll->assign(n - 1, 0.0f);
+        int next = -1;
+        if (opt.prefill_chunk <= 0) {   // token by token
+            Timing tm;
+            for (int i = 0; i < n; ++i) {
+                next = step(tokens[i], pos + i, nullptr, tm);
+                if (nll && i + 1 < n) {
+                    double mx = -1e300, se = 0;
+                    for (float v : lg) mx = std::max(mx, (double) v);
+                    for (float v : lg) se += std::exp((double) v - mx);
+                    (*nll)[i] = (float) (mx + std::log(se) - lg[tokens[i + 1]]);
+                }
+            }
+            pt.total_ms = now_ms() - t0;
+            return next;
+        }
+        prefill_begin();
+        try {
+            pt.chunk_tokens = pf.cap;
+            for (int c0 = 0; c0 < n; c0 += pf.cap) {
+                prefill_chunk(tokens, c0, std::min(pf.cap, n - c0), pos + c0, nll);
+                ++pt.chunks;
+            }
+            estream->drain();
+            const auto st = estream->take_stats();
+            pt.from_ram = st.from_ram;
+            pt.from_cache = st.from_cache;
+            pt.from_ssd = st.from_ssd;
+            pt.stream_wait_ms = st.consumer_wait_ms;
+        } catch (...) {
+            prefill_end();
+            throw;
+        }
+        prefill_end();
+        pt.total_ms = now_ms() - t0;
+        return (int) (std::max_element(lg.begin(), lg.end()) - lg.begin());
+    }
+
     // ------------------------------------------------------------------------------------- step
     int step(int token, int pos, StepDump* dump, Timing& tm) {
         if (pos != (int) history.size()) throw std::runtime_error("tokens must be fed in order from position 0");
@@ -753,6 +1310,10 @@ int Engine::vram_expert_slots() const { return impl_->vram ? impl_->vram->slots(
 Engine::~Engine() = default;
 
 int Engine::step(int token, int pos, StepDump* dump) { return impl_->step(token, pos, dump, timing_); }
+
+int Engine::prefill(const std::vector<int>& tokens, int pos, std::vector<float>* nll) {
+    return impl_->prefill(tokens, pos, nll, prefill_timing_);
+}
 
 const std::vector<float>& Engine::last_logits() const { return impl_->lg; }
 
