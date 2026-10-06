@@ -58,9 +58,15 @@ std::vector<std::pair<int, int>> plan_ram_tier(const std::vector<std::pair<int, 
 
 size_t auto_ram_budget(size_t headroom) {
     uint64_t avail = read_field("/proc/meminfo", "MemAvailable", 1024);
-    const uint64_t limit = read_number("/sys/fs/cgroup/memory.max");
+    uint64_t limit = read_number("/sys/fs/cgroup/memory.max"), anon = 0;
+    if (limit) {
+        anon = read_field("/sys/fs/cgroup/memory.stat", "anon", 1);
+    } else {   // cgroup v1 (MemAvailable is then the host's): its limit, "no limit" being a huge number
+        limit = read_number("/sys/fs/cgroup/memory/memory.limit_in_bytes");
+        if (limit >= (1ull << 60)) limit = 0;
+        anon = read_field("/sys/fs/cgroup/memory/memory.stat", "total_rss", 1);
+    }
     if (limit) {   // a container: its limit counts the file cache too, which the arena may displace
-        const uint64_t anon = read_field("/sys/fs/cgroup/memory.stat", "anon", 1);
         const uint64_t room = limit > anon ? limit - anon : 0;
         avail = avail ? std::min(avail, room) : room;
     }

@@ -26,8 +26,9 @@ namespace strata::ds41 {
 std::vector<std::pair<int, int>> plan_ram_tier(const std::vector<std::pair<int, int>>& ranked,
                                                const std::vector<int32_t>& vram_res, int n_experts, int64_t n_slots);
 
-/// RAM for the expert arena when no budget is given: the smaller of MemAvailable and the container's limit less its
-/// anonymous memory, less `headroom` (upstream keeps 4 GB free). Never negative.
+/// RAM for the expert arena when no budget is given: the smaller of MemAvailable and the container's limit (cgroup v2
+/// memory.max or v1 memory.limit_in_bytes) less its anonymous memory, less `headroom` (upstream keeps 4 GB free).
+/// Never negative.
 size_t auto_ram_budget(size_t headroom);
 
 class HostExperts {
