@@ -1,4 +1,4 @@
-# exllamav3 GPU GEMV subset
+# exllamav3 GPU GEMV and reconstruct subset
 
 Source: https://github.com/turboderp-org/exllamav3, commit
 `16a49792a3c93d8432d72e6c4bce800841566577` (v1.5.4). MIT license;
@@ -49,3 +49,21 @@ those explicit substitutions before comparing upstream arithmetic. An actual
 source-extracted C++ schedule model checks ring tails and fixed upstream fold
 boundaries, including mutation rejection. K10-08's own GPU acceptance and
 performance are pending; individual controls' gains are not assumed additive.
+
+## K12 reconstruct subset
+
+K12 adds `quant/reconstruct.cu` and `quant/reconstruct.cuh` from the same
+upstream commit. Both were copied unmodified and SHA-256 checked before
+adaptation; their pristine digests are appended to UPSTREAM.sha256.
+The reviewer stages the pristine import separately, as described in
+`ds41/tasks/K12.COMMITS.md` (the agent cannot write .git).
+
+K12 uses the trellis-only `reconstruct_tile<3, 2, false>` and its upstream
+batched wrapper, with a one-entry device pointer table per launch. It keeps
+the tile decoder, shuffle, layout and stores unchanged. The adapter removes
+Torch dispatch, unused reconstruct/Hadamard entry points and instance tables,
+and exposes one raw-pointer host launch. The complete change is appended to
+strata.patch. K10's existing sources and patch sections remain unchanged.
+K12 includes reconstruct.cu through its unity translation unit; no GEMM
+compilation units are needed for the cuBLAS path. Input/output Hadamards stay
+in the activation pipeline to retain K10's rounding locations.
