@@ -20,7 +20,7 @@ def source_model(text):
     fold = re.search(r'constexpr int FOLD\s*=\s*([^;]+);', text).group(1)
     init = text[text.index('        uint32_t pf[PF][LOADS];'):text.index('        FragC_h ch[WNT][2]')]
     start = text.index('        for (int ib = 0; ib < myn;')
-    loop = text[start:text.index('            if constexpr (SMEM_STAGE)', start)]
+    loop = text[start:text.index('            if constexpr (SMEM_STAGE || GENERIC)', start)]
     condition = re.search(r'if \(\(d \+ 1\).*?\n', text).group(0).strip()
     return '''#include <algorithm>
 #include <cassert>

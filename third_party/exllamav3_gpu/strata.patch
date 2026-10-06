@@ -3,22 +3,23 @@
 @@ -1 +1 @@
 -#include <cuda_fp16.h>
 +// Strata raw-pointer adapter for the upstream small-row GEMV kernel.
-@@ -3,5 +2,0 @@
+@@ -3,5 +3 @@
 -
 -#include <c10/cuda/CUDAGuard.h>
 -#include <ATen/cuda/CUDAContext.h>
 -#include <cooperative_groups.h>
 -namespace cg = cooperative_groups;
-@@ -11,2 +5,0 @@
++#include <cassert>
+@@ -11,2 +6,0 @@
 -#include "exl3_devctx.cuh"
 -#include <map>
-@@ -14,4 +7 @@
+@@ -14,4 +8 @@
 -/*
 -QTIP-style small-m GEMV path, kernel in exl3_gemv_kernel.cuh. Dispatched from exl3_gemm via
 -exl3_gemv_try_launch when the shape heuristic applies, or forced through the exl3_gemv entry
 -point. Kernel arguments and graph parameter offsets are identical to exl3_gemm_kernel.
 +namespace strata_exl3 {
-@@ -19,11 +9 @@
+@@ -19,11 +10,4 @@
 -Env: EXL3_GEMV = 0 disables the path, 1/unset = heuristic (default), 2 = use wherever the hard
 -constraints allow (testing).
 -
@@ -30,24 +31,36 @@
 -*/
 -
 -static int exl3_gemv_env_mode()
-+void gemv_mul1_3bit(const GemvJob* jobs, int count, int max_n, cudaStream_t stream)
-@@ -31,3 +11,4 @@
++// Each block reads one job. The branch is uniform before any barrier.
++// Retain K10's two-CTA bound for the inlined K3 body.
++__global__ __launch_bounds__(512, 2)
++void gemv_mul1_jobs(const GemvJob* jobs)
+@@ -31,3 +15,12 @@
 -    const char* env = std::getenv("EXL3_GEMV");
 -    if (!env) return 1;
 -    return atoi(env);
-+    // CFG=0: 16 k-split warps, two n-tiles per warp, four-step FP16 fold.
-+    // Ordinary launches let all tokens/slots run without a residency restriction.
-+    exl3_gemv_kernel<3, true, 2, 0, 0, false>
-+        <<<dim3(max_n / 32, count), 512, 0, stream>>>(jobs);
-@@ -36,224 +17 @@
++    const GemvJob job = jobs[blockIdx.y];
++    if (!job.B) return;
++    switch (job.bits)
++    {
++        case 3: exl3_gemv_kernel<3, true, 2, 0, 0, false>(jobs); break;
++        case 1: exl3_gemv_kernel<1, true, 2, 0, 0, false>(jobs); break;
++        case 2: exl3_gemv_kernel<2, true, 2, 0, 0, false>(jobs); break;
++        case 4: exl3_gemv_kernel<4, true, 2, 0, 0, false>(jobs); break;
++        case 5: exl3_gemv_kernel<5, true, 2, 0, 0, false>(jobs); break;
++        case 6: exl3_gemv_kernel<6, true, 2, 0, 0, false>(jobs); break;
++        default: assert(false && "K10: expected integer K1..K6");
++    }
+@@ -36,2 +29 @@
 -// -1 = default per bits, 0 = force shuffle extraction, 1 = force smem staging (testing)
 -static int exl3_gemv_env_smem()
--{
++void gemv_mul1(const GemvJob* jobs, int count, int max_n, cudaStream_t stream)
+@@ -39,3 +31 @@
 -    const char* env = std::getenv("EXL3_GEMV_SMEM");
 -    if (!env) return -1;
 -    return atoi(env);
--}
--
++    gemv_mul1_jobs<<<dim3(max_n / 32, count), 512, 0, stream>>>(jobs);
+@@ -44,216 +34 @@
 -// -1: not eligible, 0: narrow config, 1: wide config. narrow_coresident = number of narrow-config
 -// blocks that fit on the device at once (its grid is one block per 32 output columns)
 -static int exl3_gemv_cfg(int cc, int size_m, int size_k, int size_n, int K, int cb, int mode, int narrow_coresident)
@@ -277,7 +290,7 @@
 -// heuristic applies; also exposed directly for testing. Same kernel arguments as
 -// exl3_gemm_kernel, so graph recording/patching is identical.
 +namespace strata_exl3 {
-@@ -10,19 +9,9 @@
+@@ -10,19 +9,10 @@
 -// Try to dispatch a GEMM call to the GEMV kernel. Returns false (launching nothing) if the
 -// call is not eligible. On success *launched_kernel receives the kernel pointer for graph
 -// recording. `force` bypasses the shape heuristic but not the hard constraints.
@@ -305,14 +318,15 @@
 +    float* C;
 +    int k;
 +    int n;
++    int bits;
 +};
-@@ -30,2 +19,3 @@
+@@ -30,2 +20,3 @@
 -// Kernel instances for the half-integer bitrates (comp_units/exl3_gemv_half_inst.cu)
 -void* exl3_gemv_select_kernel_half(int bits, bool c_fp32, int mmode, int cfg, bool smem);
-+// K10: 3-bit mul1, narrow configuration, one row per job. max_n sizes grid.x;
++// K10: integer K1..K6 mul1, narrow configuration, one row per job. max_n sizes grid.x;
 +// each job's n must be a multiple of 128 and no larger than max_n.
-+void gemv_mul1_3bit(const GemvJob* jobs, int count, int max_n, cudaStream_t stream);
-@@ -33,12 +23 @@
++void gemv_mul1(const GemvJob* jobs, int count, int max_n, cudaStream_t stream);
+@@ -33,12 +24 @@
 -// Direct entry point (testing): errors if the call is not hard-eligible
 -void exl3_gemv
 -(
@@ -348,11 +362,13 @@
 +// same bound to narrow integer GEMV: ptxas uses 63 registers without spills,
 +// allowing 32 resident warps to cover the streaming trellis-load latency.
 +// This changes register allocation only; keep the prefetch/MMA/fold body intact.
-@@ -187,3 +191,12 @@
+@@ -187,5 +191,14 @@
 -__global__ __launch_bounds__(CFG == 0 ? 512 : 256, HALF && CFG == 0 ? 2 : 1)
 -void exl3_gemv_kernel(EXL3_GEMM_ARGS)
 -{
-+__global__ __launch_bounds__(CFG == 0 ? 512 : 256, CFG == 0 ? 2 : 1)
+-    static_assert(HALF ? (bits >= 1 && bits <= 3 && cb == 2) : (bits == 2 || bits == 3 || bits == 4),
+-                  "exl3_gemv_kernel supports 2, 3 and 4 bpw, and 1.5, 2.5 and 3.5 bpw with mul1");
++__device__ __forceinline__
 +void exl3_gemv_kernel(const strata_exl3::GemvJob* jobs)
 +{
 +    // A is already in the Hadamard basis. A null trellis marks an empty slot.
@@ -364,13 +380,25 @@
 +    const int size_m = 1;
 +    const int size_k = job.k;
 +    const int size_n = job.n;
++    static_assert(HALF ? (bits >= 1 && bits <= 3 && cb == 2) : (bits >= 1 && bits <= 6 && cb == 2),
++                  "Strata GEMV supports integer K1..K6 and half-integer K1..K3 with mul1");
 @@ -194,2 +207,3 @@
 -    constexpr int PF   = CFG == 0 ? 4 : 2;      // prefetch ring depth
 -    constexpr int FOLD = CFG == 0 ? 4 : 2;      // fp16->fp32 fold cadence (divides PF)
 +    constexpr int PF   = 2;                     // prefetch ring depth, independent of FOLD
 +    constexpr int FOLD = CFG == 0 ? 4 : 2;      // upstream fp16->fp32 fold cadence
 +    static_assert(FOLD % PF == 0, "prefetch ring must divide the arithmetic unroll");
-@@ -205,21 +218,0 @@
+@@ -202,2 +216,7 @@
+-    constexpr int LOADS = TWO_PER_LOAD ? WNT / 2 : WNT;                       // warp loads per k-slice
+-    constexpr int LSTRIDE = TWO_PER_LOAD ? 2 * TWORDS : (TWORDS < 32 ? TWORDS : 32);   // uint32 per load (lanes < LSTRIDE load)
++    // Strata: keep K2/K3/K4's register decoder and load schedule unchanged.
++    // Other integer rates use the upstream shared-memory dq_dispatch template.
++    constexpr bool GENERIC = !HALF && (bits == 1 || bits > 4);
++    constexpr int TILE_LOADS = (TWORDS + 31) / 32;
++    constexpr int STAGE_STRIDE = GENERIC ? TILE_LOADS * 32 : TWORDS;
++    constexpr int LOADS = GENERIC ? WNT * TILE_LOADS : (TWO_PER_LOAD ? WNT / 2 : WNT);                       // warp loads per k-slice
++    constexpr int LSTRIDE = GENERIC ? 32 : TWO_PER_LOAD ? 2 * TWORDS : (TWORDS < 32 ? TWORDS : 32);   // uint32 per load (lanes < LSTRIDE load)
+@@ -205,21 +223,0 @@
 -
 -    auto grid = cooperative_groups::this_grid();
 -
@@ -392,20 +420,29 @@
 -        grid.sync();
 -        A = A_had;
 -    }
-@@ -293,2 +286,10 @@
+@@ -284 +282 @@
+-    [[maybe_unused]] __shared__ uint32_t sh_stage[SMEM_STAGE ? WK : 1][SMEM_STAGE ? LOADS * LSTRIDE : 1];
++    [[maybe_unused]] __shared__ uint32_t sh_stage[(SMEM_STAGE || GENERIC) ? WK : 1][(SMEM_STAGE || GENERIC) ? LOADS * LSTRIDE : 1];
+@@ -293,2 +291,16 @@
 -            if constexpr (LSTRIDE < 32)
 -                return lane < LSTRIDE ? __ldcs(bp + (size_t) i * slice_stride + l * LSTRIDE) : 0;
 +            // Keep the same scalar uint32 load, alignment, lane guard and address.
 +            // Narrow integer weights stream through L2 without filling L1; other
 +            // configurations retain the upstream streaming/evict-first policy.
-+            if constexpr (CFG == 0 && !HALF)
++            if constexpr (GENERIC)
++            {
++                const int tile = l / TILE_LOADS;
++                const int word = (l % TILE_LOADS) * 32 + lane;
++                return word < TWORDS ? __ldcg(bp + (size_t) i * slice_stride + tile * TWORDS + word - lane) : 0;
++            }
++            else if constexpr (CFG == 0 && !HALF)
 +            {
 +                if constexpr (LSTRIDE < 32)
 +                    return lane < LSTRIDE ? __ldcg(bp + (size_t) i * slice_stride + l * LSTRIDE) : 0;
 +                else
 +                    return __ldcg(bp + (size_t) i * slice_stride + l * LSTRIDE);
 +            }
-@@ -296 +297,6 @@
+@@ -296 +308,6 @@
 -                return __ldcs(bp + (size_t) i * slice_stride + l * LSTRIDE);
 +            {
 +                if constexpr (LSTRIDE < 32)
@@ -413,21 +450,37 @@
 +                else
 +                    return __ldcs(bp + (size_t) i * slice_stride + l * LSTRIDE);
 +            }
-@@ -310 +316,3 @@
+@@ -310 +327,3 @@
 -        for (int ib = 0; ib < myn; ib += PF)
 +        // Keep the upstream arithmetic unroll/fold boundaries. Ring slots repeat
 +        // within each fold group and are refilled before their next use.
 +        for (int ib = 0; ib < myn; ib += FOLD)
-@@ -313 +321 @@
+@@ -313 +332 @@
 -        for (int d = 0; d < PF; ++d)
 +        for (int d = 0; d < FOLD; ++d)
-@@ -321 +329 @@
+@@ -321 +340 @@
 -                bw[l] = pf[d][l];
 +                bw[l] = pf[d % PF][l];
-@@ -327 +335 @@
+@@ -327,4 +346,4 @@
 -                    pf[d][l] = ld_b(i + PF, l);
+-            }
+-
+-            if constexpr (SMEM_STAGE)
 +                    pf[d % PF][l] = ld_b(i + PF, l);
-@@ -454,29 +462,2 @@
++            }
++
++            if constexpr (SMEM_STAGE || GENERIC)
+@@ -352 +371 @@
+-                if constexpr (SMEM_STAGE)
++                if constexpr (SMEM_STAGE || GENERIC)
+@@ -354,2 +373,4 @@
+-                    const uint32_t* tp = &sh_stage[warp][t * TWORDS];
+-                    if constexpr (HALF)
++                    const uint32_t* tp = &sh_stage[warp][t * STAGE_STRIDE];
++                    if constexpr (GENERIC)
++                        dq_dispatch<bits, cb, false>(tp, lane << 3, f0, f1);
++                    else if constexpr (HALF)
+@@ -454,29 +475,2 @@
 -    // Output scales and Hadamard transform, same semantics as the inner GEMM epilogue
 -    {
 -        grid.sync();
@@ -464,14 +517,15 @@
 @@ -1 +1 @@
 -#include <cuda_fp16.h>
 +// Strata K12: raw-pointer dispatch for upstream trellis-only reconstruction.
-@@ -3,3 +2,0 @@
+@@ -3,3 +3 @@
 -#include <c10/cuda/CUDAGuard.h>
 -#include <ATen/cuda/CUDAContext.h>
 -#include "../util.h"
-@@ -9,2 +5,0 @@
++#include <cassert>
+@@ -9,2 +6,0 @@
 -#include "bits_k.cuh"
 -#include "hadamard_inner.cuh"
-@@ -116,10 +111 @@
+@@ -116,10 +112 @@
 -// Index cb * 8 + K - 1 for integer K; 24 + K - 1 for the half-integer rates 1.5 / 2.5 / 3.5 (mul1 only)
 -#define __(i, cb) reconstruct_batch_kernel<i, cb>
 -constexpr auto reconstruct_batch_kernel_instances = std::array
@@ -483,7 +537,7 @@
 -};
 -#undef __
 +namespace strata_exl3 {
-@@ -127,70 +113,5 @@
+@@ -127,233 +114,12 @@
 -// Index cb * 8 + K - 1 for integer K; 24 + K - 1 for the half-integer rates 1.5 / 2.5 / 3.5 (mul1 only)
 -#define __(i, cb) reconstruct_kernel<i, cb>
 -constexpr auto reconstruct_kernel_instances = std::array
@@ -554,12 +608,8 @@
 -        packed_n_offset
 -    );
 -    cuda_check(cudaPeekAtLastError());
-+void reconstruct_mul1_3bit(half* unpacked, const uint16_t* const* packed_ptr,
-+                           int k, int n, cudaStream_t stream) {
-+    reconstruct_batch_kernel<3, 2, false>
-+        <<<dim3(n / 128, k / 16, 1), 256, 0, stream>>>
-+        (unpacked, packed_ptr, n / 16, size_t(k) * n);
-@@ -199,428 +120 @@
+-}
+-
 -
 -// Fused reconstruct + both-side Hadamard: emits W = diag(suh) . H128 . W_hat . H128 . diag(svh)
 -// (per 128x128 tile, 1/sqrt(128) per side), i.e. the ORIGINAL-basis weights, so the hgemm
@@ -721,9 +771,19 @@
 -        v.x = __hmul2(__hmul2(h01, su2), sv4.x);
 -        v.y = __hmul2(__hmul2(h23, su2), sv4.y);
 -        *((half4*) (g_unpacked + (size_t) (kb * 128 + R) * row_len + nb * 128 + lane_id * 4)) = v;
--    }
--}
--
++// K is uniform for the block. Each branch calls the upstream tile decoder.
++__global__ __launch_bounds__(256)
++void reconstruct_mul1_job(half* unpacked, const ReconstructJob* job, int blocks_n) {
++    const uint16_t* packed = job->packed;
++    switch (job->bits) {
++        case 1: reconstruct_tile<1, 2, false>(unpacked, packed, blocks_n, 0); break;
++        case 2: reconstruct_tile<2, 2, false>(unpacked, packed, blocks_n, 0); break;
++        case 3: reconstruct_tile<3, 2, false>(unpacked, packed, blocks_n, 0); break;
++        case 4: reconstruct_tile<4, 2, false>(unpacked, packed, blocks_n, 0); break;
++        case 5: reconstruct_tile<5, 2, false>(unpacked, packed, blocks_n, 0); break;
++        case 6: reconstruct_tile<6, 2, false>(unpacked, packed, blocks_n, 0); break;
++        default: assert(false && "K12: expected integer K1..K6");
+@@ -363,14 +129,3 @@
 -
 -template <int K, int cb, bool HALF = false>
 -__global__ __launch_bounds__(RH_THREADS)
@@ -738,8 +798,10 @@
 -)
 -{
 -    reconstruct_had_tile<K, cb, HALF>(g_unpacked, g_packed, suh, svh, packed_blocks_n, packed_n_offset);
--}
--
++void reconstruct_mul1(half* unpacked, const ReconstructJob* job,
++                       int k, int n, cudaStream_t stream) {
++    reconstruct_mul1_job<<<dim3(n / 128, k / 16), 256, 0, stream>>>(unpacked, job, n / 16);
+@@ -379,248 +134 @@
 -// Batched variant: blockIdx.z selects the matrix from per-matrix pointer tables, the outputs
 -// are consecutive [k, n] slabs out_stride halfs apart. Whole matrices only (no n slicing).
 -template <int K, int cb, bool HALF = false>
@@ -1016,12 +1078,12 @@
 -    bool mul1,
 -    int64_t n_offset
 -);
-+// packed_ptr is a DEVICE pointer to one trellis pointer. Output is row-major
-+// [k][n] fp16 in the Hadamard basis, without suh/svh or either Hadamard.
-+// k must be divisible by 16, n by 128; the trellis uses 3-bit mul1 (tile_w=48).
-+void reconstruct_mul1_3bit(half* unpacked, const uint16_t* const* packed_ptr,
-+                           int k, int n, cudaStream_t stream);
-@@ -24,31 +15 @@
++// One projection, prepared on the device. No descriptor readback is needed.
++struct ReconstructJob {
++    const uint16_t* packed;
++    int bits;
++};
+@@ -24,11 +15,4 @@
 -void reconstruct_had_slice
 -(
 -    at::Tensor unpacked,
@@ -1033,7 +1095,11 @@
 -    bool mul1,
 -    int64_t n_offset
 -);
--
++// job is a DEVICE pointer. Output is row-major [k][n] fp16 in the Hadamard
++// basis, without scales or Hadamards. k % 16 == 0 and n % 128 == 0.
++void reconstruct_mul1(half* unpacked, const ReconstructJob* job,
++                       int k, int n, cudaStream_t stream);
+@@ -36,19 +20 @@
 -void reconstruct_had_batch
 -(
 -    at::Tensor unpacked,

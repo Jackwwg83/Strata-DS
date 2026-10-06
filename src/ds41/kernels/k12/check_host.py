@@ -72,12 +72,18 @@ def numerics_and_includes():
 def layout():
     # Compile the real layout header and extracted pointer-binding struct.
     # half is replaced by uint16_t for storage only; this is NOT a CUDA compile.
+    header = (VENDOR / "quant/reconstruct.cuh").read_text()
+    assert "    const uint16_t* packed;\n    int bits;" in header
+    dispatch = (VENDOR / "quant/reconstruct.cu").read_text()
+    for bits in range(1, 7):
+        assert f"case {bits}: reconstruct_tile<{bits}, 2, false>" in dispatch
     workspace = section((K12 / "pipeline.cuh").read_text(), "struct Workspace {", "__device__ inline void check_proj")
     source = '''#include <cassert>
 #include <climits>
 #include <vector>
 #include "workspace.hpp"
 using half = uint16_t;
+namespace strata_exl3 { struct ReconstructJob { const uint16_t* packed; int bits; }; }
 namespace strata::ds41::kernels::k12 {
 ''' + workspace + '''}
 int main() {
