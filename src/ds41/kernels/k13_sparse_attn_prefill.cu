@@ -9,9 +9,9 @@ namespace strata::ds41::kernels {
 
 void sparse_attn_prefill(const __nv_bfloat16* q, const __nv_bfloat16* kv, const int32_t* idx, int m, int n_idx,
                          const float* sink, float scale, __nv_bfloat16* o, cudaStream_t stream) {
-    // K3 reads index j < 128 from `window` and j >= 128 from comp[j - 128]: with window = kv and comp = kv - 128 rows,
-    // every index j reads kv[j]. comp itself is never dereferenced below row 128.
-    const __nv_bfloat16* comp = kv - (ptrdiff_t) kWindow * kHeadDim;
+    // K3 reads index j < 128 from `window` and j >= 128 from comp[j - 128]: with window = kv and comp = kv + 128 rows,
+    // every index j reads kv[j] (found by dots' review: the first version had kv - 128 rows, which read kv[j - 256]).
+    const __nv_bfloat16* comp = kv + (ptrdiff_t) kWindow * kHeadDim;
     for (int t = 0; t < m; t += 8) {
         const int n = m - t < 8 ? m - t : 8;
         sparse_attn_decode(q + (size_t) t * kHeads * kHeadDim, kv, comp, idx + (size_t) t * n_idx, n, n_idx, sink,

@@ -46,9 +46,10 @@ int main() {
         Dev<__nv_bfloat16> q(rand_bf16(qn, 1.0f, 10 + c.m));
         Dev<int32_t> idx(make_idx(c.m, c.n_idx, c.p0, c.ratio, n_comp, 20 + c.m));
         Dev<__nv_bfloat16> o(qn), ref(qn);
-        // the M1 op takes window/comp; with window = kv and comp = kv - 128 rows every index reads kv[j]
+        // the M1 op reads j < 128 from window and j >= 128 from comp[j - 128]: window = kv and comp = kv + 128 rows make
+        // every index read kv[j]
         for (int t = 0; t < c.m; ++t)
-            sd::ops::sparse_attn(q.p + (size_t) t * sd::kHeads * sd::kHeadDim, kv.p, kv.p - (ptrdiff_t) sd::kWindow * sd::kHeadDim,
+            sd::ops::sparse_attn(q.p + (size_t) t * sd::kHeads * sd::kHeadDim, kv.p, kv.p + (ptrdiff_t) sd::kWindow * sd::kHeadDim,
                                  idx.p + (size_t) t * c.n_idx, c.n_idx, sink.p, scale,
                                  ref.p + (size_t) t * sd::kHeads * sd::kHeadDim);
         kk::sparse_attn_prefill(q.p, kv.p, idx.p, c.m, c.n_idx, sink.p, scale, o.p, 0);
