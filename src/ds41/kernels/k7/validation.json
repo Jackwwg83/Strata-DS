@@ -1,0 +1,564 @@
+{
+  "architectures": {
+    "sm120": {
+      "artifacts_sha256": {
+        "check_graph": "16ced45cdd6353b452377903f06ee73c16d6082e952b6506f6f6dcbc6567a671",
+        "check_graph.compile.log": "00a9beff9ed44219f90ed82acad3e4b1011e4b67ee6035e8b592cceaab384e1b",
+        "check_graph.cubins.txt": "2dc02cedbb2aadd44d349e05fcd962fecaa30360920070f0f6402895fb85b02b",
+        "check_graph.link.log": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+        "check_graph.o": "9ceafc0972786c239141c8a2979f2fc8e33a21e23c2f7206dc328fb05b039533",
+        "check_graph.run.exit": "94d5a38598be77593d4781b8fbd74cb4e2cd05bb006b1b531988ab2db90de9c9",
+        "check_graph.run.log": "568568978c1a09e75abc02b70af78561eb94a74ed933fa1fa8e0bd8e7c5b6cef",
+        "instruction-check.log": "92e46aa43b009e51526729006b486a354d28e05b03d0d4139351bfa77254ad35",
+        "k7_hc.compile.log": "569ce5a10b067c06938a192577acf38affcc360c6ef00e917c97c9812462827f",
+        "k7_hc.o": "0fa5dc5262804fb9f2c6b6871bc319402fb43606fd1187c3ff6483832a2d83c0",
+        "k7_hc.ptx": "fe71523f3b9395c2883ca8a4ded5b0868378206258acac8fd7a2d9bebce1892a",
+        "k7_hc.sass": "53b6dd1f81c1e715a5ccb44e3bfc78546061bcfcb3f87a995601f22b22c17a60",
+        "k7_hc_test": "d65ca732ee0e17848b7541fb5ea18d397c567b94f19589625a65b315816aed9c",
+        "k7_hc_test.compile.log": "2ef72a8a5c7aa5ee85b4ae329a78228de740e971dcce6a52f2b8b6da1af2f0cc",
+        "k7_hc_test.cubins.txt": "21f1f6bc27cbe02ac36319f2ec74f62c3dfc9ba4fb994aad4166887d02a2aa64",
+        "k7_hc_test.link.log": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+        "k7_hc_test.o": "aeeefa0ab424c14134b40405b735c8d802c8a18dd784914d79f113111c25d2fa",
+        "k7_hc_test.run.exit": "94d5a38598be77593d4781b8fbd74cb4e2cd05bb006b1b531988ab2db90de9c9",
+        "k7_hc_test.run.log": "568568978c1a09e75abc02b70af78561eb94a74ed933fa1fa8e0bd8e7c5b6cef",
+        "ops.compile.log": "8e33a55e40162b5fd84323b7fc2b0347fd039fc50d2257da7f8928f9e64354e3",
+        "ops.o": "a9bedf74597350484e4c7546b2c4af91267c0afbbe014a19843e17f13f115a8f",
+        "sass.stderr": "c3ffc8e44cffbea7f01f92c26cf57308de8e179d203878a037151b4b55c859fa"
+      },
+      "compile_link": "pass",
+      "functions": [
+        {
+          "kernel": "hc_partials<8>",
+          "registers": 64,
+          "shared_bytes": 0,
+          "spill_load_bytes": 0,
+          "spill_store_bytes": 0,
+          "stack_bytes": 0
+        },
+        {
+          "kernel": "hc_async_partials<8>",
+          "registers": 64,
+          "shared_bytes": 4096,
+          "spill_load_bytes": 0,
+          "spill_store_bytes": 0,
+          "stack_bytes": 0
+        },
+        {
+          "kernel": "hc_partials<7>",
+          "registers": 63,
+          "shared_bytes": 0,
+          "spill_load_bytes": 0,
+          "spill_store_bytes": 0,
+          "stack_bytes": 0
+        },
+        {
+          "kernel": "hc_async_partials<7>",
+          "registers": 72,
+          "shared_bytes": 4096,
+          "spill_load_bytes": 0,
+          "spill_store_bytes": 0,
+          "stack_bytes": 0
+        },
+        {
+          "kernel": "hc_partials<6>",
+          "registers": 56,
+          "shared_bytes": 0,
+          "spill_load_bytes": 0,
+          "spill_store_bytes": 0,
+          "stack_bytes": 0
+        },
+        {
+          "kernel": "hc_async_partials<6>",
+          "registers": 60,
+          "shared_bytes": 4096,
+          "spill_load_bytes": 0,
+          "spill_store_bytes": 0,
+          "stack_bytes": 0
+        },
+        {
+          "kernel": "hc_partials<5>",
+          "registers": 48,
+          "shared_bytes": 0,
+          "spill_load_bytes": 0,
+          "spill_store_bytes": 0,
+          "stack_bytes": 0
+        },
+        {
+          "kernel": "hc_async_partials<5>",
+          "registers": 48,
+          "shared_bytes": 4096,
+          "spill_load_bytes": 0,
+          "spill_store_bytes": 0,
+          "stack_bytes": 0
+        },
+        {
+          "kernel": "hc_partials<4>",
+          "registers": 40,
+          "shared_bytes": 0,
+          "spill_load_bytes": 0,
+          "spill_store_bytes": 0,
+          "stack_bytes": 0
+        },
+        {
+          "kernel": "hc_async_partials<4>",
+          "registers": 40,
+          "shared_bytes": 4096,
+          "spill_load_bytes": 0,
+          "spill_store_bytes": 0,
+          "stack_bytes": 0
+        },
+        {
+          "kernel": "hc_partials<3>",
+          "registers": 40,
+          "shared_bytes": 0,
+          "spill_load_bytes": 0,
+          "spill_store_bytes": 0,
+          "stack_bytes": 0
+        },
+        {
+          "kernel": "hc_async_partials<3>",
+          "registers": 40,
+          "shared_bytes": 4096,
+          "spill_load_bytes": 0,
+          "spill_store_bytes": 0,
+          "stack_bytes": 0
+        },
+        {
+          "kernel": "hc_partials<2>",
+          "registers": 40,
+          "shared_bytes": 0,
+          "spill_load_bytes": 0,
+          "spill_store_bytes": 0,
+          "stack_bytes": 0
+        },
+        {
+          "kernel": "hc_async_partials<2>",
+          "registers": 40,
+          "shared_bytes": 4096,
+          "spill_load_bytes": 0,
+          "spill_store_bytes": 0,
+          "stack_bytes": 0
+        },
+        {
+          "kernel": "hc_partials<1>",
+          "registers": 27,
+          "shared_bytes": 0,
+          "spill_load_bytes": 0,
+          "spill_store_bytes": 0,
+          "stack_bytes": 0
+        },
+        {
+          "kernel": "hc_async_partials<1>",
+          "registers": 40,
+          "shared_bytes": 4096,
+          "spill_load_bytes": 0,
+          "spill_store_bytes": 0,
+          "stack_bytes": 0
+        },
+        {
+          "kernel": "hc_finish",
+          "registers": 38,
+          "shared_bytes": 100,
+          "spill_load_bytes": 0,
+          "spill_store_bytes": 0,
+          "stack_bytes": 0
+        }
+      ],
+      "native_cubins": "verified",
+      "ptx_checks": "pass for all m=1..8 on both paths",
+      "runtime": "skip 77: no CUDA device",
+      "sass": "not inspected: nvdisasm missing"
+    },
+    "sm86": {
+      "artifacts_sha256": {
+        "check_graph": "9ccdffd5c9c4fb2d954ce09110d44f124aa8ee834abf6f9a1046f3af38649feb",
+        "check_graph.compile.log": "81ea54c248e524436e7dec2daced1ae15f7ab454fefe9660e65d52f39b360043",
+        "check_graph.cubins.txt": "875505456c2d0501858619df2390cce1c7ce94d97dd581968f4520e5955bf18d",
+        "check_graph.link.log": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+        "check_graph.o": "39c472328e06c133f9ec8a77435b2990e3524c626f5edf537689043b3aa375d3",
+        "check_graph.run.exit": "94d5a38598be77593d4781b8fbd74cb4e2cd05bb006b1b531988ab2db90de9c9",
+        "check_graph.run.log": "568568978c1a09e75abc02b70af78561eb94a74ed933fa1fa8e0bd8e7c5b6cef",
+        "instruction-check.log": "92e46aa43b009e51526729006b486a354d28e05b03d0d4139351bfa77254ad35",
+        "k7_hc.compile.log": "f921af1d799c5975633355c72827730d3e6e9abb0141a69d281770c9a5979e6d",
+        "k7_hc.o": "0ddae2f02c0ca0db67644e71fcad347013aa88fc5926d451759fbb324564396f",
+        "k7_hc.ptx": "b0d19eda90c2840154a053b208525438bbe2ae9bb4891e79ac03ba1f3c8143eb",
+        "k7_hc.sass": "18dff052e97860538fed366450c207ec0d703f4ce9a5f26ea181db8a13e6929e",
+        "k7_hc_test": "631dd22ce491dcbc8a05b9f99ee4fd433a18668d81e00fec20bb4c580fec5c82",
+        "k7_hc_test.compile.log": "2ef72a8a5c7aa5ee85b4ae329a78228de740e971dcce6a52f2b8b6da1af2f0cc",
+        "k7_hc_test.cubins.txt": "9a2ea239aa79187d5517334c6c2efdee81988a7cb3e28c905eadbc13ee0c82ae",
+        "k7_hc_test.link.log": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+        "k7_hc_test.o": "9626bd9b80110b62c573f00dbeb2064bfc959e84b33fbb8c38da07a284c05cee",
+        "k7_hc_test.run.exit": "94d5a38598be77593d4781b8fbd74cb4e2cd05bb006b1b531988ab2db90de9c9",
+        "k7_hc_test.run.log": "568568978c1a09e75abc02b70af78561eb94a74ed933fa1fa8e0bd8e7c5b6cef",
+        "ops.compile.log": "24652263d0ac3efe7172e8d49f88f8857cfa7d92b88531a7a961b15e12240639",
+        "ops.o": "04e7875c5d9ddfdc396736b70d7087d32b8b4e2afc3acb46c9b418a02fcee727",
+        "sass.stderr": "c3ffc8e44cffbea7f01f92c26cf57308de8e179d203878a037151b4b55c859fa"
+      },
+      "compile_link": "pass",
+      "functions": [
+        {
+          "kernel": "hc_partials<8>",
+          "registers": 68,
+          "shared_bytes": 0,
+          "spill_load_bytes": 0,
+          "spill_store_bytes": 0,
+          "stack_bytes": 0
+        },
+        {
+          "kernel": "hc_async_partials<8>",
+          "registers": 77,
+          "shared_bytes": 4096,
+          "spill_load_bytes": 0,
+          "spill_store_bytes": 0,
+          "stack_bytes": 0
+        },
+        {
+          "kernel": "hc_partials<7>",
+          "registers": 56,
+          "shared_bytes": 0,
+          "spill_load_bytes": 0,
+          "spill_store_bytes": 0,
+          "stack_bytes": 0
+        },
+        {
+          "kernel": "hc_async_partials<7>",
+          "registers": 64,
+          "shared_bytes": 4096,
+          "spill_load_bytes": 0,
+          "spill_store_bytes": 0,
+          "stack_bytes": 0
+        },
+        {
+          "kernel": "hc_partials<6>",
+          "registers": 52,
+          "shared_bytes": 0,
+          "spill_load_bytes": 0,
+          "spill_store_bytes": 0,
+          "stack_bytes": 0
+        },
+        {
+          "kernel": "hc_async_partials<6>",
+          "registers": 60,
+          "shared_bytes": 4096,
+          "spill_load_bytes": 0,
+          "spill_store_bytes": 0,
+          "stack_bytes": 0
+        },
+        {
+          "kernel": "hc_partials<5>",
+          "registers": 46,
+          "shared_bytes": 0,
+          "spill_load_bytes": 0,
+          "spill_store_bytes": 0,
+          "stack_bytes": 0
+        },
+        {
+          "kernel": "hc_async_partials<5>",
+          "registers": 54,
+          "shared_bytes": 4096,
+          "spill_load_bytes": 0,
+          "spill_store_bytes": 0,
+          "stack_bytes": 0
+        },
+        {
+          "kernel": "hc_partials<4>",
+          "registers": 39,
+          "shared_bytes": 0,
+          "spill_load_bytes": 0,
+          "spill_store_bytes": 0,
+          "stack_bytes": 0
+        },
+        {
+          "kernel": "hc_async_partials<4>",
+          "registers": 51,
+          "shared_bytes": 4096,
+          "spill_load_bytes": 0,
+          "spill_store_bytes": 0,
+          "stack_bytes": 0
+        },
+        {
+          "kernel": "hc_partials<3>",
+          "registers": 35,
+          "shared_bytes": 0,
+          "spill_load_bytes": 0,
+          "spill_store_bytes": 0,
+          "stack_bytes": 0
+        },
+        {
+          "kernel": "hc_async_partials<3>",
+          "registers": 39,
+          "shared_bytes": 4096,
+          "spill_load_bytes": 0,
+          "spill_store_bytes": 0,
+          "stack_bytes": 0
+        },
+        {
+          "kernel": "hc_partials<2>",
+          "registers": 29,
+          "shared_bytes": 0,
+          "spill_load_bytes": 0,
+          "spill_store_bytes": 0,
+          "stack_bytes": 0
+        },
+        {
+          "kernel": "hc_async_partials<2>",
+          "registers": 38,
+          "shared_bytes": 4096,
+          "spill_load_bytes": 0,
+          "spill_store_bytes": 0,
+          "stack_bytes": 0
+        },
+        {
+          "kernel": "hc_partials<1>",
+          "registers": 25,
+          "shared_bytes": 0,
+          "spill_load_bytes": 0,
+          "spill_store_bytes": 0,
+          "stack_bytes": 0
+        },
+        {
+          "kernel": "hc_async_partials<1>",
+          "registers": 33,
+          "shared_bytes": 4096,
+          "spill_load_bytes": 0,
+          "spill_store_bytes": 0,
+          "stack_bytes": 0
+        },
+        {
+          "kernel": "hc_finish",
+          "registers": 38,
+          "shared_bytes": 100,
+          "spill_load_bytes": 0,
+          "spill_store_bytes": 0,
+          "stack_bytes": 0
+        }
+      ],
+      "native_cubins": "verified",
+      "ptx_checks": "pass for all m=1..8 on both paths",
+      "runtime": "skip 77: no CUDA device",
+      "sass": "not inspected: nvdisasm missing"
+    },
+    "sm89": {
+      "artifacts_sha256": {
+        "check_graph": "9fc893b95ea37fd1c01e5301ec58a215506e5c32fb3b70156461064e87035818",
+        "check_graph.compile.log": "88a225645d700d61a2f310f8fe24876b48db4a41a1d41cd94474027848a994d1",
+        "check_graph.cubins.txt": "47eba0d51ca8f192395b2cf669d82ac139e0878de86e1b584fb6abbdab3b0273",
+        "check_graph.link.log": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+        "check_graph.o": "0d487489273452dcf93fafd15bd248457bf408404dcdbb92bea14bdb7eedc9b1",
+        "check_graph.run.exit": "94d5a38598be77593d4781b8fbd74cb4e2cd05bb006b1b531988ab2db90de9c9",
+        "check_graph.run.log": "568568978c1a09e75abc02b70af78561eb94a74ed933fa1fa8e0bd8e7c5b6cef",
+        "instruction-check.log": "92e46aa43b009e51526729006b486a354d28e05b03d0d4139351bfa77254ad35",
+        "k7_hc.compile.log": "10800a1e33b5ba50cee8e330634489ce8cb57aa1b63dab7feada1e8ef748e7d4",
+        "k7_hc.o": "18140eb0e45027f809824a5de8ba5861c58c89664964295c1c0144713e0e3920",
+        "k7_hc.ptx": "3dcfc51450747f117a9b7da64c3efd46708002c7c8abfe3d6b3e5c7fa16fb70e",
+        "k7_hc.sass": "8e1da619dfc274251b5571b64d7bd85ac924d2c8467d8740aec23fe3f2ae5e01",
+        "k7_hc_test": "d0cfa7bc0b3039d85679e3ceffb17899d8deff40e4ebc3412c5e60db1853e94c",
+        "k7_hc_test.compile.log": "2ef72a8a5c7aa5ee85b4ae329a78228de740e971dcce6a52f2b8b6da1af2f0cc",
+        "k7_hc_test.cubins.txt": "e71ce338fa2cf0d3dff9731d52b72008b8e07b51045dc1420861eee73b4711e5",
+        "k7_hc_test.link.log": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+        "k7_hc_test.o": "ea9b600fb7e86165347dd66190df9ee8c0ca14a67d3dfceeb6338a0360e3c8cf",
+        "k7_hc_test.run.exit": "94d5a38598be77593d4781b8fbd74cb4e2cd05bb006b1b531988ab2db90de9c9",
+        "k7_hc_test.run.log": "568568978c1a09e75abc02b70af78561eb94a74ed933fa1fa8e0bd8e7c5b6cef",
+        "ops.compile.log": "7ee7b23088160527a690e849de0c3ceb6c034a4e9a95127acb92abbc8921f831",
+        "ops.o": "f48b0fc84cc4c89d84a4265da451f0b2c8828544a3bbfbdacc6c1b7bf28f6091",
+        "sass.stderr": "c3ffc8e44cffbea7f01f92c26cf57308de8e179d203878a037151b4b55c859fa"
+      },
+      "compile_link": "pass",
+      "functions": [
+        {
+          "kernel": "hc_partials<8>",
+          "registers": 68,
+          "shared_bytes": 0,
+          "spill_load_bytes": 0,
+          "spill_store_bytes": 0,
+          "stack_bytes": 0
+        },
+        {
+          "kernel": "hc_async_partials<8>",
+          "registers": 77,
+          "shared_bytes": 4096,
+          "spill_load_bytes": 0,
+          "spill_store_bytes": 0,
+          "stack_bytes": 0
+        },
+        {
+          "kernel": "hc_partials<7>",
+          "registers": 56,
+          "shared_bytes": 0,
+          "spill_load_bytes": 0,
+          "spill_store_bytes": 0,
+          "stack_bytes": 0
+        },
+        {
+          "kernel": "hc_async_partials<7>",
+          "registers": 64,
+          "shared_bytes": 4096,
+          "spill_load_bytes": 0,
+          "spill_store_bytes": 0,
+          "stack_bytes": 0
+        },
+        {
+          "kernel": "hc_partials<6>",
+          "registers": 52,
+          "shared_bytes": 0,
+          "spill_load_bytes": 0,
+          "spill_store_bytes": 0,
+          "stack_bytes": 0
+        },
+        {
+          "kernel": "hc_async_partials<6>",
+          "registers": 60,
+          "shared_bytes": 4096,
+          "spill_load_bytes": 0,
+          "spill_store_bytes": 0,
+          "stack_bytes": 0
+        },
+        {
+          "kernel": "hc_partials<5>",
+          "registers": 46,
+          "shared_bytes": 0,
+          "spill_load_bytes": 0,
+          "spill_store_bytes": 0,
+          "stack_bytes": 0
+        },
+        {
+          "kernel": "hc_async_partials<5>",
+          "registers": 54,
+          "shared_bytes": 4096,
+          "spill_load_bytes": 0,
+          "spill_store_bytes": 0,
+          "stack_bytes": 0
+        },
+        {
+          "kernel": "hc_partials<4>",
+          "registers": 39,
+          "shared_bytes": 0,
+          "spill_load_bytes": 0,
+          "spill_store_bytes": 0,
+          "stack_bytes": 0
+        },
+        {
+          "kernel": "hc_async_partials<4>",
+          "registers": 51,
+          "shared_bytes": 4096,
+          "spill_load_bytes": 0,
+          "spill_store_bytes": 0,
+          "stack_bytes": 0
+        },
+        {
+          "kernel": "hc_partials<3>",
+          "registers": 35,
+          "shared_bytes": 0,
+          "spill_load_bytes": 0,
+          "spill_store_bytes": 0,
+          "stack_bytes": 0
+        },
+        {
+          "kernel": "hc_async_partials<3>",
+          "registers": 39,
+          "shared_bytes": 4096,
+          "spill_load_bytes": 0,
+          "spill_store_bytes": 0,
+          "stack_bytes": 0
+        },
+        {
+          "kernel": "hc_partials<2>",
+          "registers": 29,
+          "shared_bytes": 0,
+          "spill_load_bytes": 0,
+          "spill_store_bytes": 0,
+          "stack_bytes": 0
+        },
+        {
+          "kernel": "hc_async_partials<2>",
+          "registers": 38,
+          "shared_bytes": 4096,
+          "spill_load_bytes": 0,
+          "spill_store_bytes": 0,
+          "stack_bytes": 0
+        },
+        {
+          "kernel": "hc_partials<1>",
+          "registers": 25,
+          "shared_bytes": 0,
+          "spill_load_bytes": 0,
+          "spill_store_bytes": 0,
+          "stack_bytes": 0
+        },
+        {
+          "kernel": "hc_async_partials<1>",
+          "registers": 33,
+          "shared_bytes": 4096,
+          "spill_load_bytes": 0,
+          "spill_store_bytes": 0,
+          "stack_bytes": 0
+        },
+        {
+          "kernel": "hc_finish",
+          "registers": 38,
+          "shared_bytes": 100,
+          "spill_load_bytes": 0,
+          "spill_store_bytes": 0,
+          "stack_bytes": 0
+        }
+      ],
+      "native_cubins": "verified",
+      "ptx_checks": "pass for all m=1..8 on both paths",
+      "runtime": "skip 77: no CUDA device",
+      "sass": "not inspected: nvdisasm missing"
+    }
+  },
+  "artifact_directory": "strata-prefill/build/K7-11-final",
+  "base": "be8c969a1f1b7bf88d8a64ef1b3e935dcc2f376a",
+  "branch": "task/K7/dots-K7-11",
+  "compiler": "nvcc: NVIDIA (R) Cuda compiler driver\nCopyright (c) 2005-2025 NVIDIA Corporation\nBuilt on Fri_Feb_21_20:23:50_PST_2025\nCuda compilation tools, release 12.8, V12.8.93\nBuild cuda_12.8.r12.8/compiler.35583870_0\ng++-12 (Debian 12.2.0-14+deb12u1) 12.2.0\nCopyright (C) 2022 Free Software Foundation, Inc.\nThis is free software; see the source for copying conditions.  There is NO\nwarranty; not even for MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.\n\n",
+  "gpu_tests": "not run; fixed and graph tests each skip 77 on every architecture",
+  "host_artifacts_sha256": {
+    "check_numerics": "34d34bbdc91aea632ca9cb342b34875adfbc3e67d47a1d0949bceaf04f0b024b",
+    "compiler.txt": "05d68d4eab5471bdfb5cf2fa778ac755180be279710365be2c5c642a0525207a",
+    "host-model.log": "0694171970769a79fb2d994e4524422998457ff6deb47063156b373e125b1bf9",
+    "negative.log": "a8d11ed305210db4d9d487ed5977511f75fd22d744c32750b498cb0ee573ee4a",
+    "source.txt": "d69397a2ae4f78e18cb4997e04e9bf957182b60d3a4259d06c4d25028c77c4d8",
+    "structure.log": "194ab119211da6f48ce67aa962b1fc96f4c83eabc1e67600b27ae8400d891aa2"
+  },
+  "host_tests": {
+    "batched_cases": 112,
+    "host_coefficients": "bitwise reference equality",
+    "m": "1..8",
+    "negative_schedule_mutants": 5,
+    "ownership_bounds": "pass",
+    "raw_dot_norm": "bitwise equality with reference and scalar fallback",
+    "token_cases": 504,
+    "ubsan": "pass"
+  },
+  "performance": "unmeasured; control score 18.43 us is reviewer-reported, not a candidate result",
+  "runtime_sha256": "d486d27ca32b4e955d9949a36432d2457c45e8ba1a36e7bb120ee6704d5ae578",
+  "schema": 1,
+  "scope": "dot cloud only; local commit only; no GPU execution",
+  "source_and_report_sha256": {
+    "src/ds41/kernels/k7/ASYNC_WEIGHTS.md": "31b0f1257219952958ddd85d8b0d155f9c728e60b316540dc4f5d46727cfb65b",
+    "src/ds41/kernels/k7/async_weights.hpp": "137d3717941cbdbbf6fa24553737193790e261265b4f2930fcd4c1d48bb22037",
+    "src/ds41/kernels/k7/build_checks.sh": "d35f736378dae2b85b0e0fb260d3b196dc0877041f815c3cc606fb6f6faa8ea5",
+    "src/ds41/kernels/k7/check_graph.cu": "1918b5318b98c355f5aa89690ac3063c73d064f13476db4c8fdd5534a159cf96",
+    "src/ds41/kernels/k7/check_negative.py": "dec1ecc4a27aca3488191039c2379afbc033bccb22fafc30b4e7edf1f9cd1488",
+    "src/ds41/kernels/k7/check_numerics.cpp": "59f879d850c7bb801c88798fd29622f14667cf50b0648849e7e756d46ff4332b",
+    "src/ds41/kernels/k7/check_ptx.py": "97c153ba776e8f5deb88908305e01378dbc55bd84e360a9534ebd01ad4e203ce",
+    "src/ds41/kernels/k7/check_structure.py": "095f786ca982daee4676572ffd78459608bb14837510b0af700c500c6cdb7018",
+    "src/ds41/kernels/k7/register_prefetch.hpp": "9aac4e311cec750a9a260f50ebe704e6766ff65a869a36e896efff8ec252e452",
+    "src/ds41/kernels/k7_hc.cu": "d486d27ca32b4e955d9949a36432d2457c45e8ba1a36e7bb120ee6704d5ae578"
+  },
+  "task": "K7",
+  "unchanged_fixed_sha256": {
+    "CMakeLists.txt": "4654279605326ed78e1332820ecfef89b48a47f8da9e040c6594bf45804f904b",
+    "ds41/proto/ref/model.py": "4e9ae23620edc8028ccc5d5fef552ab7fdc7dcd6f79608754fe9f67644056f65",
+    "ds41/tasks/K7.md": "f2f02105e4aa52d93bfdffa10814030490e89aa7cac876a55743164e453e7712",
+    "ds41/tasks/PRIORITIES.md": "20c321a486d21ff5ce673be36d95fffd129eae12c6901f88383915caad80bb49",
+    "ds41/tasks/README.md": "718e7424252ba006a7df816ee6727ae7deba49d21ab7828ab940a66a0e3a92f9",
+    "include/strata/ds41/config.hpp": "2a88a462c09a325ca084f51ab5c7a055735272540e8503fd18a61c9a06393ff6",
+    "include/strata/ds41/kernels/k7_hc.hpp": "7848e8f694a90777b839fa89ae545867b704dd3b84f35695b73e9c502b8d41e8",
+    "src/ds41/ops.cu": "4e475f3b8b8a3bccc19cbba8b6de0d115c8ff3b886943f8d22a666f0d916c6b0",
+    "src/ds41/tests/bench_util.hpp": "7bb742453730baa88ae5c77e3eb35cae2c254edb85d1b0a8af1091bb81941159",
+    "src/ds41/tests/k7_hc_test.cu": "cba67527dec9fc1976085c0ed4b632c3d01798605724a525e04f135ecd76b77d"
+  },
+  "validation_date_utc": "2026-10-06"
+}

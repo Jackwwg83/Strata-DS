@@ -1,9 +1,11 @@
-// src/ds41/kernels/k7_hc.cu - exact-order mixes with scalar register prefetch.
+// K7-11: keep 192 exact-order producer CTAs; asynchronously stage FP32 weights.
 #include "strata/ds41/kernels/k7_hc.hpp"
 
 #include "strata/ds41/config.hpp"
 #include "k7/register_prefetch.hpp"
+#include "k7/async_weights.hpp"
 
+#include <cstdint>
 #include <cstdio>
 #include <cstdlib>
 #include <mutex>
@@ -123,6 +125,90 @@ __global__ void hc_partials(const __nv_bfloat16* __restrict__ x,
     }
 }
 
+// One warp cooperatively issues four 16-byte copies per lane for a 16-step
+// tile. Every transaction stays within one original 32-column reference warp.
+// A full warp reads one 128-byte contiguous stripe at each exact FMA step.
+struct WeightPipeline {
+    float (*cached)[k7_detail::kWeightTileValues];
+    const float* weights;
+    int warp;
+    __device__ __forceinline__ void issue(int buffer, int tile) const {
+#pragma unroll
+        for (int copy = 0; copy < k7_detail::kWeightTileValues / 128; ++copy) {
+            const int local = k7_detail::copy_offset(threadIdx.x, copy);
+            const int column = k7_detail::weight_column(warp, tile, local);
+            const unsigned destination = static_cast<unsigned>(
+                __cvta_generic_to_shared(&cached[buffer][local]));
+            asm volatile("cp.async.cg.shared.global [%0], [%1], 16;" ::
+                         "r"(destination), "l"(weights + column) : "memory");
+        }
+        asm volatile("cp.async.commit_group;" ::: "memory");
+    }
+    __device__ __forceinline__ void wait_one() const {
+        asm volatile("cp.async.wait_group 1;" ::: "memory");
+    }
+    __device__ __forceinline__ void wait_all() const {
+        asm volatile("cp.async.wait_group 0;" ::: "memory");
+    }
+    __device__ __forceinline__ void barrier() const { __syncwarp(kWarpMask); }
+};
+
+template <int Tokens>
+struct LoadCachedWeight {
+    const __nv_bfloat16* x;
+    const float* cached;
+    int original_lane, first_step;
+    __device__ __forceinline__ k7_detail::Stage<Tokens> operator()(int step) const {
+        const int column = original_lane + (first_step + step) * kDotThreads;
+        k7_detail::Stage<Tokens> stage;
+        stage.weight = cached[step * 32 + (original_lane & 31)];
+#pragma unroll
+        for (int token = 0; token < Tokens; ++token)
+            stage.values[token] = __bfloat162float(x[token * kStreamSize + column]);
+        return stage;
+    }
+};
+
+template <int Tokens>
+struct ConsumeWeightTile {
+    const __nv_bfloat16* x;
+    const float (*cached)[k7_detail::kWeightTileValues];
+    int original_lane, row;
+    float (&dots)[Tokens];
+    float (&squares)[Tokens];
+    __device__ __forceinline__ void operator()(int buffer, int tile) const {
+        // Accumulators survive all five tiles. Each tile starts at a multiple
+        // of four, so the original step-mod-four norm ownership is unchanged.
+        k7_detail::register_prefetch<Tokens, k7_detail::kWeightTileSteps>(
+            LoadCachedWeight<Tokens>{x, cached[buffer], original_lane,
+                                     tile * k7_detail::kWeightTileSteps},
+            Fma{}, row, dots, squares);
+    }
+};
+
+template <int Tokens>
+__global__ void hc_async_partials(const __nv_bfloat16* __restrict__ x,
+                                  const float* __restrict__ fn, Workspace* workspace) {
+    __shared__ __align__(16) float cached[k7_detail::kWeightBuffers][k7_detail::kWeightTileValues];
+    const int lane = threadIdx.x;
+    const int warp = blockIdx.x;
+    const int row = blockIdx.y;
+    float dots[Tokens] = {};
+    float squares[Tokens] = {};
+    k7_detail::async_weight_tiles(
+        WeightPipeline{cached, fn + row * kStreamSize, warp},
+        ConsumeWeightTile<Tokens>{x, cached, warp * 32 + lane, row, dots, squares});
+#pragma unroll
+    for (int token = 0; token < Tokens; ++token) {
+        const float dot = warp_sum(dots[token]);
+        if (lane == 0) workspace->dots[token][row][warp] = dot;
+        if (row < kHc) {
+            const float square = warp_sum(squares[token]);
+            if (lane == 0) workspace->squares[token][row * kDotWarps + warp] = square;
+        }
+    }
+}
+
 // All 32 lanes execute each shuffle. Lanes 0..15 own the 4x4 matrix;
 // lanes 16..31 duplicate it to keep the warp converged. Sum four entries in
 // reference order, rather than changing the parenthesization to a tree sum.
@@ -229,9 +315,16 @@ void hc_mixes_pre(const __nv_bfloat16* x, int m, const float* fn, const float* s
     }
     Workspace* workspace = workspace_for_device();
     const dim3 partial_grid(kDotWarps, kHcMix);
+    // Header requires only float alignment. 16-byte copies are selected only
+    // for aligned fn; all row, warp, tile and copy offsets preserve alignment.
+    // x remains scalar BF16 and needs no stronger alignment than the interface.
+    const bool aligned = reinterpret_cast<std::uintptr_t>(fn) % 16 == 0;
 #define K7_LAUNCH(TOKENS) \
     case TOKENS: \
-        hc_partials<TOKENS><<<partial_grid, kProducerThreads, 0, stream>>>(x, fn, workspace); \
+        if (aligned) \
+            hc_async_partials<TOKENS><<<partial_grid, kProducerThreads, 0, stream>>>(x, fn, workspace); \
+        else \
+            hc_partials<TOKENS><<<partial_grid, kProducerThreads, 0, stream>>>(x, fn, workspace); \
         break
     switch (m) {
         K7_LAUNCH(1);

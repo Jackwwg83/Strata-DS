@@ -1,5 +1,6 @@
 // CPU arithmetic model only. CUDA kernel execution/libm remain untested.
 #include "register_prefetch.hpp"
+#include "async_weights.hpp"
 #include <algorithm>
 #include <cassert>
 #include <array>
@@ -79,7 +80,7 @@ struct CpuFma {
     float operator()(float a, float b, float c) const { return std::fma(a, b, c); }
 };
 template <int Tokens>
-Raw candidate(const float* x, const float* weights) {
+Raw scalar_candidate(const float* x, const float* weights) {
     Raw result;
     for (int row = 0; row < Rows; ++row)
         for (int warp = 0; warp < 8; ++warp) {
@@ -99,6 +100,118 @@ Raw candidate(const float* x, const float* weights) {
             for (int token = 0; token < Tokens; ++token) {
                 result.dots[token][row][warp] = warp_sum(dots[token]);
                 if (row < 4) result.squares[token][row * 8 + warp] = warp_sum(squares[token]);
+            }
+        }
+    return result;
+}
+Raw scalar_dispatch(int m, const float* x, const float* weights) {
+    switch (m) {
+#define CASE(M) case M: return scalar_candidate<M>(x, weights)
+        CASE(1); CASE(2); CASE(3); CASE(4); CASE(5); CASE(6); CASE(7); CASE(8);
+#undef CASE
+    }
+    std::abort();
+}
+
+// Execute the same tile schedule and register-prefetch body as CUDA. The CPU
+// pipeline delays copies until wait, then publishes them only at the barrier.
+// This models ordering; GPU copy/barrier execution still needs sanitizer tests.
+using namespace strata::ds41::kernels::k7_detail;
+struct CpuPipelineState {
+    float cached[2][kWeightTileValues] = {};
+    const float* weights;
+    int warp;
+    int pending[2], count = 0;
+    int tile[2] = {-1, -1};
+    bool complete[2] = {}, published[2] = {}, consumed[2] = {}, reusable[2] = {true, true};
+    int load_visits[N] = {};
+};
+struct CpuPipeline {
+    CpuPipelineState* s;
+    void issue(int buffer, int tile) const {
+        assert(tile >= 0 && tile < kWeightTiles && buffer == (tile & 1));
+        assert(s->count < 2 && s->reusable[buffer]);
+        s->tile[buffer] = tile;
+        s->reusable[buffer] = s->complete[buffer] = s->published[buffer] = s->consumed[buffer] = false;
+        s->pending[s->count++] = buffer;
+    }
+    void wait(int keep) const {
+        while (s->count > keep) {
+            const int buffer = s->pending[0];
+            for (int i = 1; i < s->count; ++i) s->pending[i-1] = s->pending[i];
+            --s->count;
+            for (int lane = 0; lane < 32; ++lane)
+                for (int copy = 0; copy < 4; ++copy) {
+                    const int local = copy_offset(lane, copy);
+                    const int col = weight_column(s->warp, s->tile[buffer], local);
+                    assert(local % 4 == 0 && col % 4 == 0);
+                    for (int v = 0; v < 4; ++v) {
+                        assert(local + v < kWeightTileValues && col + v < N);
+                        ++s->load_visits[col + v];
+                        s->cached[buffer][local + v] = s->weights[col + v];
+                    }
+                }
+            s->complete[buffer] = true;
+        }
+    }
+    void wait_one() const { wait(1); }
+    void wait_all() const { wait(0); }
+    void barrier() const {
+        for (int b = 0; b < 2; ++b) {
+            if (s->complete[b]) s->published[b] = true;
+            if (s->consumed[b]) s->reusable[b] = true;
+        }
+    }
+};
+template <int Tokens>
+struct CpuCachedLoad {
+    const float* x;
+    const float* cached;
+    int original_lane, first_step;
+    int* visits;
+    Stage<Tokens> operator()(int step) const {
+        assert(step >= 0 && step < kWeightTileSteps);
+        ++visits[first_step + step];
+        const int column = original_lane + (first_step + step) * DotThreads;
+        assert(column >= 0 && column < N);
+        Stage<Tokens> stage;
+        stage.weight = cached[step * 32 + (original_lane & 31)];
+        for (int token = 0; token < Tokens; ++token) stage.values[token] = x[token * N + column];
+        return stage;
+    }
+};
+template <int Tokens>
+Raw candidate(const float* x, const float* weights) {
+    Raw result;
+    for (int row = 0; row < Rows; ++row)
+        for (int warp = 0; warp < 8; ++warp) {
+            CpuPipelineState state;
+            state.weights = weights + row * N;
+            state.warp = warp;
+            float dots[32][Tokens] = {}, squares[32][Tokens] = {};
+            int visits[32][80] = {};
+            async_weight_tiles(CpuPipeline{&state}, [&](int buffer, int tile) {
+                assert(state.published[buffer] && state.tile[buffer] == tile);
+                for (int lane = 0; lane < 32; ++lane)
+                    register_prefetch<Tokens, kWeightTileSteps>(
+                        CpuCachedLoad<Tokens>{x, state.cached[buffer], warp * 32 + lane,
+                                               tile * kWeightTileSteps, visits[lane]},
+                        CpuFma{}, row, dots[lane], squares[lane]);
+                state.consumed[buffer] = true;
+            });
+            assert(state.count == 0);
+            for (int column = 0; column < N; ++column)
+                assert(state.load_visits[column] == int((column % 256) / 32 == warp));
+            for (int lane = 0; lane < 32; ++lane)
+                for (int n : visits[lane]) assert(n == 1);
+            for (int token = 0; token < Tokens; ++token) {
+                std::array<float, 32> d, s;
+                for (int lane = 0; lane < 32; ++lane) {
+                    d[lane] = dots[lane][token];
+                    s[lane] = squares[lane][token];
+                }
+                result.dots[token][row][warp] = warp_sum(d);
+                if (row < 4) result.squares[token][row * 8 + warp] = warp_sum(s);
             }
         }
     return result;
@@ -207,7 +320,7 @@ Coeff warp_finish(const Coeff& mix, float reciprocal_rms, const std::vector<floa
 int main() {
     const auto base = randoms(Rows, 0.5f, 2);
     int tokens = 0, cases = 0;
-    for (int scenario = 0; scenario < 12; ++scenario) {
+    for (int scenario = 0; scenario < 14; ++scenario) {
         auto weights = randoms(Rows * N, 1 / std::sqrt(float(N)), 1103 + scenario * 31);
         for (int m = 1; m <= 8; ++m) {
             auto x = randoms(m * N, 2.f, 2027 + m + scenario * 97, true);
@@ -262,7 +375,20 @@ int main() {
                     weights[row * N + lane + (step + 2) * 256] = 1.f;
                 }
             }
+            if (scenario >= 12) {
+                std::fill(x.begin(), x.end(), 1.f);
+                std::fill(weights.begin(), weights.end(), 0.f);
+                for (int row = 0; row < Rows; ++row) {
+                    const int lane = row * 11 % 256;
+                    const int step = scenario == 13 ? 77 : 14 + 16 * (row % 4);
+                    weights[row * N + lane + step * 256] = float(1u << 25);
+                    weights[row * N + lane + (step + 1) * 256] = -float(1u << 25);
+                    weights[row * N + lane + (step + 2) * 256] = 1.f;
+                }
+            }
             const Raw raw = dispatch(m, x.data(), weights.data());
+            const Raw fallback = scalar_dispatch(m, x.data(), weights.data());
+            assert(std::memcmp(&raw, &fallback, sizeof(raw)) == 0);
             for (int token = 0; token < m; ++token) {
                 const float* xt = x.data() + token * N;
                 Coeff reference, candidate;
@@ -291,7 +417,7 @@ int main() {
                     const float new_pre = 1.f / (1.f + std::exp(-candidate[0])) + 1e-6f;
                     if (bits(ref_pre) != bits(new_pre) || std::fabs(ref_pre - 0.7310596f) > 1e-7f) return 5;
                 }
-                if (scenario == 11)
+                if (scenario >= 11)
                     for (float dot : candidate) if (dot != 1.f) return 6;
                 ++tokens;
             }
@@ -299,8 +425,8 @@ int main() {
         }
     }
     std::printf("PASS %d CPU batched cases, %d token cases, all m=1..8: exact raw dot/norm and coefficient equality\n", cases, tokens);
-    std::puts("PASS actual shared pipeline body: all 80 steps loaded exactly once; bounds checked");
-    std::puts("PASS original cancellation: reference=1, K7-06=1, rejected contiguous tiles=0");
-    std::puts("PASS wide dynamic range, subnormal values, sparse, zero, sign and pair-boundary cases");
+    std::puts("PASS actual shared pipeline body: all 80 steps loaded exactly once; async/fallback raw equality; bounds checked");
+    std::puts("PASS original cancellation: reference=1, K7-11=1, rejected contiguous tiles=0");
+    std::puts("PASS wide dynamic range, subnormal values, sparse, zero, sign, tile-boundary, final-drain and pair-boundary cases");
     std::puts("CPU arithmetic only. CUDA parity, graph replay, sanitizer and timing remain untested.");
 }

@@ -6,14 +6,13 @@ import subprocess
 root = Path(__file__).resolve().parents[4]
 source = (root / 'src/ds41/kernels/k7_hc.cu').read_text()
 control = subprocess.check_output(['git', 'show',
-    '5dc13d8d983c3abad1f9853b2dfa6731adc77dde:src/ds41/kernels/k7_hc.cu'],
+    'be8c969a1f1b7bf88d8a64ef1b3e935dcc2f376a:src/ds41/kernels/k7_hc.cu'],
     cwd=root, text=True)
-suffix = '// All 32 lanes execute each shuffle.'
-assert source[source.index(suffix):] == control[control.index(suffix):]
-start, stop = 'struct Workspace {', '// Each warp-only CTA owns'
-assert source[source.index(start):source.index('// One row and original warp')] == \
-       control[control.index(start):control.index(stop)]
-assert source.count('<<<') == 2
+def section(text, first, last):
+    return text[text.index(first):text.index(last)]
+assert section(source, 'struct Workspace {', '// All 32 lanes') .split('// One warp cooperatively')[0] == section(control, 'struct Workspace {', '// All 32 lanes')
+assert section(source, '// All 32 lanes', '}  // namespace\n') == section(control, '// All 32 lanes', '}  // namespace\n')
+assert source.count('<<<') == 3  # two mutually exclusive producers, one finish
 assert source.count('cudaMalloc(') == 1
 for forbidden in ('cudaMemcpy', 'cudaStreamSynchronize', 'cudaDeviceSynchronize',
                   'cudaFree', 'cudaMemset', 'cudaMallocAsync', 'cudaMallocFromPoolAsync',
@@ -21,7 +20,41 @@ for forbidden in ('cudaMemcpy', 'cudaStreamSynchronize', 'cudaDeviceSynchronize'
     assert forbidden not in source, forbidden
 assert 'sizeof(Workspace) == 7168' in source
 assert 'if (entry.device == device) return entry.workspace;' in source
-print('PASS unchanged repaired-control workspace, finish math, collapse and host launch path')
+assert 'reinterpret_cast<std::uintptr_t>(fn) % 16 == 0' in source
+assert source.count(', 0, stream>>>') == 3
+assert 'cp.async.cg.shared.global [%0], [%1], 16;' in source
+changed = subprocess.check_output(['git', 'diff', '--name-only', 'be8c969a'], cwd=root, text=True).splitlines()
+changed += subprocess.check_output(['git', 'ls-files', '--others', '--exclude-standard'], cwd=root, text=True).splitlines()
+for path in changed:
+    assert path == 'src/ds41/kernels/k7_hc.cu' or path.startswith('src/ds41/kernels/k7/'), path
+print('PASS byte-identical control scalar fallback, workspace lifecycle, finalization, Sinkhorn and collapse')
+print('PASS two stream-ordered runtime launches; aligned-weight selection; no hot-call host synchronization')
+
+# Cooperative four-float copies cover every original warp column exactly once.
+# Check addresses as offsets, including only-float-aligned fallback views.
+for base in (0, 4, 8, 12, 16, 20, 32):
+    async_path = base % 16 == 0
+    assert async_path == (base in (0, 16, 32))
+    if not async_path: continue
+    weights = set()
+    for row in range(24):
+        for warp in range(8):
+            for tile in range(5):
+                shared = set()
+                for lane in range(32):
+                    for copy in range(4):
+                        local = lane * 4 + copy * 128
+                        col = warp * 32 + (tile * 16 + local // 32) * 256 + local % 32
+                        assert (base + 4 * (row * 20480 + col)) % 16 == 0
+                        assert local % 4 == 0 and col + 3 < 20480
+                        for v in range(4):
+                            assert local + v not in shared
+                            shared.add(local + v)
+                            assert (row, col + v) not in weights
+                            weights.add((row, col + v))
+                assert shared == set(range(512))
+    assert len(weights) == 24 * 20480
+print('PASS cooperative 16-byte alignment, exact single ownership, 4 KiB shared bounds and final-tile bounds')
 
 # Explicitly model the current/future pairs including the separate drain.
 current = [0, 1]
