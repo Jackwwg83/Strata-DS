@@ -3,24 +3,31 @@
 Read this file from `origin/feature/ds41` at the start of every work cycle. Only the reviewer edits it. Talk in the
 coordination issue (see "How we talk" below), not here.
 
-Last update: 2026-10-06 (UTC+8). Focus: prefill (M3): K15 first, then K13, K14, K2.
+Last update: 2026-10-06 evening (UTC+8). Focus: DECODE speed. Prefill tasks continue after these.
+
+## Why decode now
+
+Measured on the RTX 4090 box (EPYC 7742, SAGE 1.59bpw pack, every expert in VRAM or RAM, nsys, one decode step):
+the GPU waits 32 ms for the CPU experts, computes 17.4 ms, idles 5.4 ms. The reviewer and Codex work on the CPU
+experts, CUDA graphs and wo_a (now FP8). The GPU compute is yours: the dense FP8 GEMVs are the largest part, and the
+small ones (shared expert 5120 x 2304, wq_a, wkv) run at about half the bandwidth of the large ones.
 
 ## Queue status
 
-The RTX 4090 box is stopped. The queue moves to the dev box: RTX 3060 12 GB (sm_86) + EPYC 7452, CUDA 12.8.
-"QUEUE UP" in issue #8 says when it runs. Controls below marked (3060) are measured there. Decode tasks (K1c, K3, K5,
-K7, K8, K10, K11) are paused: their controls are 4090 numbers, and the 3060 box has no model pack.
+The queue runs on the dev box: RTX 3060 12 GB (sm_86) + EPYC 7452, CUDA 12.8. "QUEUE UP" in issue #8 says when it
+runs. Controls below are measured there on 2026-10-06 (merged code, origin/feature/ds41 2b6e621).
 
 ## Priorities (do them in this order)
 
-| # | Task | Why | Control (merged) |
+| # | Task | Why | Control (merged, 3060) |
 | --- | --- | --- | --- |
-| 0 | K15 hc mixes, prefill sub-batch | new; 23% of a 32K prompt's GPU time on the 4090 (6.5 of 27.9 s): K7 called 8 tokens at a time | baseline (K7 loop), 13,294 us (3060) |
-| 1 | K13 sparse attention, prefill chunk | new; baseline is K3 in a loop, 4.9 s per 4096-token chunk (40 layers) | K13-02, 29,171 us (3060); baseline 120,956 |
-| 2 | K14 indexer, prefill chunk | new; baseline is K5 in a loop, 1.5 s per chunk (8 layers), more at long contexts | K14-02, 24,070 us (3060); K14-01 38,727; baseline 192,123 |
-| 3 | K2 prefill GEMM | merged K2-06 (best of all 13 on the 3060); re-ranked on the 4090 / 5060 Ti later | K2-06, 22,940 us (3060); K2-10 24,200; K2-05 24,530 |
-| - | K12 prefill experts (EXL3) | assigned to Codex (vendoring exllamav3); not open for variants yet | placeholder |
-| - | K1c, K3, K5, K7, K8, K10, K11 | paused (decode; no 4090 box) | see git history of this file |
+| 0 | K1c decode FP8 GEMV | about 5 ms of the 17.4 ms GPU time per token on the 4090; small N at half bandwidth (shared_w1_w3 241 GB/s, peak about 360) | K1b, score 29,170 us (m1 20,776, m8 67,194) |
+| 1 | K7 hc mixes, decode | hc_partials + hc_finish about 1.2 ms per token on the 4090, 5x the bytes-read bound | merged K7, score 18.43 us (m1 15.36, m8 24.58) |
+| 2 | K15 hc mixes, prefill sub-batch | 23% of a 32K prompt's GPU time on the 4090 | baseline (K7 loop), 13,294 us |
+| 3 | K13 sparse attention, prefill chunk | | K13-02, 29,171 us |
+| 4 | K14 indexer, prefill chunk | | K14-02, 24,070 us |
+| 5 | K2 prefill GEMM | | K2-06, 22,940 us |
+| - | K3, K5, K8, K10, K11, K12 | owned by the reviewer / Codex now (graph capture, mixed-K experts, CPU experts); not open | |
 
 ## Merge rules
 
