@@ -2,6 +2,7 @@
 concatenated in a fixed order and tokenized with the model's tokenizer. Same files, same ids on every machine.
 
 Usage: python make_long_ids.py --model /workspace/model --repo /workspace/Strata-DS --tokens 33000 --out long.ids
+Past the end of the file list the text starts again, so any length works (for speed runs).
 Writes comma-separated ids (BOS first), as ds41_generate --ids / --force-ids read them.
 """
 import argparse
@@ -27,18 +28,22 @@ def main():
             if f not in files:
                 files.append(f)
     ids = [tok.bos_token_id] if tok.bos_token_id is not None else []
-    for f in files:
-        with open(f, encoding="utf-8", errors="replace") as fh:
-            text = f"\n\n# file: {os.path.relpath(f, a.repo)}\n\n" + fh.read()
-        ids += tok.encode(text, add_special_tokens=False)
-        if len(ids) >= a.tokens:
-            break
-    if len(ids) < a.tokens:
-        raise SystemExit(f"only {len(ids)} tokens from {len(files)} files")
+    if not files:
+        raise SystemExit("no files")
+    # past the end of the file list the text starts again (a long-context speed run only needs the length)
+    rounds = 0
+    while len(ids) < a.tokens:
+        for f in files:
+            with open(f, encoding="utf-8", errors="replace") as fh:
+                text = f"\n\n# file: {os.path.relpath(f, a.repo)}\n\n" + fh.read()
+            ids += tok.encode(text, add_special_tokens=False)
+            if len(ids) >= a.tokens:
+                break
+        rounds += 1
     ids = ids[: a.tokens]
     with open(a.out, "w") as fh:
         fh.write(",".join(map(str, ids)))
-    print(f"{len(ids)} tokens from {len(files)} files -> {a.out}")
+    print(f"{len(ids)} tokens from {len(files)} files ({rounds} pass(es) over them) -> {a.out}")
 
 
 if __name__ == "__main__":
