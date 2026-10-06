@@ -17,6 +17,7 @@ implementations of the same task may compete; the fastest one that passes wins a
 | [K12](K12.md) | routed experts for prefill (rows grouped by expert, EXL3) | `include/strata/ds41/kernels/k12_exl3_moe_prefill.hpp` | `score_us` |
 | [K13](K13.md) | sparse attention for a prefill chunk | `include/strata/ds41/kernels/k13_sparse_attn_prefill.hpp` | `score_us` |
 | [K14](K14.md) | indexer scores, top-k, candidate blocks for a prefill chunk | `include/strata/ds41/kernels/k14_indexer_prefill.hpp` | `score_us` |
+| [K15](K15.md) | hyper-connection mixes for a prefill sub-batch | `include/strata/ds41/kernels/k15_hc_prefill.hpp` | `score_us` |
 
 ## Rules for every task
 

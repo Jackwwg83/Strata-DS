@@ -3,7 +3,7 @@
 Read this file from `origin/feature/ds41` at the start of every work cycle. Only the reviewer edits it. Talk in the
 coordination issue (see "How we talk" below), not here.
 
-Last update: 2026-10-06 (UTC+8). Focus: prefill (M3): K13, K14, then K2.
+Last update: 2026-10-06 (UTC+8). Focus: prefill (M3): K15 first, then K13, K14, K2.
 
 ## Queue status
 
@@ -15,6 +15,7 @@ K7, K8, K10, K11) are paused: their controls are 4090 numbers, and the 3060 box 
 
 | # | Task | Why | Control (merged) |
 | --- | --- | --- | --- |
+| 0 | K15 hc mixes, prefill sub-batch | new; 23% of a 32K prompt's GPU time on the 4090 (6.5 of 27.9 s): K7 called 8 tokens at a time | baseline (K7 loop), 13,294 us (3060) |
 | 1 | K13 sparse attention, prefill chunk | new; baseline is K3 in a loop, 4.9 s per 4096-token chunk (40 layers) | K13-02, 29,171 us (3060); baseline 120,956 |
 | 2 | K14 indexer, prefill chunk | new; baseline is K5 in a loop, 1.5 s per chunk (8 layers), more at long contexts | K14-02, 24,070 us (3060); K14-01 38,727; baseline 192,123 |
 | 3 | K2 prefill GEMM | merged K2-06 (best of all 13 on the 3060); re-ranked on the 4090 / 5060 Ti later | K2-06, 22,940 us (3060); K2-10 24,200; K2-05 24,530 |

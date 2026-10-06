@@ -18,6 +18,7 @@
 #include "strata/ds41/kernels/k12_exl3_moe_prefill.hpp"
 #include "strata/ds41/kernels/k13_sparse_attn_prefill.hpp"
 #include "strata/ds41/kernels/k14_indexer_prefill.hpp"
+#include "strata/ds41/kernels/k15_hc_prefill.hpp"
 #include "strata/ds41/kernels/k2_fp8_gemm.hpp"
 #include "strata/ds41/kernels/k3_sparse_attn.hpp"
 #include "strata/ds41/kernels/k5_indexer.hpp"
@@ -720,8 +721,8 @@ struct Engine::Impl {
         int32_t* idx;
         uint8_t* eng_dev;
         kernels::Exl3Expert* desc;
-        void *k2_ws, *k12_ws, *k14_ws;
-        size_t k12_bytes = 0, k14_bytes = 0;
+        void *k2_ws, *k12_ws, *k14_ws, *k15_ws;
+        size_t k12_bytes = 0, k14_bytes = 0, k15_bytes = 0;
     } pf;
     /// Pinned host buffers of prefill, kept between calls (sized for the largest chunk so far)
     struct PrefillHost {
@@ -814,6 +815,8 @@ struct Engine::Impl {
         p.k12_ws = carve<uint8_t>(base, u, p.k12_bytes);
         p.k14_bytes = kernels::indexer_topk_prefill_workspace_bytes(sub, max_seq);
         p.k14_ws = carve<uint8_t>(base, u, p.k14_bytes);
+        p.k15_bytes = kernels::hc_mixes_pre_rows_workspace_bytes(sub);
+        p.k15_ws = carve<uint8_t>(base, u, std::max<size_t>(p.k15_bytes, 1));
         return (u + 255) & ~(size_t) 255;
     }
 
@@ -944,12 +947,10 @@ struct Engine::Impl {
         kernels::fp8_block_gemm(x, T, w.k, w.w, w.s, w.n, y, pf.k2_ws, 0);
     }
 
-    /// K7 for T rows, 8 per call
+    /// K7's hyper-connection mixes for T rows (task K15)
     void hc_rows(const bf16* x, int T, const float* fn, const float* scale, const float* base, const float* pre_in,
                  bf16* y, float* pre, float* post, float* comb) {
-        for (int t = 0; t < T; t += 8)
-            kernels::hc_mixes_pre(x + (size_t) t * kHc * kDim, std::min(8, T - t), fn, scale, base, pre_in + t * kHc,
-                                  y + (size_t) t * kDim, pre + t * kHc, post + t * kHc, comb + t * kHc * kHc, 0);
+        kernels::hc_mixes_pre_rows(x, T, fn, scale, base, pre_in, y, pre, post, comb, pf.k15_ws, pf.k15_bytes, 0);
     }
 
     /// The compressed entries of kv source l completed in this chunk (decode: attention(), compressor part), their
