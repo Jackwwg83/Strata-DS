@@ -12,9 +12,12 @@
 //   - the consumer waits on the host only until job j's copy is issued, and makes its stream wait for the copy on
 //     the GPU (wait); release records that its stream is done with the slot.
 //
-// File cache: an expert whose pages were all cached before the read stays cached. An expert read (at least in part)
-// from the SSD is dropped from the cache after the copy (posix_fadvise DONTNEED): one prefill streams the whole
-// 190 GB file, and keeping it would push out the experts that decode reads from the cache.
+// File cache: an expert whose pages were all cached before the read stays cached, and so does every expert of the
+// `keep` set (the hottest experts the file cache can hold: they are cached once and then read from RAM by every
+// later prompt and by decode). Any other expert read (at least in part) from the SSD is dropped from the cache after
+// the copy (posix_fadvise DONTNEED): one prefill streams the whole 190 GB file, more than the RAM holds, and keeping
+// it would push out the hot set. Upstream's resident budget plays the same role with a RAM copy; here the file cache
+// is the copy.
 #pragma once
 
 #include "strata/ds41/pack.hpp"
@@ -38,8 +41,9 @@ class ExpertStream {
 public:
     /// ring: `slots` device slots of `slot_bytes` each. host: the RAM tier or null. readers: reader threads.
     /// host_buffers: pinned staging buffers of slot_bytes each (how far the reads can run ahead of the copies).
+    /// keep: [layers][experts] 1 = stays in the file cache after an SSD read; empty: none.
     ExpertStream(const Pack& pack, const HostExperts* host, uint8_t* ring, int slots, size_t slot_bytes, int readers,
-                 int host_buffers);
+                 int host_buffers, std::vector<uint8_t> keep = {});
     ~ExpertStream();
     ExpertStream(const ExpertStream&) = delete;
     ExpertStream& operator=(const ExpertStream&) = delete;
@@ -69,6 +73,7 @@ private:
 
     const Pack& pack_;
     const HostExperts* host_;
+    std::vector<uint8_t> keep_;
     uint8_t* ring_;
     int slots_, n_host_;
     size_t slot_bytes_;

@@ -862,9 +862,34 @@ struct Engine::Impl {
             eng_ids_pf.assign(n_eng, std::vector<int64_t>((size_t) cap * kEngRows, 0));
         }
         estream = std::make_unique<ExpertStream>(pack, host.get(), pf.ring, pf.ring_slots, pf.slot_bytes,
-                                                 std::max(1, opt.prefill_threads), std::max(1, opt.prefill_host_buffers));
+                                                 std::max(1, opt.prefill_threads), std::max(1, opt.prefill_host_buffers),
+                                                 file_cache_keep());
     }
 
+
+    /// The experts prefill leaves in the file cache: the hottest (profile order) that neither VRAM nor the RAM tier
+    /// holds, as many as the file cache can keep (the container's memory less its anonymous memory, less 8 GiB).
+    /// Every later prompt then reads them from RAM; the rest stream from the SSD and are dropped again. No profile:
+    /// none (every expert read from the SSD is dropped).
+    std::vector<uint8_t> file_cache_keep() {
+        std::vector<uint8_t> keep;
+        if (opt.expert_profile.empty()) return keep;
+        const size_t budget = auto_ram_budget(8ull << 30);
+        keep.assign((size_t) kLayers * kExperts, 0);
+        size_t used = 0;
+        int n = 0;
+        for (const auto& [l, e] : read_expert_profile(opt.expert_profile, kLayers, kExperts)) {
+            if (resident(l, e) || (host && host->slot_of(l, e) >= 0)) continue;
+            const size_t b = pack.expert(l, e).bytes;
+            if (used + b > budget) break;
+            keep[(size_t) l * kExperts + e] = 1;
+            used += b;
+            ++n;
+        }
+        std::fprintf(stderr, "ds41 prefill: the file cache keeps the %d hottest streamed experts (%.1f GiB)\n", n,
+                     used / 1073741824.0);
+        return keep;
+    }
 
     /// Returns the lent slots (or frees the scratch). After an error the stream is stopped without draining (its
     /// unreleased jobs would never complete).

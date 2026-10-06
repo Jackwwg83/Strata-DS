@@ -20,8 +20,9 @@ void ck(cudaError_t e, const char* what) {
 }  // namespace
 
 ExpertStream::ExpertStream(const Pack& pack, const HostExperts* host, uint8_t* ring, int slots, size_t slot_bytes,
-                           int readers, int host_buffers)
-    : pack_(pack), host_(host), ring_(ring), slots_(slots), n_host_(host_buffers), slot_bytes_(slot_bytes) {
+                           int readers, int host_buffers, std::vector<uint8_t> keep)
+    : pack_(pack), host_(host), keep_(std::move(keep)), ring_(ring), slots_(slots), n_host_(host_buffers),
+      slot_bytes_(slot_bytes) {
     if (slots < 1 || readers < 1 || host_buffers < 1)
         throw std::invalid_argument("ds41 expert stream: needs a slot, a reader and a host buffer");
     ck(cudaGetDevice(&device_), "cudaGetDevice");
@@ -163,7 +164,8 @@ void ExpertStream::reader() {
                     if (r <= 0) throw std::runtime_error("ds41 expert stream: short read of experts.bin");
                     got += (uint64_t) r;
                 }
-                if (!cached) posix_fadvise(fd_, (off_t) x.offset, (off_t) x.bytes, POSIX_FADV_DONTNEED);
+                const bool kept = !keep_.empty() && keep_[(size_t) job.first * pack_.n_experts() + job.second];
+                if (!cached && !kept) posix_fadvise(fd_, (off_t) x.offset, (off_t) x.bytes, POSIX_FADV_DONTNEED);
                 ++(cached ? n_cache_ : n_ssd_);
                 src = buf;
             }
