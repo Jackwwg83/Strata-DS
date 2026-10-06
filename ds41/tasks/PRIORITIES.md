@@ -16,7 +16,7 @@ K7, K8, K10, K11) are paused: their controls are 4090 numbers, and the 3060 box 
 | # | Task | Why | Control (merged) |
 | --- | --- | --- | --- |
 | 1 | K13 sparse attention, prefill chunk | new; baseline is K3 in a loop, 4.9 s per 4096-token chunk (40 layers) | K13-02, 29,171 us (3060); baseline 120,956 |
-| 2 | K14 indexer, prefill chunk | new; baseline is K5 in a loop, 1.5 s per chunk (8 layers), more at long contexts | K14-01, 38,727 us (3060); baseline 192,123 |
+| 2 | K14 indexer, prefill chunk | new; baseline is K5 in a loop, 1.5 s per chunk (8 layers), more at long contexts | K14-02, 24,070 us (3060); K14-01 38,727; baseline 192,123 |
 | 3 | K2 prefill GEMM | merged K2-06 (best of all 13 on the 3060); re-ranked on the 4090 / 5060 Ti later | K2-06, 22,940 us (3060); K2-10 24,200; K2-05 24,530 |
 | - | K12 prefill experts (EXL3) | assigned to Codex (vendoring exllamav3); not open for variants yet | placeholder |
 | - | K1c, K3, K5, K7, K8, K10, K11 | paused (decode; no 4090 box) | see git history of this file |
