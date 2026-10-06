@@ -10,6 +10,7 @@ add_library(strata_ds41_engine STATIC
   src/ds41/engram_rows.cpp
   src/ds41/host_experts.cpp
   src/ds41/lookahead.cpp
+  src/ds41/expert_stream.cpp
   src/platform/direct_file.cpp
   src/ds41/engine.cu
   third_party/exllamav3_moe/moe_mul1.cpp)
@@ -51,6 +52,10 @@ if(STRATA_BUILD_TESTS)
   target_link_libraries(vram_lend_test PRIVATE strata_ds41_engine)
   add_test(NAME vram_lend_test COMMAND vram_lend_test)
   set_tests_properties(vram_lend_test PROPERTIES SKIP_RETURN_CODE 77 TIMEOUT 300)
+  add_executable(expert_stream_test src/ds41/tests/expert_stream_test.cu)
+  target_link_libraries(expert_stream_test PRIVATE strata_ds41_engine)
+  add_test(NAME expert_stream_test COMMAND expert_stream_test)
+  set_tests_properties(expert_stream_test PROPERTIES SKIP_RETURN_CODE 77 TIMEOUT 300)
   add_executable(vram_experts_test src/ds41/tests/vram_experts_test.cu)
   target_link_libraries(vram_experts_test PRIVATE strata_ds41_engine)
   add_test(NAME vram_experts_test COMMAND vram_experts_test)
