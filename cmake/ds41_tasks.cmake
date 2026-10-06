@@ -23,3 +23,11 @@ add_executable(k1c_fp8_gemv_test src/ds41/tests/k1c_fp8_gemv_test.cu)
 target_link_libraries(k1c_fp8_gemv_test PRIVATE strata_ds41 strata_ds41_engine)
 add_test(NAME k1c_fp8_gemv_test COMMAND k1c_fp8_gemv_test)
 set_tests_properties(k1c_fp8_gemv_test PROPERTIES SKIP_RETURN_CODE 77 TIMEOUT 900)
+
+# K12: prefill experts (rows grouped by expert); the test uses K10 as its reference. cuBLAS is available to it.
+add_library(ds41_k12_exl3_moe_prefill STATIC src/ds41/kernels/k12_exl3_moe_prefill.cu)
+target_link_libraries(ds41_k12_exl3_moe_prefill PUBLIC strata_ds41_engine CUDA::cublas)
+add_executable(k12_exl3_moe_prefill_test src/ds41/tests/k12_exl3_moe_prefill_test.cu)
+target_link_libraries(k12_exl3_moe_prefill_test PRIVATE ds41_k12_exl3_moe_prefill ds41_k10_exl3_moe strata_ds41_engine)
+add_test(NAME k12_exl3_moe_prefill_test COMMAND k12_exl3_moe_prefill_test)
+set_tests_properties(k12_exl3_moe_prefill_test PROPERTIES SKIP_RETURN_CODE 77 TIMEOUT 900)
