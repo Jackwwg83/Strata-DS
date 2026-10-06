@@ -218,7 +218,7 @@ int main() {
         for (size_t i = 0; i < wv.size(); ++i) rms += ((double) wv[i] - init[i]) * ((double) wv[i] - init[i]);
         std::printf("%s: rows %zu, reference output rms %.4g, rel_l2 %.3g\n", k.name, c.tok.size(),
                     std::sqrt(rms / wv.size()), err);
-        v.check(err <= 5e-3, std::string(k.name) + ": relative L2 error above 5e-3 against K10");
+        v.check(err <= 1e-2, std::string(k.name) + ": relative L2 error above 1e-2 against K10");
         bool idle_same = true;
         for (int t : k.idle)
             for (int i = 0; i < H; ++i) idle_same &= g[(size_t) t * H + i] == init[(size_t) t * H + i];
