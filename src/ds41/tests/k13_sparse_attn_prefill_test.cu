@@ -53,9 +53,16 @@ int main() {
                                  ref.p + (size_t) t * sd::kHeads * sd::kHeadDim);
         kk::sparse_attn_prefill(q.p, kv.p, idx.p, c.m, c.n_idx, sink.p, scale, o.p, 0);
         ck(cudaDeviceSynchronize(), "run");
-        const double err = rel_l2(o.down(), ref.down());
-        std::printf("m=%d n_idx=%d p0=%d ratio=%d rel_l2=%.3g\n", c.m, c.n_idx, c.p0, c.ratio, err);
+        const auto got = o.down(), want = ref.down();
+        const double err = rel_l2(got, want);
+        double worst = 0;   // per query: one bad query must not hide in the average
+        const size_t qs = (size_t) sd::kHeads * sd::kHeadDim;
+        for (int t = 0; t < c.m; ++t)
+            worst = std::max(worst, rel_l2(std::vector<__nv_bfloat16>(got.begin() + t * qs, got.begin() + (t + 1) * qs),
+                                           std::vector<__nv_bfloat16>(want.begin() + t * qs, want.begin() + (t + 1) * qs)));
+        std::printf("m=%d n_idx=%d p0=%d ratio=%d rel_l2=%.3g worst query %.3g\n", c.m, c.n_idx, c.p0, c.ratio, err, worst);
         v.check(err <= 3e-3, "relative L2 error above 3e-3");
+        v.check(worst <= 3e-3, "a query's relative L2 error above 3e-3");
         if (c.m == 37)
             graph_check(v, "sparse_attn_prefill m=37",
                         [&](cudaStream_t s) { kk::sparse_attn_prefill(q.p, kv.p, idx.p, c.m, c.n_idx, sink.p, scale, o.p, s); },

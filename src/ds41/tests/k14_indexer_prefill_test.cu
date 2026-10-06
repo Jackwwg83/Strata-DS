@@ -88,6 +88,7 @@ int main() {
         const auto gc = cand_out.down();
         Dev<float> rs(std::max<int64_t>(t_max, 1));
         int64_t overlap = 0, wanted = 0, cand_bad = 0, cand_n = 0;
+        double worst_q = 1.0;
         bool shape_ok = true;
         for (int i = 0; i < c.m; ++i) {
             const int64_t t = (int64_t) (c.pos0 + i + 1) / c.ratio;
@@ -105,8 +106,11 @@ int main() {
                     if (!ch[(size_t) i * stride + j]) s[j] = -INFINITY;
             const auto want = ref_topk(s, ki, OFF);
             std::set<int32_t> ws_(want.begin(), want.end());
-            for (int j = 0; j < ki; ++j) overlap += ws_.count(row[j]);
+            int64_t ov = 0;
+            for (int j = 0; j < ki; ++j) ov += ws_.count(row[j]);
+            overlap += ov;
             wanted += ki;
+            worst_q = std::min(worst_q, (double) ov / ki);   // one bad query must not hide in the average
             if (c.cand_out) {
                 const auto rc = ref_cand(s, c.topk_blocks, sd::kCandidateBlock);
                 for (int64_t j = 0; j < t; ++j) cand_bad += gc[(size_t) i * stride + j] != rc[j];
@@ -114,9 +118,10 @@ int main() {
                 cand_n += t;
             }
         }
-        std::printf("m=%d pos0=%d ratio=%d cand_in=%d cand_out=%d: overlap %lld/%lld, candidate mismatches %lld/%lld\n",
-                    c.m, c.pos0, c.ratio, c.cand_in, c.cand_out, (long long) overlap, (long long) wanted,
-                    (long long) cand_bad, (long long) cand_n);
+        std::printf("m=%d pos0=%d ratio=%d cand_in=%d cand_out=%d: overlap %lld/%lld (worst query %.4f), candidate "
+                    "mismatches %lld/%lld\n", c.m, c.pos0, c.ratio, c.cand_in, c.cand_out, (long long) overlap,
+                    (long long) wanted, worst_q, (long long) cand_bad, (long long) cand_n);
+        v.check(worst_q >= 0.98, "a query's top-k overlap below 98%");
         v.check(shape_ok, "rows not ascending, not -1 padded, or the candidate mask written past t_i");
         v.check(overlap * 1000 >= wanted * 995, "top-k overlap below 99.5%");
         v.check(cand_bad * 1000 <= cand_n, "more than 0.1% of candidate mask entries differ");
