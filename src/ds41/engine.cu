@@ -204,6 +204,13 @@ struct Engine::Impl {
     std::map<uint64_t, cudaGraphExec_t> graphs;
     int graph_captures = 0;
 
+    struct VerifyWorkspace;
+    std::shared_ptr<VerifyWorkspace> verify_ws;
+    bool verify_pending = false, verify_failed = false;
+    void enqueue_verify(int m);
+    VerifyResult verify(const std::vector<int>& window, int pos, bool logits, Timing& tm);
+    void commit_verify(int n_keep);
+
     // shared attention state for the current token (SharedAttentionRuntime)
     const bf16* cur_comp = nullptr;
     const bf16* cur_index_k = nullptr;
@@ -1638,6 +1645,8 @@ struct Engine::Impl {
     }
 };
 
+#include "verify.cu"
+
 Engine::Engine(const std::string& pack_dir, const EngineOptions& opt) : impl_(new Impl(pack_dir, opt)) {
     impl_->init();
 }
@@ -1654,9 +1663,13 @@ int Engine::vram_expert_slots() const { return impl_->vram ? impl_->vram->slots(
 
 Engine::~Engine() = default;
 
-int Engine::step(int token, int pos, StepDump* dump) { return impl_->step(token, pos, dump, timing_); }
+int Engine::step(int token, int pos, StepDump* dump) {
+    if (impl_->verify_pending) throw std::logic_error("commit the pending verify window first");
+    return impl_->step(token, pos, dump, timing_);
+}
 
 int Engine::prefill(const std::vector<int>& tokens, int pos, std::vector<float>* nll) {
+    if (impl_->verify_pending) throw std::logic_error("commit the pending verify window first");
     return impl_->prefill(tokens, pos, nll, prefill_timing_);
 }
 

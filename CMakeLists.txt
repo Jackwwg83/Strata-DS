@@ -92,6 +92,7 @@ endif()
 option(STRATA_BUILD_TESTS "Build the test suite" ${_strata_tests_default})
 option(STRATA_BUILD_CONVERSATION_TESTS "Build standalone conversation cache tests" OFF)
 option(STRATA_WERROR "Treat compiler warnings as errors" OFF)
+include(cmake/ds41_suffix.cmake)
 
 if(STRATA_BUILD_CONVERSATION_TESTS)
   enable_testing()

@@ -11,6 +11,10 @@
 // per-layer comparison stays aligned even after the first differing token. Tokenization stays in Python.
 #include "strata/ds41/config.hpp"
 #include "strata/ds41/engine.hpp"
+#include "strata/ds41/suffix_drafter.hpp"
+
+#include <algorithm>
+#include <chrono>
 
 #include <cmath>
 #include <cstdio>
@@ -39,8 +43,58 @@ static std::vector<int> parse_ids(const std::string& arg) {
     return v;
 }
 
+// Output history contains raw IDs. It includes the pending target prediction.
+static void generate(Engine& engine, const EngineOptions& opt, const std::vector<int>& prompt,
+                     int count, bool batched, bool suffix, int max_t, int eos) {
+    if (prompt.empty()) throw std::invalid_argument("generation needs a nonempty prompt");
+    int next = -1;
+    if (batched) {
+        next = engine.prefill(prompt, 0);
+        const auto& tm = engine.last_prefill();
+        std::printf("prefill_tokens %zu ms %.1f tok_s %.1f\n", prompt.size(), tm.total_ms,
+                    prompt.size()*1000.0/std::max(tm.total_ms, 1e-9));
+    } else {
+        for (size_t p = 0; p < prompt.size(); ++p) next = engine.step(prompt[p], int(p));
+    }
+    SuffixDrafter drafter(3, 64, size_t(opt.max_seq)+8);
+    for (int token : prompt) drafter.append(token);
+    std::vector<int> out;
+    if (count > 0) { out.push_back(next); drafter.append(next); }
+    int pos = int(prompt.size()), rounds = 0, accepted = 0;
+    const auto begin = std::chrono::steady_clock::now();
+    while (int(out.size()) < count && next != eos) {
+        const int limit = std::min({max_t, count-int(out.size()), opt.max_seq-pos});
+        if (limit < 1) throw std::runtime_error("generation exceeds max_seq");
+        if (!suffix) {
+            next = engine.step(next, pos++);
+            out.push_back(next); drafter.append(next); ++rounds;
+            continue;
+        }
+        int32_t draft[8];
+        const int proposed = drafter.propose(limit-1, draft);
+        std::vector<int> window{next};
+        window.insert(window.end(), draft, draft+proposed);
+        auto result = engine.verify(window, pos);
+        int keep = accepted_inputs(window, result.next);
+        for (int i = 0; i < keep; ++i)
+            if (result.next[i] == eos) { keep = i+1; break; }
+        engine.commit(keep);
+        std::printf("spec_window pos %d T %zu accepted %d emitted %d\n", pos, window.size(), keep-1, keep);
+        for (int i = 0; i < keep; ++i) { out.push_back(result.next[i]); drafter.append(result.next[i]); }
+        accepted += keep-1; ++rounds;
+        next = result.next[keep-1]; pos += keep;
+    }
+    const double seconds = std::chrono::duration<double>(std::chrono::steady_clock::now()-begin).count();
+    const int decoded = std::max(0, int(out.size())-1);
+    std::printf("generated:");
+    for (int token : out) std::printf(" %d", token);
+    std::printf("\ndecode_tokens %d windows %d accepted_drafts %d seconds %.6f tok_s %.3f\n",
+                decoded, rounds, accepted, seconds, decoded/std::max(seconds, 1e-9));
+}
+
 int main(int argc, char** argv) {
-    std::string pack, ids_s, dump_path, force_path;
+    std::string pack, ids_s, dump_path, force_path, spec = "none";
+    int spec_max = kVerifyMaxTokens, eos = -1;
     int gen = 32;
     bool batched = false;
     EngineOptions opt;
@@ -50,6 +104,9 @@ int main(int argc, char** argv) {
         if (a == "--pack") pack = next();
         else if (a == "--ids") ids_s = next();
         else if (a == "--gen") gen = std::stoi(next());
+        else if (a == "--spec") spec = next();
+        else if (a == "--spec-max") spec_max = std::stoi(next());
+        else if (a == "--eos-id") eos = std::stoi(next());
         else if (a == "--threads") opt.cpu_threads = std::stoi(next());
         else if (a == "--max-seq") opt.max_seq = std::stoi(next());
         else if (a == "--expert-profile") opt.expert_profile = next();
@@ -67,7 +124,7 @@ int main(int argc, char** argv) {
         else { std::fprintf(stderr, "unknown argument %s\n", a.c_str()); return 2; }
     }
     if (pack.empty() || (ids_s.empty() && force_path.empty())) {
-        std::fprintf(stderr, "usage: ds41_generate --pack DIR --ids a,b,c [--gen N] [--threads T] [--dump F] [--force-ids F]\n");
+        std::fprintf(stderr, "usage: ds41_generate --pack DIR --ids a,b,c [--gen N] [--threads T] [--dump F] [--force-ids F] [--spec none|suffix] [--spec-max 1..8] [--eos-id ID]\n");
         return 2;
     }
     std::vector<int> prompt = parse_ids(ids_s), forced;
@@ -77,7 +134,19 @@ int main(int argc, char** argv) {
         forced = parse_ids(all);
     }
     try {
+        if (gen < 0 || spec_max < 1 || spec_max > 8 || (spec != "none" && spec != "suffix"))
+            throw std::invalid_argument("use --gen >= 0, --spec none|suffix, --spec-max 1..8");
+        if (spec == "suffix" && (!force_path.empty() || !dump_path.empty()))
+            throw std::invalid_argument("--spec suffix cannot be combined with --force-ids or --dump");
+        if (spec_max > kVerifyMaxTokens) {
+            std::fprintf(stderr, "spec: cap T at %d until CPU rows 5..8 are validated\n", kVerifyMaxTokens);
+            spec_max = kVerifyMaxTokens;
+        }
         Engine engine(pack, opt);
+        if (force_path.empty() && dump_path.empty()) {
+            generate(engine, opt, prompt, gen, batched, spec == "suffix", spec_max, eos);
+            return 0;
+        }
         if (batched) {   // prefill the prompt (or the forced sequence) in one call, then decode with step()
             const std::vector<int>& pre = forced.empty() ? prompt : forced;
             std::vector<float> nll;
@@ -112,7 +181,7 @@ int main(int argc, char** argv) {
         }
         std::FILE* dump = dump_path.empty() ? nullptr : std::fopen(dump_path.c_str(), "wb");
         StepDump sd;
-        const int total = forced.empty() ? (int) prompt.size() + gen : (int) forced.size();
+        const int total = forced.empty() ? (int) prompt.size() + std::max(0, gen-1) : (int) forced.size();
         int next = -1;
         std::vector<int> out;
         double decode_ms = 0, nll_sum = 0, cpu_ms = 0;
@@ -138,7 +207,7 @@ int main(int argc, char** argv) {
             warmed += t.warmed;
             useful += t.warmed_useful;
             routed += t.expert_total;
-            if (pos >= (int) prompt.size() - 1 && forced.empty()) out.push_back(next);
+            if (pos >= (int) prompt.size() - 1 && forced.empty() && gen > 0) out.push_back(next);
             std::fprintf(stderr,
                          "pos %d tok %d -> %d  total %.1f ms (engram reads %.1f, layers %.1f, of which cpu experts %.1f)"
                          "  vram hits %d/%d swaps %d  zero-copy %d cpu %d: ram %d file %d (ssd %d)  warmed %d useful %d\n",
