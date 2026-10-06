@@ -840,7 +840,8 @@ struct Engine::Impl {
         int plan = -1;   // 0: both lent; 1: scratch lent, ring cudaMalloc; 2: ring lent, scratch cudaMalloc; 3: both cudaMalloc
         int cap = std::max(1, std::min(n, opt.prefill_chunk)), sub = 0;
         for (; plan < 0; cap /= 2) {
-            if (cap < 16) throw std::runtime_error("ds41 prefill: not enough VRAM for a 16-token pass");
+            // the smallest pass is 16 tokens, or the whole prompt when it is shorter
+            if (cap < std::min(n, 16)) throw std::runtime_error("ds41 prefill: not enough VRAM for a 16-token pass");
             for (sub = std::max(1, std::min(cap, opt.prefill_batch)); plan < 0 && sub >= std::min(cap, 512); sub /= 2) {
                 scratch = layout(pf, nullptr, cap, sub);
                 for (int r = std::max(opt.prefill_ring, kMinRing); plan < 0 && r >= kMinRing; r /= 2) {

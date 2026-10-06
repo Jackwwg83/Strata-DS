@@ -5,6 +5,8 @@
 #      per document is the reference ($O/fp16/<doc>.npz from the M2 accuracy run).
 #   2. a long text (3000 tokens of tools/ds41/make_long_ids.py output): one chunk against 999-token chunks.
 #   3. generation: a prompt prefilled, then 32 greedy tokens, against the same prompt fed with step().
+#   4. a 5-token prompt (shorter than prefill's 16-token minimum pass): prefill runs, and its first generated token
+#      is step()'s.
 # Usage: bash m3_verify.sh   (env: G ds41_generate, PACK, PROF expert profile, O prototype references, LONG ids)
 set -u
 G=${G:-/workspace/Strata-DS/build/ds41_generate}
@@ -39,4 +41,12 @@ s=$(run --ids "$p" --gen 32 2>/dev/null | grep generated)
 b=$(run --ids "$p" --gen 32 --prefill 2>/dev/null | grep -E "generated|prefill_tokens|decode_ms")
 echo "GEN step:    $s"
 echo "GEN prefill: $(echo "$b" | tr '\n' ' ')"
+# a prompt shorter than the 16-token minimum pass (regression: it failed with "not enough VRAM for a 16-token pass")
+p=$(cut -d, -f1-5 "$LONG")
+s=$(run --ids "$p" --gen 8 2>/dev/null | grep generated)
+b=$(run --ids "$p" --gen 8 --prefill 2>&1 | grep -E "generated|error")
+# greedy tokens may part later (prefill computes the experts in FP16, step's CPU experts use int8 activations); the
+# first token comes from the prompt alone and must match
+first() { echo "$1" | grep -o "generated: [0-9]*"; }
+echo "SHORT 5-token prompt: step [$s] prefill [$b] $([ -n "$(first "$s")" ] && [ "$(first "$s")" = "$(first "$b")" ] && echo pass || echo FAIL)"
 echo M3_VERIFY_DONE
