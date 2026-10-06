@@ -1,29 +1,30 @@
-# Hybrid decode progress
+# Hybrid decode staging progress
 
-Every item was reviewed before delivery. A checked implementation item means code is written, not GPU-tested.
-See `HYBRID.REPORT.md` for the state of each part and the real local output.
+Checked items mean the work described is done. They do not imply CUDA compilation or GPU acceptance.
+See [HYBRID.REPORT.md](HYBRID.REPORT.md) for separate states and real local output.
 
-- [x] Read the task rules, decode review, tier code, doorbell, K10, and upstream mapped-memory precedent.
-- [x] Write synthetic split, memory parity, table lifecycle, and graph replay tests before production changes.
-- [x] Register the RAM arena and maintain the fixed device descriptor table at tier safe points.
-- [x] Publish a deterministic CPU / VRAM / zero-copy split and per-call K10 descriptors for m=1..8.
-- [x] Integrate per-layer device quotas and per-step counts. Keep K10 math and `step()` unchanged.
-- [x] Cover quota 0..6, no tiers, null quota, all tiers, inactive routes, and mixed expert sizes in tests.
-- [x] Add a test for the real adaptive VRAM swap callbacks and nonblocking-stream RAM reads.
-- [x] Check the source diff and compile the generator object with strict warnings on macOS.
-- [x] Build and run all eight available portable CTest targets. All eight passed.
-- [x] Attempt full CPU and CUDA configurations/builds. Record the real failures and limitations.
-- [x] Document exact Linux build, synthetic GPU tests, forced decode quota sweep, and count checks.
-- [x] Attempt the first commit. Record the sandbox refusal and five commit units, each at most five files.
-- [x] Preserve the user's untracked `DECODE.STUDY.md`.
-- [x] Review all items and separate written, compiled, GPU-tested, and blocked work.
+- [x] Confirm branch `feature/ds41-hybrid`, merged stream/graph code, and reviewer baseline.
+- [x] Preserve the pre-existing untracked `DECODE.STUDY.md`.
+- [x] Write copy byte tests and expand K10 parity tests before production changes.
+- [x] Allocate fixed staging storage from the pack's largest expert before automatic cache sizing.
+- [x] Publish compact device copy jobs and rebase only RAM-assigned call descriptors.
+- [x] Add a fixed-grid uint4 copy with exact byte tails.
+- [x] Fork a copy stream, compute the shared expert on the main stream, then join before one K10 call.
+- [x] Keep `DS41_ZC_QUOTA`; add default-on staging and `DS41_ZC_STAGE=0` direct comparison.
+- [x] Cover q0..6, m1..8, mixed blob sizes, nonzero component offsets, changed graph routes, and repeated forks.
+- [x] Poison staging before parity replays and check copy counts, jobs, descriptors, and output bits.
+- [x] Verify source invariants: K10 arithmetic and `enqueue_step()` / `step()` remain unchanged.
+- [x] Build all eight portable regression targets and run all eight tests successfully.
+- [x] Compile the generator object with strict warnings; check shell and embedded Python syntax.
+- [x] Attempt CUDA configuration and full CPU build; record the actual failures.
+- [x] Supply exact build, sanitizer, fixed-slot 42-case sweep, dump parity, and nsys commands.
+- [x] Update the report and commit units. Keep prior reviewer measurements separate from new results.
 
-Environment-blocked acceptance:
+Not done in this environment:
 
-- [ ] Compile the changed CUDA engine and new tests. No CUDA toolkit is installed on this macOS arm64 host.
-- [ ] Run GPU split, bitwise K10 parity, table lifecycle, and graph replay tests. No NVIDIA GPU is available.
-- [ ] Run SAGE forced decode for q=0..6, validate real counts, compare outputs, and measure overlap/latency.
-      The RTX 4090 and `/workspace/pack-sage` are not available here.
-- [ ] Complete the entire native CPU build. Its x86 expert target requires AVX compiler options unavailable on arm64.
-- [ ] Create Git commits. The shared `.git/worktrees/Strata-DS-hybrid` directory is sandbox-protected.
-      `HYBRID.COMMITS.md` contains the exact commands and required co-author trailers.
+- [ ] Compile the new CUDA source and tests for sm_89 / sm_86 / sm_120. No CUDA toolkit is installed.
+- [ ] Run new and existing DS41 GPU acceptance tests and sanitizer. No NVIDIA GPU is available.
+- [ ] Run SAGE forced decode, compare direct/staged dumps, and validate graph replay in the full engine.
+- [ ] Measure copy bandwidth, overlap, and ms/token at 8 / 16 / 30 threads and q0..6.
+- [ ] Exercise adaptive swaps and no-RAM fallback in real decode with staging enabled.
+- [ ] Create follow-up commits. Git metadata is deliberately outside the sandbox's writable roots.
