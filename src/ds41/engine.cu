@@ -657,6 +657,46 @@ struct Engine::Impl {
     /// the 7950X + 4090 box, 32K prompt: 16 (the decode default) 14.9 s of GPU wait, 64 2.6 s (1,148 tok/s).
     static constexpr int kEngIoThreads = 64;
 
+    /// DS41_PF_PROFILE=1: the GPU time of prefill by phase, printed at its end. Events in stream order; the time
+    /// between two marks goes to the phase of the first one, so host waits (the routes' sort, expert copies not yet
+    /// issued) count in the phase during which the GPU stood idle.
+    struct PfProfile {
+        enum { kEngram, kHc, kProj, kComp, kIndexer, kAttn, kOut, kRouter, kExperts, kShared, kHead, kN };
+        bool on = false;
+        std::vector<cudaEvent_t> ev;
+        std::vector<int> cat;
+        size_t n = 0;
+        void mark(int c) {
+            if (!on) return;
+            if (n == ev.size()) {
+                cudaEvent_t e;
+                ck(cudaEventCreate(&e), "profile event");
+                ev.push_back(e);
+                cat.push_back(0);
+            }
+            ck(cudaEventRecord(ev[n], 0), "profile mark");
+            cat[n++] = c;
+        }
+        void report() {
+            if (!on || n < 2) return;
+            static const char* names[kN] = {"engram", "hc mixes + norms", "q/kv projections", "compressor",
+                                             "indexer", "attention", "o projection", "routing + sort",
+                                             "routed experts", "shared expert + hc post", "head"};
+            ck(cudaEventSynchronize(ev[n - 1]), "profile end");
+            double t[kN] = {}, total = 0;
+            for (size_t i = 0; i + 1 < n; ++i) {
+                float ms = 0;
+                ck(cudaEventElapsedTime(&ms, ev[i], ev[i + 1]), "profile time");
+                t[cat[i]] += ms;
+                total += ms;
+            }
+            std::fprintf(stderr, "ds41 prefill profile (GPU timeline, %.0f ms):", total);
+            for (int c = 0; c < kN; ++c) std::fprintf(stderr, " %s %.0f ms (%.0f%%);", names[c], t[c], 100 * t[c] / total);
+            std::fprintf(stderr, "\n");
+            n = 0;
+        }
+    } pfp;
+
     /// Device scratch of one prefill call: per-pass arrays ([cap] tokens) and per-sub-batch arrays ([sub] tokens),
     /// carved from lent VRAM tier slots or cudaMalloc; the ring separately
     struct Prefill {
@@ -783,6 +823,7 @@ struct Engine::Impl {
     /// sub-batch (up to opt.prefill_batch) and ring (opt.prefill_ring, at least 16 slots) that fit.
     void prefill_begin(int n) {
         pf = Prefill{};
+        if (const char* v = std::getenv("DS41_PF_PROFILE")) pfp.on = v[0] && v[0] != '0';
         if (vram) pf.slot_bytes = vram->slot_bytes();
         else {
             for (int l = 0; l < kLayers; ++l)
@@ -984,6 +1025,7 @@ struct Engine::Impl {
         auto& y = L[l];
         const bool yarn = y.ratio > 0;
         const float* table = yarn ? rope_yarn : rope_plain;
+        pfp.mark(PfProfile::kProj);
         fp8_rows(pf.xa, T, y.wq_a, pf.qr);
         ops::rmsnorm(pf.qr, y.q_norm, pf.qr, kQLora, kNormEps, T);
         fp8_rows(pf.qr, T, y.wq_b, pf.q);
@@ -995,8 +1037,11 @@ struct Engine::Impl {
         int win_base = 0, n_idx = kWindow;
         const int32_t* topk = nullptr;
         if (y.ratio > 0) {
+            pfp.mark(PfProfile::kComp);
             if (is_kv_source(l)) compress_rows(l, T, p0);
+            pfp.mark(PfProfile::kIndexer);
             if (is_index_source(l)) indexer_rows(l, T, p0, b0);
+            pfp.mark(PfProfile::kAttn);
             const int c_end = (p0 + T) / y.ratio;   // compressed rows any query of the chunk may see
             if (c_end)
                 ck(cudaMemcpyAsync(pf.attn_kv, cur_comp, (size_t) c_end * kHeadDim * 2, cudaMemcpyDeviceToDevice, 0),
@@ -1006,6 +1051,7 @@ struct Engine::Impl {
             topk = pf.topk + (size_t) b0 * kIndexTopK;
         }
         // window rows: the ring's positions before the chunk, then the chunk's own; then the ring for decode
+        pfp.mark(PfProfile::kAttn);
         const int prev = std::min(p0, kWindow - 1);
         prefill::window_gather(y.window, p0, prev, pf.attn_kv + (size_t) (win_base + kWindow - 1 - prev) * kHeadDim);
         ck(cudaMemcpyAsync(pf.attn_kv + (size_t) (win_base + kWindow - 1) * kHeadDim, pf.kvv, (size_t) T * kHeadDim * 2,
@@ -1014,6 +1060,7 @@ struct Engine::Impl {
         prefill::attn_index_rows(T, p0, win_base, topk, kIndexTopK, pf.idx, n_idx);
         kernels::sparse_attn_prefill(pf.q, pf.attn_kv, pf.idx, T, n_idx, y.sink, (float) std::pow(kHeadDim, -0.5), pf.o,
                                      0);
+        pfp.mark(PfProfile::kOut);
         prefill::rope_rows(pf.o, T, kHeads, kHeadDim, table, p0, 1, true);
         prefill::wo_a_grouped_rows(pf.o, y.wo_a, T, pf.oa, pf.ftmp);
         fp8_rows(pf.oa, T, y.wo_b, pf.attn_out);
@@ -1025,6 +1072,7 @@ struct Engine::Impl {
     void moe_route(int l, int T, int b0) {
         auto& y = L[l];
         const bf16* xf = pf.xf + (size_t) b0 * kDim;
+        pfp.mark(PfProfile::kRouter);
         prefill::bf16_gemm(xf, y.gate_w, T, kDim, kExperts, nullptr, pf.router_logits);
         prefill::route_rows(pf.router_logits, y.gate_bias, T, pf.ids + (size_t) b0 * kTopK, pf.wts + (size_t) b0 * kTopK);
         ops::to_half_fp8q(xf, pf.x_half + (size_t) b0 * kDim, T * kDim);
@@ -1034,6 +1082,7 @@ struct Engine::Impl {
     /// by expert, VRAM tier experts first (one K12 call from their slots), then the streamed experts in job order
     /// (one K12 call per group of ring slots, each released when its call has run). Each expert is copied once.
     void moe_experts(int l, int S) {
+        pfp.mark(PfProfile::kRouter);
         ck(cudaMemcpyAsync(pfh.ids, pf.ids, (size_t) S * kTopK * 4, cudaMemcpyDeviceToHost, 0), "routes down");
         ck(cudaMemcpyAsync(pfh.wts, pf.wts, (size_t) S * kTopK * 4, cudaMemcpyDeviceToHost, 0), "weights down");
         ck(cudaMemsetAsync(pf.routed, 0, (size_t) S * kDim * 4, 0), "routed");
@@ -1077,6 +1126,7 @@ struct Engine::Impl {
         ck(cudaMemcpyAsync(pf.rows_tok, pfh.rows_tok, (size_t) S * kTopK * 4, cudaMemcpyHostToDevice, 0), "rows up");
         ck(cudaMemcpyAsync(pf.rows_w, pfh.rows_w, (size_t) S * kTopK * 4, cudaMemcpyHostToDevice, 0), "rows up");
         const auto* xh = (const __half*) pf.x_half;
+        pfp.mark(PfProfile::kExperts);
         if (n_res) {
             for (int i = 0; i < n_res; ++i) pfh.desc[i] = vram->desc(vram->res_host()[(size_t) l * kExperts + order[i]]);
             ck(cudaMemcpyAsync(pf.desc, pfh.desc, n_res * sizeof(kernels::Exl3Expert), cudaMemcpyHostToDevice, 0),
@@ -1106,6 +1156,7 @@ struct Engine::Impl {
     void moe_finish(int l, int T, int b0) {
         auto& y = L[l];
         const bf16* xf = pf.xf + (size_t) b0 * kDim;
+        pfp.mark(PfProfile::kShared);
         fp8_rows(xf, T, y.sh_w1, pf.g);
         fp8_rows(xf, T, y.sh_w3, pf.u);
         ops::swiglu(pf.g, pf.u, kSwigluLimit, pf.sh_h, T * kMoeInter);
@@ -1211,6 +1262,7 @@ struct Engine::Impl {
                 bf16* h = pf.h + (size_t) b0 * kHc * kDim;
                 bf16* h2 = pf.h2 + (size_t) b0 * kHc * kDim;
                 if (is_engram_layer(l)) {   // this sub-batch's rows of this table, pinned -> device
+                    pfp.mark(PfProfile::kEngram);
                     if (b0 == 0) {
                         const double w0 = now_ms();
                         eng_ready[eng_i].get();   // rethrows a read error
@@ -1230,10 +1282,12 @@ struct Engine::Impl {
                     fp8_rows(pf.eng_vals, T, y.eng_wkv, pf.eng_kv);
                     ops::engram_apply(h, pf.eng_kv, y.eng_qw, y.eng_kw, kNormEps, T);
                 }
+                pfp.mark(PfProfile::kHc);
                 hc_rows(h, T, y.hc_attn_fn, y.hc_attn_scale, y.hc_attn_base, pf.pre_mix + b0 * kHc, pf.xa, pf.attn_pre,
                         pf.attn_post, pf.attn_comb);
                 ops::rmsnorm(pf.xa, y.attn_norm, pf.xa, kDim, kNormEps, T);
                 attention_rows(l, T, p0 + b0, b0);
+                pfp.mark(PfProfile::kHc);
                 ops::hc_post(pf.attn_out, h, pf.attn_post, pf.attn_comb, h2, T);
                 bf16* xf = pf.xf + (size_t) b0 * kDim;
                 hc_rows(h2, T, y.hc_ffn_fn, y.hc_ffn_scale, y.hc_ffn_base, pf.attn_pre, xf, pf.ffn_pre + b0 * kHc,
@@ -1250,6 +1304,7 @@ struct Engine::Impl {
             for (int i = 0; i < S; ++i) pfh.targets[i] = c0 + i + 1 < n ? tokens[c0 + i + 1] : -1;
             ck(cudaMemcpyAsync(pf.targets, pfh.targets, (size_t) S * 4, cudaMemcpyHostToDevice, 0), "targets up");
         }
+        pfp.mark(PfProfile::kHead);
         for (int b0 = 0; b0 < S; b0 += B) {
             const int T = std::min(B, S - b0);
             ops::hc_pre(pf.h + (size_t) b0 * kHc * kDim, pf.pre_mix + b0 * kHc, pf.final_x, T);
@@ -1271,6 +1326,8 @@ struct Engine::Impl {
             for (int i = 0; i < S; ++i)
                 if (c0 + i + 1 < n) (*nll)[c0 + i] = pfh.nll[i];
         }
+        pfp.mark(PfProfile::kHead);
+        pfp.report();
         if (S >= kStreamAll) estream->drain();   // every job of the pass was consumed
     }
 
