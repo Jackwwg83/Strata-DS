@@ -1,4 +1,4 @@
-// K13-02: bounded, staged BF16 tensor-core attention for prefill.
+// K13-04: wider QK tile, retaining K13-02 softmax/PV and bounded scratch.
 // QK, softmax and PV are separate batched kernels. No CTA retains the full
 // score matrix; small operand stages leave shared memory available for residency.
 #include "strata/ds41/kernels/k13_sparse_attn_prefill.hpp"
@@ -20,7 +20,9 @@ constexpr int kMaxIndices = 1024;
 constexpr int kQueryChunk = 256;
 constexpr int kThreads = 256;
 constexpr int kWarps = kThreads / 32;
-constexpr int kQKRows = 64;
+constexpr int kQKRows = 128;
+constexpr int kQKThreads = 512;
+constexpr int kQKKeyWarps = kQKRows / 16;
 constexpr int kQKDepth = 64;
 constexpr int kQKStride = kQKDepth + 8;
 constexpr int kPVDim = 64;
@@ -42,15 +44,18 @@ union __align__(32) PVStorage {
     PVOperands operands;
     float output[kWarps][16 * 16];
 };
-static_assert(sizeof(QKStorage) == 18688, "QK shared layout changed");
+static_assert(sizeof(QKStorage) == 28160, "QK shared layout changed");
 static_assert(sizeof(PVStorage) == 9728, "PV shared layout changed");
 static_assert(sizeof(QKStorage) <= 99 * 1024 && sizeof(PVStorage) <= 99 * 1024,
               "K13 shared-memory limit exceeded");
 
-// One CTA computes all 64 heads by 64 listed KV rows for one query. The
+// One CTA computes all 64 heads by 128 listed KV rows for one query. The
 // KV tile is shared by every head, with arbitrary order, duplicates and -1
 // padding permitted. Both tensor-core inputs are BF16; accumulators are FP32.
-__global__ __launch_bounds__(kThreads, 4) void qk_stage(
+// Doubling the warps, rather than each warp's accumulators, keeps two fragments
+// per warp. At 64 registers/thread sm_86 fits two CTAs (32 resident warps),
+// matching K13-02's four 256-thread CTAs while halving repeated Q global loads.
+__global__ __launch_bounds__(kQKThreads, 2) void qk_stage(
         const bf16* __restrict__ q, const bf16* __restrict__ kv,
         const int32_t* __restrict__ idx, int n_idx, float scale,
         float* __restrict__ scores) {
@@ -58,8 +63,8 @@ __global__ __launch_bounds__(kThreads, 4) void qk_stage(
     const int query = blockIdx.y;
     const int first = blockIdx.x * kQKRows;
     const int warp = threadIdx.x / 32;
-    const int head = (warp / 4) * 32;
-    const int row = (warp % 4) * 16;
+    const int head = (warp / kQKKeyWarps) * 32;
+    const int row = (warp % kQKKeyWarps) * 16;
     if (threadIdx.x < kQKRows) {
         const int t = first + threadIdx.x;
         shared.indices[threadIdx.x] = t < n_idx ? idx[static_cast<size_t>(query) * n_idx + t] : -1;
@@ -70,14 +75,14 @@ __global__ __launch_bounds__(kThreads, 4) void qk_stage(
     __syncthreads();
     for (int dim = 0; dim < kDim; dim += kQKDepth) {
 #pragma unroll
-        for (int i = threadIdx.x; i < kHeads * kQKDepth / 8; i += kThreads) {
+        for (int i = threadIdx.x; i < kHeads * kQKDepth / 8; i += kQKThreads) {
             const int h = i / (kQKDepth / 8);
             const int d = (i % (kQKDepth / 8)) * 8;
             *reinterpret_cast<uint4*>(shared.q + h * kQKStride + d) =
                 *reinterpret_cast<const uint4*>(q + (static_cast<size_t>(query) * kHeads + h) * kDim + dim + d);
         }
 #pragma unroll
-        for (int i = threadIdx.x; i < kQKRows * kQKDepth / 8; i += kThreads) {
+        for (int i = threadIdx.x; i < kQKRows * kQKDepth / 8; i += kQKThreads) {
             const int r = i / (kQKDepth / 8);
             const int d = (i % (kQKDepth / 8)) * 8;
             const int j = shared.indices[r];
@@ -105,7 +110,7 @@ __global__ __launch_bounds__(kThreads, 4) void qk_stage(
 #pragma unroll
         for (int i = 0; i < accum[h].num_elements; ++i) accum[h].x[i] *= scale;
         // The fixed 1024-column scratch pitch safely contains a final partial
-        // 64-row tile. Softmax masks padding using the actual index list.
+        // 128-row tile. Softmax masks padding using the actual index list.
         float* dst = scores + (static_cast<size_t>(query) * kHeads + head + h * 16) * kMaxIndices + first + row;
         wmma::store_matrix_sync(dst, accum[h], kMaxIndices, wmma::mem_row_major);
     }
@@ -222,7 +227,7 @@ struct Scratch {
 
 void cuda_check(cudaError_t status, const char* operation) {
     if (status != cudaSuccess) {
-        std::fprintf(stderr, "K13-02 %s: %s\n", operation, cudaGetErrorString(status));
+        std::fprintf(stderr, "K13-04 %s: %s\n", operation, cudaGetErrorString(status));
         std::abort();
     }
 }
@@ -262,7 +267,7 @@ void sparse_attn_prefill(const bf16* q, const bf16* kv, const int32_t* idx, int 
         const size_t query_offset = static_cast<size_t>(first) * kHeads * kDim;
         const int32_t* indices = idx + static_cast<size_t>(first) * n_idx;
         if (n_idx > 0)
-            qk_stage<<<dim3((n_idx + kQKRows - 1) / kQKRows, count), kThreads, 0, stream>>>(
+            qk_stage<<<dim3((n_idx + kQKRows - 1) / kQKRows, count), kQKThreads, 0, stream>>>(
                 q + query_offset, kv, indices, n_idx, scale, scratch.scores);
         softmax_stage<<<dim3(kHeads / kWarps, count), kThreads, 0, stream>>>(
             scratch.scores, indices, n_idx, sink, scratch.probabilities, scratch.denominators);
