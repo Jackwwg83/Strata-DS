@@ -84,11 +84,12 @@ int main(int argc, char** argv) {
             int next = engine.prefill(pre, 0, forced.empty() ? nullptr : &nll);
             const auto& p = engine.last_prefill();
             std::printf("prefill_tokens %zu ms %.1f tok_s %.1f chunks %d chunk_tokens %d sub_batch %d engram_ms %.1f stream_wait_ms %.1f"
-                        " vram_experts %lld streamed %lld (ram %lld cache %lld ssd %lld)\n",
+                        " vram_experts %lld streamed %lld (ram %lld cache %lld ssd %lld) engram_rows %lld unique %lld\n",
                         pre.size(), p.total_ms, pre.size() / (p.total_ms / 1000.0), p.chunks, p.chunk_tokens, p.sub_batch,
                         p.engram_ms,
                         p.stream_wait_ms, (long long) p.vram_experts, (long long) p.streamed, (long long) p.from_ram,
-                        (long long) p.from_cache, (long long) p.from_ssd);
+                        (long long) p.from_cache, (long long) p.from_ssd, (long long) p.engram_rows,
+                        (long long) p.engram_unique);
             if (!nll.empty()) {
                 double sum = 0;
                 for (float v : nll) sum += v;

@@ -49,7 +49,9 @@ struct EngineOptions {
 
 /// What one prefill() call did
 struct PrefillTiming {
-    double total_ms = 0, engram_ms = 0, stream_wait_ms = 0;   ///< stream_wait: the GPU side waited for expert copies
+    /// engram_ms: the GPU side waited for engram rows (read on their own thread); stream_wait: for expert copies
+    double total_ms = 0, engram_ms = 0, stream_wait_ms = 0;
+    int64_t engram_rows = 0, engram_unique = 0;                ///< engram rows used, and distinct rows read
     int chunks = 0, chunk_tokens = 0, sub_batch = 0;           ///< passes, tokens per pass, tokens per sub-batch
     int64_t vram_experts = 0;                                  ///< (layer, expert) pairs computed from VRAM slots
     int64_t streamed = 0, from_ram = 0, from_cache = 0, from_ssd = 0;   ///< pairs copied through the ring, by source

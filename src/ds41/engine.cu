@@ -43,6 +43,7 @@
 #include <cstdlib>
 #include <condition_variable>
 #include <cstring>
+#include <future>
 #include <mutex>
 #include <numeric>
 #include <stdexcept>
@@ -651,7 +652,7 @@ struct Engine::Impl {
     static constexpr int kStreamAll = 1024;   ///< from this many tokens, every expert of every layer is streamed
     static constexpr int kNllRows = 64;       ///< logits rows per head GEMM when measuring nll
     static constexpr int kMinRing = 16;       ///< the ring shrinks to this many slots before the pass shrinks
-    static constexpr int kEngBatch = 128;     ///< tokens per engram read (its O_DIRECT buffers: 16 KiB per row)
+    static constexpr int kEngBatch = 256;     ///< tokens per engram read (its O_DIRECT buffers: 16 KiB per row)
 
     /// Device scratch of one prefill call: per-pass arrays ([cap] tokens) and per-sub-batch arrays ([sub] tokens),
     /// carved from lent VRAM tier slots or cudaMalloc; the ring separately
@@ -688,7 +689,7 @@ struct Engine::Impl {
         kernels::Exl3Expert* desc;
         uint8_t* eng;   // per engram table: cap * kEngRows * 256 weight bytes, then cap * kEngRows * 8 scale bytes
     } pfh;
-    std::unique_ptr<EngramRows> eng_rows_pf;
+    std::vector<std::unique_ptr<EngramRows>> eng_rows_pf;   // one reader per table: read one after the other
     int eng_rows_pf_cap = 0;
     std::vector<std::vector<int64_t>> eng_ids_pf;
     std::unique_ptr<ExpertStream> estream;
@@ -848,11 +849,10 @@ struct Engine::Impl {
             for (int i = 0; i < cap; ++i)
                 for (int j = 0; j < kHc; ++j) pfh.pre[i * kHc + j] = j == 0 ? 1.0f : 0.0f;
         }
-        if (n_eng && !eng_rows_pf) {
-            std::vector<EngramRows::Table> tabs;
-            for (const auto& t : pack.engram_tables()) tabs.push_back({t.path, t.weight_offset, t.scale_offset});
-            eng_rows_pf = std::make_unique<EngramRows>(tabs, kEngBatch * kEngRows);
-        }
+        if (n_eng && eng_rows_pf.empty())
+            for (const auto& t : pack.engram_tables())
+                eng_rows_pf.push_back(std::make_unique<EngramRows>(
+                    std::vector<EngramRows::Table>{{t.path, t.weight_offset, t.scale_offset}}, kEngBatch * kEngRows));
         if (n_eng && eng_rows_pf_cap < cap) {
             eng_rows_pf_cap = cap;
             eng_ids_pf.assign(n_eng, std::vector<int64_t>((size_t) cap * kEngRows, 0));
@@ -1094,39 +1094,67 @@ struct Engine::Impl {
                            0), "pre_mix");
     }
 
+    /// The engram rows of a pass, table by table (engram layer order), into the pinned buffer in token order. A row
+    /// that several positions share is read once. Runs on its own thread while the GPU works; done[t] is set when
+    /// table t is in the buffer (or carries the read error).
+    void engram_pass(int S, int p0, std::vector<std::promise<void>>& done, double& ms) {
+        const double t0 = now_ms();
+        size_t t = 0;
+        try {
+            const auto& hs = pack.engram_hash();
+            const int cols = (hs.max_ngram - 1) * hs.n_heads;
+            if (cols != kEngRows) throw std::runtime_error("engram: the prefill buffers assume 24 rows per token");
+            const size_t eng_table = (size_t) pf.cap * kEngRows * (256 + 8);
+            for (int l = 0; l < kLayers; ++l) {
+                if (!is_engram_layer(l)) continue;
+                const int li = (int) t;
+                std::vector<int64_t>& all = eng_ids_pf[li];
+                for (int i = 0; i < S; ++i) {
+                    engram_ids(l, li, p0 + i);
+                    std::copy(eng_ids[li].begin(), eng_ids[li].begin() + cols, all.begin() + (size_t) i * cols);
+                }
+                const size_t n = (size_t) S * cols;
+                std::vector<int64_t> uniq(all.begin(), all.begin() + n);
+                std::sort(uniq.begin(), uniq.end());
+                uniq.erase(std::unique(uniq.begin(), uniq.end()), uniq.end());
+                std::vector<uint8_t> uw(uniq.size() * 256), us(uniq.size() * 8);
+                const size_t batch = (size_t) kEngBatch * kEngRows;
+                for (size_t r = 0; r < uniq.size(); r += batch)
+                    eng_rows_pf[li]->read({uniq.data() + r}, (int) std::min(batch, uniq.size() - r), {uw.data() + r * 256},
+                                          {us.data() + r * 8});
+                uint8_t* w = pfh.eng + (size_t) li * eng_table;
+                uint8_t* sc = w + (size_t) pf.cap * kEngRows * 256;
+                for (size_t i = 0; i < n; ++i) {
+                    const size_t u = (size_t) (std::lower_bound(uniq.begin(), uniq.end(), all[i]) - uniq.begin());
+                    std::memcpy(w + i * 256, uw.data() + u * 256, 256);
+                    std::memcpy(sc + i * 8, us.data() + u * 8, 8);
+                }
+                ptm->engram_rows += (int64_t) n;
+                ptm->engram_unique += (int64_t) uniq.size();
+                done[li].set_value();
+                ++t;
+            }
+        } catch (...) {
+            for (; t < done.size(); ++t) done[t].set_exception(std::current_exception());
+        }
+        ms = now_ms() - t0;
+    }
+
     /// One pass: tokens[c0 .. c0 + S) at positions p0 ..; with nll, the nll of every next token inside `tokens`.
     void prefill_pass(const std::vector<int>& tokens, int c0, int S, int p0, std::vector<float>* nll) {
         const int B = pf.sub;
         for (int i = 0; i < S; ++i) history.push_back(pack.engram_hash().token_map[tokens[c0 + i]]);
         const size_t eng_table = (size_t) pf.cap * kEngRows * (256 + 8);   // pinned bytes per engram table
-        if (n_eng) {
-            const double t0 = now_ms();
-            const auto& hs = pack.engram_hash();
-            const int cols = (hs.max_ngram - 1) * hs.n_heads;
-            if (cols != kEngRows) throw std::runtime_error("engram: the prefill buffers assume 24 rows per token");
-            int li = 0;
-            for (int l = 0; l < kLayers; ++l) {
-                if (!is_engram_layer(l)) continue;
-                for (int i = 0; i < S; ++i) {
-                    engram_ids(l, li, p0 + i);
-                    std::copy(eng_ids[li].begin(), eng_ids[li].begin() + cols, eng_ids_pf[li].begin() + (size_t) i * cols);
-                }
-                ++li;
-            }
-            for (int r = 0; r < S; r += kEngBatch) {
-                const size_t r0 = (size_t) r * cols;
-                std::vector<const int64_t*> ids;
-                std::vector<uint8_t*> w, s;
-                for (int t = 0; t < n_eng; ++t) {
-                    uint8_t* base = pfh.eng + (size_t) t * eng_table;
-                    ids.push_back(eng_ids_pf[t].data() + r0);
-                    w.push_back(base + r0 * 256);
-                    s.push_back(base + (size_t) pf.cap * kEngRows * 256 + r0 * 8);
-                }
-                eng_rows_pf->read(ids, std::min(kEngBatch, S - r) * cols, w, s);
-            }
-            ptm->engram_ms += now_ms() - t0;
-        }
+        // the engram rows are read on their own thread while the GPU works; a layer waits for its table only
+        std::vector<std::promise<void>> eng_done(n_eng);
+        std::vector<std::future<void>> eng_ready;
+        for (auto& d : eng_done) eng_ready.push_back(d.get_future());
+        double eng_thread_ms = 0;
+        std::thread eng_thread([&] { engram_pass(S, p0, eng_done, eng_thread_ms); });
+        struct Join {
+            std::thread& t;
+            ~Join() { if (t.joinable()) t.join(); }
+        } eng_join{eng_thread};
         for (int i = 0; i < S; ++i) pfh.tok[i] = tokens[c0 + i];
         ck(cudaMemcpyAsync(pf.tok, pfh.tok, (size_t) S * 4, cudaMemcpyHostToDevice, 0), "tokens up");
         ck(cudaMemcpyAsync(pf.pre_mix, pfh.pre, (size_t) S * kHc * 4, cudaMemcpyHostToDevice, 0), "pre_mix");
@@ -1152,6 +1180,11 @@ struct Engine::Impl {
                 bf16* h = pf.h + (size_t) b0 * kHc * kDim;
                 bf16* h2 = pf.h2 + (size_t) b0 * kHc * kDim;
                 if (is_engram_layer(l)) {   // this sub-batch's rows of this table, pinned -> device
+                    if (b0 == 0) {
+                        const double w0 = now_ms();
+                        eng_ready[eng_i].get();   // rethrows a read error
+                        ptm->engram_ms += now_ms() - w0;
+                    }
                     const uint8_t* hw = pfh.eng + (size_t) eng_i * eng_table;
                     uint8_t* dw = pf.eng_dev;
                     const size_t rows = (size_t) T * kEngRows, r0 = (size_t) b0 * kEngRows;
