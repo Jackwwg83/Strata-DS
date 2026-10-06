@@ -20,16 +20,26 @@ void ck(cudaError_t e, const char* what) {
 }  // namespace
 
 ExpertStream::ExpertStream(const Pack& pack, const HostExperts* host, uint8_t* ring, int slots, size_t slot_bytes,
-                           int threads)
-    : pack_(pack), host_(host), ring_(ring), slots_(slots), slot_bytes_(slot_bytes) {
-    if (slots < 1 || threads < 1) throw std::invalid_argument("ds41 expert stream: needs a slot and a reader");
+                           int readers, int host_buffers)
+    : pack_(pack), host_(host), ring_(ring), slots_(slots), n_host_(host_buffers), slot_bytes_(slot_bytes) {
+    if (slots < 1 || readers < 1 || host_buffers < 1)
+        throw std::invalid_argument("ds41 expert stream: needs a slot, a reader and a host buffer");
     ck(cudaGetDevice(&device_), "cudaGetDevice");
     const std::string path = pack.dir() + "/experts.bin";
     fd_ = open(path.c_str(), O_RDONLY);
     if (fd_ < 0) throw std::runtime_error("ds41 expert stream: cannot open " + path);
-    used_.resize(slots);
-    for (auto& e : used_) ck(cudaEventCreateWithFlags(&e, cudaEventDisableTiming), "event");
-    for (int i = 0; i < threads; ++i) threads_.emplace_back([this, i] { reader(i); });
+    ck(cudaStreamCreateWithFlags(&copy_, cudaStreamNonBlocking), "copy stream");
+    auto events = [&](std::vector<cudaEvent_t>& v, size_t n) {
+        v.resize(n);
+        for (auto& e : v) ck(cudaEventCreateWithFlags(&e, cudaEventDisableTiming), "event");
+    };
+    events(dma_done_, (size_t) n_host_);
+    events(copied_, (size_t) slots_);
+    events(used_, (size_t) slots_);
+    host_buf_.assign((size_t) n_host_, nullptr);
+    for (auto& b : host_buf_) ck(cudaHostAlloc((void**) &b, slot_bytes_, cudaHostAllocDefault), "pinned staging");
+    for (int i = 0; i < readers; ++i) threads_.emplace_back([this] { reader(); });
+    threads_.emplace_back([this] { issuer(); });
 }
 
 ExpertStream::~ExpertStream() {
@@ -39,26 +49,42 @@ ExpertStream::~ExpertStream() {
     }
     cv_.notify_all();
     for (auto& t : threads_) t.join();
-    for (auto& e : used_) cudaEventDestroy(e);
+    if (copy_) cudaStreamSynchronize(copy_);
+    for (auto* v : {&dma_done_, &copied_, &used_})
+        for (auto& e : *v) cudaEventDestroy(e);
+    for (auto* b : host_buf_)
+        if (b) cudaFreeHost(b);
+    if (copy_) cudaStreamDestroy(copy_);
     if (fd_ >= 0) close(fd_);
+}
+
+void ExpertStream::fail(const std::string& what) {
+    std::lock_guard<std::mutex> lk(mu_);
+    if (error_.empty()) error_ = what;
+    cv_.notify_all();
 }
 
 int64_t ExpertStream::push(const std::vector<std::pair<int, int>>& jobs) {
     std::lock_guard<std::mutex> lk(mu_);
     const int64_t first = (int64_t) jobs_.size();
     jobs_.insert(jobs_.end(), jobs.begin(), jobs.end());
-    done_.resize(jobs_.size(), 0);
+    src_.resize(jobs_.size(), nullptr);
+    read_.resize(jobs_.size(), 0);
     cv_.notify_all();
     return first;
 }
 
-uint8_t* ExpertStream::wait(int64_t j) {
+uint8_t* ExpertStream::wait(int64_t j, cudaStream_t stream) {
     const auto t0 = std::chrono::steady_clock::now();
-    std::unique_lock<std::mutex> lk(mu_);
-    if (j < 0 || j >= (int64_t) jobs_.size()) throw std::logic_error("ds41 expert stream: wait for an unknown job");
-    cv_.wait(lk, [&] { return done_[j] || !error_.empty(); });
-    if (!error_.empty()) throw std::runtime_error(error_);
-    wait_ms_ += std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - t0).count();
+    {
+        std::unique_lock<std::mutex> lk(mu_);
+        if (j < 0 || j >= (int64_t) jobs_.size()) throw std::logic_error("ds41 expert stream: wait for an unknown job");
+        cv_.wait(lk, [&] { return issued_ > j || !error_.empty(); });
+        if (!error_.empty()) throw std::runtime_error(error_);
+        wait_ms_ += std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - t0).count();
+    }
+    // the copy was recorded before issued_ passed j, and job j + slots is not issued before j is released
+    ck(cudaStreamWaitEvent(stream, copied_[j % slots_], 0), "wait for the copy");
     return ring_ + (size_t) (j % slots_) * slot_bytes_;
 }
 
@@ -71,14 +97,19 @@ void ExpertStream::release(int64_t j, cudaStream_t stream) {
 }
 
 void ExpertStream::drain() {
-    std::unique_lock<std::mutex> lk(mu_);
-    cv_.wait(lk, [&] { return (released_ == (int64_t) jobs_.size() && next_ == released_) || !error_.empty(); });
-    if (!error_.empty()) throw std::runtime_error(error_);
-    // every release has an event; the readers hold no job: wait for the device side, then restart the numbering
-    for (auto& e : used_) ck(cudaEventSynchronize(e), "drain");
+    {
+        std::unique_lock<std::mutex> lk(mu_);
+        cv_.wait(lk, [&] { return released_ == (int64_t) jobs_.size() || !error_.empty(); });
+        if (!error_.empty()) throw std::runtime_error(error_);
+    }
+    // the next round starts at job 0 in slot 0 and host buffer 0 without waiting: everything must be done
+    ck(cudaStreamSynchronize(copy_), "drain copies");
+    for (auto& e : used_) ck(cudaEventSynchronize(e), "drain releases");
+    std::lock_guard<std::mutex> lk(mu_);
     jobs_.clear();
-    done_.clear();
-    next_ = released_ = 0;
+    src_.clear();
+    read_.clear();
+    next_read_ = issued_ = released_ = 0;
 }
 
 ExpertStream::Stats ExpertStream::take_stats() {
@@ -93,36 +124,33 @@ ExpertStream::Stats ExpertStream::take_stats() {
     return s;
 }
 
-void ExpertStream::reader(int id) {
-    (void) id;
-    uint8_t* staging = nullptr;
-    cudaStream_t st = nullptr;
+void ExpertStream::reader() {
     std::vector<unsigned char> vec;
     try {
         ck(cudaSetDevice(device_), "cudaSetDevice");
-        ck(cudaMallocHost((void**) &staging, slot_bytes_), "pinned staging");
-        ck(cudaStreamCreateWithFlags(&st, cudaStreamNonBlocking), "reader stream");
         for (;;) {
             int64_t j;
             std::pair<int, int> job;
             {
                 std::unique_lock<std::mutex> lk(mu_);
-                // job j may start once job j - slots is released (its event then exists)
+                // host buffer j % n_host is free once job j - n_host's copy is issued (its DMA event then exists)
                 cv_.wait(lk, [&] {
-                    return stop_ || (next_ < (int64_t) jobs_.size() && next_ - slots_ < released_ && error_.empty());
+                    return stop_ || !error_.empty() ||
+                           (next_read_ < (int64_t) jobs_.size() && next_read_ - n_host_ < issued_);
                 });
-                if (stop_) break;
-                j = next_++;
+                if (stop_ || !error_.empty()) return;
+                j = next_read_++;
                 job = jobs_[j];
             }
-            if (j >= slots_) ck(cudaEventSynchronize(used_[j % slots_]), "wait for the slot");
             const ExpertSlot& x = pack_.expert(job.first, job.second);
-            uint8_t* dst = ring_ + (size_t) (j % slots_) * slot_bytes_;
             const int32_t ram = host_ ? host_->slot_of(job.first, job.second) : -1;
-            if (ram >= 0) {
-                ck(cudaMemcpyAsync(dst, host_->slot_ptr(ram), x.bytes, cudaMemcpyHostToDevice, st), "copy from RAM");
+            const uint8_t* src;
+            if (ram >= 0) {   // pinned already: copied from its RAM slot, no staging
+                src = host_->slot_ptr(ram);
                 ++n_ram_;
             } else {
+                uint8_t* buf = host_buf_[j % n_host_];
+                if (j >= n_host_) ck(cudaEventSynchronize(dma_done_[j % n_host_]), "wait for the host buffer");
                 // was every page cached? (the mapped file shares the page cache with pread)
                 const uintptr_t a = (uintptr_t) (pack_.expert_base() + x.offset) & ~(uintptr_t) 4095;
                 const size_t len = (uintptr_t) (pack_.expert_base() + x.offset + x.bytes) - a;
@@ -131,28 +159,56 @@ void ExpertStream::reader(int id) {
                 for (size_t i = 0; cached && i < vec.size(); ++i) cached = vec[i] & 1;
                 uint64_t got = 0;
                 while (got < x.bytes) {
-                    const ssize_t r = pread(fd_, staging + got, x.bytes - got, (off_t) (x.offset + got));
+                    const ssize_t r = pread(fd_, buf + got, x.bytes - got, (off_t) (x.offset + got));
                     if (r <= 0) throw std::runtime_error("ds41 expert stream: short read of experts.bin");
                     got += (uint64_t) r;
                 }
                 if (!cached) posix_fadvise(fd_, (off_t) x.offset, (off_t) x.bytes, POSIX_FADV_DONTNEED);
-                ck(cudaMemcpyAsync(dst, staging, x.bytes, cudaMemcpyHostToDevice, st), "copy from file");
                 ++(cached ? n_cache_ : n_ssd_);
+                src = buf;
             }
-            ck(cudaStreamSynchronize(st), "reader copy");
-            {
-                std::lock_guard<std::mutex> lk(mu_);
-                done_[j] = 1;
-            }
+            std::lock_guard<std::mutex> lk(mu_);
+            src_[j] = src;
+            read_[j] = 1;
             cv_.notify_all();
         }
     } catch (const std::exception& e) {
-        std::lock_guard<std::mutex> lk(mu_);
-        if (error_.empty()) error_ = e.what();
-        cv_.notify_all();
+        fail(e.what());
     }
-    if (st) cudaStreamDestroy(st);
-    if (staging) cudaFreeHost(staging);
+}
+
+void ExpertStream::issuer() {
+    try {
+        ck(cudaSetDevice(device_), "cudaSetDevice");
+        for (;;) {
+            int64_t j;
+            const uint8_t* src;
+            std::pair<int, int> job;
+            {
+                std::unique_lock<std::mutex> lk(mu_);
+                // in order: job j is read, and job j - slots is released (its "used" event then exists)
+                cv_.wait(lk, [&] {
+                    return stop_ || !error_.empty() ||
+                           (issued_ < (int64_t) jobs_.size() && read_[issued_] && issued_ - slots_ < released_);
+                });
+                if (stop_ || !error_.empty()) return;
+                j = issued_;
+                src = src_[j];
+                job = jobs_[j];
+            }
+            const int sl = (int) (j % slots_);
+            if (j >= slots_) ck(cudaStreamWaitEvent(copy_, used_[sl], 0), "wait for the slot");   // on the GPU
+            ck(cudaMemcpyAsync(ring_ + (size_t) sl * slot_bytes_, src, pack_.expert(job.first, job.second).bytes,
+                               cudaMemcpyHostToDevice, copy_), "copy");
+            ck(cudaEventRecord(copied_[sl], copy_), "record copy");
+            ck(cudaEventRecord(dma_done_[j % n_host_], copy_), "record host buffer");
+            std::lock_guard<std::mutex> lk(mu_);
+            issued_ = j + 1;
+            cv_.notify_all();
+        }
+    } catch (const std::exception& e) {
+        fail(e.what());
+    }
 }
 
 }  // namespace strata::ds41

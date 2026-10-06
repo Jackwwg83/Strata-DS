@@ -28,7 +28,7 @@ int main() {
     constexpr int kSlots = 8, kJobs = 300;
     const size_t slot_bytes = kExpertBytes;
     Dev<uint8_t> ring((size_t) kSlots * slot_bytes), check((size_t) kJobs * slot_bytes);
-    sd::ExpertStream stream(pack, nullptr, ring.p, kSlots, slot_bytes, 3);
+    sd::ExpertStream stream(pack, nullptr, ring.p, kSlots, slot_bytes, 3, 5);   // fewer host buffers than slots too
     for (int round = 0; round < 2; ++round) {
         std::vector<std::pair<int, int>> jobs;
         for (int j = 0; j < kJobs; ++j) jobs.push_back({(j * 3 + round) % L, (j * 37 + 5 * round) % E});
@@ -37,7 +37,7 @@ int main() {
         stream.push({jobs.begin() + 100, jobs.end()});
         v.check(first == 0, "job numbers start at 0 (again after drain)");
         for (int j = 0; j < kJobs; ++j) {
-            uint8_t* slot = stream.wait(j);
+            uint8_t* slot = stream.wait(j, 0);
             v.check(slot == ring.p + (size_t) (j % kSlots) * slot_bytes, "job j uses slot j % slots");
             if (j % 7 == 0) spin<<<1, 1>>>(2000000);   // about 1 ms: readers must not overwrite the slot meanwhile
             ck(cudaMemcpyAsync(check.p + (size_t) j * slot_bytes, slot, slot_bytes, cudaMemcpyDeviceToDevice, 0), "copy out");

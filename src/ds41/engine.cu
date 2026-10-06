@@ -862,7 +862,7 @@ struct Engine::Impl {
             eng_ids_pf.assign(n_eng, std::vector<int64_t>((size_t) cap * kEngRows, 0));
         }
         estream = std::make_unique<ExpertStream>(pack, host.get(), pf.ring, pf.ring_slots, pf.slot_bytes,
-                                                 std::max(1, opt.prefill_threads));
+                                                 std::max(1, opt.prefill_threads), std::max(1, opt.prefill_host_buffers));
     }
 
 
@@ -1070,7 +1070,7 @@ struct Engine::Impl {
         for (int g0 = 0; g0 < n_jobs; g0 += group) {
             const int n = std::min(group, n_jobs - g0);
             for (int i = 0; i < n; ++i) {
-                uint8_t* slot = estream->wait(first_job + g0 + i);
+                uint8_t* slot = estream->wait(first_job + g0 + i, 0);   // stream 0 waits for the copy on the GPU
                 pfh.desc[kExperts + g0 + i] = VramExperts::describe_at(pack, l, order[n_res + g0 + i], slot);
             }
             ck(cudaMemcpyAsync(pf.desc + kExperts + g0, pfh.desc + kExperts + g0, n * sizeof(kernels::Exl3Expert),

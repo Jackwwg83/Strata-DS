@@ -44,7 +44,8 @@ struct EngineOptions {
     int prefill_chunk = 65536;
     int prefill_batch = 4096;   ///< sub-batch tokens (halved down to 512 when the scratch does not fit)
     int prefill_ring = 256;     ///< expert ring slots at most (halved down to 16 when they do not fit)
-    int prefill_threads = 8;    ///< expert stream readers
+    int prefill_threads = 16;       ///< expert stream readers (pread from the pack)
+    int prefill_host_buffers = 64;  ///< pinned staging buffers of the expert stream (how far reads run ahead)
 };
 
 /// What one prefill() call did
