@@ -1,0 +1,117 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<title>M3 批量 prefill 方案</title>
+<link rel="icon" href="data:,">
+<style>
+:root{--bg:#fbfbf9;--fg:#1d1d1b;--mut:#6b6b66;--line:#e2e1dc;--card:#fff;--acc:#2f5d8a;--ok:#2e7d4f;--warn:#9a5b00;--chip:#eef2f6}
+@media (prefers-color-scheme:dark){:root:not([data-theme=light]){--bg:#161615;--fg:#e9e8e3;--mut:#9b9a94;--line:#33332f;--card:#1f1f1d;--acc:#8db7e0;--ok:#7cc79a;--warn:#e0b060;--chip:#26303a}}
+:root[data-theme=dark]{--bg:#161615;--fg:#e9e8e3;--mut:#9b9a94;--line:#33332f;--card:#1f1f1d;--acc:#8db7e0;--ok:#7cc79a;--warn:#e0b060;--chip:#26303a}
+body{margin:0;background:var(--bg);color:var(--fg);font:15px/1.7 -apple-system,BlinkMacSystemFont,"Segoe UI","PingFang SC","Hiragino Sans GB","Microsoft YaHei","Noto Sans CJK SC",sans-serif}
+main{max-width:1080px;margin:0 auto;padding:24px 16px 72px}
+h1{font-size:26px;margin:0 0 4px}
+h2{font-size:19px;margin:36px 0 10px;color:var(--acc);border-bottom:1px solid var(--line);padding-bottom:4px}
+h3{font-size:15.5px;margin:20px 0 6px}
+p{margin:8px 0}
+.sub,.note{color:var(--mut);font-size:13px}
+.card{background:var(--card);border:1px solid var(--line);border-radius:10px;padding:14px 18px;margin:12px 0}
+.tw{overflow-x:auto;margin:10px 0;border:1px solid var(--line);border-radius:8px;background:var(--card)}
+table{border-collapse:collapse;width:100%;font-size:13.5px;font-variant-numeric:tabular-nums}
+th,td{padding:7px 10px;border-bottom:1px solid var(--line);text-align:left;vertical-align:top}
+th{font-weight:600;background:color-mix(in srgb,var(--acc) 8%,transparent);white-space:nowrap}
+tr:last-child td{border-bottom:0}
+code{font-family:ui-monospace,SFMono-Regular,Menlo,Consolas,monospace;font-size:12.5px;background:var(--chip);padding:1px 4px;border-radius:4px;word-break:break-all}
+ol li,ul li{margin:4px 0}
+</style>
+</head>
+<body>
+<main>
+<h1>M3：批量 prefill</h1>
+<p class="sub">2026-10-06 · <b>已确认</b>：单段和分段一起做；开一台便宜 GPU 机器用于编译和单元测试 · 依据：上游 <code>src/prefill/prefill.cpp</code>、<code>src/program/generate.cpp</code>、<code>docs/DETAILS.md</code>；DeepSeek 官方 <code>ds41/proto/ref/model.py</code>；exllamav3 v1.5.4 的 <code>quant/</code>。</p>
+
+<div class="card">
+<h3 style="margin-top:4px">一页结论</h3>
+<ol>
+<li><b>现状：</b>引擎没有 prefill，提示词也是一个 token 一个 token 地过，约 3 token/秒。4K 的提示词要 20 多分钟。</li>
+<li><b>做法：照搬上游。</b>提示词一次进 GPU，40 层全在 GPU 上批量计算，CPU 不算 prefill 的专家。显存里有的专家直接用；没有的，经 PCIe 从内存拷进 GPU。拷贝走一个借用显存缓存槽位的环形缓冲区，和计算重叠进行。</li>
+<li><b>DeepSeek 特有的部分：</b>注意力的窗口、KV 压缩器、indexer 的 top-k 和候选块、Engram、hc 混合，都要改成批量版本。官方参考实现只支持「从位置 0 开始一次处理完」，所以分两步：
+  <ul>
+  <li><b>第一步</b>做单段 prefill（上下文 ≤ 8K），语义和官方完全一致，可以直接和原型的 oracle 逐层比对。</li>
+  <li><b>第二步</b>做分段 prefill（16K 以上），这部分官方没有实现，需要我们自己推导。</li>
+  </ul></li>
+<li><b>速度预期（推算）：</b>3bpw 的专家共 190 GB。批量 prefill 时几乎每层的每个专家都会被用到，所以每处理一段，就要把约 190 GB 的专家从内存或 SSD 搬进 GPU 一遍。瓶颈是搬运带宽，不是计算：
+  <ul>
+  <li>64 GB 内存的机器，大部分专家从 SSD 读（约 6.5 GB/s），一段约 25–30 秒。</li>
+  <li>按这个算，4K 上下文约 150 tok/s，8K 约 300 tok/s；1K 约 40 tok/s；512 约 20 tok/s。上下文越长，越能摊薄搬运成本。</li>
+  </ul>
+  这比现在快 7–100 倍，但比上游跑小模型时慢（上游的专家只有 23–50 GB）。所以<b>SAGE 1.59 的 prefill 会快很多</b>，原因是专家只有 101 GB，128 GB 内存能全部装下。</li>
+<li><b>工作量：</b>我写引擎部分，约 2–3 天。专家的批量 GEMM 原样搬 exllamav3 的现成 kernel，交给 Codex，做法和 K10 一样。</li>
+<li><b>需要你确认 2 件事</b>，见文末。</li>
+</ol>
+</div>
+
+<h2>0. 分段的语义（已确认一起做）</h2>
+<p><b>定义：分段 prefill 的结果，等于把这些 token 按官方 decode 的规则一个一个处理的结果。</b>官方的单段 prefill（<code>start_pos == 0</code>）本身就和逐个 decode 等价：</p>
+<ul>
+<li>窗口：第 i 个 query 看 <code>[i−127, i]</code>，和 decode 的环形缓冲区覆盖的位置相同。</li>
+<li>压缩器：整组池化，余数进状态。和 decode 每满一组压缩一次的结果相同。</li>
+<li>indexer：每个 query 用 <code>(i+1)//r</code> 做因果遮罩，候选块也按各自的可见长度选，和 decode 相同。</li>
+</ul>
+<p>所以段的起点 p0 &gt; 0 时，套用同一套规则即可：窗口里早于 p0 的位置从上一段留下的环形缓冲区取；压缩器把上一段剩下的余数和本段开头的 token 拼成一组；indexer 能看到之前所有段压缩好的 key。<b>验证：</b>分段结果、单段结果、逐 token decode 结果三方对照。单段最长受显存限制（24 GB 卡约 8K），所以 16K/32K 必须分段。</p>
+
+<h2>1. 每段的计算流程（T 个 token，起点 p0）</h2>
+<div class="tw"><table>
+<tr><th>步骤</th><th>做什么</th><th>用什么算</th><th>状态</th></tr>
+<tr><td>Engram（第 1、14 层）</td><td>T 个 token 的 n-gram 哈希，48T 行一次性 O_DIRECT 读</td><td>EngramRows（已有）+ 批量反量化</td><td>小改</td></tr>
+<tr><td>hc 混合 + collapse</td><td>每个 token 独立</td><td>K7（每次 8 个 token，循环）</td><td>已有</td></tr>
+<tr><td>注意力投影 wq_a / wq_b / wkv / wo_b</td><td>FP8 块缩放 GEMM，M = T</td><td>K2（dots 的 K2-07，3.65 ms@2048，待合并）</td><td>合并即可</td></tr>
+<tr><td>滑动窗口 KV</td><td>每个 query 看自己之前的 128 个位置；把最后 128 个写进环形缓冲区给 decode 用</td><td>新写：窗口索引 kernel</td><td>我写</td></tr>
+<tr><td>KV 压缩器（2、8、14、20 层）</td><td>每 r 个 token 池化成 1 个；余数留在状态里给 decode 接着用</td><td>cuBLAS BF16 GEMM + 新写的池化 kernel</td><td>我写</td></tr>
+<tr><td>Indexer（8 个源层）</td><td>每个 query 对它之前的压缩 key 打分（因果遮罩），取 top-512；第 20 层还要选候选块</td><td>cuBLAS GEMM 打分 + 新写的逐行 top-k</td><td>我写；以后可以交给 dots 优化</td></tr>
+<tr><td>稀疏注意力</td><td>每个 query 看 640 个位置（窗口 128 + top-512）</td><td>K3（每次 8 个 query，循环）</td><td>已有</td></tr>
+<tr><td>Router</td><td>T 个 token 各选 6 个专家</td><td>K8（每次 8 个，循环）</td><td>已有</td></tr>
+<tr><td>共享专家</td><td>FP8 GEMM</td><td>K2</td><td>合并即可</td></tr>
+<tr><td><b>路由专家</b></td><td>在 GPU 上把 token 按专家分组，每个专家做一次 GEMM（gate、up → SwiGLU → down）</td><td><b>exllamav3 <code>exl3_mgemm</code></b>（多专家分组 GEMM，原样搬进来）</td><td><b>新任务 K12，交给 Codex</b></td></tr>
+<tr><td>专家搬运</td><td>不在显存里的专家：mmap → pinned 中转 → 借来的显存槽位；下一层的专家在本层注意力计算时就开始拷</td><td>上游的 Stager + 环形缓冲区设计</td><td>我写</td></tr>
+<tr><td>输出头</td><td>只算最后一个位置；测 nll 时算全部位置</td><td>cuBLAS</td><td>我写</td></tr>
+</table></div>
+<p class="note">第一步里 K3、K7、K8 先每次处理 8 个 token、循环调用，省去重写；4K 上下文多出来的启动开销约 1 秒，和搬运专家的 25 秒比可以忽略。以后再换成真正的批量 kernel。</p>
+
+<h2>2. 显存怎么分</h2>
+<ul>
+<li>prefill 期间，从显存专家缓存的末尾借出一部分槽位当环形缓冲区，上限和上游一样：最多借 90%，至少留 128 个槽位。</li>
+<li>T 个 token 的中间结果：hc 流 40 KB/token，q 64 KB/token，indexer 的分数矩阵 T × T/r × 4 字节。8K 上下文合计约 1–2 GB，24 GB 的卡放得下；16 GB 的卡要把单段限制在 4K 左右（第二步分段之后就没有这个限制了）。</li>
+<li>prefill 结束后，把借出的槽位还原成原来的专家，和上游一样。</li>
+</ul>
+
+<h2>3. 怎么验证</h2>
+<ol>
+<li><b>和原型比</b>：原型（官方 <code>model.py</code>）对文档做的就是 prefill。拿同一篇文档，比较每层的 hidden、每个位置的路由和 logits，以及<b>整段的 nll</b>。prefill 一次就能给出所有位置的 logits，可以直接算 nll。</li>
+<li><b>和我们自己的 decode 路径比</b>：同一段提示词，prefill 之后接着生成，和逐 token 处理完提示词再生成相比，nll 应该在噪声范围内。注意两者不会逐字节相同：上游的 prefill 和 decode 也不相同，注意力的求和顺序不一样。</li>
+<li><b>单元测试</b>：窗口索引、压缩器池化、逐行 top-k、token 按专家分组，各自对照 CPU 参考实现。</li>
+<li><b>测速</b>：上下文 512 / 1K / 2K / 4K / 8K，各测 prefill tok/s，以及紧接着 decode 64 个 token 的速度。这就是你要的「不同上下文下 prefill 和 decode 速度」的图。</li>
+</ol>
+
+<h2>4. 分工和顺序</h2>
+<div class="tw"><table>
+<tr><th>顺序</th><th>内容</th><th>谁</th></tr>
+<tr><td>1</td><td>合并 dots 的 K2（审代码 + 补 graph 检查之外的检查）；搭 prefill 框架：分段循环、批量 hc/注意力/router（复用 K3/K7/K8）、投影、Engram</td><td>我</td></tr>
+<tr><td>2</td><td>窗口、压缩器、indexer 的批量版本 + 单元测试</td><td>我</td></tr>
+<tr><td>并行</td><td>K12：搬 exllamav3 的 <code>exl3_mgemm</code>（多专家分组 GEMM），做法和 K10 一样（先原样搬、再改接口），配验收测试和 golden</td><td>Codex</td></tr>
+<tr><td>3</td><td>专家搬运：Stager、环形缓冲区、借用和还原显存槽位</td><td>我</td></tr>
+<tr><td>4</td><td>对照原型的 nll 验证、上下文测速脚本、报告生成（HTML，带图）</td><td>我</td></tr>
+<tr><td>之后</td><td>分段 prefill（16K 以上）；把 K3/K5/K7/K8 换成真正的批量 kernel（可交给 dots）</td><td>我 / dots</td></tr>
+</table></div>
+
+<h2>5. 待确认</h2>
+<div class="card">
+<ol>
+<li><b>先做单段（上下文 ≤ 8K），分段以后再做？</b>单段和官方语义完全一致，能直接对照验证；分段需要自己推导，风险更高。报告里的上下文就测到 8K 为止。</li>
+<li><b>开发期间要不要开一台便宜的 GPU 机器，用来编译和跑单元测试？</b>我本机（Mac）没有 CUDA，Codex 那台也没有。如果完全不开机器，2–3 天写下来的代码一行都没编译过，到最后再上 GPU 一起调，风险很大。我建议开一台最便宜的（比如 RTX 3060，约 $0.10/h），只用来编译和跑小测试，不下载模型。用到模型的测试，等代码写好后再开正式的测试机。</li>
+</ol>
+</div>
+</main>
+</body>
+</html>
