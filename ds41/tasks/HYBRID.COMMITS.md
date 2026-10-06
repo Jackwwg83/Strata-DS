@@ -1,34 +1,32 @@
-# Hybrid commit units
+# Hybrid staging commit units
 
-No commit was created. The first test commit attempt failed:
+The reviewer committed the prior direct-path work and merged `feature/ds41`.
+This follow-up starts at `e4afe65` on `feature/ds41-hybrid`. No new commit was made in this session.
+Git metadata is read-only under the current sandbox, so no metadata write was attempted.
+The earlier report recorded an `index.lock: Operation not permitted` failure for this shared worktree.
+Source changes are present and reviewable. Preserve the pre-existing untracked `ds41/tasks/DECODE.STUDY.md`.
 
-```text
-fatal: Unable to create '/Users/jackwu/Projects/Strata-DS/.git/worktrees/Strata-DS-hybrid/index.lock': Operation not permitted
-```
-
-The shared Git metadata is outside this sandbox's writable roots. The source worktree is writable.
-Do not stage the pre-existing untracked `ds41/tasks/DECODE.STUDY.md`.
-The tests were written before the production changes. The final test files also include review fixes.
-Each unit below touches at most five files. Run these commands in this worktree when Git metadata is writable.
+The tests were edited before production code. Units 1 and 2 below belong together for compilation;
+the test-first unit references the new staging API. Each commit touches at most five files.
+Run these commands only where Git metadata is writable:
 
 ```sh
-git add src/ds41/tests/hybrid_decode_test.cu src/ds41/tests/hybrid_host_table_test.cu cmake/ds41_engine.cmake
-git commit -m 'test(ds41): cover hybrid expert routing and mapped memory' \
+cd /workspace/Strata-DS-hybrid
+git add src/ds41/tests/expert_staging_test.cu src/ds41/tests/hybrid_decode_test.cu
+git commit -m 'test(ds41): check staged expert bytes and decode parity' \
   -m 'Co-Authored-By: Codex <noreply@openai.com>'
 
-git add include/strata/ds41/host_experts.hpp src/ds41/host_experts.cpp src/ds41/vram_experts.cu
-git commit -m 'feat(ds41): publish mapped RAM expert descriptors at tier safe points' \
+git add include/strata/ds41/expert_staging.hpp src/ds41/expert_staging.cu \
+  include/strata/ds41/doorbell.hpp src/ds41/doorbell.cu cmake/ds41_engine.cmake
+git commit -m 'feat(ds41): stream mapped expert blobs into fixed VRAM slots' \
   -m 'Co-Authored-By: Codex <noreply@openai.com>'
 
-git add include/strata/ds41/doorbell.hpp src/ds41/doorbell.cu
-git commit -m 'feat(ds41): split RAM misses with a device quota' \
+git add src/ds41/engine.cu
+git commit -m 'feat(ds41): overlap expert staging with shared decode work' \
   -m 'Co-Authored-By: Codex <noreply@openai.com>'
 
-git add src/ds41/engine.cu include/strata/ds41/engine.hpp src/ds41/ds41_generate.cpp
-git commit -m 'feat(ds41): run hybrid decode and report expert counts' \
-  -m 'Co-Authored-By: Codex <noreply@openai.com>'
-
-git add ds41/tasks/HYBRID.PROGRESS.md ds41/tasks/HYBRID.REPORT.md ds41/tasks/HYBRID.COMMITS.md
-git commit -m 'docs(ds41): record hybrid validation and GPU acceptance commands' \
+git add tools/ds41/zc_stage_sweep.sh ds41/tasks/HYBRID.REPORT.md \
+  ds41/tasks/HYBRID.PROGRESS.md ds41/tasks/HYBRID.COMMITS.md
+git commit -m 'docs(ds41): record staging limits and fixed-residency GPU checks' \
   -m 'Co-Authored-By: Codex <noreply@openai.com>'
 ```
