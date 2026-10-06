@@ -8,6 +8,10 @@
 
 namespace strata::ds41::kernels {
 
+/// Allocate maximum scratch for the current device. Call before capture.
+/// Idempotent. Scratch lives until process exit. Calls/replays on one device must not overlap.
+void router_init();
+
 /// For m tokens (1..8): logits = x . w_e in fp32 (bf16 inputs), s_e = sqrt(softplus(logit_e)) with softplus(v) = v
 /// for v > 20 else log1p(exp(v)); pick the 6 experts with the largest s_e + bias_e (ties: lower expert id), in that
 /// order; weight_i = s_i / (sum of the 6 s + 1e-20) * 1.5.

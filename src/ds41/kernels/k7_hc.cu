@@ -220,6 +220,8 @@ __global__ void hc_finish(const __nv_bfloat16* __restrict__ x,
 
 }  // namespace
 
+void hc_init() { (void) workspace_for_device(); }
+
 void hc_mixes_pre(const __nv_bfloat16* x, int m, const float* fn, const float* scale, const float* base,
                   const float* pre_in, __nv_bfloat16* y, float* pre, float* post, float* comb,
                   cudaStream_t stream) {
