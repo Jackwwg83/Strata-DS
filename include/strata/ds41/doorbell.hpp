@@ -10,6 +10,8 @@
 // CUDA graph. Round numbers are fixed per layer (1, 2, ...) and the host resets both words before each step.
 #pragma once
 
+#include "strata/ds41/kernels/k10_exl3_moe.hpp"
+
 #include <cuda_runtime.h>
 
 #include <atomic>
@@ -30,11 +32,23 @@ public:
     int dim() const { return dim_; }
 
     // ---- GPU side (stream-ordered, graph-capturable)
-    /// Copy x [m][dim] fp16 bits, and for every routed (token, slot): the id if the expert is not resident (else
-    /// -1) and the weight, to mapped memory; then raise seq to `round`. `res` [n_expert] (slot or -1) may be null
-    /// (nothing resident). With `gpu_sel` non-null also write the resident slot (else -1) per (token, slot) there.
+    /// Publish x [m][dim] fp16 bits, CPU ids, and weights. Then raise seq to round.
+    /// res is this layer's VRAM slot table, or null. GPU-assigned CPU ids become -1.
+    /// Legacy mode (vram and ram null): gpu_sel holds VRAM slot indices or -1.
+    /// With descriptors supplied: gpu_sel holds i or -1 into gpu_experts() [m][topk].
+    /// Supply vram whenever res is supplied in descriptor mode. ram is this layer's RAM table.
+    /// quota is one device int, capped to [0, topk]. Null means zero.
+    /// Each token sends its first quota eligible RAM misses to K10, in routing order.
+    /// Update tables and quota only between steps. Buffers must survive the graph.
     void publish(const uint16_t* x, const int32_t* ids, const float* w, int m, const int32_t* res, int32_t* gpu_sel,
-                 uint32_t round, cudaStream_t stream);
+                 uint32_t round, cudaStream_t stream,
+                 const kernels::Exl3Expert* vram = nullptr, const kernels::Exl3Expert* ram = nullptr,
+                 const int* quota = nullptr);
+    /// Per-call descriptors. Consume on the publish stream before the next publish.
+    const kernels::Exl3Expert* gpu_experts() const { return gpu_experts_; }
+    struct Counts { int vram, zero_copy, cpu; };
+    /// Read after wait_published, before mark_done. Counts refer to this call.
+    Counts counts() const { return *h_counts_; }
     /// Wait until the CPU raised done to `round`, then out[i] += its rows [m][dim] (FP32).
     void wait_add(float* out, int m, uint32_t round, cudaStream_t stream);
 
@@ -52,6 +66,8 @@ public:
 
 private:
     int max_m_, topk_, dim_;
+    kernels::Exl3Expert* gpu_experts_ = nullptr;
+    Counts *h_counts_ = nullptr, *d_counts_ = nullptr;
     void* host_ = nullptr;   // one cudaHostAlloc block holding every buffer below
     uint32_t *h_seq_ = nullptr, *d_seq_ = nullptr;
     uint32_t *h_done_ = nullptr, *d_done_ = nullptr;
