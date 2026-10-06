@@ -22,7 +22,7 @@ struct Layout {
 
     explicit Layout(int max_rows) : rows(max_rows < ROW_TILE ? max_rows : ROW_TILE) {
         if (max_rows < 1) throw std::invalid_argument("K12: layout needs rows");
-        matrices = 256;  // three device pointers, padded to 256 bytes
+        matrices = 256;  // three reconstruction jobs, padded to 256 bytes
         input = matrices + 3 * MATRIX_ELEMENTS * sizeof(uint16_t);
         gu = input + size_t(2) * rows * H * sizeof(uint16_t);
         down_input = gu + size_t(2) * rows * F * sizeof(float);

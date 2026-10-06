@@ -46,10 +46,10 @@ void exl3_moe_prefill(const __half* x, const int32_t* tok, const float* w,
         if (off[g] == off[g + 1]) continue;
         const Exl3Expert* expert = experts + g;
         k12::prepare<<<1, 1, 0, stream>>>(expert, ws.trellis);
-        strata_exl3::reconstruct_mul1_3bit(ws.matrices, ws.trellis, k12::H, k12::F, stream);
-        strata_exl3::reconstruct_mul1_3bit(ws.matrices + k12::MATRIX_ELEMENTS, ws.trellis + 1,
+        strata_exl3::reconstruct_mul1(ws.matrices, ws.trellis, k12::H, k12::F, stream);
+        strata_exl3::reconstruct_mul1(ws.matrices + k12::MATRIX_ELEMENTS, ws.trellis + 1,
                                           k12::H, k12::F, stream);
-        strata_exl3::reconstruct_mul1_3bit(ws.matrices + 2 * k12::MATRIX_ELEMENTS, ws.trellis + 2,
+        strata_exl3::reconstruct_mul1(ws.matrices + 2 * k12::MATRIX_ELEMENTS, ws.trellis + 2,
                                           k12::F, k12::H, stream);
         k12::check_cuda(cudaPeekAtLastError(), "reconstruct launches");
 
