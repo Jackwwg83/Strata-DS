@@ -3,6 +3,7 @@
 #include "strata/kernels/bf16_bits.hpp"
 
 #include <cuda_runtime.h>
+#include <cuda_fp8.h>
 
 #include <cstdio>
 #include <cstdlib>
@@ -145,6 +146,8 @@ __global__ void gemv(const float* __restrict__ x, const uint8_t* __restrict__ w,
     }
 }
 
+#include "fp8_gemv/small_pair.cuh"
+
 unsigned grid_for(int64_t rows) {
     const int64_t grid = (rows - 1) / (THREADS / 32) + 1;
     return unsigned(grid < 65535 ? grid : 65535);
@@ -156,8 +159,17 @@ void launch_layout(const float* x, const uint8_t* w, const uint8_t* scales, uint
     constexpr int ROWS_PER_BLOCK = (THREADS / 32 / SPLIT) * ROWS;
     const int64_t blocks = (n - 1) / ROWS_PER_BLOCK + 1;
     const unsigned grid = unsigned(blocks < 65535 ? blocks : 65535);
-    if (((reinterpret_cast<uintptr_t>(w) | reinterpret_cast<uintptr_t>(x)) & 15u) == 0)
+    if (((reinterpret_cast<uintptr_t>(w) | reinterpret_cast<uintptr_t>(x)) & 15u) == 0) {
+        // Keep the original path for large streamed matrices and all verify windows.
+        // The fixed split/row dispatch and 16-byte lane ownership stay the same.
+        if constexpr (M == 1 && SPLIT > 1) {
+            if (n * k <= (int64_t(16) << 20)) {
+                gemv_small_pair<ROWS, SPLIT><<<grid, THREADS, 0, stream>>>(x, w, scales, y, int(k), int(n));
+                return;
+            }
+        }
         gemv<M, ROWS, SPLIT, true><<<grid, THREADS, 0, stream>>>(x, w, scales, y, k, n);
+    }
     else
         gemv<M, ROWS, SPLIT, false><<<grid, THREADS, 0, stream>>>(x, w, scales, y, k, n);
 }

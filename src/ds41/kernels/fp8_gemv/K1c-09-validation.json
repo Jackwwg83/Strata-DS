@@ -1,0 +1,183 @@
+{
+  "base": "be8c969a1f1b7bf88d8a64ef1b3e935dcc2f376a",
+  "changed_paths": [
+    "src/ds41/kernels/fp8_gemv.cu",
+    "src/ds41/kernels/fp8_gemv/K1c-09-report.md",
+    "src/ds41/kernels/fp8_gemv/build_small_pair.sh",
+    "src/ds41/kernels/fp8_gemv/check_pair_mutants.py",
+    "src/ds41/kernels/fp8_gemv/check_small_pair.cu",
+    "src/ds41/kernels/fp8_gemv/pair_decode.cuh",
+    "src/ds41/kernels/fp8_gemv/small_pair.cuh",
+    "src/ds41/kernels/fp8_gemv/validate_small_pair.py"
+  ],
+  "protected_sha256": {
+    "include/strata/ds41/fp8_gemv.hpp": "01a5c451a0f6331894cb3479d148ae7a5ba8ae64652075f38a0d027d4fdfa760",
+    "src/ds41/tests/k1c_fp8_gemv_test.cu": "3d5b1556f6e6e9571f82ca02494a73b9e0227dedd4373c8167d8cebbc5a20b1c",
+    "src/ds41/kernels/fp8_gemv_parity.cpp": "120a161325b98fa6aa2f925a02dea4bc867291540ae9c5e4ed942750e11d6c2c",
+    "src/ds41/ops.cu": "4e475f3b8b8a3bccc19cbba8b6de0d115c8ff3b886943f8d22a666f0d916c6b0",
+    "cmake/ds41.cmake": "1f987621c236ee1e9e1fba328207a492d721ad6459ec62f38fd1dcf424d8a1c7"
+  },
+  "architectures": {
+    "86": {
+      "unchanged_original_ptx_entries": 97,
+      "new_pair_entries": 4,
+      "resources": [
+        {
+          "name": "_ZN6strata4ds4144_GLOBAL__N__e01d672c_11_fp8_gemv_cu_29bc5d0515gemv_small_pairILi1ELi2EEEvPKfPKhS6_Ptii",
+          "registers": 40,
+          "shared_bytes": 16,
+          "stack_bytes": 0,
+          "spill_loads": 0,
+          "spill_stores": 0
+        },
+        {
+          "name": "_ZN6strata4ds4144_GLOBAL__N__e01d672c_11_fp8_gemv_cu_29bc5d0515gemv_small_pairILi1ELi4EEEvPKfPKhS6_Ptii",
+          "registers": 40,
+          "shared_bytes": 16,
+          "stack_bytes": 0,
+          "spill_loads": 0,
+          "spill_stores": 0
+        },
+        {
+          "name": "_ZN6strata4ds4144_GLOBAL__N__e01d672c_11_fp8_gemv_cu_29bc5d0515gemv_small_pairILi2ELi2EEEvPKfPKhS6_Ptii",
+          "registers": 40,
+          "shared_bytes": 32,
+          "stack_bytes": 0,
+          "spill_loads": 0,
+          "spill_stores": 0
+        },
+        {
+          "name": "_ZN6strata4ds4144_GLOBAL__N__e01d672c_11_fp8_gemv_cu_29bc5d0515gemv_small_pairILi2ELi4EEEvPKfPKhS6_Ptii",
+          "registers": 40,
+          "shared_bytes": 32,
+          "stack_bytes": 0,
+          "spill_loads": 0,
+          "spill_stores": 0
+        }
+      ],
+      "gpu_test_exit": 77,
+      "ptx_sha256": "c508f143ad7be75d9c219bd40d4ead0e26604749ac6bf96851cf535cf3ed194b",
+      "object_sha256": "79c254e04a66032355a27508d878f611deee7037f39bdd375d56907955779d1d",
+      "executable_sha256": "61c0fa018b8bcb2bfc7e627a84eb3f1e5de9ee277881420d66943a9d220ffcea"
+    },
+    "89": {
+      "unchanged_original_ptx_entries": 97,
+      "new_pair_entries": 4,
+      "resources": [
+        {
+          "name": "_ZN6strata4ds4144_GLOBAL__N__e01d672c_11_fp8_gemv_cu_29bc5d0515gemv_small_pairILi1ELi2EEEvPKfPKhS6_Ptii",
+          "registers": 38,
+          "shared_bytes": 16,
+          "stack_bytes": 0,
+          "spill_loads": 0,
+          "spill_stores": 0
+        },
+        {
+          "name": "_ZN6strata4ds4144_GLOBAL__N__e01d672c_11_fp8_gemv_cu_29bc5d0515gemv_small_pairILi1ELi4EEEvPKfPKhS6_Ptii",
+          "registers": 38,
+          "shared_bytes": 16,
+          "stack_bytes": 0,
+          "spill_loads": 0,
+          "spill_stores": 0
+        },
+        {
+          "name": "_ZN6strata4ds4144_GLOBAL__N__e01d672c_11_fp8_gemv_cu_29bc5d0515gemv_small_pairILi2ELi2EEEvPKfPKhS6_Ptii",
+          "registers": 40,
+          "shared_bytes": 32,
+          "stack_bytes": 0,
+          "spill_loads": 0,
+          "spill_stores": 0
+        },
+        {
+          "name": "_ZN6strata4ds4144_GLOBAL__N__e01d672c_11_fp8_gemv_cu_29bc5d0515gemv_small_pairILi2ELi4EEEvPKfPKhS6_Ptii",
+          "registers": 40,
+          "shared_bytes": 32,
+          "stack_bytes": 0,
+          "spill_loads": 0,
+          "spill_stores": 0
+        }
+      ],
+      "gpu_test_exit": 77,
+      "ptx_sha256": "d4ee888570e100677084b79c465cae8abab2eeabefde877b35e41a9df9a596e8",
+      "object_sha256": "8a66162e93bd9aa2a232eadc4b70254d1a272ec1c3dbb11420455b1e4aa3ef0b",
+      "executable_sha256": "cfd6bd09eeafe157a9df2d712d3ec91662d0f1c2c35a3aee891be7c255459cfd"
+    },
+    "120": {
+      "unchanged_original_ptx_entries": 97,
+      "new_pair_entries": 4,
+      "resources": [
+        {
+          "name": "_ZN6strata4ds4144_GLOBAL__N__e01d672c_11_fp8_gemv_cu_29bc5d0515gemv_small_pairILi1ELi2EEEvPKfPKhS6_Ptii",
+          "registers": 39,
+          "shared_bytes": 16,
+          "stack_bytes": 0,
+          "spill_loads": 0,
+          "spill_stores": 0
+        },
+        {
+          "name": "_ZN6strata4ds4144_GLOBAL__N__e01d672c_11_fp8_gemv_cu_29bc5d0515gemv_small_pairILi1ELi4EEEvPKfPKhS6_Ptii",
+          "registers": 37,
+          "shared_bytes": 16,
+          "stack_bytes": 0,
+          "spill_loads": 0,
+          "spill_stores": 0
+        },
+        {
+          "name": "_ZN6strata4ds4144_GLOBAL__N__e01d672c_11_fp8_gemv_cu_29bc5d0515gemv_small_pairILi2ELi2EEEvPKfPKhS6_Ptii",
+          "registers": 40,
+          "shared_bytes": 32,
+          "stack_bytes": 0,
+          "spill_loads": 0,
+          "spill_stores": 0
+        },
+        {
+          "name": "_ZN6strata4ds4144_GLOBAL__N__e01d672c_11_fp8_gemv_cu_29bc5d0515gemv_small_pairILi2ELi4EEEvPKfPKhS6_Ptii",
+          "registers": 40,
+          "shared_bytes": 32,
+          "stack_bytes": 0,
+          "spill_loads": 0,
+          "spill_stores": 0
+        }
+      ],
+      "gpu_test_exit": 77,
+      "ptx_sha256": "8f738e48039a0297d98d76bbda91bee7b79fc60ba7a4de8fd4d2261543c0eb70",
+      "object_sha256": "549f0539dd54c084505f5d97073f94f6c05daf67b192aa0b53c1293fb2afaa81",
+      "executable_sha256": "8f0c43708d0aec134f4764df3cf493f07a7bc0dd5f0af7cb6b9ff637d6275790"
+    }
+  },
+  "limitations": [
+    "No GPU; numerical/graph/performance acceptance not run",
+    "No nvdisasm in existing toolchain; no SASS instruction validation"
+  ],
+  "source_sha256": {
+    "src/ds41/kernels/fp8_gemv.cu": "12b01d1190499d4b9a7f9877b98b16757b54d4a3a9f3dda3c0caaf45acc063f6",
+    "src/ds41/kernels/fp8_gemv/build_small_pair.sh": "e7977cef542236eab218fa1e5f08637285ed2e53adddfcb04bce134c92bdfd62",
+    "src/ds41/kernels/fp8_gemv/check_pair_mutants.py": "6e650a57825f60c4d64261c6da7f4abed964a45b86819d22ddbd4f1ba4cdd776",
+    "src/ds41/kernels/fp8_gemv/check_small_pair.cu": "9b05a763cf51e358d4617ecc6d943f57c99aea2e34cc06c64b8ef17386efdee4",
+    "src/ds41/kernels/fp8_gemv/pair_decode.cuh": "6557fd7468af3ae67773c071f39e132d1973926df6d3a61d1d269d6ce2ed2642",
+    "src/ds41/kernels/fp8_gemv/small_pair.cuh": "481ae91910653845d159230f731b32886c4f4d0b6ab1eb6152bd6614eb7423e1",
+    "src/ds41/kernels/fp8_gemv/validate_small_pair.py": "8f1056e519928643d4f03f3f9828d76b185419286d457e535f72b970394edfc2"
+  },
+  "host_pair_log": "pair conversions: 16777216 pairs x 2 values, all 256 scale codes, software/native-host/reference agree; negative controls PASS\nlayout: 280 geometries, unique reads/writes, tails and capped grid PASS\naccumulation: 2496 sampled output rows, lane FP32 and final BF16 bit-exact to control PASS\nHOST PASS; GPU numerics, graph replay and speed are not established\n",
+  "host_parity_log": "host layout: 288 geometries, each output/weight owned once, tails and grid-stride cap OK\nhost conversions: 65280 finite BF16 inputs, 256 E4M3 codes, 256 E8M0 codes, 756 FP8 tie probes OK\nhost BF16: 32639 positive boundaries and their negatives, ties and adjacent doubles OK\nhost lane model: 56 cases, max relative L2=1.84642982e-09, tolerance=0.002 OK\n",
+  "mutants": [
+    {
+      "mutation": "wrong_scale_bias",
+      "exit_code": 1,
+      "expected_failure": "FAIL: pair low byte/scale"
+    },
+    {
+      "mutation": "lost_sign",
+      "exit_code": 1,
+      "expected_failure": "FAIL: pair low byte/scale"
+    },
+    {
+      "mutation": "swapped_host_bytes",
+      "exit_code": 1,
+      "expected_failure": "FAIL: pair low byte/scale"
+    }
+  ],
+  "report_sha256": "bf084dc805127cd98369372e7a966d2bfcb0937ab3fc557b7fae8ce31f4430b8",
+  "artifact_directory": "/workspace/scratch/e01bacaed083/strata-prefill/build/K1c-09-frozen",
+  "control_artifact_directory": "/workspace/scratch/e01bacaed083/strata-prefill/build/K1c-10-control"
+}
