@@ -4,7 +4,8 @@
 #      with --dump (the top logits of every step: top-1 agreement between packs is computed from the dumps);
 #   2. 3000 tokens of tools/ds41/make_long_ids.py output: teacher-forced nll through prefill;
 #   3. 4 fixed chat prompts (tools/ds41/quality_prompts.py): 128 greedy tokens each, decoded to text.
-# Usage: TAG=3bpw bash quality_eval.sh   (env: G, PACK, PROF, O, LONG, MODEL tokenizer dir, REPO, W)
+# Usage: TAG=3bpw bash quality_eval.sh   (env: G, PACK, PROF, O, LONG, MODEL tokenizer dir, REPO, W,
+#        EXTRA: more ds41_generate arguments, for example "--ram-budget-gib 100")
 set -u
 TAG=${TAG:?set TAG, for example 3bpw or sage159}
 G=${G:-/workspace/Strata-DS/build/ds41_generate}
@@ -16,7 +17,7 @@ MODEL=${MODEL:-/workspace/model}
 REPO=${REPO:-/workspace/Strata-DS}
 W=${W:-/workspace/results/quality/$TAG}
 mkdir -p "$W"
-run() { "$G" --pack "$PACK" --threads 8 --expert-profile "$PROF" "$@"; }
+run() { "$G" --pack "$PACK" --threads 8 --expert-profile "$PROF" ${EXTRA:-} "$@"; }
 nll() { grep -o "teacher_forced_mean_nll [0-9.]*" | awk '{print $2}'; }
 for id in code_py_0 zh_0 en_0 code_cpp_1 zh_2; do
   ids=$W/$id.ids
@@ -24,7 +25,8 @@ for id in code_py_0 zh_0 en_0 code_cpp_1 zh_2; do
   ref=$(python -c "import numpy as np; print(round(float(np.load('$O/fp16/$id.npz')['nll'].mean()), 6))")
   n=$(tr ',' '\n' < "$ids" | wc -l)
   run --force-ids "$ids" --dump "$W/$id.dump" > "$W/$id.log" 2>&1
-  echo "DOC $id tokens $n | prototype_fp16 $ref | $TAG $(nll < "$W/$id.log")"
+  run --force-ids "$ids" --prefill > "$W/$id.prefill.log" 2>&1
+  echo "DOC $id tokens $n | prototype_fp16 $ref | $TAG step $(nll < "$W/$id.log") prefill $(nll < "$W/$id.prefill.log")"
 done
 cut -d, -f1-3000 "$LONG" > "$W/long3000.ids"
 run --force-ids "$W/long3000.ids" --prefill --max-seq 4096 > "$W/long3000.log" 2>&1
