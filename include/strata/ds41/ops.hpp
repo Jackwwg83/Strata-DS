@@ -14,15 +14,16 @@ using bf16 = __nv_bfloat16;
 
 /// h[c][d] = embed[token][d] for the 4 hyper-connection copies
 void embed(const bf16* table, int token, bf16* h);
-/// RMSNorm: y = bf16(w * x * rsqrt(mean(x^2) + eps)), statistics in fp32
-void rmsnorm(const bf16* x, const bf16* w, bf16* y, int n, float eps);
+/// RMSNorm: y = bf16(w * x * rsqrt(mean(x^2) + eps)), statistics in fp32; `rows` rows of n, one after the other
+void rmsnorm(const bf16* x, const bf16* w, bf16* y, int n, float eps, int rows = 1);
 /// Hyper-connection coefficients from the stream x [4*5120]: pre[4], post[4], comb[4][4] (Sinkhorn)
 void hc_mixes(const bf16* x, const float* fn, const float* scale, const float* base,
               float* pre, float* post, float* comb, float* scratch /* >= 25 floats */);
-/// y[d] = bf16(sum_j pre[j] * x[j][d])
-void hc_pre(const bf16* x, const float* pre, bf16* y);
-/// y[k][d] = bf16(post[k] * out[d] + sum_j comb[j][k] * res[j][d]); y must not alias res
-void hc_post(const bf16* out, const bf16* res, const float* post, const float* comb, bf16* y);
+/// y[d] = bf16(sum_j pre[j] * x[j][d]). Rows (prefill): x [rows][4][5120], pre [rows][4], y [rows][5120]
+void hc_pre(const bf16* x, const float* pre, bf16* y, int rows = 1);
+/// y[k][d] = bf16(post[k] * out[d] + sum_j comb[j][k] * res[j][d]); y must not alias res.
+/// Rows (prefill): out [rows][5120], res and y [rows][4][5120], post [rows][4], comb [rows][16]
+void hc_post(const bf16* out, const bf16* res, const float* post, const float* comb, bf16* y, int rows = 1);
 
 /// FP8 linear as model.py linear(): activation FP8 block quantized (32, power-of-two scale), weight FP8 E4M3
 /// with E8M0 32x32 block scales, FP32 accumulation, BF16 output. `act` is scratch for K floats.
@@ -61,11 +62,13 @@ void add_f32_bf16(const float* a, const bf16* b, bf16* y, int n);
 /// x_half = fp16(x) after the FP8 activation quantization (the routed-expert input in the prototype)
 void to_half_fp8q(const bf16* x, uint16_t* x_half, int n);
 
-/// Compressor pooling of one finished group: out[d] = bf16(sum_r kv[r][d] * softmax_r(score[r][d]))
-void compress_pool(const float* kv_state, const float* score_state, int ratio, bf16* out);
+/// Compressor pooling of finished groups: out[g][d] = bf16(sum_r kv[g][r][d] * softmax_r(score[g][r][d]))
+void compress_pool(const float* kv_state, const float* score_state, int ratio, bf16* out, int groups = 1);
 
 /// Engram gate (model.py Engram.forward): h[c] += gate_c * value, gate from the normalized dot of h[c] and key[c]
-void engram_apply(bf16* h, const bf16* kv /* [5*5120]: 4 keys then value */, const bf16* qw, const bf16* kw, float eps);
+/// Rows (prefill): h [rows][4][5120], kv [rows][5][5120]
+void engram_apply(bf16* h, const bf16* kv /* [5*5120]: 4 keys then value */, const bf16* qw, const bf16* kw, float eps,
+                  int rows = 1);
 /// Engram rows: FP8 E4M3 [rows][256] times E8M0 [rows][8] -> BF16 [rows][256]
 void engram_dequant(const uint8_t* w, const uint8_t* s, int rows, bf16* out);
 

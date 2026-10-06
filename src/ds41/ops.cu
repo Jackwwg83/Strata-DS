@@ -101,6 +101,8 @@ __global__ void embed_k(const bf16* table, int token, bf16* h) {
 
 __global__ void rmsnorm_k(const bf16* x, const bf16* w, bf16* y, int n, float eps) {
     __shared__ float sh[32];
+    x += (int64_t) blockIdx.x * n;   // one block per row
+    y += (int64_t) blockIdx.x * n;
     float ss = 0.0f;
     for (int i = threadIdx.x; i < n; i += blockDim.x) {
         const float v = bf(x[i]);
@@ -173,6 +175,9 @@ __global__ void hc_sinkhorn_k(const float* mixes, const float* scale, const floa
 __global__ void hc_pre_k(const bf16* x, const float* pre, bf16* y) {
     const int d = blockIdx.x * blockDim.x + threadIdx.x;
     if (d >= kDim) return;
+    x += (int64_t) blockIdx.y * kHc * kDim;   // row blockIdx.y
+    pre += blockIdx.y * kHc;
+    y += (int64_t) blockIdx.y * kDim;
     float acc = 0.0f;
     for (int j = 0; j < kHc; ++j) acc += pre[j] * bf(x[j * kDim + d]);
     y[d] = tobf(acc);
@@ -181,6 +186,11 @@ __global__ void hc_pre_k(const bf16* x, const float* pre, bf16* y) {
 __global__ void hc_post_k(const bf16* out, const bf16* res, const float* post, const float* comb, bf16* y) {
     const int d = blockIdx.x * blockDim.x + threadIdx.x;
     if (d >= kDim) return;
+    out += (int64_t) blockIdx.y * kDim;       // row blockIdx.y
+    res += (int64_t) blockIdx.y * kHc * kDim;
+    post += blockIdx.y * kHc;
+    comb += blockIdx.y * kHc * kHc;
+    y += (int64_t) blockIdx.y * kHc * kDim;
     const float o = bf(out[d]);
     for (int k = 0; k < kHc; ++k) {
         float acc = post[k] * o;
@@ -391,6 +401,8 @@ __global__ void to_half_fp8q_k(const bf16* x, uint16_t* out, int n) {
 __global__ void engram_apply_k(bf16* h, const bf16* kv, const bf16* qw, const bf16* kw, float eps) {
     __shared__ float sh[32];
     const int c = blockIdx.x;
+    h += (int64_t) blockIdx.y * kHc * kDim;   // row blockIdx.y
+    kv += (int64_t) blockIdx.y * (kHc + 1) * kDim;
     const bf16* key = kv + c * kDim;
     const bf16* value = kv + kHc * kDim;
     float hh = 0.0f, kk = 0.0f, dot = 0.0f;
@@ -421,6 +433,9 @@ __global__ void engram_dequant_k(const uint8_t* w, const uint8_t* s, int rows, b
 __global__ void compress_pool_k(const float* kv, const float* sc, int ratio, bf16* out) {
     const int d = blockIdx.x * blockDim.x + threadIdx.x;
     if (d >= kHeadDim) return;
+    kv += (int64_t) blockIdx.y * ratio * kHeadDim;   // group blockIdx.y
+    sc += (int64_t) blockIdx.y * ratio * kHeadDim;
+    out += (int64_t) blockIdx.y * kHeadDim;
     float mx = -INFINITY;
     for (int r = 0; r < ratio; ++r) mx = fmaxf(mx, sc[r * kHeadDim + d]);
     float den = 0.0f;
@@ -446,8 +461,8 @@ void embed(const bf16* table, int token, bf16* h) {
     embed_k<<<grid(kDim, 256), 256>>>(table, token, h);
     LAUNCH_CHECK("embed");
 }
-void rmsnorm(const bf16* x, const bf16* w, bf16* y, int n, float eps) {
-    rmsnorm_k<<<1, 1024>>>(x, w, y, n, eps);
+void rmsnorm(const bf16* x, const bf16* w, bf16* y, int n, float eps, int rows) {
+    if (rows > 0) rmsnorm_k<<<rows, 1024>>>(x, w, y, n, eps);
     LAUNCH_CHECK("rmsnorm");
 }
 void hc_mixes(const bf16* x, const float* fn, const float* scale, const float* base, float* pre, float* post,
@@ -457,12 +472,12 @@ void hc_mixes(const bf16* x, const float* fn, const float* scale, const float* b
     hc_sinkhorn_k<<<1, 32>>>(scratch + 1, scale, base, pre, post, comb);
     LAUNCH_CHECK("hc_mixes");
 }
-void hc_pre(const bf16* x, const float* pre, bf16* y) {
-    hc_pre_k<<<grid(kDim, 256), 256>>>(x, pre, y);
+void hc_pre(const bf16* x, const float* pre, bf16* y, int rows) {
+    if (rows > 0) hc_pre_k<<<dim3(grid(kDim, 256), rows), 256>>>(x, pre, y);
     LAUNCH_CHECK("hc_pre");
 }
-void hc_post(const bf16* out, const bf16* res, const float* post, const float* comb, bf16* y) {
-    hc_post_k<<<grid(kDim, 256), 256>>>(out, res, post, comb, y);
+void hc_post(const bf16* out, const bf16* res, const float* post, const float* comb, bf16* y, int rows) {
+    if (rows > 0) hc_post_k<<<dim3(grid(kDim, 256), rows), 256>>>(out, res, post, comb, y);
     LAUNCH_CHECK("hc_post");
 }
 void fp8_linear(const bf16* x, int64_t k, const uint8_t* w, const uint8_t* w_scale, int64_t n, bf16* y, float* act) {
@@ -516,12 +531,12 @@ void to_half_fp8q(const bf16* x, uint16_t* x_half, int n) {
     to_half_fp8q_k<<<grid(n / 32, 8), 256>>>(x, x_half, n);
     LAUNCH_CHECK("to_half_fp8q");
 }
-void compress_pool(const float* kv_state, const float* score_state, int ratio, bf16* out) {
-    compress_pool_k<<<grid(kHeadDim, 256), 256>>>(kv_state, score_state, ratio, out);
+void compress_pool(const float* kv_state, const float* score_state, int ratio, bf16* out, int groups) {
+    if (groups > 0) compress_pool_k<<<dim3(grid(kHeadDim, 256), groups), 256>>>(kv_state, score_state, ratio, out);
     LAUNCH_CHECK("compress_pool");
 }
-void engram_apply(bf16* h, const bf16* kv, const bf16* qw, const bf16* kw, float eps) {
-    engram_apply_k<<<kHc, 1024>>>(h, kv, qw, kw, eps);
+void engram_apply(bf16* h, const bf16* kv, const bf16* qw, const bf16* kw, float eps, int rows) {
+    if (rows > 0) engram_apply_k<<<dim3(kHc, rows), 1024>>>(h, kv, qw, kw, eps);
     LAUNCH_CHECK("engram_apply");
 }
 void window_index(int pos, int32_t* idx) {
