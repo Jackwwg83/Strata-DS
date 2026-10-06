@@ -39,4 +39,14 @@ void bf16_gemm(const bf16* x, const bf16* w, int64_t M, int64_t K, int64_t N, bf
 /// y [M][8 * 1024], BF16, FP32 accumulation (cuBLAS, one strided batch), through the FP32 scratch tmp [M][8192].
 void wo_a_grouped_rows(const bf16* o, const bf16* wo_a, int64_t M, bf16* y, float* tmp);
 
+/// The decode window ring [128][512] holds position p at row p % 128. window_gather copies positions
+/// p0 - n .. p0 - 1 (n <= 128, all >= 0) to dst rows 0 .. n - 1; window_scatter writes chunk rows src [rows][512]
+/// (positions p0 .. p0 + rows - 1) into the ring: the last min(rows, 128) of them.
+void window_gather(const bf16* ring, int p0, int n, bf16* dst);
+void window_scatter(bf16* ring, const bf16* src, int p0, int rows);
+
+/// Per row: nll[r] = logsumexp(logits[r]) - logits[r][target[r]] (FP32), target from device int32 [rows];
+/// rows with target -1 get 0.
+void nll_rows(const float* logits, int rows, int vocab, const int32_t* target, float* nll);
+
 }  // namespace strata::ds41::prefill

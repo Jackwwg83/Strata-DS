@@ -165,6 +165,48 @@ int main() {
             }
         v.check(ok, "attn_index_rows lists other entries than expected");
     }
+    {   // window ring: gather 100 positions before p0 = 300, scatter a 200-row chunk (only its last 128 land)
+        const auto r0 = rand_bf16((size_t) 128 * 512, 1.0f, 40);
+        Dev<bf16> ring(r0), dst((size_t) 100 * 512), src(rand_bf16((size_t) 200 * 512, 1.0f, 41));
+        pf::window_gather(ring.p, 300, 100, dst.p);
+        const auto g = dst.down();
+        bool ok = true;
+        for (int k = 0; k < 100; ++k)
+            ok &= std::memcmp(&g[(size_t) k * 512], &r0[(size_t) ((300 - 100 + k) % 128) * 512], 512 * 2) == 0;
+        pf::window_scatter(ring.p, src.p, 300, 200);
+        const auto after = ring.down(), sv = src.down();
+        for (int pos = 300 + 200 - 128; pos < 500; ++pos)
+            ok &= std::memcmp(&after[(size_t) (pos % 128) * 512], &sv[(size_t) (pos - 300) * 512], 512 * 2) == 0;
+        Dev<bf16> ring2(r0), small(rand_bf16((size_t) 5 * 512, 1.0f, 42));
+        pf::window_scatter(ring2.p, small.p, 126, 5);   // wraps: positions 126..130 at rows 126, 127, 0, 1, 2
+        const auto a2 = ring2.down(), s2 = small.down();
+        for (int r = 0; r < 128; ++r) {
+            const int pos = r >= 126 ? r : r + 128;
+            const bool written = pos >= 126 && pos < 131;
+            ok &= std::memcmp(&a2[(size_t) r * 512], written ? &s2[(size_t) (pos - 126) * 512] : &r0[(size_t) r * 512],
+                              512 * 2) == 0;
+        }
+        v.check(ok, "window_gather / window_scatter move other rows than expected");
+    }
+    {   // nll_rows against a double-precision host log-softmax
+        constexpr int NR = 5, V = 129280;
+        const auto lg = rand_f32((size_t) NR * V, 3.0f, 43);
+        const std::vector<int32_t> tg = {0, 17, V - 1, -1, 4242};
+        Dev<float> logits(lg), nll(NR);
+        Dev<int32_t> t(tg);
+        pf::nll_rows(logits.p, NR, V, t.p, nll.p);
+        const auto got = nll.down();
+        double worst = 0;
+        for (int r = 0; r < NR; ++r) {
+            double mx = -1e300, sum = 0;
+            for (int i = 0; i < V; ++i) mx = std::max(mx, (double) lg[(size_t) r * V + i]);
+            for (int i = 0; i < V; ++i) sum += std::exp(lg[(size_t) r * V + i] - mx);
+            const double want = tg[r] < 0 ? 0.0 : std::log(sum) + mx - lg[(size_t) r * V + tg[r]];
+            worst = std::max(worst, std::fabs(got[r] - want));
+        }
+        std::printf("nll_rows: max abs error %.3g\n", worst);
+        v.check(worst <= 1e-4, "nll_rows differs from the host log-softmax");
+    }
     ck(cudaDeviceSynchronize(), "end");
     return v.finish();
 }

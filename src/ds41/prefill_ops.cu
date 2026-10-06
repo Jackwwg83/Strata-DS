@@ -114,6 +114,47 @@ __global__ void attn_index_rows_k(int p0, int win_base, const int32_t* topk, int
     }
 }
 
+__global__ void window_gather_k(const bf16* ring, int p0, int n, bf16* dst) {
+    const int k = blockIdx.x;   // dst row k = position p0 - n + k
+    const bf16* src = ring + (int64_t) ((p0 - n + k) % kWindow) * kHeadDim;
+    for (int d = threadIdx.x; d < kHeadDim; d += blockDim.x) dst[(int64_t) k * kHeadDim + d] = src[d];
+}
+
+__global__ void window_scatter_k(bf16* ring, const bf16* src, int p0, int first) {
+    const int r = first + blockIdx.x;   // chunk row r = position p0 + r
+    bf16* dst = ring + (int64_t) ((p0 + r) % kWindow) * kHeadDim;
+    for (int d = threadIdx.x; d < kHeadDim; d += blockDim.x) dst[d] = src[(int64_t) r * kHeadDim + d];
+}
+
+__global__ void nll_rows_k(const float* logits, int vocab, const int32_t* target, float* nll) {
+    __shared__ float sh[32];
+    const int r = blockIdx.x;
+    const int t = target[r];
+    if (t < 0) {
+        if (threadIdx.x == 0) nll[r] = 0.0f;
+        return;
+    }
+    const float* row = logits + (int64_t) r * vocab;
+    float mx = -INFINITY;
+    for (int i = threadIdx.x; i < vocab; i += blockDim.x) mx = fmaxf(mx, row[i]);
+    for (int off = 16; off > 0; off >>= 1) mx = fmaxf(mx, __shfl_xor_sync(0xffffffffu, mx, off));
+    if ((threadIdx.x & 31) == 0) sh[threadIdx.x >> 5] = mx;
+    __syncthreads();
+    mx = sh[0];
+    for (int i = 1; i < (int) blockDim.x / 32; ++i) mx = fmaxf(mx, sh[i]);
+    __syncthreads();
+    float sum = 0.0f;
+    for (int i = threadIdx.x; i < vocab; i += blockDim.x) sum += expf(row[i] - mx);
+    for (int off = 16; off > 0; off >>= 1) sum += __shfl_xor_sync(0xffffffffu, sum, off);
+    if ((threadIdx.x & 31) == 0) sh[threadIdx.x >> 5] = sum;
+    __syncthreads();
+    if (threadIdx.x == 0) {
+        float total = 0.0f;
+        for (int i = 0; i < (int) blockDim.x / 32; ++i) total += sh[i];
+        nll[r] = logf(total) + mx - row[t];
+    }
+}
+
 __global__ void round_bf16_k(const float* x, bf16* y, int64_t n) {
     const int64_t i = (int64_t) blockIdx.x * blockDim.x + threadIdx.x;
     if (i < n) y[i] = tobf(x[i]);
@@ -146,6 +187,22 @@ void route_rows(const float* logits, const float* bias, int rows, int32_t* ids, 
 void attn_index_rows(int rows, int p0, int win_base, const int32_t* topk, int k_top, int32_t* idx, int n_idx) {
     if (rows > 0) attn_index_rows_k<<<rows, 128>>>(p0, win_base, topk, k_top, idx, n_idx);
     LAUNCH_CHECK("attn_index_rows");
+}
+
+void window_gather(const bf16* ring, int p0, int n, bf16* dst) {
+    if (n > 0) window_gather_k<<<n, 128>>>(ring, p0, n, dst);
+    LAUNCH_CHECK("window_gather");
+}
+
+void window_scatter(bf16* ring, const bf16* src, int p0, int rows) {
+    const int first = rows > kWindow ? rows - kWindow : 0;
+    if (rows > 0) window_scatter_k<<<rows - first, 128>>>(ring, src, p0, first);
+    LAUNCH_CHECK("window_scatter");
+}
+
+void nll_rows(const float* logits, int rows, int vocab, const int32_t* target, float* nll) {
+    if (rows > 0) nll_rows_k<<<rows, 1024>>>(logits, vocab, target, nll);
+    LAUNCH_CHECK("nll_rows");
 }
 
 void bf16_gemm(const bf16* x, const bf16* w, int64_t M, int64_t K, int64_t N, bf16* yb, float* yf, float* tmp) {
