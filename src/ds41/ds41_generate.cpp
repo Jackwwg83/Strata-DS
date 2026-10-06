@@ -43,6 +43,17 @@ static std::vector<int> parse_ids(const std::string& arg) {
     return v;
 }
 
+/// The prefill line the speed scripts read (m3_context.sh): every field of PrefillTiming
+static void print_prefill(const Engine& engine, size_t n) {
+    const auto& p = engine.last_prefill();
+    std::printf("prefill_tokens %zu ms %.1f tok_s %.1f chunks %d chunk_tokens %d sub_batch %d engram_ms %.1f stream_wait_ms %.1f"
+                " vram_experts %lld streamed %lld (ram %lld cache %lld ssd %lld) engram_rows %lld unique %lld\n",
+                n, p.total_ms, n / (std::max(p.total_ms, 1e-9) / 1000.0), p.chunks, p.chunk_tokens, p.sub_batch,
+                p.engram_ms, p.stream_wait_ms, (long long) p.vram_experts, (long long) p.streamed,
+                (long long) p.from_ram, (long long) p.from_cache, (long long) p.from_ssd, (long long) p.engram_rows,
+                (long long) p.engram_unique);
+}
+
 // Output history contains raw IDs. It includes the pending target prediction.
 static void generate(Engine& engine, const EngineOptions& opt, const std::vector<int>& prompt,
                      int count, bool batched, bool suffix, int max_t, int eos) {
@@ -50,9 +61,7 @@ static void generate(Engine& engine, const EngineOptions& opt, const std::vector
     int next = -1;
     if (batched) {
         next = engine.prefill(prompt, 0);
-        const auto& tm = engine.last_prefill();
-        std::printf("prefill_tokens %zu ms %.1f tok_s %.1f\n", prompt.size(), tm.total_ms,
-                    prompt.size()*1000.0/std::max(tm.total_ms, 1e-9));
+        print_prefill(engine, prompt.size());
     } else {
         for (size_t p = 0; p < prompt.size(); ++p) next = engine.step(prompt[p], int(p));
     }
@@ -61,12 +70,18 @@ static void generate(Engine& engine, const EngineOptions& opt, const std::vector
     std::vector<int> out;
     if (count > 0) { out.push_back(next); drafter.append(next); }
     int pos = int(prompt.size()), rounds = 0, accepted = 0;
+    double step_ms = 0;            // plain decode: the engine's step times, as the forced path reports them
+    int64_t hits = 0, routed = 0;
     const auto begin = std::chrono::steady_clock::now();
     while (int(out.size()) < count && next != eos) {
         const int limit = std::min({max_t, count-int(out.size()), opt.max_seq-pos});
         if (limit < 1) throw std::runtime_error("generation exceeds max_seq");
         if (!suffix) {
             next = engine.step(next, pos++);
+            const auto& tm = engine.last_timing();
+            step_ms += tm.total_ms;
+            hits += tm.expert_hits;
+            routed += tm.expert_total;
             out.push_back(next); drafter.append(next); ++rounds;
             continue;
         }
@@ -90,6 +105,12 @@ static void generate(Engine& engine, const EngineOptions& opt, const std::vector
     for (int token : out) std::printf(" %d", token);
     std::printf("\ndecode_tokens %d windows %d accepted_drafts %d seconds %.6f tok_s %.3f\n",
                 decoded, rounds, accepted, seconds, decoded/std::max(seconds, 1e-9));
+    // the lines the speed scripts read (m3_context.sh); speculation: wall time per emitted token
+    const double ms = suffix ? seconds * 1000.0 : step_ms;
+    std::printf("decode_ms_per_token %.1f over %d steps\n", decoded > 0 ? ms / decoded : 0.0, decoded);
+    if (!suffix)
+        std::printf("vram_expert_slots %d hit_rate %.4f\n", engine.vram_expert_slots(),
+                    routed ? (double) hits / routed : 0.0);
 }
 
 int main(int argc, char** argv) {
@@ -151,14 +172,7 @@ int main(int argc, char** argv) {
             const std::vector<int>& pre = forced.empty() ? prompt : forced;
             std::vector<float> nll;
             int next = engine.prefill(pre, 0, forced.empty() ? nullptr : &nll);
-            const auto& p = engine.last_prefill();
-            std::printf("prefill_tokens %zu ms %.1f tok_s %.1f chunks %d chunk_tokens %d sub_batch %d engram_ms %.1f stream_wait_ms %.1f"
-                        " vram_experts %lld streamed %lld (ram %lld cache %lld ssd %lld) engram_rows %lld unique %lld\n",
-                        pre.size(), p.total_ms, pre.size() / (p.total_ms / 1000.0), p.chunks, p.chunk_tokens, p.sub_batch,
-                        p.engram_ms,
-                        p.stream_wait_ms, (long long) p.vram_experts, (long long) p.streamed, (long long) p.from_ram,
-                        (long long) p.from_cache, (long long) p.from_ssd, (long long) p.engram_rows,
-                        (long long) p.engram_unique);
+            print_prefill(engine, pre.size());
             if (!nll.empty()) {
                 double sum = 0;
                 for (float v : nll) sum += v;

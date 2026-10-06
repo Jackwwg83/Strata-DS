@@ -6,6 +6,7 @@
 
 namespace {
 int windows = 0, multi = 0, rejected = 0;
+std::string last_text;   // the whole stdout of the last cli() call
 constexpr int sequence[] = {101, 102, 103, 104, 101, 102, 103, 105};
 int predict(int pos) { return sequence[pos % 8]; }
 void check(bool value) { if (!value) throw std::runtime_error("mock generation assertion"); }
@@ -64,6 +65,7 @@ static std::vector<int> cli(std::vector<std::string> args) {
     char buffer[4096];
     while (size_t n = std::fread(buffer, 1, sizeof buffer, output)) text.append(buffer, n);
     std::fclose(output);
+    last_text = text;
     const size_t at = text.find("generated:");
     check(at != std::string::npos);
     std::istringstream line(text.substr(at+10, text.find('\n', at)-at-10));
@@ -82,6 +84,13 @@ int main() {
             check(plain == spec && int(spec.size()) == count);
             for (int i = 0; i < count; ++i) check(spec[i] == predict(i));
         }
+        // the speed scripts (m3_context.sh) read these lines: keep them in the generation path
+        cli({"mock", "--pack", "synthetic", "--ids", "10,11,12", "--gen", "8", "--prefill"});
+        for (const char* key : {"prefill_tokens 3 ms", "chunk_tokens", "streamed", "stream_wait_ms",
+                                "decode_ms_per_token", "hit_rate"})
+            check(last_text.find(key) != std::string::npos);
+        cli({"mock", "--pack", "synthetic", "--ids", "10", "--gen", "8", "--spec", "suffix"});
+        check(last_text.find("decode_ms_per_token") != std::string::npos);
         for (int eos : {101, 104, 105}) {
             std::vector<std::string> args{"mock", "--pack", "synthetic", "--ids", "10", "--gen", "64", "--eos-id", std::to_string(eos)};
             const auto plain = cli(args);
