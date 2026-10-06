@@ -10,7 +10,8 @@ Output (the engine reads only flat text indexes written here, as upstream Strata
 once, the engine never re-derives it):
 
   dense.bin      every non-expert text tensor, raw bytes, each 256 B aligned. Vision tensors are left out.
-                 attn.wo_a is dequantized to BF16 exactly as DeepSeek's inference/convert.py does.
+                 attn.wo_a stays FP8 with its block scales (--wo-a-bf16: dequantized to BF16 exactly as DeepSeek's
+                 inference/convert.py does; the engine reads both).
   index.txt      one line per dense tensor: name dtype ndim dims... offset bytes
   experts.bin    one slot per routed expert, layer-major then expert-major. A slot starts on a 4 KiB boundary
                  and its length is a multiple of 4 KiB, so one O_DIRECT read fetches a whole expert.
@@ -94,17 +95,19 @@ def dequant_wo_a(w_bytes, w_shape, s_bytes, s_shape):
     return bytearray(w.flatten(2, 3).flatten(0, 1).bfloat16().contiguous().view(torch.uint8).numpy().tobytes())
 
 
-def write_dense(srcs, out):
+def write_dense(srcs, out, wo_a_fp8=True):
+    """wo_a_fp8: keep attn.wo_a as FP8 E4M3 with its E8M0 block scales (the engine dequantizes it on the fly, to the
+    same BF16 values); else dequantize it to BF16 here, as inference/convert.py does."""
     names = sorted(n for n in srcs.entries
-                   if ".ffn.experts." not in n and not n.startswith(SKIP_PREFIX) and not n.endswith("wo_a.scale")
-                   and ".engram.embed." not in n)
+                   if ".ffn.experts." not in n and not n.startswith(SKIP_PREFIX)
+                   and (wo_a_fp8 or not n.endswith("wo_a.scale")) and ".engram.embed." not in n)
     off = 0
     with open(os.path.join(out, "dense.bin"), "wb") as fb, open(os.path.join(out, "index.txt"), "w") as fi:
         fi.write("# ds41 dense index v1: name dtype ndim dims... offset bytes\n")
         for n in names:
             _, dt, shape, _, _ = srcs.entries[n]
             data = srcs.read(n)
-            if n.endswith("wo_a.weight"):
+            if n.endswith("wo_a.weight") and not wo_a_fp8:
                 sname = n[:-len("weight")] + "scale"
                 data = dequant_wo_a(data, shape, srcs.read(sname), srcs.entries[sname][2])
                 dt = "BF16"
@@ -274,13 +277,25 @@ class EngramArgs:
         self.engram_compressed_vocab_size = tc["engram_compressed_vocab_size"]
 
 
-def build_pack(src, out, n_layers=40, n_experts=384):
+def build_pack(src, out, n_layers=40, n_experts=384, wo_a_fp8=True, dense_only=False):
+    """dense_only: rewrite dense.bin and index.txt of a finished pack; experts.bin and the rest stay."""
     os.makedirs(out, exist_ok=True)
     info = os.path.join(out, "pack_info.txt")
+    old = {}
+    if dense_only:
+        old = dict(l.split(None, 1) for l in open(info).read().splitlines() if l.strip())
+        if old.get("finished", "").strip() != "1":
+            raise SystemExit("--dense-only needs a finished pack")
     if os.path.exists(info):
         os.remove(info)                  # an old marker must not vouch for a new, half-written pack
     srcs = Source(src)
-    n_dense, dense_bytes = write_dense(srcs, out)
+    n_dense, dense_bytes = write_dense(srcs, out, wo_a_fp8)
+    if dense_only:
+        with open(info, "w") as f:
+            f.write(f"source {os.path.abspath(src)}\nlayers {old['layers']}\nexperts {old['experts']}\n"
+                    f"dense_tensors {n_dense}\ndense_bytes {dense_bytes}\nexpert_bytes {old['expert_bytes']}\n"
+                    f"engram_layers {old['engram_layers']}\nfinished 1\n")
+        return
     expert_bytes = write_experts(srcs, out, n_layers, n_experts)
     n_engram = write_engram(src, out)
     cfg = json.load(open(os.path.join(src, "config.json")))
@@ -301,8 +316,10 @@ def main():
     ap.add_argument("--out", required=True)
     ap.add_argument("--layers", type=int, default=40)
     ap.add_argument("--experts", type=int, default=384)
+    ap.add_argument("--wo-a-bf16", action="store_true", help="dequantize attn.wo_a to BF16 (packs before 2026-10-06)")
+    ap.add_argument("--dense-only", action="store_true", help="rewrite only dense.bin and index.txt of a finished pack")
     a = ap.parse_args()
-    build_pack(a.src, a.out, a.layers, a.experts)
+    build_pack(a.src, a.out, a.layers, a.experts, wo_a_fp8=not a.wo_a_bf16, dense_only=a.dense_only)
 
 
 if __name__ == "__main__":

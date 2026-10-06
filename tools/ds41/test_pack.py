@@ -96,7 +96,29 @@ class PackTest(unittest.TestCase):
             self.assertEqual(dims, list(self.truth[name].shape), name)
             np.testing.assert_array_equal(blob[off:off + nb], want, err_msg=name)
 
+    def test_wo_a_stays_fp8_with_its_scales(self):
+        # the default: the engine dequantizes wo_a on the fly (half the bytes of BF16 per decode step)
+        idx = read_index(os.path.join(self.out, "index.txt"))
+        blob = np.fromfile(os.path.join(self.out, "dense.bin"), dtype=np.uint8)
+        for name, dtype in (("layers.0.attn.wo_a.weight", "f8e4m3"), ("layers.0.attn.wo_a.scale", "e8m0")):
+            got_dtype, dims, off, nb = idx[name]
+            self.assertEqual((got_dtype, dims), (dtype, list(self.truth[name].shape)), name)
+            want = self.truth[name].contiguous().view(torch.uint8).numpy().reshape(-1)
+            np.testing.assert_array_equal(blob[off:off + nb], want, err_msg=name)
+
+    def test_dense_only_rewrites_dense_and_keeps_the_experts(self):
+        experts = os.path.join(self.out, "experts.bin")
+        before = (os.path.getsize(experts), os.stat(experts).st_mtime_ns)
+        P.build_pack(self.src, self.out, n_layers=2, n_experts=3, wo_a_fp8=False, dense_only=True)
+        self.assertEqual((os.path.getsize(experts), os.stat(experts).st_mtime_ns), before)
+        idx = read_index(os.path.join(self.out, "index.txt"))
+        self.assertEqual(idx["layers.0.attn.wo_a.weight"][0], "bf16")
+        info = open(os.path.join(self.out, "pack_info.txt")).read()
+        self.assertIn("finished 1", info)
+        self.assertIn(f"dense_bytes {os.path.getsize(os.path.join(self.out, 'dense.bin'))}", info)
+
     def test_wo_a_is_dequantized_to_bf16_like_convert_py(self):
+        P.build_pack(self.src, self.out, n_layers=2, n_experts=3, wo_a_fp8=False)
         idx = read_index(os.path.join(self.out, "index.txt"))
         self.assertNotIn("layers.0.attn.wo_a.scale", idx)
         dtype, dims, off, nb = idx["layers.0.attn.wo_a.weight"]
