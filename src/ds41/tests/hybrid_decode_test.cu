@@ -4,6 +4,7 @@
 #include "strata/ds41/kernels/k10_exl3_moe.hpp"
 
 #include <numeric>
+#include <memory>
 
 using namespace ds41test;
 namespace sd = strata::ds41;
@@ -27,19 +28,24 @@ struct Fixture {
     uint16_t* alias = nullptr;
     Dev<uint16_t> vram;
     std::vector<kk::Exl3Expert> hd, vd;
+    std::vector<sd::ExpertBlob> blobs;
     static constexpr size_t trellis = size_t(H / 16) * (F / 16) * 96;
     static constexpr size_t per = 3 * (trellis + H + F);
-    Fixture() : vram(per * E), hd(E), vd(E) {
+    Fixture() : vram(per * E), hd(E), vd(E), blobs(E) {
         ck(cudaHostAlloc(&host, per * E * 2, cudaHostAllocMapped), "mapped experts");
         ck(cudaHostGetDevicePointer(&alias, host, 0), "expert alias");
+        std::memset(host, 0x5a, per * E * 2);
         std::mt19937 rng(907);
         size_t at = 0;
         for (int e = 0; e < E; ++e) {
+            const size_t start = at;
+            at += 128; // Nonzero first-component offset, as allowed by pack metadata.
             auto proj = [&](int k, int n, int bits, kk::Exl3Proj& a, kk::Exl3Proj& b) {
                 a = {alias + at, nullptr, nullptr, k, n, bits * 16};
                 b = {vram.p + at, nullptr, nullptr, k, n, bits * 16};
-                for (size_t i = 0; i < trellis; ++i) host[at + i] = uint16_t(rng());
-                at += trellis;
+                const size_t words = size_t(k / 16) * (n / 16) * bits * 16;
+                for (size_t i = 0; i < words; ++i) host[at + i] = uint16_t(rng());
+                at += words;
                 a.suh = (const __half*) (alias + at);
                 b.suh = (const __half*) (vram.p + at);
                 for (int i = 0; i < k; ++i)
@@ -52,14 +58,20 @@ struct Fixture {
             proj(H, F, e % 6 + 1, hd[e].w1, vd[e].w1);
             proj(H, F, (e + 1) % 6 + 1, hd[e].w3, vd[e].w3);
             proj(F, H, (e + 5) % 6 + 1, hd[e].w2, vd[e].w2);
+            blobs[e] = {(at - start) * 2, 256};
         }
         ck(cudaMemcpy(vram.p, host, per * E * 2, cudaMemcpyHostToDevice), "expert upload");
     }
     ~Fixture() { cudaFreeHost(host); }
 };
 
-void run(Verdict& v, Fixture& f, int m) {
-    sd::ExpertDoorbell db(8, K, H);
+void run(Verdict& v, Fixture& f, int m, bool staged) {
+    sd::ExpertDoorbell db(8, K, H), direct_db(8, K, H);
+    size_t largest = 0;
+    for (const auto& b : f.blobs) largest = std::max(largest, b.bytes);
+    std::unique_ptr<sd::ExpertStaging> stage;
+    if (staged) stage = std::make_unique<sd::ExpertStaging>(m * K, largest);
+    Dev<sd::ExpertBlob> blobs(f.blobs);
     Dev<uint16_t> x(size_t(m) * H);
     std::vector<uint16_t> hx(x.n);
     for (size_t i = 0; i < hx.size(); ++i)
@@ -72,8 +84,12 @@ void run(Verdict& v, Fixture& f, int m) {
     cudaStream_t stream;
     ck(cudaStreamCreateWithFlags(&stream, cudaStreamNonBlocking), "stream");
     auto enqueue = [&] {
-        db.publish(x.p, ids.p, weights.p, m, res.p, sel.p, 1, stream, vd.p, ram.p, quota.p);
+        db.publish(x.p, ids.p, weights.p, m, res.p, sel.p, 1, stream, vd.p, ram.p, quota.p,
+                   stage.get(), staged ? blobs.p : nullptr);
+        if (stage) stage->fork_copy(stream);
+        // Independent main-stream work between fork and join.
         ck(cudaMemsetAsync(out.p, 0, out.n * sizeof(float), stream), "out reset");
+        if (stage) stage->join(stream);
         kk::exl3_moe_decode((const __half*) x.p, m, sel.p, weights.p, K, db.gpu_experts(),
                             out.p, ws.p, ws.n, stream);
     };
@@ -88,7 +104,7 @@ void run(Verdict& v, Fixture& f, int m) {
     ck(cudaStreamSynchronize(stream), "warm up");
     cudaGraph_t graph;
     cudaGraphExec_t exec;
-    ck(cudaStreamBeginCapture(stream, cudaStreamCaptureModeThreadLocal), "capture");
+    ck(cudaStreamBeginCapture(stream, cudaStreamCaptureModeGlobal), "capture");
     enqueue();
     ck(cudaStreamEndCapture(stream, &graph), "end capture");
     ck(cudaGraphInstantiate(&exec, graph, 0), "instantiate");
@@ -128,12 +144,17 @@ void run(Verdict& v, Fixture& f, int m) {
             ref_sel.up(expected);
             ck(cudaDeviceSynchronize(), "publish changed inputs");
             ck(cudaMemsetAsync(ref.p, 0, ref.n * sizeof(float), stream), "reference reset");
-            kk::exl3_moe_decode((const __half*) x.p, m, ref_sel.p, weights.p, K, vd.p,
+            if (staged) direct_db.publish(x.p, ids.p, weights.p, m, res.p, ref_sel.p, 1, stream,
+                                          vd.p, ram.p, quota.p);
+            kk::exl3_moe_decode((const __half*) x.p, m, ref_sel.p, weights.p, K,
+                                staged ? direct_db.gpu_experts() : vd.p,
                                 ref.p, ws.p, ws.n, stream);
             ck(cudaStreamSynchronize(stream), "reference");
             const auto want = ref.down();
             for (bool replay : {false, true}) {
                 db.reset();
+                if (stage)
+                    ck(cudaMemsetAsync(stage->data(), 0xa5, stage->stride() * m * K, stream), "poison staging");
                 if (replay) ck(cudaGraphLaunch(exec, stream), "replay");
                 else enqueue();
                 ck(cudaStreamSynchronize(stream), "hybrid run");
@@ -143,7 +164,8 @@ void run(Verdict& v, Fixture& f, int m) {
                 ck(cudaMemcpy(call.data(), db.gpu_experts(), call.size() * sizeof(call[0]),
                               cudaMemcpyDeviceToHost), "call descriptors");
                 v.check(std::memcmp(got.data(), want.data(), got.size() * sizeof(float)) == 0,
-                        "mapped and VRAM K10 are bitwise equal, direct and graph");
+                        staged ? "staged and direct K10 are bitwise equal, eager and graph"
+                               : "mapped and VRAM K10 are bitwise equal, eager and graph");
                 bool nonzero = false;
                 for (float value : got) {
                     v.check(std::isfinite(value), "finite K10 output");
@@ -156,7 +178,16 @@ void run(Verdict& v, Fixture& f, int m) {
                     v.check(selection[i] == (expected[i] < 0 ? -1 : i), "GPU keeps routing order");
                     if (expected[i] >= 0) {
                         const int e = routes[i];
-                        const auto& desc = residency[e] >= 0 ? f.vd[residency[e]] : f.hd[e];
+                        auto desc = residency[e] >= 0 ? f.vd[residency[e]] : f.hd[e];
+                        if (staged && residency[e] < 0) {
+                            const auto src = reinterpret_cast<uintptr_t>(desc.w1.trellis) - f.blobs[e].first_trellis;
+                            const auto dst = reinterpret_cast<uintptr_t>(stage->data()) + size_t(i) * stage->stride();
+                            for (auto* p : {&desc.w1, &desc.w3, &desc.w2}) {
+                                p->trellis = reinterpret_cast<const uint16_t*>(dst + reinterpret_cast<uintptr_t>(p->trellis) - src);
+                                p->suh = reinterpret_cast<const __half*>(dst + reinterpret_cast<uintptr_t>(p->suh) - src);
+                                p->svh = reinterpret_cast<const __half*>(dst + reinterpret_cast<uintptr_t>(p->svh) - src);
+                            }
+                        }
                         v.check(same_expert(call[i], desc), "all descriptor fields match");
                     } else {
                         v.check(call[i].w1.trellis == nullptr, "inactive descriptors are cleared");
@@ -166,6 +197,24 @@ void run(Verdict& v, Fixture& f, int m) {
                 const auto counts = db.counts();
                 v.check(counts.vram == nv && counts.zero_copy == nz && counts.cpu == nc,
                         "counts partition active route uses");
+                if (stage) {
+                    int count = -1;
+                    ck(cudaMemcpy(&count, stage->count(), sizeof(count), cudaMemcpyDeviceToHost), "copy count");
+                    v.check(count == nz, "copy count resets on each publish, including quota zero");
+                    std::vector<sd::ExpertCopy> jobs(m * K);
+                    ck(cudaMemcpy(jobs.data(), stage->jobs(), jobs.size() * sizeof(jobs[0]),
+                                  cudaMemcpyDeviceToHost), "copy jobs");
+                    int at = 0;
+                    for (int i = 0; i < m * K; ++i) {
+                        const int e = routes[i];
+                        if (e < 0 || residency[e] >= 0 || expected[i] < 0) continue;
+                        const auto* src = reinterpret_cast<const uint8_t*>(f.hd[e].w1.trellis) - f.blobs[e].first_trellis;
+                        v.check(jobs[at].src == src && jobs[at].bytes == f.blobs[e].bytes &&
+                                jobs[at].dst == stage->data() + size_t(i) * stage->stride(),
+                                "compact copy list contains only eligible RAM experts and exact blob sizes");
+                        ++at;
+                    }
+                }
             }
         }
     }
@@ -212,6 +261,7 @@ int main() {
     Verdict v;
     Fixture fixture;
     absent_tiers(v, fixture);
-    for (int m = 1; m <= 8; ++m) run(v, fixture, m);
+    for (bool staged : {false, true})
+        for (int m = 1; m <= 8; ++m) run(v, fixture, m, staged);
     return v.finish();
 }

@@ -6,6 +6,7 @@ add_library(strata_ds41_engine STATIC
   src/ds41/ops.cu
   src/ds41/prefill_ops.cu
   src/ds41/doorbell.cu
+  src/ds41/expert_staging.cu
   src/ds41/vram_experts.cu
   src/ds41/engram_rows.cpp
   src/ds41/host_experts.cpp
@@ -29,7 +30,7 @@ add_executable(ds41_generate src/ds41/ds41_generate.cpp)
 target_link_libraries(ds41_generate PRIVATE strata_ds41_engine)
 
 if(STRATA_BUILD_TESTS)
-  foreach(test hybrid_decode hybrid_host_table)
+  foreach(test hybrid_decode hybrid_host_table expert_staging)
     add_executable(${test}_test src/ds41/tests/${test}_test.cu)
     target_link_libraries(${test}_test PRIVATE strata_ds41_engine)
     add_test(NAME ${test}_test COMMAND ${test}_test)
