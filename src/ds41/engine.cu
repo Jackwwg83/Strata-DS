@@ -352,7 +352,7 @@ struct Engine::Impl {
         }
         // the RAM tier after it: the hottest experts the VRAM tier does not hold (upstream's resident budget)
         if (!opt.expert_profile.empty() && opt.ram_budget_gib != 0) {
-            const size_t budget = opt.ram_budget_gib < 0 ? auto_ram_budget(4ull << 30)
+            const size_t budget = opt.ram_budget_gib < 0 ? auto_ram_budget(24ull << 30)
                                                          : (size_t) (opt.ram_budget_gib * (double) (1ull << 30));
             std::vector<int64_t> handles;
             for (const auto& y : L) handles.push_back(y.moe_handle);

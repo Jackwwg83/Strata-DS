@@ -2,7 +2,7 @@
 //
 //   ds41_generate --pack DIR --ids 0,128000,... [--gen 32] [--threads 8] [--dump steps.bin] [--force-ids FILE]
 //                 [--expert-profile ds41/data/expert-profile.bin [--vram-slots N] [--adapt-every 4] [--adapt-swaps 96]
-//                  [--ram-budget-gib N (0 none: default, -1 available RAM less 4 GB)]]
+//                  [--ram-budget-gib N (-1 available RAM less 24 GiB: default, as upstream setup; 0 none)]]
 //                 [--prefill [--prefill-chunk 65536] [--prefill-batch 4096] [--prefill-ring 256] [--prefill-threads 8]]
 //
 // --prefill runs the prompt (or, with --force-ids, the whole forced sequence for its nll) through the batched
