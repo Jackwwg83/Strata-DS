@@ -1161,6 +1161,10 @@ struct Engine::Impl {
         prefill::embed_rows(embed, pf.tok, S, pf.h);
         // stream mode: with this many tokens nearly every expert is routed in every layer, so the stream starts
         // with all non-resident experts of all layers before any routing is known (upstream's stream_all)
+        // The first engram table is needed at layer 1; its rows are small random reads that lose most of their
+        // throughput when the expert stream's large reads share the SSD (measured at 32K: 10.3 s alone, 14.9 s
+        // shared). So the stream starts with layer 0's experts only and gets the rest once that table is read.
+        std::vector<std::pair<int, int>> later_jobs;
         if (S >= kStreamAll) {
             layer_first_job.assign(kLayers + 1, 0);
             std::vector<std::pair<int, int>> jobs;
@@ -1169,9 +1173,13 @@ struct Engine::Impl {
                     if (!resident(l, e)) jobs.push_back({l, e});
                 layer_first_job[l + 1] = (int64_t) jobs.size();
             }
-            const int64_t first = estream->push(jobs);
+            const size_t now = n_eng ? (size_t) layer_first_job[1] : jobs.size();
+            later_jobs.assign(jobs.begin() + now, jobs.end());
+            jobs.resize(now);
+            const int64_t first = estream->push(jobs);   // later_jobs follow in the same numbering
             for (auto& j : layer_first_job) j += first;
         }
+        bool later_pushed = later_jobs.empty();
         int eng_i = 0;
         for (int l = 0; l < kLayers; ++l) {
             auto& y = L[l];
@@ -1184,6 +1192,10 @@ struct Engine::Impl {
                         const double w0 = now_ms();
                         eng_ready[eng_i].get();   // rethrows a read error
                         ptm->engram_ms += now_ms() - w0;
+                        if (!later_pushed) {      // the first table is in: the SSD goes to the expert stream
+                            estream->push(later_jobs);
+                            later_pushed = true;
+                        }
                     }
                     const uint8_t* hw = pfh.eng + (size_t) eng_i * eng_table;
                     uint8_t* dw = pf.eng_dev;
