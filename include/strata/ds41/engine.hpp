@@ -37,18 +37,20 @@ struct EngineOptions {
     /// less 4 GB. Measured in a 64 GiB container (2026-10-06): a static RAM tier starves the file cache, which
     /// follows the text better; 0 was fastest for documents, 16 GiB for chat generation.
     double ram_budget_gib = 0;
-    /// Batched prefill (M3): tokens per chunk at most (halved until the scratch fits; upstream's chunk is 8192);
-    /// 0 = prefill() runs step() token by token. Scratch and the expert ring come from VRAM tier slots lent for the
-    /// call (upstream), else from cudaMalloc.
-    int prefill_chunk = 8192;
-    int prefill_ring = 64;      ///< expert ring slots
+    /// Batched prefill (M3), layer-major: tokens per pass at most (halved until the scratch fits); a pass copies every
+    /// expert to the GPU once, so one pass for the whole prompt is the fastest. 0 = prefill() runs step() token by
+    /// token. Inside a layer the pass runs in sub-batches of prefill_batch tokens. Scratch and the expert ring come
+    /// from VRAM tier slots lent for the call (upstream), else from cudaMalloc.
+    int prefill_chunk = 65536;
+    int prefill_batch = 4096;   ///< sub-batch tokens (halved down to 512 when the scratch does not fit)
+    int prefill_ring = 256;     ///< expert ring slots at most (halved down to 16 when they do not fit)
     int prefill_threads = 8;    ///< expert stream readers
 };
 
 /// What one prefill() call did
 struct PrefillTiming {
     double total_ms = 0, engram_ms = 0, stream_wait_ms = 0;   ///< stream_wait: the GPU side waited for expert copies
-    int chunks = 0, chunk_tokens = 0;                          ///< chunk_tokens: rows per chunk used
+    int chunks = 0, chunk_tokens = 0, sub_batch = 0;           ///< passes, tokens per pass, tokens per sub-batch
     int64_t vram_experts = 0;                                  ///< (layer, expert) pairs computed from VRAM slots
     int64_t streamed = 0, from_ram = 0, from_cache = 0, from_ssd = 0;   ///< pairs copied through the ring, by source
 };

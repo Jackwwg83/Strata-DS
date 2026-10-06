@@ -3,7 +3,7 @@
 //   ds41_generate --pack DIR --ids 0,128000,... [--gen 32] [--threads 8] [--dump steps.bin] [--force-ids FILE]
 //                 [--expert-profile ds41/data/expert-profile.bin [--vram-slots N] [--adapt-every 4] [--adapt-swaps 96]
 //                  [--ram-budget-gib N (0 none: default, -1 available RAM less 4 GB)]]
-//                 [--prefill [--prefill-chunk 8192] [--prefill-ring 64] [--prefill-threads 8]]
+//                 [--prefill [--prefill-chunk 65536] [--prefill-batch 4096] [--prefill-ring 256] [--prefill-threads 8]]
 //
 // --prefill runs the prompt (or, with --force-ids, the whole forced sequence for its nll) through the batched
 // prefill (M3) instead of step() token by token; generation then continues with step().
@@ -60,6 +60,7 @@ int main(int argc, char** argv) {
         else if (a == "--prefill") batched = true;
         else if (a == "--prefill-chunk") opt.prefill_chunk = std::stoi(next());
         else if (a == "--prefill-ring") opt.prefill_ring = std::stoi(next());
+        else if (a == "--prefill-batch") opt.prefill_batch = std::stoi(next());
         else if (a == "--prefill-threads") opt.prefill_threads = std::stoi(next());
         else if (a == "--dump") dump_path = next();
         else if (a == "--force-ids") force_path = next();
@@ -82,9 +83,10 @@ int main(int argc, char** argv) {
             std::vector<float> nll;
             int next = engine.prefill(pre, 0, forced.empty() ? nullptr : &nll);
             const auto& p = engine.last_prefill();
-            std::printf("prefill_tokens %zu ms %.1f tok_s %.1f chunks %d chunk_tokens %d engram_ms %.1f stream_wait_ms %.1f"
+            std::printf("prefill_tokens %zu ms %.1f tok_s %.1f chunks %d chunk_tokens %d sub_batch %d engram_ms %.1f stream_wait_ms %.1f"
                         " vram_experts %lld streamed %lld (ram %lld cache %lld ssd %lld)\n",
-                        pre.size(), p.total_ms, pre.size() / (p.total_ms / 1000.0), p.chunks, p.chunk_tokens, p.engram_ms,
+                        pre.size(), p.total_ms, pre.size() / (p.total_ms / 1000.0), p.chunks, p.chunk_tokens, p.sub_batch,
+                        p.engram_ms,
                         p.stream_wait_ms, (long long) p.vram_experts, (long long) p.streamed, (long long) p.from_ram,
                         (long long) p.from_cache, (long long) p.from_ssd);
             if (!nll.empty()) {
