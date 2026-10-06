@@ -40,7 +40,8 @@ struct Workspace {
 static_assert(Workspace::bytes(48) <= (64ull << 20), "K10 workspace exceeds contract");
 
 __device__ inline void check_proj(const Exl3Proj& p, int k, int n) {
-    assert(p.k == k && p.n == n && p.tile_w == 48);
+    assert(p.k == k && p.n == n);
+    assert(p.tile_w % 16 == 0 && p.tile_w / 16 >= 1 && p.tile_w / 16 <= 6);
     assert(p.trellis && p.suh && p.svh);
 }
 
@@ -60,7 +61,7 @@ __global__ void input_had(const half* x, const int32_t* sel, int topk,
     check_proj(p, H, F);
     half* a = input + size_t(job) * H;
     if (off == 0 && threadIdx.x == 0)
-        jobs[job] = Job{a, p.trellis, gu + size_t(job) * F, H, F};
+        jobs[job] = Job{a, p.trellis, gu + size_t(job) * F, H, F, p.tile_w / 16};
     had_hf_r_128_inner<true, false>(x + size_t(slot / topk) * H + off,
                                    a + off, p.suh, HAD_SCALE);
 }
@@ -113,7 +114,7 @@ __global__ void activate_down_had(const int32_t* sel, const float* weights,
     half* a = down_input + size_t(slot) * F;
     had_hf_r_128_inner<true, false>(hidden, a + off, e.w2.suh, HAD_SCALE);
     if (off == 0 && lane == 0)
-        jobs[slot] = Job{a, e.w2.trellis, down + size_t(slot) * H, F, H};
+        jobs[slot] = Job{a, e.w2.trellis, down + size_t(slot) * H, F, H, e.w2.tile_w / 16};
 }
 
 // Each token/chunk has one owner. Add in slot order, starting with the caller's

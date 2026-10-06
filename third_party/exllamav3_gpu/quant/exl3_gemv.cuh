@@ -14,10 +14,11 @@ struct GemvJob {
     float* C;
     int k;
     int n;
+    int bits;
 };
 
-// K10: 3-bit mul1, narrow configuration, one row per job. max_n sizes grid.x;
+// K10: integer K1..K6 mul1, narrow configuration, one row per job. max_n sizes grid.x;
 // each job's n must be a multiple of 128 and no larger than max_n.
-void gemv_mul1_3bit(const GemvJob* jobs, int count, int max_n, cudaStream_t stream);
+void gemv_mul1(const GemvJob* jobs, int count, int max_n, cudaStream_t stream);
 
 }  // namespace strata_exl3

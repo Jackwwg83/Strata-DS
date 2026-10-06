@@ -1,4 +1,4 @@
-// K10: EXL3 3-bit mul1 routed experts, using exllamav3's small-row GEMV.
+// K10: EXL3 integer K1..K6 mul1 routed experts, using exllamav3's small-row GEMV.
 #include "strata/ds41/kernels/k10_exl3_moe.hpp"
 
 // CMake intentionally builds only this translation unit.
@@ -23,10 +23,10 @@ void exl3_moe_decode(const __half* x, int m, const int32_t* sel, const float* w,
 
     k10::input_had<<<dim3(2 * slots, k10::H / 128), 32, 0, stream>>>
         (x, sel, topk, experts, ws.input, ws.gu, ws.jobs);
-    strata_exl3::gemv_mul1_3bit(ws.jobs, 2 * slots, k10::F, stream);
+    strata_exl3::gemv_mul1(ws.jobs, 2 * slots, k10::F, stream);
     k10::activate_down_had<<<dim3(slots, k10::F / 128), 32, 0, stream>>>
         (sel, w, experts, ws.gu, ws.down_input, ws.down, ws.jobs);
-    strata_exl3::gemv_mul1_3bit(ws.jobs, slots, k10::H, stream);
+    strata_exl3::gemv_mul1(ws.jobs, slots, k10::H, stream);
     k10::output_had_add<<<dim3(m, k10::H / 128), 32, 0, stream>>>
         (sel, topk, experts, ws.down, out);
 }
