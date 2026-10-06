@@ -81,6 +81,7 @@ struct MoeCpuMatrixDesc
     const at::Half* svh;
     int k_tiles;
     int n_tiles;
+    // Strata-DS: each projection of each expert has its own rate.
     int tile_w;
 };
 
