@@ -1,0 +1,66 @@
+{
+  "title": "Strata-DS 测试报告：DeepSeek V4.1 Flash（3bpw）在普通 PC 配置上的 prefill 和 decode 速度",
+  "short_title": "Strata-DS M3 测试报告",
+  "date": "2026-10-06",
+  "subtitle": "批量 prefill（M3）上线后的第一次实测 · 引擎版本 b194191 · 模型 EXL3 3bpw（专家 190.5 GiB）",
+  "summary": [
+    "<b>Prefill 快了约 60 倍。</b>24 GB 的 RTX 4090 + Ryzen 9 7950X：8K 到 32K 上下文的 prefill 约 <b>270–300 token/秒</b>，32K 的提示词 <b>114 秒</b>处理完。M3 之前提示词只能逐 token 处理，速度等于 decode（约 5 token/秒），32K 要将近 2 小时。",
+    "<b>16 GB 显卡也能用，但长上下文慢一些。</b>RTX 5060 Ti 显存放不下 8192 个 token 一段，只能 4096 一段，8K 以上约 150–190 token/秒。4K 以下它反而比 4090 那台快：这台机器的 SSD 更快，短提示词主要是在等专家从 SSD 读进来。",
+    "<b>Decode 三台都在 3–6 token/秒，显卡大小几乎不影响。</b>瓶颈是内存：3bpw 的专家有 190 GB，120 GiB 的内存装不下，每个 token 都有一部分专家要从 SSD 读。没有 AVX-512 的 EPYC 最慢（约 3.5 token/秒）。",
+    "<b>结果正确。</b>分段 prefill 和一次处理的 nll 只差 0.4%；5 篇文档上 prefill 和 DeepSeek 官方实现（FP16 专家）的平均差距是 0.031，比逐 token decode 的 0.047 还小。",
+    "<b>下一步：测 1.59 bpw（专家约 101 GB）。</b>128 GB 内存能装下全部专家，decode 不再读 SSD，prefill 每段的搬运量减半。预计两者各快 2–3 倍，这是让 128 GB 内存的 PC 真正好用的关键。这是推算，待实测。"
+  ],
+  "machines": [
+    {
+      "label": "Ryzen 9 7950X + RTX 4090",
+      "machine_json": "ds41/bench/results/2026-10-06-m3/7950x-4090/machine.json",
+      "context_tsv": "ds41/bench/results/2026-10-06-m3/7950x-4090/m3_context.tsv",
+      "notes": [
+        "容器内存上限 119.9 GiB（接近 128 GB 的 PC）。每段 8192 个 token，借出 408 个显存缓存槽位放中间结果和环形缓冲区。CPU 专家 16 线程（AVX-512）。"
+      ],
+      "ram": "容器上限 119.9 GiB"
+    },
+    {
+      "label": "EPYC 7443P + RTX 4090",
+      "machine_json": "ds41/bench/results/2026-10-06-m3/epyc7443p-4090/machine.json",
+      "context_tsv": "ds41/bench/results/2026-10-06-m3/epyc7443p-4090/m3_context.tsv",
+      "notes": [
+        "服务器 CPU（Zen 3，<b>没有 AVX-512</b>），24 线程。容器上限本来是 241.7 GiB，测试时用一个占住内存的进程压到 119.9 GiB，和上一台一致，所以两台 4090 只差 CPU 和 SSD。"
+      ],
+      "ram": "压到 119.9 GiB（宿主 504 GiB）"
+    },
+    {
+      "label": "Ryzen 9 7950X + RTX 5060 Ti 16 GB",
+      "machine_json": "ds41/bench/results/2026-10-06-m3/7950x-2x5060ti/machine.json",
+      "context_tsv": "ds41/bench/results/2026-10-06-m3/7950x-2x5060ti/m3_context.tsv",
+      "verify_log": "ds41/bench/results/2026-10-06-m3/7950x-2x5060ti/m3_verify.log",
+      "notes": [
+        "机器有两张 5060 Ti，引擎目前只用一张。容器内存上限 89.7 GiB（比另外两台小）。每段 4096 个 token（16 GB 显存的上限），借出约 180–230 个缓存槽位。"
+      ],
+      "ram": "容器上限 89.7 GiB"
+    },
+    {
+      "label": "i9-14900K + RTX 4090（10 月 5 日，只有 decode）",
+      "static": {
+        "cpu": "Intel Core i9-14900K（AVX2，无 AVX-512）",
+        "gpu": "RTX 4090 24 GB",
+        "ram": "64 GiB（容器上限）"
+      },
+      "decode_only": [
+        [
+          512,
+          2.69
+        ]
+      ],
+      "notes": []
+    }
+  ],
+  "notes": [
+    "<b>怎么测的：</b>每台机器、每个上下文长度各跑一次 ds41_generate：先用批量 prefill 处理前 L 个 token，再逐个生成 64 个 token。prefill 速度 = L ÷ prefill 总时间（含读 Engram、专家搬运、结束时还原显存缓存）。decode 速度 = 64 个生成 token 的平均。文本是本仓库的文档和源码拼成的固定长文本（tools/ds41/make_long_ids.py），三台完全相同。",
+    "<b>没控制的变量：</b>每档只跑一次，页缓存保持上一次运行留下的状态，所以 decode 有约 ±20% 的起伏（看表里相邻档位）。三台的 SSD 速度也不同，这对 4K 以下的 prefill 影响最大。",
+    "<b>表里「等待搬运」</b>是显卡等专家拷贝的时间。它占 prefill 总时间的 75–95%：prefill 的瓶颈是把专家从内存或 SSD 搬到显卡，不是计算。每处理一段，都要把 15,000 个左右的专家（约 200 GB）搬一遍，所以段越大越划算。从 1024 个 token 起，所有层的专家都会提前流式搬运。",
+    "<b>和上游 Strata 比：</b>上游在 RTX 5070 上跑 Qwen 的 2 bit 量化，prefill 是 1K 536、32K 2171 token/秒。它的专家只有 23–50 GB，是我们的 1/4 到 1/8，所以同样的搬运快 4–8 倍。这是数量级差距的主要来源。",
+    "<b>版本：</b>引擎 b194191。32K 那一档用 9ff7660 补测：只改了命令行读取 token 的方式（32K 的 id 超过了单个命令行参数的长度上限），引擎代码相同。",
+    "<b>数据状态：</b>表中所有速度和 nll 都是真实运行的实测输出，原始日志在 ds41/bench/results/2026-10-06-m3/。1.59 bpw 的预期是推算，未实测。"
+  ]
+}

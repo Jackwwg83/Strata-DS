@@ -172,6 +172,7 @@ def main():
         ram = f'{i.get("mem_total_gib", 0):.0f} GiB'
         if i.get("cgroup_memory_max") and i["cgroup_memory_max"].strip().isdigit():
             ram += f' (容器上限 {int(i["cgroup_memory_max"]) / 2**30:.0f} GiB)'
+        ram = mm["cfg"].get("ram", ram)   # the config overrides it (container limits machine.json cannot see)
         return i.get("cpu_model", ""), f'{i.get("gpu_name", "")} {i.get("gpu_mem_gib", 0):.0f} GB', ram
 
     out = ['<!doctype html><html lang="zh-CN"><head><meta charset="utf-8">',
@@ -191,10 +192,11 @@ def main():
         dec = [r["decode_tok_s"] for r in rows if r["decode_tok_s"]]
         if not rows and mm["cfg"].get("decode_only"):
             dec = [d for _, d in mm["cfg"]["decode_only"]]
+        med = sorted(dec)[len(dec) // 2] if dec else None
         out.append(f'<div class="card" style="border-top:3px solid {mm["color"]}"><h3>{html.escape(mm["cfg"]["label"])}</h3>'
                    f'<div class="sub">{html.escape(cpu)}<br>{html.escape(gpu)} · 内存 {html.escape(ram)}</div>'
                    f'<div style="margin-top:8px"><span class="big">{fmt(best) if best else "–"}</span> tok/s prefill 峰值'
-                   f'<br><span class="big">{fmt(dec[0], 2) if dec else "–"}</span> tok/s decode（最短上下文）</div></div>')
+                   f'<br><span class="big">{fmt(med, 2) if med else "–"}</span> tok/s decode（各上下文的中位数）</div></div>')
     out.append("</div>")
     # charts
     out.append("<h2>不同上下文下的速度</h2>")
@@ -240,8 +242,12 @@ def main():
             if v["long"]:
                 n, one, ck = v["long"]
                 out.append(f"<p>长文本 {n} token：一段处理 nll {one}，每 999 个 token 一段 nll {ck}。</p>")
-            for g in v["gen"]:
-                out.append(f'<p class="meta">{html.escape(g)}</p>')
+            seqs = [re.findall(r"generated:((?: \d+)+)", g) for g in v["gen"]]
+            if len(seqs) == 2 and all(seqs):
+                a_ids, b_ids = seqs[0][0].split(), seqs[1][0].split()
+                same = next((i for i, (x, y) in enumerate(zip(a_ids, b_ids)) if x != y), min(len(a_ids), len(b_ids)))
+                out.append(f'<p>生成：同一个 300 token 的提示词，逐 token 处理后生成和 prefill 后生成，前 {same} 个 token 完全相同'
+                           f'（共 {len(b_ids)} 个），之后因舍入差异分叉。</p>')
     if cfg.get("notes"):
         out.append("<h2>说明</h2><ul>" + "".join(f"<li>{n}</li>" for n in cfg["notes"]) + "</ul>")
     out.append("</main></body></html>")

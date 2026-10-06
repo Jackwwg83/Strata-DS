@@ -1,0 +1,18 @@
+{
+ "date_utc": "2026-10-06T04:51:49Z",
+ "cpu_model": "AMD Ryzen 9 7950X 16-Core Processor",
+ "cpu_logical": 32,
+ "cpu_avx2": true,
+ "cpu_avx512f": true,
+ "cpu_avx512_vnni": true,
+ "cpu_avx512_vbmi": true,
+ "cpu_avx512_bf16": true,
+ "mem_total_gib": 124.88,
+ "cgroup_memory_max": "",
+ "gpu_name": "NVIDIA GeForce RTX 4090",
+ "gpu_cc": "8.9",
+ "gpu_mem_gib": 23.52,
+ "gpu_query": "580.65.06, 4, 1, 16, 16",
+ "torch": "2.8.0+cu128",
+ "torch_cuda": "12.8"
+}
