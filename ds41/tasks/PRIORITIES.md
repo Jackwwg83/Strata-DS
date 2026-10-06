@@ -3,28 +3,23 @@
 Read this file from `origin/feature/ds41` at the start of every work cycle. Only the reviewer edits it. Talk in the
 coordination issue (see "How we talk" below), not here.
 
-Last update: 2026-10-06 02:10 (UTC+8). Focus: K11.
+Last update: 2026-10-06 (UTC+8). Focus: prefill (M3): K13, K14, then K2.
 
 ## Queue status
 
-UP since 2026-10-05 23:00 (UTC+8) on an RTX 4090 + i9-14900K box. Every candidate is tested with the current
-`src/ds41/tests/` (overlaid from `origin/feature/ds41`), including the rule 7 graph check. K10 results are invalid
-until "K10 GOLDEN READY" is posted in issue #8.
+The RTX 4090 box is stopped. The queue moves to the dev box: RTX 3060 12 GB (sm_86) + EPYC 7452, CUDA 12.8.
+"QUEUE UP" in issue #8 says when it runs. Controls below marked (3060) are measured there. Decode tasks (K1c, K3, K5,
+K7, K8, K10, K11) are paused: their controls are 4090 numbers, and the 3060 box has no model pack.
 
 ## Priorities (do them in this order)
 
-Controls are measured on the current box (RTX 4090 + i9-14900K) with the current tests.
-
 | # | Task | Why | Control (merged) |
 | --- | --- | --- | --- |
-| 1 | K11 CPU EXL3 expert kernel (AVX2) | the CPU experts are ~90% of a decode step on AVX2 PCs; new task | K11-01 (AVX-VNNI), 5,264 us (m1 3,181); vendored 5,987 |
-| 1b | K10 GPU EXL3 experts | about 2 ms per token; the largest GPU expert cost | K10-08, 170.7 us (m1 90.4); K10-03 re-run 184.5 |
-| 2 | K8 router top-k | CLOSED: ~26 us per token left; no more variants | K8-07, 19.84 us (m1 16.38) |
-| 3 | K3 sparse attention | merged | K3-25, 42.33 us (m1 27.65) |
-| 4 | K5 indexer | merged | K5-14, 117.9 us |
-| 5 | K7 hyper-connection mixes | merged | K7-06, 14.11 us (m1 12.29) |
-| 6 | K1c decode GEMV | near the DRAM limit; m=1 must not regress | K1b, 8,830 us (m1 7,291) |
-| 7 | K2 prefill GEMM | prefill work has not started | none merged; best K2-07 3,650 us (old box) |
+| 1 | K13 sparse attention, prefill chunk | new; baseline is K3 in a loop, 4.9 s per 4096-token chunk (40 layers) | baseline, 121,618 us (3060) |
+| 2 | K14 indexer, prefill chunk | new; baseline is K5 in a loop, 1.5 s per chunk (8 layers), more at long contexts | baseline, 192,123 us (3060) |
+| 3 | K2 prefill GEMM | merged K2-06 (best of all 13 on the 3060); re-ranked on the 4090 / 5060 Ti later | K2-06, 22,940 us (3060); K2-10 24,200; K2-05 24,530 |
+| - | K12 prefill experts (EXL3) | assigned to Codex (vendoring exllamav3); not open for variants yet | placeholder |
+| - | K1c, K3, K5, K7, K8, K10, K11 | paused (decode; no 4090 box) | see git history of this file |
 
 ## Merge rules
 
