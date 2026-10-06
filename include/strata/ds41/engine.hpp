@@ -7,6 +7,7 @@
 #pragma once
 
 #include "strata/ds41/pack.hpp"
+#include "strata/ds41/verify.hpp"
 
 #include <array>
 #include <cstdint>
@@ -69,6 +70,12 @@ public:
     /// Run token `token` at position `pos` (0, 1, 2, ... in order). Returns the greedy next token.
     /// With `dump` non-null, fills it for this step.
     int step(int token, int pos, StepDump* dump = nullptr);
+
+    /// Check a tentative window at the committed position. Call commit before step, prefill, or verify again.
+    /// Each output is the greedy next token after that input row. CPU windows are capped at four rows.
+    VerifyResult verify(const std::vector<int>& window, int pos, bool logits = false);
+    /// Keep the first n_keep inputs (1..T). Discard every later input and its state.
+    void commit(int n_keep);
 
     /// Feed tokens at positions pos, pos + 1, ... (pos = the tokens fed so far) in batched chunks: every layer on the
     /// GPU, all routed experts on the GPU (VRAM tier slots, the rest streamed through a ring). Returns the greedy
