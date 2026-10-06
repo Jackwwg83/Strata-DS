@@ -173,6 +173,9 @@ kernels::Exl3Expert VramExperts::describe_at(const Pack& pack, int layer, int ex
 void VramExperts::upload_res() {
     ck(cudaMemcpy(res_dev_, res_host_.data(), res_host_.size() * sizeof(int32_t), cudaMemcpyHostToDevice),
        "residency table");
+    // Publish before a nonblocking decode stream or the background copier can use the table.
+    // This function runs only during initialization or between steps.
+    ck(cudaStreamSynchronize(nullptr), "residency publication");
 }
 
 void VramExperts::count(const int32_t* routes, int topk) {

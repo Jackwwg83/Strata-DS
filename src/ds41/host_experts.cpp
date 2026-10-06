@@ -2,6 +2,7 @@
 #include "strata/ds41/host_experts.hpp"
 
 #include "strata/ds41/config.hpp"
+#include "strata/ds41/vram_experts.hpp"
 
 #include "moe_mul1.h"   // third_party/exllamav3_moe
 
@@ -22,6 +23,11 @@
 namespace strata::ds41 {
 
 namespace {
+
+void ck(cudaError_t e, const char* what) {
+    if (e != cudaSuccess)
+        throw std::runtime_error(std::string("ds41 RAM tier: ") + what + ": " + cudaGetErrorString(e));
+}
 
 /// a "key: N kB" line of /proc/meminfo, or a "key N" line of a cgroup stat file, in bytes; 0 when absent
 uint64_t read_field(const char* path, const std::string& key, uint64_t scale) {
@@ -115,9 +121,14 @@ HostExperts::HostExperts(const Pack& pack, const std::vector<std::pair<int, int>
             }
         });
     for (auto& t : pool) t.join();
-    // page-lock (pinned for CUDA copies) when the driver allows it, else mlock, else plain memory
-    if (cudaHostRegister(arena_, arena_bytes_, cudaHostRegisterDefault) == cudaSuccess) {
+    // Map the anonymous arena only. Pageable file experts must stay CPU-only.
+    if (cudaHostRegister(arena_, arena_bytes_, cudaHostRegisterMapped | cudaHostRegisterPortable) == cudaSuccess) {
         locked_ = registered_ = true;
+        void* alias = nullptr;
+        if (cudaHostGetDevicePointer(&alias, arena_, 0) == cudaSuccess)
+            device_alias_ = static_cast<uint8_t*>(alias);
+        else
+            cudaGetLastError();
     } else {
         cudaGetLastError();
         locked_ = mlock(arena_, arena_bytes_) == 0;
@@ -125,6 +136,28 @@ HostExperts::HostExperts(const Pack& pack, const std::vector<std::pair<int, int>
     if (!locked_)
         std::fprintf(stderr, "ds41 RAM tier: could not lock %.1f GiB (memlock limit?); it may be paged out\n",
                      arena_bytes_ / 1073741824.0);
+    if (!device_alias_)
+        std::fprintf(stderr, "ds41 RAM tier: GPU mapping unavailable; RAM experts stay on the CPU\n");
+    if (device_alias_) {
+        try {
+            std::vector<kernels::Exl3Expert> desc((size_t) L * n_experts_);
+            for (int s = 0; s < slots_; ++s) {
+                const auto [l, e] = holder_[s];
+                desc[(size_t) l * n_experts_ + e] =
+                    VramExperts::describe_at(pack_, l, e, device_alias_ + off_[s]);
+            }
+            ck(cudaMalloc(&experts_dev_, desc.size() * sizeof(desc[0])), "descriptor allocation");
+            ck(cudaMemcpy(experts_dev_, desc.data(), desc.size() * sizeof(desc[0]), cudaMemcpyHostToDevice),
+               "descriptor upload");
+            // The next step may use a nonblocking stream.
+            ck(cudaStreamSynchronize(nullptr), "descriptor publication");
+        } catch (...) {
+            cudaFree(experts_dev_);
+            cudaHostUnregister(arena_);
+            munmap(arena_, arena_bytes_);
+            throw;
+        }
+    }
     for (int s = 0; s < slots_; ++s) {
         slot_[(size_t) holder_[s].first * n_experts_ + holder_[s].second] = s;
         point(holder_[s].first, holder_[s].second, slot_ptr(s));
@@ -132,6 +165,7 @@ HostExperts::HostExperts(const Pack& pack, const std::vector<std::pair<int, int>
 }
 
 HostExperts::~HostExperts() {
+    cudaFree(experts_dev_);
     if (!arena_) return;
     if (registered_) cudaHostUnregister(arena_);
     else if (locked_) munlock(arena_, arena_bytes_);
@@ -156,7 +190,17 @@ void HostExperts::point(int layer, int expert, const uint8_t* bytes) {
     exl3_moe_cpu_set_expert_raw(handles_[layer], expert, &g, &u, &d, 0);
 }
 
+void HostExperts::publish_descriptor(int layer, int expert, int slot) {
+    if (!experts_dev_) return;
+    kernels::Exl3Expert desc{};
+    if (slot >= 0) desc = VramExperts::describe_at(pack_, layer, expert, device_alias_ + off_[slot]);
+    ck(cudaMemcpy(experts_dev_ + (size_t) layer * n_experts_ + expert, &desc, sizeof(desc),
+                  cudaMemcpyHostToDevice), "descriptor update");
+    ck(cudaStreamSynchronize(nullptr), "descriptor publication");
+}
+
 void HostExperts::point_to_file(int layer, int expert) {
+    publish_descriptor(layer, expert, -1);
     point(layer, expert, pack_.expert_base() + pack_.expert(layer, expert).offset);
     slot_[(size_t) layer * n_experts_ + expert] = -1;   // read from the file now; its slot stays reserved until assign
 }
@@ -166,10 +210,12 @@ void HostExperts::assign(int slot, int layer, int expert) {
     if (pack_.expert(layer, expert).bytes > slot_capacity(slot))
         throw std::invalid_argument("HostExperts::assign: the expert is larger than the slot");
     const auto [ol, oe] = holder_[slot];
+    publish_descriptor(ol, oe, -1);
     slot_[(size_t) ol * n_experts_ + oe] = -1;
     holder_[slot] = {layer, expert};
     slot_[(size_t) layer * n_experts_ + expert] = slot;
     point(layer, expert, slot_ptr(slot));
+    publish_descriptor(layer, expert, slot);
 }
 
 }  // namespace strata::ds41
