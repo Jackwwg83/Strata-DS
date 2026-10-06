@@ -8,8 +8,13 @@ Same prompts, same ids on every machine: the answers of two packs can be put sid
 """
 import argparse
 import os
+import sys
 
 from transformers import AutoTokenizer
+
+# DeepSeek V4.1 ships its chat format as a script, not as a tokenizer chat template
+sys.path.insert(0, os.path.join(os.path.dirname(os.path.abspath(__file__)), "..", "..", "ds41", "proto", "ref"))
+import encoding  # noqa: E402
 
 PROMPTS = {
     "zh_explain": "用三句话解释为什么天空是蓝色的。",
@@ -31,7 +36,8 @@ def main():
     if a.mode == "ids":
         os.makedirs(a.out, exist_ok=True)
         for name, text in PROMPTS.items():
-            ids = tok.apply_chat_template([{"role": "user", "content": text}], add_generation_prompt=True)
+            prompt = encoding.encode_messages([{"role": "user", "content": text}], thinking_mode="chat")
+            ids = tok.encode(prompt, add_special_tokens=False)
             with open(os.path.join(a.out, name + ".ids"), "w") as f:
                 f.write(",".join(map(str, ids)))
         return

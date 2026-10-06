@@ -115,31 +115,38 @@ class ExpertStore:
     def __init__(self, ckpt, threads=8, slots=48, pin=True):
         self.ckpt = ckpt
         self.pool = ThreadPoolExecutor(threads)
-        layout, off = [], 0
-        for w, _, _ in self.PROJ:
-            for p in self.PARTS:
-                dt, shape, _, nb = ckpt.where[f"layers.0.ffn.experts.0.{w}.{p}"].entries[f"layers.0.ffn.experts.0.{w}.{p}"]
-                layout.append((w, p, dt, shape, off, nb))
-                off += (nb + SLOT_ALIGN - 1) // SLOT_ALIGN * SLOT_ALIGN
-        self.layout, self.slot_bytes = layout, off
+        # experts may differ in size (SAGE 1.59bpw mixes K per projection): a slot holds the largest one
+        n_exp = sum(1 for k in ckpt.where if k.startswith("layers.0.ffn.experts.") and k.endswith(".w1.trellis"))
+        self.slot_bytes = max(self._layout(l, e)[1] for l in range(N_LAYERS) for e in range(n_exp))
         self.free = queue.Queue()
         for _ in range(slots):
             self.free.put(torch.empty(self.slot_bytes, dtype=torch.uint8, device="cpu", pin_memory=pin))
         self.bytes_read = 0
         self.read_s = 0.0
 
+    def _layout(self, layer, e):
+        """(w, part, dtype, shape, offset in the slot, bytes) of each tensor of expert (layer, e), and its size"""
+        layout, off = [], 0
+        for w, _, _ in self.PROJ:
+            for p in self.PARTS:
+                name = f"layers.{layer}.ffn.experts.{e}.{w}.{p}"
+                dt, shape, _, nb = self.ckpt.where[name].entries[name]
+                layout.append((w, p, dt, shape, off, nb))
+                off += (nb + SLOT_ALIGN - 1) // SLOT_ALIGN * SLOT_ALIGN
+        return layout, off
+
     def _read(self, layer, e):
         slot = self.free.get()
         buf = slot.numpy()
         t0 = time.perf_counter()
-        for w, p, dt, shape, off, nb in self.layout:
+        layout, _ = self._layout(layer, e)
+        for w, p, dt, shape, off, nb in layout:
             name = f"layers.{layer}.ffn.experts.{e}.{w}.{p}"
             f = self.ckpt.where[name]
-            _, _, foff, fnb = f.entries[name]
-            assert fnb == nb, name
+            foff = f.entries[name][2]
             got = os.preadv(f.fd, [memoryview(buf[off:off + nb])], foff)
             assert got == nb, (name, got, nb)
-        return slot, time.perf_counter() - t0
+        return slot, layout, time.perf_counter() - t0
 
     def stream(self, layer, ids, lookahead=32):
         """Yield (expert_id, (w1, w3, w2)) in order, with reads running `lookahead` ahead."""
@@ -149,7 +156,7 @@ class ExpertStore:
         for i, e in enumerate(ids[:lookahead]):
             futs[i] = self.pool.submit(self._read, layer, e)
         for i, e in enumerate(ids):
-            slot, dt = futs.pop(i).result()
+            slot, layout, dt = futs.pop(i).result()
             nxt = i + lookahead
             if nxt < len(ids):
                 futs[nxt] = self.pool.submit(self._read, layer, ids[nxt])
@@ -159,7 +166,7 @@ class ExpertStore:
             self.bytes_read += self.slot_bytes
             self.read_s += dt
             t = {}
-            for w, p, dts, shape, off, nb in self.layout:
+            for w, p, dts, shape, off, nb in layout:
                 t[(w, p)] = dev[off:off + nb].view(ST_DTYPES[dts]).view(shape)
             lins = tuple(LinearEXL3(None, k, n, suh=t[(w, "suh")], svh=t[(w, "svh")],
                                     trellis=t[(w, "trellis")], mul1=t[(w, "mul1")], key=f"L{layer}.E{e}.{w}")
