@@ -66,8 +66,9 @@ def fmt(v, digits=1):
 
 
 def chart(series, key, title, unit):
-    """Line chart: x = context (log 2), y = metric. series: [(label, color, [(x, y)])]"""
-    pts = [(x, y) for _, _, s in series for x, y in s if y is not None]
+    """Line chart: x = context (log 2), y = metric. series: [(label, color, [(x, y)]) or (label, color, pts, dashed)]"""
+    series = [s if len(s) == 4 else (*s, False) for s in series]
+    pts = [(x, y) for _, _, s, _ in series for x, y in s if y is not None]
     if not pts:
         return f'<div class="chart-empty">{html.escape(title)}: no data yet</div>'
     W, H, L, R, T, B = 720, 360, 64, 20, 30, 50
@@ -91,25 +92,27 @@ def chart(series, key, title, unit):
         g.append(f'<text class="tick" x="{L - 8}" y="{Y(y) + 4:.1f}" text-anchor="end">{fmt(y, 1 if step < 1 else 0)}</text>')
         y += step
     for x in xs:
-        lab = f"{x // 1024}K" if x >= 1024 else str(x)
+        lab = f"{round(x / 1024)}K" if x >= 1024 else str(x)
         g.append(f'<line class="grid v" x1="{X(x):.1f}" x2="{X(x):.1f}" y1="{T}" y2="{H - B}"/>')
         g.append(f'<text class="tick" x="{X(x):.1f}" y="{H - B + 18}" text-anchor="middle">{lab}</text>')
     g.append(f'<text class="axis" x="{(L + W - R) / 2}" y="{H - 8}" text-anchor="middle">上下文长度（token）</text>')
     g.append(f'<text class="axis" x="14" y="{(T + H - B) / 2}" text-anchor="middle" '
              f'transform="rotate(-90 14 {(T + H - B) / 2})">{html.escape(unit)}</text>')
-    for label, color, s in series:
+    for label, color, s, dashed in series:
         s = [(x, y) for x, y in s if y is not None]
         if not s:
             continue
         d = " ".join(f"{'M' if i == 0 else 'L'}{X(x):.1f},{Y(y):.1f}" for i, (x, y) in enumerate(s))
-        g.append(f'<path d="{d}" fill="none" stroke="{color}" stroke-width="2.5"/>')
+        dash = ' stroke-dasharray="6 5"' if dashed else ""
+        g.append(f'<path d="{d}" fill="none" stroke="{color}" stroke-width="2.5"{dash}/>')
         for x, y in s:
             g.append(f'<circle cx="{X(x):.1f}" cy="{Y(y):.1f}" r="4" fill="{color}"><title>{html.escape(label)}: '
                      f'{x} token, {fmt(y, 2)} {html.escape(unit)}</title></circle>')
             g.append(f'<text class="val" x="{X(x):.1f}" y="{Y(y) - 9:.1f}" text-anchor="middle" fill="{color}">'
                      f'{fmt(y, 1)}</text>')
     g.append("</svg>")
-    legend = "".join(f'<span class="key"><i style="background:{c}"></i>{html.escape(l)}</span>' for l, c, _ in series)
+    legend = "".join(f'<span class="key"><i style="background:{c}{";opacity:.55" if dsh else ""}"></i>'
+                     f'{html.escape(l)}{" (虚线)" if dsh else ""}</span>' for l, c, _, dsh in series)
     return f'<figure><figcaption>{html.escape(title)}</figcaption><div class="legend">{legend}</div>{"".join(g)}</figure>'
 
 
@@ -141,6 +144,7 @@ svg .val{font-size:11px;font-weight:600}
 .tablewrap{overflow-x:auto}
 table{border-collapse:collapse;width:100%;font-size:13px;background:var(--card)}
 th,td{border:1px solid var(--line);padding:6px 8px;text-align:right;white-space:nowrap}
+th{white-space:normal;min-width:72px}
 th{background:var(--bg);text-align:center}td:first-child,th:first-child{text-align:left}
 .tag{display:inline-block;font-size:11px;padding:1px 7px;border-radius:9px;border:1px solid currentColor}
 .real{color:var(--ok)}.est{color:var(--warn)}.miss{color:var(--bad)}
@@ -161,8 +165,12 @@ def main():
         if m.get("machine_json"):
             info = json.load(open(m["machine_json"]))
         rows = read_tsv(m["context_tsv"]) if m.get("context_tsv") else []
+        for r in m.get("rows", []):   # [[context, prefill tok/s or null, decode tok/s or null], ...] (published numbers)
+            rows.append({"context": r[0], "prefill_ms": None, "prefill_tok_s": r[1], "decode_ms": None,
+                         "decode_tok_s": r[2], "chunk": "", "streamed": "", "ssd": "", "wait_ms": None})
         ver = read_verify(m["verify_log"]) if m.get("verify_log") else None
-        machines.append({"cfg": m, "info": info, "rows": rows, "verify": ver, "color": COLORS[i % len(COLORS)]})
+        machines.append({"cfg": m, "info": info, "rows": rows, "verify": ver,
+                         "color": m.get("color", COLORS[i % len(COLORS)]), "dashed": bool(m.get("dashed"))})
 
     def spec(mm):
         if mm["cfg"].get("static"):
@@ -200,19 +208,18 @@ def main():
     out.append("</div>")
     # charts
     out.append("<h2>不同上下文下的速度</h2>")
-    out.append(chart([(mm["cfg"]["label"], mm["color"], [(r["context"], r["prefill_tok_s"]) for r in mm["rows"]])
-                      for mm in machines], "prefill_tok_s", "Prefill 速度（越高越好）", "token / 秒"))
+    out.append(chart([(mm["cfg"]["label"], mm["color"], [(r["context"], r["prefill_tok_s"]) for r in mm["rows"]],
+                       mm["dashed"]) for mm in machines], "prefill_tok_s", "Prefill 速度（越高越好）", "token / 秒"))
     out.append(chart([(mm["cfg"]["label"], mm["color"],
                        [(r["context"], r["decode_tok_s"]) for r in mm["rows"]] or
-                       [(x, y) for x, y in mm["cfg"].get("decode_only", [])]) for mm in machines],
-                     "decode_tok_s", "Decode 速度（紧接 prefill 生成 64 个 token，越高越好）", "token / 秒"))
-    out.append(chart([(mm["cfg"]["label"], mm["color"],
-                       [(r["context"], (r["prefill_ms"] or 0) / 1000 or None) for r in mm["rows"]]) for mm in machines],
-                     "prefill_s", "处理完整个提示词所需时间（越低越好）", "秒"))
+                       [(x, y) for x, y in mm["cfg"].get("decode_only", [])], mm["dashed"]) for mm in machines],
+                     "decode_tok_s", cfg.get("decode_title", "Decode 速度（越高越好）"), "token / 秒"))
+    for sec in cfg.get("sections", []):   # free sections after the charts: {"title": ..., "html": ...}
+        out.append(f'<h2>{html.escape(sec["title"])}</h2>{sec["html"]}')
     # tables
     out.append("<h2>全部数字</h2>")
     for mm in machines:
-        if not mm["rows"]:
+        if not mm["rows"] or mm["cfg"].get("rows"):   # published numbers are in the comparison table
             continue
         out.append(f'<h3>{html.escape(mm["cfg"]["label"])}</h3><div class="tablewrap"><table><tr><th>上下文</th>'
                    '<th>prefill 用时 (s)</th><th>prefill tok/s</th><th>decode ms/token</th><th>decode tok/s</th>'
