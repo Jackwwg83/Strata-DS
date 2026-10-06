@@ -81,5 +81,29 @@ int main() {
     }
     s = plan_expert_swaps(u, res, L, E, 2);
     v.check(s.size() == 2 && s[0].gain == 9.0f && s[1].in == 2, "max_swaps keeps the largest gains");
+    // the same plan through a fit test that accepts everything (experts of one size)
+    auto all = [](int, int, int) { return true; };
+    v.check(plan_expert_swaps(u, res, L, E, 96, all).size() == 4, "a fit test that accepts all: the same plan");
+
+    // ---- experts of different sizes (SAGE 1.59bpw): `in` must fit the slot of `out`
+    // layer 0: resident e0 (usage 0, small slot), e1 (0.5, large slot); missing e2 (9, large), e3 (8, small)
+    std::vector<int32_t> r2(L * E, -1);
+    std::vector<float> u2(L * E, 0.0f);
+    r2[0] = 0; r2[1] = 1;
+    u2[0] = 0; u2[1] = 0.5f; u2[2] = 9; u2[3] = 8;
+    auto large = [](int l, int e) { return l == 0 && (e == 1 || e == 2); };
+    auto fits = [&](int l, int in, int out) { return !large(l, in) || large(l, out); };
+    s = plan_expert_swaps(u2, r2, L, E, 96, fits);
+    // e2 (large) cannot take e0's small slot: it takes e1's; e3 (small) then takes e0's
+    v.check(s.size() == 2, "two swaps with sizes, got " + std::to_string(s.size()));
+    if (s.size() == 2) {
+        v.check(s[0].in == 2 && s[0].out == 1 && s[0].gain == 8.5f, "the large candidate takes the large slot");
+        v.check(s[1].in == 3 && s[1].out == 0 && s[1].gain == 8.0f, "the small candidate takes the small slot");
+    }
+    // only a small slot left: the large candidate is skipped, the small one after it still swaps
+    r2[1] = -1;
+    u2[1] = 0;
+    s = plan_expert_swaps(u2, r2, L, E, 96, fits);
+    v.check(s.size() == 1 && s[0].in == 3 && s[0].out == 0, "a candidate that fits no slot is skipped");
     return v.finish();
 }

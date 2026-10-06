@@ -48,9 +48,11 @@ std::vector<std::pair<int, int>> read_expert_profile(const std::string& path, in
 }
 
 std::vector<ExpertSwap> plan_expert_swaps(const std::vector<float>& usage, const std::vector<int32_t>& res,
-                                          int n_layers, int n_experts, int max_swaps) {
+                                          int n_layers, int n_experts, int max_swaps,
+                                          const std::function<bool(int, int, int)>& fits) {
     std::vector<ExpertSwap> swaps;
     std::vector<std::pair<float, int32_t>> cand, vict;
+    std::vector<uint8_t> taken;
     for (int l = 0; l < n_layers; ++l) {
         cand.clear();
         vict.clear();
@@ -67,12 +69,16 @@ std::vector<ExpertSwap> plan_expert_swaps(const std::vector<float>& usage, const
         // ties: lower expert first, so the plan does not depend on the sort's stability
         std::sort(cand.begin(), cand.end(),
                   [](auto& a, auto& b) { return a.first > b.first || (a.first == b.first && a.second < b.second); });
-        const size_t nc = std::min(cand.size(), vict.size());
-        std::partial_sort(vict.begin(), vict.begin() + (ptrdiff_t) nc, vict.end(),
-                          [](auto& a, auto& b) { return a.first < b.first || (a.first == b.first && a.second < b.second); });
-        for (size_t i = 0; i < nc; ++i) {
-            if (cand[i].first < vict[i].first + 1.5f) break;
-            swaps.push_back({cand[i].first - vict[i].first, (int32_t) l, cand[i].second, vict[i].second});
+        std::sort(vict.begin(), vict.end(),
+                  [](auto& a, auto& b) { return a.first < b.first || (a.first == b.first && a.second < b.second); });
+        taken.assign(vict.size(), 0);
+        for (const auto& c : cand) {
+            // the least-used victim not taken yet whose slot holds the candidate
+            size_t j = 0;
+            while (j < vict.size() && (taken[j] || (fits && !fits(l, c.second, vict[j].second)))) ++j;
+            if (j == vict.size() || c.first < vict[j].first + 1.5f) continue;
+            taken[j] = 1;
+            swaps.push_back({c.first - vict[j].first, (int32_t) l, c.second, vict[j].second});
         }
     }
     std::stable_sort(swaps.begin(), swaps.end(), [](const ExpertSwap& a, const ExpertSwap& b) { return a.gain > b.gain; });
@@ -90,27 +96,35 @@ VramExperts::VramExperts(const Pack& pack, const std::string& profile_path, int6
     ck(cudaMalloc(&res_dev_, res_host_.size() * sizeof(int32_t)), "residency table");
     ck(cudaMalloc(&ws_, kWorkspaceBytes), "K10 workspace");
     ck(cudaStreamCreateWithFlags(&copy_stream_, cudaStreamNonBlocking), "copy stream");
-    for (int l = 0; l < L; ++l)
-        for (int e = 0; e < E; ++e) slot_bytes_ = std::max<size_t>(slot_bytes_, pack.expert(l, e).bytes);
-    slot_bytes_ = (slot_bytes_ + 255) / 256 * 256;
+    auto slot_size = [&](int l, int e) { return (size_t) (pack.expert(l, e).bytes + 255) / 256 * 256; };
     if (n_slots != 0 && !profile_path.empty()) {
         const auto ranked = read_expert_profile(profile_path, L, E);
-        if (n_slots < 0) {
+        if (n_slots < 0) {   // by bytes, in rank order, up to the first that does not fit (upstream)
             size_t free_b = 0, total_b = 0;
             ck(cudaMemGetInfo(&free_b, &total_b), "cudaMemGetInfo");
             const size_t descs = (size_t) L * E * sizeof(kernels::Exl3Expert);
-            n_slots = free_b > reserve_bytes + descs ? (int64_t) ((free_b - reserve_bytes - descs) / slot_bytes_) : 0;
+            const size_t room = free_b > reserve_bytes + descs ? free_b - reserve_bytes - descs : 0;
+            size_t used = 0;
+            n_slots = 0;
+            for (const auto& [l, e] : ranked) {
+                if (slot_size(l, e) > room - used) break;
+                used += slot_size(l, e);
+                ++n_slots;
+            }
         }
         slots_ = (int) std::min<int64_t>(n_slots, (int64_t) ranked.size());
+        for (int s = 0; s < slots_; ++s) {
+            off_.push_back(off_.back() + slot_size(ranked[s].first, ranked[s].second));
+            max_slot_bytes_ = std::max(max_slot_bytes_, off_.back() - off_[s]);
+        }
         if (slots_ > 0) {
-            ck(cudaMalloc(&arena_, (size_t) slots_ * slot_bytes_), "expert slots");
+            ck(cudaMalloc(&arena_, off_.back()), "expert slots");
             desc_host_.resize(slots_);
             const uint8_t* base = pack.expert_base();
             for (int s = 0; s < slots_; ++s) {
                 const auto [l, e] = ranked[s];
                 const ExpertSlot& x = pack.expert(l, e);
-                ck(cudaMemcpy(arena_ + (size_t) s * slot_bytes_, base + x.offset, x.bytes, cudaMemcpyHostToDevice),
-                   "expert copy");
+                ck(cudaMemcpy(arena_ + off_[s], base + x.offset, x.bytes, cudaMemcpyHostToDevice), "expert copy");
                 desc_host_[s] = describe(l, e, s);
                 res_host_[(size_t) l * E + e] = s;
             }
@@ -134,7 +148,7 @@ VramExperts::~VramExperts() {
 }
 
 kernels::Exl3Expert VramExperts::describe(int layer, int expert, int slot) const {
-    return describe_at(pack_, layer, expert, arena_ + (size_t) slot * slot_bytes_);
+    return describe_at(pack_, layer, expert, arena_ + off_[slot]);
 }
 
 kernels::Exl3Expert VramExperts::describe_at(const Pack& pack, int layer, int expert, const uint8_t* dst) {
@@ -173,7 +187,7 @@ void VramExperts::count(const int32_t* routes, int topk) {
 void VramExperts::set_host(HostExperts* host) {
     host_ = host;
     if (host_ && host_->slots() > 0 && !staging_)
-        ck(cudaMallocHost((void**) &staging_, slot_bytes_), "swap staging");
+        ck(cudaMallocHost((void**) &staging_, max_slot_bytes_), "swap staging");
 }
 
 void VramExperts::copy_worker(std::vector<Pending> work) {
@@ -181,7 +195,7 @@ void VramExperts::copy_worker(std::vector<Pending> work) {
     const uint8_t* base = pack_.expert_base();
     for (size_t i = 0; ok && i < work.size(); ++i) {
         const Pending& w = work[i];
-        uint8_t* vslot = arena_ + (size_t) w.vram_slot * slot_bytes_;
+        uint8_t* vslot = arena_ + off_[w.vram_slot];
         const ExpertSlot& xin = pack_.expert(w.layer, w.in);
         if (w.ram_slot >= 0) {
             // out: VRAM -> staging; in: its RAM slot -> VRAM; then out: staging -> the RAM slot
@@ -231,7 +245,14 @@ int VramExperts::between_steps() {
     const int committed = commit_pending(false);
     if (was_pending && !pending_.empty()) return 0;   // still copying
     if (++calls_ % adapt_.every != 0) return committed;
-    const auto swaps = plan_expert_swaps(usage_, res_host_, L, E, adapt_.max_swaps);
+    // `in` must fit the VRAM slot of `out`; with a RAM tier, `out` then takes the RAM slot of `in`, and must fit it
+    auto fits = [&](int l, int in, int out) {
+        const size_t vcap = off_[res_host_[(size_t) l * E + out] + 1] - off_[res_host_[(size_t) l * E + out]];
+        if (pack_.expert(l, in).bytes > vcap) return false;
+        const int32_t ram = host_ ? host_->slot_of(l, in) : -1;
+        return ram < 0 || pack_.expert(l, out).bytes <= host_->slot_capacity(ram);
+    };
+    const auto swaps = plan_expert_swaps(usage_, res_host_, L, E, adapt_.max_swaps, fits);
     for (float& v : usage_) v *= adapt_.decay;
     if (swaps.empty()) return committed;
     for (const ExpertSwap& s : swaps) {
@@ -264,7 +285,14 @@ uint8_t* VramExperts::lend(int n) {
     }
     lent_ = n;
     upload_res();
-    return arena_ + (size_t) (slots_ - n) * slot_bytes_;
+    return arena_ + off_[slots_ - n];
+}
+
+uint8_t* VramExperts::lend_bytes(size_t bytes) {
+    if (bytes > tail_bytes(slots_)) throw std::invalid_argument("ds41 vram experts: the slots hold fewer bytes");
+    int n = 0;
+    while (tail_bytes(n) < bytes) ++n;
+    return lend(n);
 }
 
 void VramExperts::restore() {
@@ -276,8 +304,7 @@ void VramExperts::restore() {
         if (l < 0) continue;
         const int s = slots_ - lent_ + i;
         const ExpertSlot& x = pack_.expert(l, e);
-        ck(cudaMemcpy(arena_ + (size_t) s * slot_bytes_, base + x.offset, x.bytes, cudaMemcpyHostToDevice),
-           "restore lent slot");
+        ck(cudaMemcpy(arena_ + off_[s], base + x.offset, x.bytes, cudaMemcpyHostToDevice), "restore lent slot");
         res_host_[(size_t) l * E + e] = s;   // desc_host_ and experts_dev_ still describe (l, e) at slot s
     }
     lent_ = 0;

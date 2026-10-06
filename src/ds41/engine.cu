@@ -349,7 +349,7 @@ struct Engine::Impl {
             vram = std::make_unique<VramExperts>(pack, opt.expert_profile, opt.vram_expert_slots,
                                                  opt.vram_reserve_bytes, ad);
             std::fprintf(stderr, "ds41: %d VRAM expert slots (%.2f GiB)\n", vram->slots(),
-                         vram->slots() * (double) vram->slot_bytes() / (1ull << 30));
+                         vram->arena_bytes() / (double) (1ull << 30));
         }
         // the RAM tier after it: the hottest experts the VRAM tier does not hold (upstream's resident budget)
         if (!opt.expert_profile.empty() && opt.ram_budget_gib != 0) {
@@ -827,17 +827,15 @@ struct Engine::Impl {
     void prefill_begin(int n) {
         pf = Prefill{};
         if (const char* v = std::getenv("DS41_PF_PROFILE")) pfp.on = v[0] && v[0] != '0';
-        if (vram) pf.slot_bytes = vram->slot_bytes();
-        else {
-            for (int l = 0; l < kLayers; ++l)
-                for (int e = 0; e < kExperts; ++e) pf.slot_bytes = std::max<size_t>(pf.slot_bytes, pack.expert(l, e).bytes);
-            pf.slot_bytes = (pf.slot_bytes + 255) & ~(size_t) 255;
-        }
-        const int lendable = vram ? vram->slots() * 9 / 10 : 0;
+        // a ring slot holds any expert of the pack (upstream: MAXBLOB); the tier's slots may be smaller
+        for (int l = 0; l < kLayers; ++l)
+            for (int e = 0; e < kExperts; ++e) pf.slot_bytes = std::max<size_t>(pf.slot_bytes, pack.expert(l, e).bytes);
+        pf.slot_bytes = (pf.slot_bytes + 255) & ~(size_t) 255;
+        // the bytes of the last 90% of the tier's slots (upstream lends up to 90% of the tier)
+        const size_t lendable = vram ? vram->tail_bytes(vram->slots() * 9 / 10) : 0;
         size_t free_b = 0, total_b = 0;
         ck(cudaMemGetInfo(&free_b, &total_b), "cudaMemGetInfo");
         const size_t spare = free_b > (512ull << 20) ? free_b - (512ull << 20) : 0;   // cuBLAS and K13 scratch
-        auto slots_for = [&](size_t b) { return (int) ((b + pf.slot_bytes - 1) / pf.slot_bytes); };
         size_t scratch = 0, ring = 0;
         int plan = -1;   // 0: both lent; 1: scratch lent, ring cudaMalloc; 2: ring lent, scratch cudaMalloc; 3: both cudaMalloc
         int cap = std::max(1, std::min(n, opt.prefill_chunk)), sub = 0;
@@ -848,9 +846,9 @@ struct Engine::Impl {
                 for (int r = std::max(opt.prefill_ring, kMinRing); plan < 0 && r >= kMinRing; r /= 2) {
                     pf.ring_slots = r;
                     ring = (size_t) r * pf.slot_bytes;
-                    if (slots_for(scratch + ring) <= lendable) plan = 0;
-                    else if (slots_for(scratch) <= lendable && ring <= spare) plan = 1;
-                    else if (slots_for(ring) <= lendable && scratch <= spare) plan = 2;
+                    if (scratch + ring <= lendable) plan = 0;
+                    else if (scratch <= lendable && ring <= spare) plan = 1;
+                    else if (ring <= lendable && scratch <= spare) plan = 2;
                     else if (scratch + ring <= spare) plan = 3;
                 }
                 if (plan >= 0) break;
@@ -860,7 +858,7 @@ struct Engine::Impl {
         pf.cap = cap;
         pf.sub = sub;
         const size_t lend_bytes = plan == 0 ? scratch + ring : plan == 1 ? scratch : plan == 2 ? ring : 0;
-        if (lend_bytes) pf.lent = vram->lend(slots_for(lend_bytes));
+        if (lend_bytes) pf.lent = vram->lend_bytes(lend_bytes);
         uint8_t* scratch_base = plan <= 1 ? pf.lent : nullptr;
         if (plan >= 2) ck(cudaMalloc((void**) &pf.own_scratch, scratch), "prefill scratch");
         if (plan == 1 || plan == 3) ck(cudaMalloc((void**) &pf.own_ring, ring), "prefill ring");
@@ -870,7 +868,7 @@ struct Engine::Impl {
         std::fprintf(stderr, "ds41 prefill: pass %d tokens, sub-batch %d; scratch %.2f GiB %s; ring %d slots %s; %d tier "
                      "slots lent\n", cap, sub, scratch / 1073741824.0, plan <= 1 ? "in lent slots" : "cudaMalloc",
                      pf.ring_slots, plan == 0 || plan == 2 ? "in lent slots" : "cudaMalloc",
-                     lend_bytes ? slots_for(lend_bytes) : 0);
+                     lend_bytes ? vram->lent() : 0);
         // pinned host buffers
         if (pfh.cap < cap) {
             if (pfh.base) cudaFreeHost(pfh.base);

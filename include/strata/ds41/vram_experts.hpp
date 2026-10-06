@@ -2,6 +2,8 @@
 //
 // Some routed experts live in VRAM slots and the GPU computes them (task K10); the CPU computes only the misses.
 // The slots are filled at start from a profile (tools/ds41/make_profile.py, upstream's STRP format) in rank order.
+// Experts may differ in size (SAGE 1.59bpw): as upstream's sized slots (src/core/expert_cache.cpp open_sized), the
+// slots are compact, each as large as the expert that first filled it, in one arena.
 // The residency table maps (layer, expert) to a slot or -1; the doorbell publish reads it on the device, so the
 // GPU and the CPU split every routed expert the same way.
 //
@@ -9,7 +11,9 @@
 // routing counts per (layer, expert); every few steps, per layer, the most-routed missing experts replace the
 // least-routed resident ones when they were routed clearly more often. An evicted expert leaves the table at once
 // (the CPU computes it); the new one enters once its copy has landed. The copies run on their own thread and
-// stream, because the pack is mmap'ed (pageable) and a pageable copy holds the calling thread.
+// stream, because the pack is mmap'ed (pageable) and a pageable copy holds the calling thread. A swap needs the new
+// expert to fit the old one's slot (upstream swaps only within a layer, whose experts have one size there; here a
+// layer mixes sizes, so the plan checks it).
 #pragma once
 
 #include "strata/ds41/kernels/k10_exl3_moe.hpp"
@@ -20,6 +24,7 @@
 #include <atomic>
 #include <cstddef>
 #include <cstdint>
+#include <functional>
 #include <string>
 #include <thread>
 #include <utility>
@@ -37,10 +42,13 @@ struct ExpertSwap {
     int32_t layer, in, out;   ///< `in` (missing) takes the slot of `out` (resident), same layer
 };
 /// Upstream's swap choice. usage and res: [n_layers][n_experts]. Per layer, candidates are missing experts with
-/// usage >= 2, victims the resident ones; the i-th most-used candidate pairs with the i-th least-used victim while
-/// it leads by 1.5 or more. All layers' swaps, largest gain first, at most max_swaps.
+/// usage >= 2, victims the resident ones; the most-used candidates first, each pairs with the least-used victim
+/// not taken yet that it fits (fits(layer, in, out); empty: every expert fits), if it leads that victim by 1.5 or
+/// more. With one expert size this is upstream's pairing of the i-th candidate with the i-th victim. All layers'
+/// swaps, largest gain first, at most max_swaps.
 std::vector<ExpertSwap> plan_expert_swaps(const std::vector<float>& usage, const std::vector<int32_t>& res,
-                                          int n_layers, int n_experts, int max_swaps);
+                                          int n_layers, int n_experts, int max_swaps,
+                                          const std::function<bool(int, int, int)>& fits = {});
 
 class VramExperts {
 public:
@@ -53,8 +61,9 @@ public:
         int max_swaps = 96;
     };
 
-    /// Fills `n_slots` slots with the profile's first pairs, copied from the mapped pack. n_slots < 0: as many as
-    /// fit in the free VRAM after keeping `reserve_bytes` free (and the workspace). 0 slots is valid (no tier).
+    /// Fills `n_slots` slots with the profile's first pairs, copied from the mapped pack. n_slots < 0: the profile's
+    /// first pairs while their bytes fit in the free VRAM after keeping `reserve_bytes` free (and the workspace), as
+    /// upstream (it stops at the first that does not fit). 0 slots is valid (no tier).
     VramExperts(const Pack& pack, const std::string& profile_path, int64_t n_slots, size_t reserve_bytes,
                 Adapt adapt);
     ~VramExperts();
@@ -62,7 +71,12 @@ public:
     VramExperts& operator=(const VramExperts&) = delete;
 
     int slots() const { return slots_; }
-    size_t slot_bytes() const { return slot_bytes_; }
+    /// the arena: the slots' capacities summed
+    size_t arena_bytes() const { return off_.back(); }
+    /// the largest slot
+    size_t max_slot_bytes() const { return max_slot_bytes_; }
+    /// the bytes of the last n slots (what lend(n) gives)
+    size_t tail_bytes(int n) const { return off_[slots_] - off_[slots_ - n]; }
     /// [n_layers][n_experts] slot or -1, on the device; layer l starts at res_dev() + l * n_experts
     const int32_t* res_dev() const { return res_dev_; }
     const std::vector<int32_t>& res_host() const { return res_host_; }
@@ -85,6 +99,8 @@ public:
     /// leave the residency table and their memory goes to the caller until restore(). Call between steps; adaptive
     /// copies in flight are finished and committed first. Returns the first lent byte.
     uint8_t* lend(int n);
+    /// lend() of the fewest last slots that hold `bytes`. Throws if all slots together hold less.
+    uint8_t* lend_bytes(size_t bytes);
     /// Copies the lent slots' experts back from the pack and enters them in the table again.
     void restore();
     int lent() const { return lent_; }
@@ -108,7 +124,8 @@ private:
     Adapt adapt_;
     int device_ = 0;
     int slots_ = 0;
-    size_t slot_bytes_ = 0;
+    std::vector<size_t> off_{0};       ///< [slots + 1] slot offsets in the arena, 256 B aligned
+    size_t max_slot_bytes_ = 0;
     uint8_t* arena_ = nullptr;
     int32_t* res_dev_ = nullptr;
     std::vector<int32_t> res_host_;
