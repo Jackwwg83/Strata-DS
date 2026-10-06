@@ -163,6 +163,8 @@ struct Engine::Impl {
     int32_t* gpu_sel = nullptr;        // [6] per-call descriptor indices (-1: CPU)
     std::shared_ptr<int> zc_quota;      // [layers] device values; update only between steps
     std::shared_ptr<void> zc_workspace; // used when there is no VRAM tier
+    std::unique_ptr<ExpertStaging> zc_stage;
+    std::shared_ptr<ExpertBlob> zc_blobs; // immutable [layers][experts] pack metadata
     int32_t* routes_dev = nullptr;     // [40][6]
     float* weights_dev = nullptr;      // [40][6]
     uint8_t* cand_dev = nullptr;       // [max_seq] candidate mask of the candidate layer
@@ -386,6 +388,30 @@ struct Engine::Impl {
         kernels::hc_init();       // K7 / K8 scratch, allocated outside any capture
         kernels::router_init();
         if (const char* v = std::getenv("DS41_GRAPH")) use_graph = v[0] != '0';
+        // Reserve staging before the automatic VRAM cache consumes free memory. Keep this reservation at q=0
+        // too, so quota sweeps within staged mode use the same initial residency.
+        const char* stage_env = std::getenv("DS41_ZC_STAGE");
+        if (stage_env && std::strcmp(stage_env, "0") != 0 && std::strcmp(stage_env, "1") != 0)
+            throw std::invalid_argument("DS41_ZC_STAGE must be 0 or 1");
+        if ((!stage_env || stage_env[0] != '0') && !opt.expert_profile.empty() && opt.ram_budget_gib != 0) {
+            std::vector<ExpertBlob> blobs;
+            size_t largest = 0;
+            for (int l = 0; l < kLayers; ++l) {
+                for (int e = 0; e < kExperts; ++e) {
+                    const auto& slot = pack.expert(l, e);
+                    blobs.push_back({size_t(slot.bytes), size_t(slot.comp_off[0])});
+                    largest = std::max(largest, size_t(slot.bytes));
+                }
+            }
+            zc_stage = std::make_unique<ExpertStaging>(kTopK, largest);
+            zc_blobs = std::shared_ptr<ExpertBlob>(dalloc<ExpertBlob>(blobs.size()),
+                                                  [](ExpertBlob* p) { cudaFree(p); });
+            ck(cudaMemcpy(zc_blobs.get(), blobs.data(), blobs.size() * sizeof(ExpertBlob), cudaMemcpyHostToDevice),
+               "staging blob metadata");
+            ck(cudaStreamSynchronize(nullptr), "staging initialization");
+            std::fprintf(stderr, "ds41: zero-copy staging %d slots x %zu bytes (pack max %zu)\n",
+                         kTopK, zc_stage->stride(), largest);
+        }
         // the VRAM expert tier last: an automatic slot count takes what the rest left free
         if (!opt.expert_profile.empty() && opt.vram_expert_slots != 0) {
             VramExperts::Adapt ad;
@@ -431,7 +457,8 @@ struct Engine::Impl {
                 zc_workspace = std::shared_ptr<void>(dalloc<uint8_t>(VramExperts::kWorkspaceBytes),
                                                      [](void* p) { cudaFree(p); });
             ck(cudaStreamSynchronize(nullptr), "zero-copy initialization");
-            std::fprintf(stderr, "ds41: mapped RAM experts enabled, GPU quota %d per token per layer\n", quota);
+            std::fprintf(stderr, "ds41: mapped RAM experts enabled, GPU quota %d per token per layer, %s\n",
+                         quota, zc_stage ? "staged" : "direct");
         }
         // the router lookahead: every expert outside the VRAM and RAM tiers is read from the file (upstream turns it
         // on with a RAM budget; here the file tier exists whenever the experts do not all fit in RAM)
@@ -695,22 +722,30 @@ struct Engine::Impl {
         int32_t* ids = routes_dev + l * kTopK;
         float* w = weights_dev + l * kTopK;
         kernels::router_topk(xf, 1, y.gate_w, y.gate_bias, ids, w, st);
-        // K10 computes VRAM hits and a quota of RAM misses (read over PCIe) while the CPU computes the rest
+        // K10 computes VRAM hits and a quota of RAM misses (staged or direct) while the CPU computes the rest.
         ops::to_half_fp8q(xf, x_half_dev, kDim, st);
         const bool tier = vram && vram->slots() > 0;
         const auto* ram = host && host->experts_dev() ? host->experts_dev() + (size_t) l * kExperts : nullptr;
         db->publish(x_half_dev, ids, w, 1, tier ? vram->res_dev() + (size_t) l * kExperts : nullptr, gpu_sel,
                     (uint32_t) (l + 1), st, tier ? vram->experts_dev() : nullptr, ram,
-                    zc_quota ? zc_quota.get() + l : nullptr);
+                    zc_quota ? zc_quota.get() + l : nullptr,
+                    ram ? zc_stage.get() : nullptr, ram && zc_blobs ? zc_blobs.get() + (size_t) l * kExperts : nullptr);
+        const bool staged = ram && zc_stage;
+        if (staged) zc_stage->fork_copy(st);
         ck(cudaMemsetAsync(routed, 0, kDim * sizeof(float), st), "routed");
-        if (tier || ram)
+        if (!staged && (tier || ram))
             kernels::exl3_moe_decode((const __half*) x_half_dev, 1, gpu_sel, w, kTopK, db->gpu_experts(), routed,
                                      vram ? vram->workspace() : zc_workspace.get(), VramExperts::kWorkspaceBytes, st);
-        // shared expert, while the CPU works
+        // Shared expert overlaps the staging copy and CPU work. One K10 call preserves route reduction order.
         fp8_linear(xf, y.sh_w1, g);
         fp8_linear(xf, y.sh_w3, u);
         ops::swiglu(g, u, kSwigluLimit, sh_h, kMoeInter, st);
         fp8_linear(sh_h, y.sh_w2, sh_out);
+        if (staged) {
+            zc_stage->join(st);
+            kernels::exl3_moe_decode((const __half*) x_half_dev, 1, gpu_sel, w, kTopK, db->gpu_experts(), routed,
+                                     vram ? vram->workspace() : zc_workspace.get(), VramExperts::kWorkspaceBytes, st);
+        }
         db->wait_add(routed, 1, (uint32_t) (l + 1), st);
         ops::add_f32_bf16(routed, sh_out, ffn_out, kDim, st);
     }
