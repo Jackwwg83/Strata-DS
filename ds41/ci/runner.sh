@@ -18,8 +18,9 @@
 # Results never need a GitHub token on this (public cloud) machine: each result is written to $STATE/outbox/ as
 # "<issue number>\n<markdown comment>", and ds41/ci/relay.sh on the reviewer's machine posts and archives them.
 #
-# Env: REPO_DIR (clone of the repo), BASE (default origin/feature/ds41), POLL (default 60), CMAKE_EXTRA (more configure
-# options, e.g. -DSTRATA_GGML_DIR=/workspace/llama.cpp so a configure does not clone llama.cpp each time).
+# Env: REPO_DIR (clone of the repo), BASE (default origin/feature/ds41), POLL (default 60), CUDA_ARCH (default 89: RTX
+# 4090; 86 for an RTX 3060/3090), CMAKE_EXTRA (more configure options, e.g. -DSTRATA_GGML_DIR=/workspace/llama.cpp so a
+# configure does not clone llama.cpp each time).
 set -u
 REPO_DIR=${REPO_DIR:-/workspace/ci/repo}
 BASE=${BASE:-origin/feature/ds41}
@@ -69,7 +70,7 @@ test_branch() {
 
     {
         echo "== $branch $sha  $(date -u +%FT%TZ)"
-        cmake -S "$wt" -B "$wt/build" -DSTRATA_ENABLE_CUDA=ON -DCMAKE_CUDA_ARCHITECTURES=89 -DSTRATA_BUILD_TESTS=ON \
+        cmake -S "$wt" -B "$wt/build" -DSTRATA_ENABLE_CUDA=ON -DCMAKE_CUDA_ARCHITECTURES=${CUDA_ARCH:-89} -DSTRATA_BUILD_TESTS=ON \
               -DCMAKE_BUILD_TYPE=Release -DCMAKE_CUDA_COMPILER_LAUNCHER=ccache -DCMAKE_CXX_COMPILER_LAUNCHER=ccache \
               ${CMAKE_EXTRA:-} 2>&1 | tail -3
         cmake --build "$wt/build" -j"$(nproc)" --target $targets 2>&1 | grep -E "error|warning: unused|Error" | head -40
