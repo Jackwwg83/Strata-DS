@@ -107,16 +107,16 @@ def main():
         allocated = min(m, 256) * tmax
         for first in range(0, m, 256):
             rows = min(256, m - first)
-            for tile in range(0, rows, 4):
-                tile_rows = min(4, rows - tile)
+            for tile in range(0, rows, 16):
+                tile_rows = min(16, rows - tile)
                 end = (pos0 + first + tile + tile_rows) // ratio
                 for local in range(tile_rows):
                     n = (pos0 + first + tile + local + 1) // ratio
                     assert n <= end <= tmax
                     if n:
                         assert (tile + local) * tmax + n - 1 < allocated
-                        assert ((n - 1) // 64) * 64 < end
-                        assert (n - 1) // 64 <= (end - 1) // 64
+                        assert ((n - 1) // 128) * 128 < end
+                        assert (n - 1) // 128 <= (end - 1) // 128
                     for block in (1, 8, 31):
                         if n:
                             begin = ((n - 1) // block) * block

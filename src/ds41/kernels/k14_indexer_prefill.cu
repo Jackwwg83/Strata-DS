@@ -1,4 +1,4 @@
-// K14-01: four-query BF16 tensor-core tiles and parallel, exact row selection.
+// K14-02: head-streamed 16-query x 128-key BF16 tensor-core score tiles.
 // All scratch belongs to the caller; no allocation, host sync, or per-query launch.
 #include "strata/ds41/kernels/k14_indexer_prefill.hpp"
 
@@ -14,8 +14,10 @@ namespace strata::ds41::kernels {
 namespace {
 using bf16 = __nv_bfloat16;
 using Count = unsigned long long;
-constexpr int kQueryTile = 4;
-constexpr int kKeyTile = 64;
+constexpr int kQueryTile = 16;
+constexpr int kKeyTile = 128;
+constexpr int kHeadGroup = 8;
+constexpr int kInputStride = 136;
 constexpr int kScoreThreads = 512;
 constexpr int kSelectThreads = 256;
 constexpr int kBatchRows = 256;
@@ -46,21 +48,31 @@ __device__ __forceinline__ float rounded(float value) {
     return __bfloat162float(__float2bfloat16_rn(value));
 }
 
-// The query array and the FP32 dot array have the same size. Every warp finishes
-// reading queries before any warp stores its dots into the reused shared array.
-// 32 KiB for queries/dots + 16 KiB for keys = 48 KiB, without opt-in attributes.
+// Stage eight heads from every query, compute them, then reuse the same
+// storage for their FP32 dots. Keys remain resident through all four groups.
+// The +8 BF16 input stride rotates consecutive rows across shared banks.
 union __align__(32) QueryDots {
-    bf16 queries[kQueryTile * 32 * 128];
-    float dots[kQueryTile * 32 * kKeyTile];
+    bf16 queries[kQueryTile * kHeadGroup * kInputStride];
+    float dots[kQueryTile * kHeadGroup * kKeyTile];
 };
-static_assert(sizeof(QueryDots) == 32 * 1024, "query/dot storage size");
+struct __align__(32) ScoreTile {
+    QueryDots group;
+    bf16 keys[kKeyTile * kInputStride];
+    bf16 weights[kQueryTile * kHeadGroup];
+};
+static_assert(sizeof(QueryDots) == 64 * 1024, "query/dot storage size");
+static_assert(sizeof(ScoreTile) == 100608, "score tile storage size");
+static_assert(sizeof(ScoreTile) <= 99 * 1024, "consumer shared-memory budget");
+static_assert(kQueryTile * kKeyTile % kScoreThreads == 0, "whole thread-owned scores");
+constexpr int kThreadScores = kQueryTile * kKeyTile / kScoreThreads;
 
-__global__ void batched_scores(const bf16* q, const bf16* keys, const bf16* w,
-                                int first, int rows, int pos0, int ratio,
-                                const uint8_t* cand, int64_t cand_stride,
-                                bf16* scores, int64_t score_stride) {
-    __shared__ QueryDots storage;
-    __shared__ __align__(32) bf16 sk[kKeyTile * 128];
+__global__ __launch_bounds__(kScoreThreads) void batched_scores(
+        const bf16* q, const bf16* keys, const bf16* w,
+        int first, int rows, int pos0, int ratio,
+        const uint8_t* cand, int64_t cand_stride,
+        bf16* scores, int64_t score_stride) {
+    extern __shared__ __align__(32) unsigned char shared[];
+    ScoreTile& tile = *reinterpret_cast<ScoreTile*>(shared);
     const int tid = threadIdx.x;
     const int tile_row = int(blockIdx.y) * kQueryTile;
     const int tile_rows = min(kQueryTile, rows - tile_row);
@@ -68,64 +80,93 @@ __global__ void batched_scores(const bf16* q, const bf16* keys, const bf16* w,
     const int64_t tile_end = (int64_t(pos0) + first + tile_row + tile_rows) / ratio;
     if (key_base >= tile_end) return;  // Uniform, before any barrier.
 
-    for (int item = tid; item < kQueryTile * 32 * 128; item += kScoreThreads) {
-        const int local_row = item / (32 * 128);
-        storage.queries[item] = local_row < tile_rows
-            ? q[(size_t(first + tile_row + local_row) * 32 * 128) + item % (32 * 128)]
-            : __float2bfloat16_rn(0.0f);
-    }
     for (int item = tid; item < kKeyTile * 128; item += kScoreThreads) {
-        const int64_t j = key_base + item / 128;
-        sk[item] = j < tile_end ? keys[size_t(j) * 128 + item % 128] : __float2bfloat16_rn(0.0f);
+        const int key_row = item / 128, d = item % 128;
+        const int64_t j = key_base + key_row;
+        tile.keys[key_row * kInputStride + d] = j < tile_end
+            ? keys[size_t(j) * 128 + d] : __float2bfloat16_rn(0.0f);
     }
-    __syncthreads();
-
+    float total[kThreadScores] = {};
     const int warp = tid >> 5;
-    const int query = warp / 4;
-    const int key_group = warp % 4;
+    const int query_pair = warp / 2;
+    const int key_parity = warp % 2;
     namespace wm = nvcuda::wmma;
-    wm::fragment<wm::matrix_a, 16, 16, 16, bf16, wm::row_major> a0, a1;
-    wm::fragment<wm::matrix_b, 16, 16, 16, bf16, wm::col_major> b;
-    wm::fragment<wm::accumulator, 16, 16, 16, float> c0, c1;
-    wm::fill_fragment(c0, 0.0f);
-    wm::fill_fragment(c1, 0.0f);
-#pragma unroll
-    for (int d = 0; d < 128; d += 16) {
-        wm::load_matrix_sync(a0, storage.queries + query * 32 * 128 + d, 128);
-        wm::load_matrix_sync(a1, storage.queries + query * 32 * 128 + 16 * 128 + d, 128);
-        wm::load_matrix_sync(b, sk + key_group * 16 * 128 + d, 128);
-        wm::mma_sync(c0, a0, b, c0);
-        wm::mma_sync(c1, a1, b, c1);
-    }
-    __syncthreads();  // The query storage is no longer read by any warp.
-    wm::store_matrix_sync(storage.dots + query * 32 * kKeyTile + key_group * 16, c0, kKeyTile, wm::mem_row_major);
-    wm::store_matrix_sync(storage.dots + query * 32 * kKeyTile + 16 * kKeyTile + key_group * 16,
-                          c1, kKeyTile, wm::mem_row_major);
-    __syncthreads();
 
-    if (tid < kQueryTile * kKeyTile) {
-        const int local_row = tid / kKeyTile;
-        const int key_col = tid % kKeyTile;
+    // Ascending groups and ascending heads within each group preserve the
+    // reference's FP32 head-sum order, including the group boundaries.
+#pragma unroll 1
+    for (int head_base = 0; head_base < 32; head_base += kHeadGroup) {
+        for (int item = tid; item < kQueryTile * kHeadGroup * 128; item += kScoreThreads) {
+            const int qh = item / 128, d = item % 128;
+            const int local_row = qh / kHeadGroup, head = qh % kHeadGroup;
+            tile.group.queries[qh * kInputStride + d] = local_row < tile_rows
+                ? q[(size_t(first + tile_row + local_row) * 32 + head_base + head) * 128 + d]
+                : __float2bfloat16_rn(0.0f);
+        }
+        if (tid < kQueryTile * kHeadGroup) {
+            const int local_row = tid / kHeadGroup, head = tid % kHeadGroup;
+            tile.weights[tid] = local_row < tile_rows
+                ? w[size_t(first + tile_row + local_row) * 32 + head_base + head]
+                : __float2bfloat16_rn(0.0f);
+        }
+        __syncthreads();  // Queries, weights, and the retained keys are ready.
+
+        // Each warp computes two queries x eight heads against four disjoint
+        // 16-key groups. All 16 warps together cover the 128x128 dot matrix.
+        wm::fragment<wm::matrix_a, 16, 16, 16, bf16, wm::row_major> a;
+        wm::fragment<wm::matrix_b, 16, 16, 16, bf16, wm::col_major> b;
+        wm::fragment<wm::accumulator, 16, 16, 16, float> dots[4];
+#pragma unroll
+        for (int part = 0; part < 4; ++part) wm::fill_fragment(dots[part], 0.0f);
+#pragma unroll
+        for (int d = 0; d < 128; d += 16) {
+            wm::load_matrix_sync(a, tile.group.queries + query_pair * 16 * kInputStride + d, kInputStride);
+#pragma unroll
+            for (int part = 0; part < 4; ++part) {
+                const int key_group = key_parity + part * 2;
+                wm::load_matrix_sync(b, tile.keys + key_group * 16 * kInputStride + d, kInputStride);
+                wm::mma_sync(dots[part], a, b, dots[part]);
+            }
+        }
+        __syncthreads();  // Retire every query reader before the overlay stores.
+#pragma unroll
+        for (int part = 0; part < 4; ++part) {
+            const int key_group = key_parity + part * 2;
+            wm::store_matrix_sync(tile.group.dots + query_pair * 16 * kKeyTile + key_group * 16,
+                                  dots[part], kKeyTile, wm::mem_row_major);
+        }
+        __syncthreads();  // Every dot is now visible to its owning score thread.
+#pragma unroll
+        for (int part = 0; part < kThreadScores; ++part) {
+            const int output = tid + part * kScoreThreads;
+            const int local_row = output / kKeyTile, key_col = output % kKeyTile;
+#pragma unroll
+            for (int head = 0; head < kHeadGroup; ++head) {
+                const float dot = rounded(tile.group.dots[(local_row * kHeadGroup + head) * kKeyTile + key_col]);
+                total[part] += rounded(fmaxf(dot, 0.0f)
+                    * __bfloat162float(tile.weights[local_row * kHeadGroup + head]));
+            }
+        }
+        __syncthreads();  // Retire dot/weight readers before staging the next group.
+    }
+#pragma unroll
+    for (int part = 0; part < kThreadScores; ++part) {
+        const int output = tid + part * kScoreThreads;
+        const int local_row = output / kKeyTile, key_col = output % kKeyTile;
         const int row = first + tile_row + local_row;
         const int64_t j = key_base + key_col;
         const int64_t n = (int64_t(pos0) + row + 1) / ratio;
         if (local_row < tile_rows && j < n) {
-            float total = -CUDART_INF_F;
-            if (!cand || cand[size_t(row) * size_t(cand_stride) + size_t(j)]) {
-                total = 0.0f;
-                // Match ops::indexer_scores: separate BF16 dot and product
-                // conversions, then ascending-head FP32 sum and BF16 output.
-#pragma unroll
-                for (int h = 0; h < 32; ++h) {
-                    const float dot = rounded(storage.dots[(local_row * 32 + h) * kKeyTile + key_col]);
-                    total += rounded(fmaxf(dot, 0.0f) * __bfloat162float(w[size_t(row) * 32 + h]));
-                }
-            }
-            scores[size_t(tile_row + local_row) * size_t(score_stride) + size_t(j)] = __float2bfloat16_rn(total);
+            const float value = !cand || cand[size_t(row) * size_t(cand_stride) + size_t(j)]
+                ? total[part] : -CUDART_INF_F;
+            scores[size_t(tile_row + local_row) * size_t(score_stride) + size_t(j)] = __float2bfloat16_rn(value);
         }
     }
 }
 
+// Exact selector copied without functional changes from reviewed K14-01,
+// commit 1e8f6d22166620116d76d81c1c00851f4b100285, production SHA-256:
+// d061923b0df41325df17949a730cfb694b184f13e314f2a7a4def368d818a11e.
 // All stored scores and block maxima are BF16 values (or infinity). Float-flip
 // therefore needs only two radix bytes. Signed zeros compare equal by contract.
 __device__ __forceinline__ uint32_t key_of(float value) {
@@ -328,6 +369,13 @@ void indexer_topk_prefill(const bf16* q, const bf16* keys, const bf16* w, int m,
         if (error != cudaSuccess) throw std::runtime_error("K14: output padding failed");
         return;
     }
+    // Opt in for this function on the current device, without allocating
+    // scratch, querying device properties, or synchronizing a stream. Repeating
+    // the same function attribute avoids process-global per-device cache state.
+    const cudaError_t attribute_error = cudaFuncSetAttribute(batched_scores,
+        cudaFuncAttributeMaxDynamicSharedMemorySize, int(sizeof(ScoreTile)));
+    if (attribute_error != cudaSuccess)
+        throw std::runtime_error(std::string("K14 shared-memory opt-in: ") + cudaGetErrorString(attribute_error));
     // The API includes alignment slack, so even a byte-aligned workspace works.
     const size_t adjustment = (kAlignment - (reinterpret_cast<uintptr_t>(workspace) % kAlignment)) % kAlignment;
     bf16* scores = reinterpret_cast<bf16*>(static_cast<unsigned char*>(workspace) + adjustment);
@@ -336,7 +384,7 @@ void indexer_topk_prefill(const bf16* q, const bf16* keys, const bf16* w, int m,
         const int64_t batch_end = (int64_t(pos0) + first + rows) / ratio;
         if (batch_end) {
             const dim3 grid(unsigned((batch_end - 1) / kKeyTile + 1), unsigned((rows + kQueryTile - 1) / kQueryTile));
-            batched_scores<<<grid, kScoreThreads, 0, stream>>>(q, keys, w, first, rows, pos0, ratio,
+            batched_scores<<<grid, kScoreThreads, sizeof(ScoreTile), stream>>>(q, keys, w, first, rows, pos0, ratio,
                                                               cand, cand_stride, scores, t_max);
             check_launch("K14 batched scores");
         }
