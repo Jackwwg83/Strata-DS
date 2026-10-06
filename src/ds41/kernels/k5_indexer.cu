@@ -6,6 +6,7 @@
 #include <math_constants.h>
 
 #include <algorithm>
+#include <cassert>
 #include <cstdio>
 #include <cstdlib>
 
@@ -29,8 +30,18 @@ __device__ __forceinline__ float rounded(float x) {
     return __bfloat162float(__float2bfloat16_rn(x));
 }
 
+__device__ __forceinline__ int64_t live_length(const int* pos, int ratio, int64_t cap) {
+    const int64_t t = (int64_t(*pos) + 1) / ratio;
+    assert(t >= 0 && t <= cap);
+    return t;
+}
+
 __global__ void small_scores(const bf16* q, const bf16* keys, int64_t n, const bf16* w,
-                             const uint8_t* cand, float* scores) {
+                             const uint8_t* cand, float* scores, const int* pos = nullptr, int ratio = 1) {
+    if (pos) {
+        n = live_length(pos, ratio, n);
+        if (n > 512) return;
+    }
     const int64_t j = int64_t(blockIdx.x) * 8 + (threadIdx.x >> 5);
     const int lane = threadIdx.x & 31;
     if (j >= n) return;
@@ -69,7 +80,11 @@ struct Selection {
 // Each warp computes 32 heads x 16 positions. The matrix intermediates are
 // FP32; the three BF16 conversions remain separate from tensor accumulation.
 __global__ void tensor_scores(const bf16* q, const bf16* keys, int64_t n, const bf16* w,
-                              const uint8_t* cand, float* scores) {
+                              const uint8_t* cand, float* scores, const int* pos = nullptr, int ratio = 1) {
+    if (pos) {
+        n = live_length(pos, ratio, n);
+        if (n <= 512 || int64_t(blockIdx.x) * 64 >= n) return;
+    }
     __shared__ __align__(32) bf16 sq[32 * 128];
     __shared__ __align__(32) bf16 sk[64 * 128];
     __shared__ __align__(32) float dots[32 * 64];
@@ -159,7 +174,19 @@ __global__ void all_candidates(const float* scores, int64_t n, int block_size, u
 template <bool Candidate>
 __global__ void select_without_scratch(Values<Candidate> values, int64_t n,
                                        int k, int32_t offset, int32_t* out,
-                                       uint8_t* cand) {
+                                       uint8_t* cand, const int* pos = nullptr, int ratio = 1) {
+    if (pos) {
+        values.positions = live_length(pos, ratio, values.positions);
+        if (values.positions == 0) return;
+        n = Candidate ? (values.positions - 1) / values.block_size + 1 : values.positions;
+        k = int(n < k ? n : k);
+        if (k <= 0) {
+            if constexpr (Candidate) {
+                for (int64_t j = threadIdx.x; j < values.positions; j += blockDim.x) cand[j] = 0;
+            }
+            return;
+        }
+    }
     __shared__ Count bins[256];
     __shared__ Selection state;
     __shared__ uint32_t greater_prefix[32], equal_prefix[32];
@@ -554,6 +581,33 @@ void candidate_blocks(const float* scores, int64_t t, int topk_blocks, int block
         }
     }
     check(cudaGetLastError(), "candidate launch");
+}
+
+void indexer_topk_device(const bf16* q, const bf16* keys, const int* pos_dev,
+                         int ratio, int64_t t_cap, const bf16* w, const uint8_t* cand,
+                         int k, int32_t offset, float* scores, int32_t* out_idx, cudaStream_t stream) {
+    if (ratio <= 0 || t_cap < 0 || !pos_dev) {
+        std::fprintf(stderr, "K5: invalid device length parameters\n"); std::abort();
+    }
+    if (t_cap == 0) return;
+    small_scores<<<unsigned((std::min<int64_t>(t_cap, 512) + 7) / 8), kThreads, 0, stream>>>(
+        q, keys, t_cap, w, cand, scores, pos_dev, ratio);
+    if (t_cap > 512) tensor_scores<<<unsigned((t_cap + 63) / 64), 128, 0, stream>>>(
+        q, keys, t_cap, w, cand, scores, pos_dev, ratio);
+    select_without_scratch<false><<<1, kThreads, 0, stream>>>(
+        {scores, t_cap, 1}, t_cap, k, offset, out_idx, nullptr, pos_dev, ratio);
+    check(cudaGetLastError(), "device indexer launch");
+}
+
+void candidate_blocks_device(const float* scores, const int* pos_dev, int ratio, int64_t t_cap,
+                              int topk_blocks, int block, uint8_t* cand, cudaStream_t stream) {
+    if (ratio <= 0 || t_cap < 0 || !pos_dev) {
+        std::fprintf(stderr, "K5: invalid device length parameters\n"); std::abort();
+    }
+    if (t_cap == 0 || block <= 0) return;
+    select_without_scratch<true><<<1, kThreads, 0, stream>>>(
+        {scores, t_cap, block}, 0, topk_blocks, 0, nullptr, cand, pos_dev, ratio);
+    check(cudaGetLastError(), "device candidate launch");
 }
 
 }  // namespace strata::ds41::kernels

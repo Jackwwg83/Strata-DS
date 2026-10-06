@@ -9,6 +9,8 @@
 #include <math_constants.h>
 #include <cstdio>
 #include <cstdlib>
+#include <cassert>
+#include "strata/ds41/config.hpp"
 
 namespace strata::ds41::kernels {
 namespace {
@@ -112,7 +114,12 @@ __global__ __launch_bounds__(kThreads, 6) void attention_online(
         const bf16* __restrict__ q, const bf16* __restrict__ window,
         const bf16* __restrict__ comp, const int32_t* __restrict__ idx,
         int n_idx, const float* __restrict__ sink, float scale,
-        bf16* __restrict__ output) {
+        bf16* __restrict__ output, const int* t_dev = nullptr) {
+    if (t_dev) {
+        const int t = *t_dev;
+        assert(t >= 0);
+        n_idx = kWindow + (t < strata::ds41::kIndexTopK ? t : strata::ds41::kIndexTopK);
+    }
     __shared__ TileStorage tile;
     const int lane = threadIdx.x & 31;
     const int warp = threadIdx.x >> 5;
@@ -288,5 +295,11 @@ void sparse_attn_decode(const bf16* q, const bf16* window, const bf16* comp,
     }
     attention_online<<<dim3(kHeads / kHeadTile, kDim / kOutputDim, m), kThreads, 0, stream>>>(
         q, window, comp, idx, n_idx, sink, scale, o);
+}
+void sparse_attn_decode_device(const bf16* q, const bf16* window, const bf16* comp,
+                               const int32_t* idx, const int* t_dev, const float* sink,
+                               float scale, bf16* o, cudaStream_t stream) {
+    attention_online<<<dim3(kHeads / kHeadTile, kDim / kOutputDim, 1), kThreads, 0, stream>>>(
+        q, window, comp, idx, kWindow + strata::ds41::kIndexTopK, sink, scale, o, t_dev);
 }
 }  // namespace strata::ds41::kernels
