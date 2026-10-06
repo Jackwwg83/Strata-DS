@@ -22,11 +22,19 @@ inline void cpu_relax() {
 constexpr size_t kAlign = 256;   // every buffer, and the two words on separate lines
 size_t up(size_t v) { return (v + kAlign - 1) / kAlign * kAlign; }
 
+__device__ void rebase(kernels::Exl3Proj& p, const uint8_t* src, uint8_t* dst) {
+    p.trellis = reinterpret_cast<const uint16_t*>(dst + (reinterpret_cast<const uint8_t*>(p.trellis) - src));
+    p.suh = reinterpret_cast<const __half*>(dst + (reinterpret_cast<const uint8_t*>(p.suh) - src));
+    p.svh = reinterpret_cast<const __half*>(dst + (reinterpret_cast<const uint8_t*>(p.svh) - src));
+}
+
 __global__ void publish_k(const uint4* __restrict__ x, int n_x16, const int32_t* __restrict__ ids,
                           const float* __restrict__ w, int m, int topk, const int32_t* __restrict__ res,
                           int32_t* __restrict__ gpu_sel, uint4* mx, int32_t* mids, float* mw, volatile uint32_t* seq,
                           uint32_t round, const kernels::Exl3Expert* vram, const kernels::Exl3Expert* ram,
-                          const int* quota, kernels::Exl3Expert* call, ExpertDoorbell::Counts* counts) {
+                          const int* quota, kernels::Exl3Expert* call, ExpertDoorbell::Counts* counts,
+                          const ExpertBlob* blobs, uint8_t* staging, size_t stride,
+                          ExpertCopy* jobs, int* copy_count) {
     for (int i = threadIdx.x; i < n_x16; i += blockDim.x) mx[i] = x[i];
     // At most 48 route uses in decode/verify. One lane makes the prefix rule explicit.
     if (threadIdx.x == 0) {
@@ -46,6 +54,15 @@ __global__ void publish_k(const uint4* __restrict__ x, int n_x16, const int32_t*
                 if (gpu_sel) gpu_sel[i] = descriptors ? ((hit || zc) ? i : -1) : slot;
                 if (descriptors) {
                     call[i] = hit ? vram[slot] : (zc ? ram[id] : kernels::Exl3Expert{});
+                    if (zc && staging) {
+                        const ExpertBlob blob = blobs[id];
+                        const auto* src = reinterpret_cast<const uint8_t*>(call[i].w1.trellis) - blob.first_trellis;
+                        auto* dst = staging + size_t(i) * stride;
+                        jobs[c.zero_copy] = {src, dst, blob.bytes};
+                        rebase(call[i].w1, src, dst);
+                        rebase(call[i].w3, src, dst);
+                        rebase(call[i].w2, src, dst);
+                    }
                 }
                 if (hit) ++c.vram;
                 else if (zc) { ++used; ++c.zero_copy; }
@@ -53,6 +70,7 @@ __global__ void publish_k(const uint4* __restrict__ x, int n_x16, const int32_t*
             }
         }
         *counts = c;
+        if (copy_count) *copy_count = c.zero_copy;
     }
     __threadfence_system();   // Every thread publishes its writes before seq.
     __syncthreads();
@@ -113,11 +131,16 @@ ExpertDoorbell::~ExpertDoorbell() {
 
 void ExpertDoorbell::publish(const uint16_t* x, const int32_t* ids, const float* w, int m, const int32_t* res,
                              int32_t* gpu_sel, uint32_t round, cudaStream_t stream,
-                             const kernels::Exl3Expert* vram, const kernels::Exl3Expert* ram, const int* quota) {
+                             const kernels::Exl3Expert* vram, const kernels::Exl3Expert* ram, const int* quota,
+                             ExpertStaging* stage, const ExpertBlob* blobs) {
     if (m < 1 || m > max_m_) throw std::invalid_argument("ExpertDoorbell::publish: bad m");
     if (res && ram && !vram) throw std::invalid_argument("ExpertDoorbell::publish: missing VRAM descriptors");
+    if (stage && (!blobs || stage->capacity() < m * topk_))
+        throw std::invalid_argument("ExpertDoorbell::publish: missing blob metadata or staging slots");
     publish_k<<<1, 512, 0, stream>>>((const uint4*) x, m * dim_ / 8, ids, w, m, topk_, res, gpu_sel, (uint4*) d_x_,
-                                     d_ids_, d_w_, d_seq_, round, vram, ram, quota, gpu_experts_, d_counts_);
+                                     d_ids_, d_w_, d_seq_, round, vram, ram, quota, gpu_experts_, d_counts_,
+                                     blobs, stage ? stage->data() : nullptr, stage ? stage->stride() : 0,
+                                     stage ? stage->jobs() : nullptr, stage ? stage->count() : nullptr);
     ck(cudaGetLastError(), "publish");
 }
 

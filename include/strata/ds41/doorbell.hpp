@@ -11,6 +11,7 @@
 #pragma once
 
 #include "strata/ds41/kernels/k10_exl3_moe.hpp"
+#include "strata/ds41/expert_staging.hpp"
 
 #include <cuda_runtime.h>
 
@@ -40,10 +41,13 @@ public:
     /// quota is one device int, capped to [0, topk]. Null means zero.
     /// Each token sends its first quota eligible RAM misses to K10, in routing order.
     /// Update tables and quota only between steps. Buffers must survive the graph.
+    /// With stage: blobs is this layer's device metadata. Publish writes copy jobs and rebases RAM descriptors.
+    /// Call stage->fork_copy(stream), then stage->join(stream) before K10. Storage must cover m * topk slots.
+    /// Each blob must fit a staging slot. Its mapped base must be 16-byte aligned.
     void publish(const uint16_t* x, const int32_t* ids, const float* w, int m, const int32_t* res, int32_t* gpu_sel,
                  uint32_t round, cudaStream_t stream,
                  const kernels::Exl3Expert* vram = nullptr, const kernels::Exl3Expert* ram = nullptr,
-                 const int* quota = nullptr);
+                 const int* quota = nullptr, ExpertStaging* stage = nullptr, const ExpertBlob* blobs = nullptr);
     /// Per-call descriptors. Consume on the publish stream before the next publish.
     const kernels::Exl3Expert* gpu_experts() const { return gpu_experts_; }
     struct Counts { int vram, zero_copy, cpu; };
