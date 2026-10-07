@@ -1,0 +1,41 @@
+loading the model (the first start takes a minute or two) ...
+[strata] starting the engine: reading the model's weights ...
+[strata] still starting (20 s) - please wait ...
+ready: http://127.0.0.1:18000/v1  (OpenAI: /v1/chat/completions, Anthropic: /v1/messages, context 32768 tokens)
+       open http://127.0.0.1:18000/ in a browser to chat; close this window to stop the model
+[strata] reading the prompt: 16 of 43 tokens, 1 s so far
+[strata] reading the prompt: 32 of 43 tokens, 2 s so far
+[strata] thinking: 3 of max 400 tokens, 14.6 tok/s, 3 s
+[strata] thinking: 17 of max 400 tokens, 13.9 tok/s, 4 s
+[strata] thinking: 31 of max 400 tokens, 13.8 tok/s, 5 s
+[strata] thinking: 45 of max 400 tokens, 13.8 tok/s, 7 s
+[strata] thinking: 63 of max 400 tokens, 14.7 tok/s, 8 s
+[strata] thinking: 81 of max 400 tokens, 15.2 tok/s, 9 s
+[strata] thinking: 98 of max 400 tokens, 15.3 tok/s, 10 s
+[strata] answering: 116 of max 400 tokens, 15.6 tok/s, 11 s
+[strata] answering: 135 of max 400 tokens, 16.0 tok/s, 12 s
+[strata] answering: 153 of max 400 tokens, 16.2 tok/s, 13 s
+[strata] answering: 173 of max 400 tokens, 16.5 tok/s, 14 s
+[strata] done: 180 tokens in 14 s (16.5 tok/s) (stop, cancel=False), expert cache 56.3% hit (+28.8% of the routed experts over PCIe)
+[strata] reading the prompt: 6 of 273 tokens, 1 s so far
+[strata] reading the prompt: 102 of 273 tokens, 3 s so far
+[strata] reading the prompt: 191 of 273 tokens, 4 s so far
+[strata] answering: 1 of max 300 tokens, 127100.1 tok/s, 5 s
+[strata] answering: 14 of max 300 tokens, 13.8 tok/s, 6 s
+[strata] writing a tool call: get_weather: 29 of max 300 tokens, 14.3 tok/s, 7 s
+[strata] tool call complete: 46 of max 300 tokens, 15.1 tok/s, 9 s
+[strata] done: 49 tokens in 9 s (15.1 tok/s) (stop, cancel=False), expert cache 42.0% hit (+33.3% of the routed experts over PCIe)
+[strata] reading the prompt: 7 of 293 tokens, 1 s so far
+[strata] reading the prompt: 102 of 293 tokens, 2 s so far
+[strata] reading the prompt: 190 of 293 tokens, 3 s so far
+[strata] thinking: 1 of max 600 tokens, 167772.2 tok/s, 5 s
+[strata] thinking: 18 of max 600 tokens, 17.7 tok/s, 6 s
+[strata] writing a tool call: get_weather: 39 of max 600 tokens, 19.2 tok/s, 7 s
+[strata] done: 59 tokens in 8 s (20.4 tok/s) (stop, cancel=False), expert cache 62.6% hit (+26.3% of the routed experts over PCIe)
+[strata] reading the prompt: 371 of 375 tokens, 1 s so far
+[strata] answering: 16 of max 600 tokens, 19.0 tok/s, 2 s
+[strata] answering: 36 of max 600 tokens, 19.2 tok/s, 3 s
+[strata] done: 57 tokens in 4 s (19.9 tok/s) (stop, cancel=False), expert cache 58.7% hit (+27.4% of the routed experts over PCIe)
+
+[strata] stopping (Ctrl+C again to end the engine at once) ...
+[strata] stopped

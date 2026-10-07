@@ -1,0 +1,12 @@
+ds41: zero-copy staging 6 slots x 22167552 bytes (pack max 22167552)
+ds41: 1603 VRAM expert slots (11.46 GiB)
+ds41: RAM tier 13757 experts (90.0 GiB, locked), filled in 19.5 s
+ds41: mapped RAM experts enabled, GPU quota 4 per token per layer, staged
+ds41_serve: prompt 43 (reused 0, read 43) 3250 ms, 180 out 60.9 ms/token, VRAM hits 24174 of 42960, stop
+ds41 prefill: pass 273 tokens, sub-batch 273; scratch 0.38 GiB in lent slots; ring 256 slots in lent slots; 744 tier slots lent
+ds41 prefill: 251.4 GiB available, 11.5 GiB of experts read from the pack: through the file cache
+ds41_serve: prompt 273 (reused 0, read 273) 5475 ms, 49 out 67.5 ms/token, VRAM hits 4840 of 11520, stop
+ds41 prefill: pass 293 tokens, sub-batch 293; scratch 0.39 GiB in lent slots; ring 256 slots in lent slots; 746 tier slots lent
+ds41 prefill: 251.0 GiB available, 11.5 GiB of experts read from the pack: through the file cache
+ds41_serve: prompt 293 (reused 0, read 293) 5271 ms, 59 out 50.0 ms/token, VRAM hits 8708 of 13920, stop
+ds41_serve: prompt 375 (reused 351, read 24) 1282 ms, 57 out 51.2 ms/token, VRAM hits 7888 of 13440, stop
