@@ -2609,6 +2609,19 @@ def move_into(src: Path, dst: Path) -> None:
             pass
 
 
+def moved_path(v: str, old: Path, new: Path) -> str:
+    """`v` at its new place when its file moved from `old` to `new` (only if it is there and no longer at the old
+    place), else `v`."""
+    for d in DATA_ITEMS:
+        o = str(old / d)
+        nv, no = os.path.normcase(v), os.path.normcase(o)   # Windows: C:\ and c:\ are the same place
+        if nv == no or nv.startswith(no + os.sep):
+            n = str(new / d) + v[len(o):]
+            if Path(n).exists() and not Path(v).exists():
+                return n
+    return v
+
+
 def repoint_config(cfg_file: Path, old: Path, new: Path) -> None:
     """A config whose model files moved from `old` to `new` points at them there (each path only if its file is
     now there and no longer at the old place)."""
@@ -2623,18 +2636,31 @@ def repoint_config(cfg_file: Path, old: Path, new: Path) -> None:
         if isinstance(v, dict):
             return {k: fix(x) for k, x in v.items()}
         if isinstance(v, str):
-            for d in DATA_ITEMS:
-                o = str(old / d)
-                nv, no = os.path.normcase(v), os.path.normcase(o)   # Windows: C:\ and c:\ are the same place
-                if nv == no or nv.startswith(no + os.sep):
-                    n = str(new / d) + v[len(o):]
-                    if Path(n).exists() and not Path(v).exists():
-                        return n
+            return moved_path(v, old, new)
         return v
 
     new_cfg = fix(cfg)
     if new_cfg != cfg:
         write_config(cfg_file, new_cfg)
+
+
+def repoint_ds41_pack(pack: Path, old: Path, new: Path) -> None:
+    """A DeepSeek pack reads its Engram tables from the source shards by absolute path (engram.txt) and names its
+    source (pack_info.txt): when the shards moved from `old` to `new`, both point at them there."""
+    for name, column in (("engram.txt", 5), ("pack_info.txt", 1)):
+        f = pack / name
+        try:
+            lines = f.read_text(encoding="utf-8").splitlines(keepends=True)
+        except OSError:
+            continue
+        out = []
+        for line in lines:
+            fields = line.rstrip("\n").split(None, column)
+            keep = line.startswith("#") or len(fields) != column + 1 or (name == "pack_info.txt" and fields[0] != "source")
+            out.append(line if keep else line[:len(line.rstrip("\n")) - len(fields[column])] +
+                       moved_path(fields[column], old, new) + line[len(line.rstrip("\n")):])
+        if out != lines:
+            f.write_text("".join(out), encoding="utf-8")
 
 
 def data_folder(requested: str | None) -> tuple:
@@ -2681,6 +2707,9 @@ def data_folder(requested: str | None) -> tuple:
                 pass
         for c in folder.glob("strata-*.json"):
             repoint_config(c, folder, dest)
+        for p in ((dest / "packs").glob("*") if (dest / "packs").is_dir() else []):
+            if (p / "engram.txt").is_file():
+                repoint_ds41_pack(p, folder, dest)
         if has_data(folder):
             elsewhere.append(folder)                    # in use, or a copy the data folder already has
             warn(f"some model files are still in {folder} (in use, or already in {dest})")
@@ -3714,8 +3743,8 @@ def setup_deepseek(a, data, elsewhere, adopted=None):
         ctx = contexts[int(ask("Context?", [str(i) for i in range(1, len(contexts) + 1)], "2", a.yes)) - 1]
     else:
         ctx = a.context
-    if not 1 <= ctx <= 262144:
-        fail("DeepSeek context must be between 1 and 262144 tokens; no RoPE extension")
+    if not 64 <= ctx <= 262144:                         # ds41_serve refuses a context under 64
+        fail("DeepSeek context must be between 64 and 262144 tokens; no RoPE extension")
     if a.vision not in (None, "no", "none") or a.kv or a.low_ram != "auto" or \
             a.experimental_speed_projection not in (None, "off") or a.draft_vocab or a.parallel or \
             a.kv_streaming != "auto" or a.vram_reserve_mib is not None:
@@ -3733,11 +3762,14 @@ def setup_deepseek(a, data, elsewhere, adopted=None):
     except (OSError, ValueError, KeyError):
         old_src = src
     candidates = [src, old_src, *(r / "models" / DEEPSEEK_TAG for r in elsewhere)]
-    for candidate in candidates:
-        shards = [candidate / f"model-{i:05d}-of-00017.safetensors" for i in range(1, 18)]
-        if all(p.is_file() and done(p) for p in shards):
-            src = candidate.resolve()
-            break
+
+    def shards_done(folder):
+        return sum(1 for i in range(1, 18) if done(folder / f"model-{i:05d}-of-00017.safetensors"))
+
+    # the folder with the most finished shards (the first one on a tie); the download resumes there
+    best = max(candidates, key=shards_done)
+    if shards_done(best):
+        src = best.resolve()
     # Source paths in engram.txt are absolute. A moved source needs a fresh pack.
     ready = deepseek_pack_ready(pack, src)
     on_disk = sum(p.stat().st_size for p in src.glob("*") if p.is_file() and
@@ -3767,12 +3799,12 @@ def setup_deepseek(a, data, elsewhere, adopted=None):
             str(ROOT / "ds41/data/expert-profile.bin"), "--threads", str(deepseek_threads())]
     if a.resident_budget_gib is not None:
         args += ["--ram-budget-gib", f"{a.resident_budget_gib:g}"]
-    port = a.port or 8080
+    port = a.port or network.get("port") or 8080       # a run again keeps the saved port, host and key
     cfg = {"exe": str(eng / "ds41_serve"), "args": args, "cwd": str(ROOT), "tokenizer": str(pack),
            "format": "deepseek_v41", "model_name": "deepseek-v4.1-flash",
            "log": str(ROOT / f"strata-{DEEPSEEK_TAG}.log"), "lib_dirs": dirs, "port": port,
            "gpu": gpu["index"], "gpus_asked": True, "cuda": 12 if a.cuda == "12" else 13}
-    for key, value in (("host", a.host), ("api_key", a.api_key), ("open_browser", a.browser)):
+    for key, value in (("host", network.get("host")), ("api_key", network.get("api_key")), ("open_browser", a.browser)):
         if value is not None:
             cfg[key] = value
     cfg_path = ROOT / f"strata-{DEEPSEEK_TAG}.json"

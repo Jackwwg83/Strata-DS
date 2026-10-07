@@ -31,7 +31,7 @@ class Installer(unittest.TestCase):
         (self.root / 'ds41/data/expert-profile.bin').write_bytes(b'mock profile')
         self.cfg_path = self.root / 'strata-deepseek-sage-1.59bpw.json'
 
-    def invoke(self, flags=(), system='linux', cards=None, ram=128, free=600, answers=None, family=True, fingerprint="mock-source", fail_build=False, previous=None):
+    def invoke(self, flags=(), system='linux', cards=None, ram=128, free=600, answers=None, family=True, fingerprint="mock-source", fail_build=False, previous=None, elsewhere=()):
         cards = [CARD] if cards is None else cards
         def download(url, dst, what=None):
             if dst.exists() and setup.done(dst):
@@ -81,7 +81,7 @@ class Installer(unittest.TestCase):
             argv.append('--yes')
         with contextlib.ExitStack() as st:
             patches = dict(ROOT=self.root, WIN=system=='win32', GPU_PICK=None, OLD_GPUS=None,
-                           data_folder=lambda d: (self.root / 'data', []), load_settings=lambda: {},
+                           data_folder=lambda d: (self.root / 'data', list(elsewhere)), load_settings=lambda: {},
                            previous_config=lambda *a: previous, save_settings=lambda s: None,
                            gpus=lambda: cards, amd_gpus=lambda: [], ram_gb=lambda: ram,
                            cpu_info=lambda: ('Mock CPU', True, True), cpu_cores=lambda: (8, 16),
@@ -212,6 +212,57 @@ class Installer(unittest.TestCase):
     def test_nominal_16gb_card_is_allowed_with_warning(self):
         self.install(cards=[{**CARD, 'vram_gb': 15.99}])
         self.assertIn('under 24 GB', self.output)
+
+    def test_rerun_keeps_saved_host_key_and_port(self):
+        # PR #11 review: a second setup run without the network flags kept none of them
+        self.install('--host', '0.0.0.0', '--api-key', 'secret', '--port', '8091')
+        cfg = self.install('--context', '65536')
+        self.assertEqual((cfg.get('host'), cfg.get('api_key'), cfg.get('port')), ('0.0.0.0', 'secret', 8091))
+        self.assertIn('65536', cfg['args'])
+
+    def test_partial_source_elsewhere_is_resumed_not_downloaded_again(self):
+        # PR #11 review: a source folder with 16 of 17 shards was skipped and the whole checkpoint downloaded again
+        other = self.root / 'other-drive'
+        src = other / 'models/deepseek-sage-1.59bpw'
+        src.mkdir(parents=True)
+        for name in FILES:
+            if name != 'model-00017-of-00017.safetensors':
+                (src / name).write_text('{}')
+                setup.mark(src / name)
+        cfg = self.install(elsewhere=[other])
+        self.assertEqual(self.downloads, [f'https://huggingface.co/{REPO}/resolve/{REV}/model-00017-of-00017.safetensors'])
+        command = next(c for c in self.commands if any(x.endswith('/ds41/pack.py') for x in c))
+        self.assertEqual(command[command.index('--src') + 1], str(src.resolve()))
+        self.assertEqual(cfg['format'], 'deepseek_v41')
+
+    def test_context_below_engine_minimum_is_refused_before_download(self):
+        # PR #11 review: ds41_serve needs --max-context 64 or more; setup accepted 32 and failed only at the start
+        self.assertNotEqual(self.invoke(['--no-start', '--context', '32']), 0)
+        self.assertIn('64', self.output)
+        self.assertEqual(self.downloads, [])
+
+    def test_moved_data_folder_repoints_the_pack_sources(self):
+        # PR #11 review: --data-dir moved the shards and the pack, but engram.txt and pack_info.txt kept the old paths
+        old, new = self.root / 'old', self.root / 'new'
+        src = old / 'models/deepseek-sage-1.59bpw'
+        pack = old / 'packs/deepseek-sage-1.59bpw'
+        src.mkdir(parents=True); pack.mkdir(parents=True)
+        for i in (16, 17):
+            (src / f'model-{i:05d}-of-00017.safetensors').write_text('{}')
+        (pack / 'engram.txt').write_text('# ds41 engram tables v1: layer rows dim weight_offset scale_offset path\n'
+                                         f'1 384006168 256 664 98305579672 {src}/model-00016-of-00017.safetensors\n'
+                                         f'14 384016682 256 672 98308271264 {src}/model-00017-of-00017.safetensors\n')
+        (pack / 'pack_info.txt').write_text(f'source {src}\nlayers 40\nfinished 1\n')
+        with mock.patch.object(setup, 'ROOT', old), mock.patch.object(setup, 'load_settings', lambda: {}), \
+                mock.patch.object(setup, 'save_settings', lambda s: None), \
+                mock.patch.object(setup, 'other_installs', lambda s: []), contextlib.redirect_stdout(io.StringIO()):
+            setup.data_folder(str(new))
+        new_src = new / 'models/deepseek-sage-1.59bpw'
+        lines = (new / 'packs/deepseek-sage-1.59bpw/engram.txt').read_text().splitlines()
+        self.assertEqual([l.split()[5] for l in lines[1:]],
+                         [str(new_src / f'model-{i:05d}-of-00017.safetensors') for i in (16, 17)])
+        info = (new / 'packs/deepseek-sage-1.59bpw/pack_info.txt').read_text()
+        self.assertIn(f'source {new_src}\n', info)
 
     def test_nominal_24gb_card_is_not_warned(self):
         # an RTX 4090 reports 23.99 GB (24564 MiB): the measured card must not get the "not tested" warning
