@@ -47,10 +47,12 @@ public:
     void publish(const uint16_t* x, const int32_t* ids, const float* w, int m, const int32_t* res, int32_t* gpu_sel,
                  uint32_t round, cudaStream_t stream,
                  const kernels::Exl3Expert* vram = nullptr, const kernels::Exl3Expert* ram = nullptr,
-                 const int* quota = nullptr, ExpertStaging* stage = nullptr, const ExpertBlob* blobs = nullptr);
+                 const int* quota = nullptr, ExpertStaging* stage = nullptr, const ExpertBlob* blobs = nullptr,
+                 const int32_t* pf_ids = nullptr, const kernels::Exl3Expert* pf_desc = nullptr, int pf_n = 0);
     /// Per-call descriptors. Consume on the publish stream before the next publish.
     const kernels::Exl3Expert* gpu_experts() const { return gpu_experts_; }
-    struct Counts { int vram, zero_copy, cpu; };
+    /// prefetched: misses the GPU computes from the prefetch buffer (pf_ids / pf_desc of publish), outside the quota
+    struct Counts { int vram, zero_copy, cpu, prefetched; };
     /// Read after wait_published, before mark_done. Counts refer to this call.
     Counts counts() const { return *h_counts_; }
     /// Wait until the CPU raised done to `round`, then out[i] += its rows [m][dim] (FP32).
