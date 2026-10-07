@@ -230,6 +230,13 @@ struct Engine::Impl {
         vram.reset();
         host.reset();
         for (auto& [k, e] : graphs) cudaGraphExecDestroy(e);
+        if (st) cudaStreamSynchronize(st);
+        prefill_end_quiet();
+        for (const auto& y : L)
+            if (y.moe_handle >= 0) exl3_moe_cpu_free_layer(y.moe_handle);
+        for (void* p : owned_dev) cudaFree(p);
+        for (cudaEvent_t e : pfp.ev) cudaEventDestroy(e);
+        if (dbg) std::fclose(dbg);
         if (eng_host) cudaFreeHost(eng_host);
         if (hp) cudaFreeHost(hp);
         if (hp_next) cudaFreeHost(hp_next);
@@ -237,6 +244,34 @@ struct Engine::Impl {
         if (routes_pinned) cudaFreeHost(routes_pinned);
         if (st) cudaStreamDestroy(st);
         if (pfh.base) cudaFreeHost(pfh.base);
+    }
+
+    // device allocations of this engine (decode state, scratch, tables): freed in ~Impl
+    std::vector<void*> owned_dev;
+    template <typename T>
+    T* dalloc_own(size_t n) {
+        T* p = dalloc<T>(n);
+        owned_dev.push_back(p);
+        return p;
+    }
+
+    // a failure after the state changed (history pushed, a step released to the CPU worker, a prefill pass started)
+    // leaves the KV caches and the history out of step: every later call is refused
+    bool broken = false;
+    bool pf_started = false;           // the running prefill has begun changing the state
+    std::exception_ptr worker_error;   // set by the CPU worker; rethrown by the step that ran into it
+    void usable() const {
+        if (broken) throw std::runtime_error("ds41 engine: unusable after an earlier failure; create a new Engine");
+    }
+    static void check_token(int t) {
+        if (t < 0 || t >= kVocab) throw std::invalid_argument("ds41 engine: token id " + std::to_string(t) + " is outside [0, " + std::to_string(kVocab) + ")");
+    }
+    /// DS41_TEST_FAULT=<name>: throw at that point once, then the variable is cleared (tests of the failure paths)
+    static bool fault(const char* name) {
+        const char* v = std::getenv("DS41_TEST_FAULT");
+        if (!v || std::strcmp(v, name) != 0) return false;
+        unsetenv("DS41_TEST_FAULT");
+        return true;
     }
 
     Fp8 fp8(const std::string& name) {
@@ -293,11 +328,11 @@ struct Engine::Impl {
                 y.c_wkv = bf(p + "attn.compressor.wkv.weight");
                 y.c_norm = bf(p + "attn.compressor.norm.weight");
                 if (y.ratio > 1) y.c_wgate = bf(p + "attn.compressor.wgate.weight");
-                y.comp = dalloc<bf16>((size_t) (max_seq / y.ratio + 1) * kHeadDim);
-                y.idx_keys = dalloc<bf16>((size_t) (max_seq / y.ratio + 1) * kIndexDim);
+                y.comp = dalloc_own<bf16>((size_t) (max_seq / y.ratio + 1) * kHeadDim);
+                y.idx_keys = dalloc_own<bf16>((size_t) (max_seq / y.ratio + 1) * kIndexDim);
                 if (y.ratio > 1) {
-                    y.kv_state = dalloc<float>((size_t) y.ratio * kHeadDim);
-                    y.score_state = dalloc<float>((size_t) y.ratio * kHeadDim);
+                    y.kv_state = dalloc_own<float>((size_t) y.ratio * kHeadDim);
+                    y.score_state = dalloc_own<float>((size_t) y.ratio * kHeadDim);
                 }
                 y.idx_wk = bf(p + "attn.indexer.wk.weight");
                 y.idx_knorm = bf(p + "attn.indexer.k_norm.weight");
@@ -311,13 +346,13 @@ struct Engine::Impl {
                 y.eng_qw = bf(p + "engram.q_weight");
                 y.eng_kw = bf(p + "engram.k_weight");
             }
-            y.window = dalloc<bf16>((size_t) kWindow * kHeadDim);
+            y.window = dalloc_own<bf16>((size_t) kWindow * kHeadDim);
             register_cpu_experts(l);
         }
         // rope tables
         auto plain = rope_table(max_seq, false), yarn = rope_table(max_seq, true);
-        rope_plain = dalloc<float>(plain.size());
-        rope_yarn = dalloc<float>(yarn.size());
+        rope_plain = dalloc_own<float>(plain.size());
+        rope_yarn = dalloc_own<float>(yarn.size());
         ck(cudaMemcpy(rope_plain, plain.data(), plain.size() * 4, cudaMemcpyHostToDevice), "rope");
         ck(cudaMemcpy(rope_yarn, yarn.data(), yarn.size() * 4, cudaMemcpyHostToDevice), "rope");
         // engram tables
@@ -330,64 +365,64 @@ struct Engine::Impl {
         }
         const size_t eng_bytes = (size_t) n_eng * kEngRows * (256 + 8);
         ck(cudaHostAlloc((void**) &eng_host, std::max<size_t>(eng_bytes, 1), cudaHostAllocDefault), "engram pinned");
-        eng_dev = dalloc<uint8_t>(std::max<size_t>(eng_bytes, 1));
+        eng_dev = dalloc_own<uint8_t>(std::max<size_t>(eng_bytes, 1));
         // scratch
-        h = dalloc<bf16>(kHc * kDim);
-        h2 = dalloc<bf16>(kHc * kDim);
-        xa = dalloc<bf16>(kDim);
-        xf = dalloc<bf16>(kDim);
-        qr = dalloc<bf16>(kQLora);
-        q = dalloc<bf16>(kHeads * kHeadDim);
-        kvv = dalloc<bf16>(kHeadDim);
-        o = dalloc<bf16>(kHeads * kHeadDim);
-        oa = dalloc<bf16>(kOGroups * kOLora);
-        attn_out = dalloc<bf16>(kDim);
-        latent = dalloc<bf16>(kHeadDim);
-        ik = dalloc<bf16>(kIndexDim);
-        iq = dalloc<bf16>(kIndexHeads * kIndexDim);
-        iw_raw = dalloc<bf16>(kIndexHeads);
-        iw = dalloc<bf16>(kIndexHeads);
-        g = dalloc<bf16>(kMoeInter);
-        u = dalloc<bf16>(kMoeInter);
-        sh_h = dalloc<bf16>(kMoeInter);
-        sh_out = dalloc<bf16>(kDim);
-        ffn_out = dalloc<bf16>(kDim);
-        eng_vals = dalloc<bf16>(24 * 256);
-        eng_kv = dalloc<bf16>((kHc + 1) * kDim);
-        final_x = dalloc<bf16>(kDim);
-        act = dalloc<float>(8192);
-        pre_mix = dalloc<float>(kHc);
-        pre = dalloc<float>(kHc);
-        post = dalloc<float>(kHc);
-        comb = dalloc<float>(kHc * kHc);
-        attn_pre = dalloc<float>(kHc);
-        attn_post = dalloc<float>(kHc);
-        attn_comb = dalloc<float>(kHc * kHc);
-        ffn_pre = dalloc<float>(kHc);
-        ffn_post = dalloc<float>(kHc);
-        ffn_comb = dalloc<float>(kHc * kHc);
-        ckv = dalloc<float>(kHeadDim);
-        cscore = dalloc<float>(kHeadDim);
-        scores = dalloc<float>(max_seq + 1);
-        routed = dalloc<float>(kDim);
-        logits = dalloc<float>(kVocab);
-        x_half_dev = dalloc<uint16_t>(kDim);
-        idx_dev = dalloc<int32_t>(kWindow + kIndexTopK);
-        routes_dev = dalloc<int32_t>(kLayers * kTopK);
-        weights_dev = dalloc<float>(kLayers * kTopK);
-        cand_dev = dalloc<uint8_t>(max_seq + 1);
+        h = dalloc_own<bf16>(kHc * kDim);
+        h2 = dalloc_own<bf16>(kHc * kDim);
+        xa = dalloc_own<bf16>(kDim);
+        xf = dalloc_own<bf16>(kDim);
+        qr = dalloc_own<bf16>(kQLora);
+        q = dalloc_own<bf16>(kHeads * kHeadDim);
+        kvv = dalloc_own<bf16>(kHeadDim);
+        o = dalloc_own<bf16>(kHeads * kHeadDim);
+        oa = dalloc_own<bf16>(kOGroups * kOLora);
+        attn_out = dalloc_own<bf16>(kDim);
+        latent = dalloc_own<bf16>(kHeadDim);
+        ik = dalloc_own<bf16>(kIndexDim);
+        iq = dalloc_own<bf16>(kIndexHeads * kIndexDim);
+        iw_raw = dalloc_own<bf16>(kIndexHeads);
+        iw = dalloc_own<bf16>(kIndexHeads);
+        g = dalloc_own<bf16>(kMoeInter);
+        u = dalloc_own<bf16>(kMoeInter);
+        sh_h = dalloc_own<bf16>(kMoeInter);
+        sh_out = dalloc_own<bf16>(kDim);
+        ffn_out = dalloc_own<bf16>(kDim);
+        eng_vals = dalloc_own<bf16>(24 * 256);
+        eng_kv = dalloc_own<bf16>((kHc + 1) * kDim);
+        final_x = dalloc_own<bf16>(kDim);
+        act = dalloc_own<float>(8192);
+        pre_mix = dalloc_own<float>(kHc);
+        pre = dalloc_own<float>(kHc);
+        post = dalloc_own<float>(kHc);
+        comb = dalloc_own<float>(kHc * kHc);
+        attn_pre = dalloc_own<float>(kHc);
+        attn_post = dalloc_own<float>(kHc);
+        attn_comb = dalloc_own<float>(kHc * kHc);
+        ffn_pre = dalloc_own<float>(kHc);
+        ffn_post = dalloc_own<float>(kHc);
+        ffn_comb = dalloc_own<float>(kHc * kHc);
+        ckv = dalloc_own<float>(kHeadDim);
+        cscore = dalloc_own<float>(kHeadDim);
+        scores = dalloc_own<float>(max_seq + 1);
+        routed = dalloc_own<float>(kDim);
+        logits = dalloc_own<float>(kVocab);
+        x_half_dev = dalloc_own<uint16_t>(kDim);
+        idx_dev = dalloc_own<int32_t>(kWindow + kIndexTopK);
+        routes_dev = dalloc_own<int32_t>(kLayers * kTopK);
+        weights_dev = dalloc_own<float>(kLayers * kTopK);
+        cand_dev = dalloc_own<uint8_t>(max_seq + 1);
         history.reserve(max_seq);
         db = std::make_unique<ExpertDoorbell>(1, kTopK, kDim);
-        gpu_sel = dalloc<int32_t>(kTopK);
+        gpu_sel = dalloc_own<int32_t>(kTopK);
         // decode stream, graph staging, outputs
         ck(cudaStreamCreateWithFlags(&st, cudaStreamNonBlocking), "decode stream");
         ck(cudaHostAlloc((void**) &hp, sizeof(StepParams), cudaHostAllocDefault), "step params");
         ck(cudaHostAlloc((void**) &hp_next, sizeof(int), cudaHostAllocDefault), "next token");
         ck(cudaHostAlloc((void**) &lg_pinned, (size_t) kVocab * 4, cudaHostAllocDefault), "logits");
         ck(cudaHostAlloc((void**) &routes_pinned, kLayers * kTopK * 4, cudaHostAllocDefault), "routes");
-        dp = dalloc<int>(4);
-        d_next = dalloc<int>(1);
-        one_hot_dev = dalloc<float>(kHc);
+        dp = dalloc_own<int>(4);
+        d_next = dalloc_own<int>(1);
+        one_hot_dev = dalloc_own<float>(kHc);
         {
             const float oh[kHc] = {1, 0, 0, 0};
             ck(cudaMemcpy(one_hot_dev, oh, sizeof oh, cudaMemcpyHostToDevice), "one hot");
@@ -558,11 +593,19 @@ struct Engine::Impl {
                 // Keep expert_hits as VRAM hits. Timing derives CPU and zero-copy counts from the partition.
                 worker_misses += misses + db->counts().zero_copy;
                 const double t0 = now_ms();
-                if (misses)
-                    exl3_moe_cpu_forward_raw(L[l].moe_handle, (const at::Half*) db->x(), db->ids(), wh, db->y(), 1,
-                                             kTopK, cpu_threads);
-                else
+                try {
+                    if (fault("worker")) throw std::runtime_error("ds41 test fault: CPU expert worker");
+                    if (misses)
+                        exl3_moe_cpu_forward_raw(L[l].moe_handle, (const at::Half*) db->x(), db->ids(), wh, db->y(), 1,
+                                                 kTopK, cpu_threads);
+                    else
+                        std::fill_n(db->y(), kDim, 0.0f);
+                } catch (...) {
+                    // keep the protocol (the GPU waits for this layer); the step rethrows after its sync
                     std::fill_n(db->y(), kDim, 0.0f);
+                    std::lock_guard<std::mutex> lk(mu);
+                    if (!worker_error) worker_error = std::current_exception();
+                }
                 worker_us += (int64_t) ((now_ms() - t0) * 1000.0);
                 db->mark_done(l + 1);
             }
@@ -991,6 +1034,8 @@ struct Engine::Impl {
         // pinned host buffers
         if (pfh.cap < cap) {
             if (pfh.base) cudaFreeHost(pfh.base);
+            pfh.base = nullptr;   // a failed allocation below must not leave the freed block behind
+            pfh.cap = 0;
             size_t u = 0;
             auto lay = [&](uint8_t* b) {
                 u = 0;
@@ -1048,6 +1093,14 @@ struct Engine::Impl {
 
     /// Returns the lent slots (or frees the scratch). After an error the stream is stopped without draining (its
     /// unreleased jobs would never complete).
+    /// The destructor's form: the VRAM tier (owner of lent slots) is gone already
+    void prefill_end_quiet() {
+        estream.reset();
+        if (pf.own_scratch) cudaFree(pf.own_scratch);
+        if (pf.own_ring) cudaFree(pf.own_ring);
+        pf.lent = pf.own_scratch = pf.own_ring = nullptr;
+    }
+
     void prefill_end() {
         estream.reset();
         ck(cudaDeviceSynchronize(), "prefill end");
@@ -1455,16 +1508,30 @@ struct Engine::Impl {
     }
 
     int prefill(const std::vector<int>& tokens, int pos, std::vector<float>* nll, PrefillTiming& pt) {
+        usable();
         if (pos != (int) history.size()) throw std::runtime_error("prefill must continue at the tokens fed so far");
         const int n = (int) tokens.size();
         if (n == 0) throw std::runtime_error("prefill of no tokens");
         if (pos + n > max_seq) throw std::runtime_error("prefill past max_seq");
+        for (int t : tokens) check_token(t);
+        if (opt.prefill_chunk <= 0) return prefill_steps(tokens, pos, nll, pt);
+        pf_started = false;
+        try {
+            return prefill_batched(tokens, pos, nll, pt);
+        } catch (...) {
+            if (pf_started) broken = true;   // a pass may have written part of the layers' caches and the history
+            throw;
+        }
+    }
+
+    int prefill_steps(const std::vector<int>& tokens, int pos, std::vector<float>* nll, PrefillTiming& pt) {
+        const int n = (int) tokens.size();
         pt = PrefillTiming{};
         ptm = &pt;
         const double t0 = now_ms();
         if (nll) nll->assign(n - 1, 0.0f);
         int next = -1;
-        if (opt.prefill_chunk <= 0) {   // token by token
+        {   // token by token
             Timing tm;
             for (int i = 0; i < n; ++i) {
                 next = step(tokens[i], pos + i, nullptr, tm);
@@ -1478,10 +1545,21 @@ struct Engine::Impl {
             pt.total_ms = now_ms() - t0;
             return next;
         }
-        prefill_begin(n);
+    }
+
+    int prefill_batched(const std::vector<int>& tokens, int pos, std::vector<float>* nll, PrefillTiming& pt) {
+        const int n = (int) tokens.size();
+        pt = PrefillTiming{};
+        ptm = &pt;
+        const double t0 = now_ms();
+        if (nll) nll->assign(n - 1, 0.0f);
         try {
+            prefill_begin(n);   // a partial failure returns what it took (lent slots, scratch, ring)
             pt.chunk_tokens = pf.cap;
             pt.sub_batch = pf.sub;
+            if (fault("prefill")) throw std::runtime_error("ds41 test fault: before the first prefill pass");
+            pf_started = true;
+            if (fault("prefill_pass")) throw std::runtime_error("ds41 test fault: inside a prefill pass");
             for (int c0 = 0; c0 < n; c0 += pf.cap) {
                 prefill_pass(tokens, c0, std::min(pf.cap, n - c0), pos + c0, nll);
                 ++pt.chunks;
@@ -1559,8 +1637,22 @@ struct Engine::Impl {
     }
 
     int step(int token, int pos, StepDump* dump, Timing& tm) {
+        usable();
+        check_token(token);
         if (pos != (int) history.size()) throw std::runtime_error("tokens must be fed in order from position 0");
         if (pos >= max_seq) throw std::runtime_error("position past max_seq");
+        bool released = false;
+        try {
+            return step_body(token, pos, dump, tm, released);
+        } catch (...) {
+            // nothing reached the device or the worker: undo the history, the step may be retried
+            if (released) broken = true;
+            else if ((int) history.size() == pos + 1) history.pop_back();
+            throw;
+        }
+    }
+
+    int step_body(int token, int pos, StepDump* dump, Timing& tm, bool& released) {
         tm = Timing{};
         const double t_start = now_ms();
         history.push_back(pack.engram_hash().token_map[token]);
@@ -1569,6 +1661,7 @@ struct Engine::Impl {
             int li = 0;
             for (int l = 0; l < kLayers; ++l)
                 if (is_engram_layer(l)) engram_ids(l, li++, pos);
+            if (fault("engram")) throw std::runtime_error("ds41 test fault: engram read");
             engram_read_all();
             tm.engram_ms = now_ms() - t0;
         }
@@ -1581,6 +1674,7 @@ struct Engine::Impl {
             std::lock_guard<std::mutex> lk(mu);
             ++go;
         }
+        released = true;
         cv.notify_one();
         if (dump) {
             dump->hidden.assign((size_t) kLayers * kHc * kDim, 0);
@@ -1611,6 +1705,14 @@ struct Engine::Impl {
             enqueue_step(dump);
         }
         ck(cudaStreamSynchronize(st), "step");
+        {
+            std::lock_guard<std::mutex> lk(mu);
+            if (worker_error) {
+                std::exception_ptr e = worker_error;
+                worker_error = nullptr;
+                std::rethrow_exception(e);
+            }
+        }
         const int best = *hp_next;
         lg.assign(lg_pinned, lg_pinned + kVocab);
         if (vram) vram->count(routes_pinned, kTopK);
