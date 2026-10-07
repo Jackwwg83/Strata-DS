@@ -1,0 +1,135 @@
+{
+  "mock": true,
+  "command": [
+    "setup.py",
+    "--family",
+    "deepseek",
+    "--resident-budget-gib",
+    "96",
+    "--context",
+    "32768",
+    "--port",
+    "8091",
+    "--no-browser",
+    "--yes"
+  ],
+  "first_exit": 0,
+  "second_exit": 0,
+  "commands": [
+    [
+      "/mock/bin/cmake",
+      "-G",
+      "Ninja",
+      "-DCMAKE_MAKE_PROGRAM=/mock/bin/ninja",
+      "-S",
+      "/private/tmp/strata-deepseek-setup-evidence-final",
+      "-B",
+      "/private/tmp/strata-deepseek-setup-evidence-final/build-ds41",
+      "-DCMAKE_BUILD_TYPE=Release",
+      "-DSTRATA_ENABLE_CUDA=ON",
+      "-DSTRATA_ENABLE_HIP=OFF",
+      "-DSTRATA_BUILD_TESTS=OFF",
+      "-DCMAKE_CUDA_ARCHITECTURES=89",
+      "-DCMAKE_CUDA_COMPILER=/mock/cuda/bin/nvcc",
+      "-DSTRATA_GGML_DIR=/private/tmp/strata-deepseek-setup-evidence-final/llama.cpp"
+    ],
+    [
+      "/mock/bin/cmake",
+      "--build",
+      "/private/tmp/strata-deepseek-setup-evidence-final/build-ds41",
+      "--target",
+      "ds41_serve",
+      "-j",
+      "7"
+    ],
+    [
+      "/opt/homebrew/opt/python@3.14/bin/python3.14",
+      "/private/tmp/strata-deepseek-setup-evidence-final/tools/ds41/pack.py",
+      "--src",
+      "/private/tmp/strata-deepseek-setup-evidence-final/data/models/deepseek-sage-1.59bpw",
+      "--out",
+      "/private/tmp/strata-deepseek-setup-evidence-final/data/packs/deepseek-sage-1.59bpw",
+      "--engram-from",
+      "/private/tmp/strata-deepseek-setup-evidence-final/ds41/data/engram"
+    ]
+  ],
+  "downloads": [
+    "https://huggingface.co/vcruz305/DSV4.1-Flash-SAGE-EXL3-1.59bpw/resolve/eca94a388a70841858feed8f057a9862e897aba4/config.json",
+    "https://huggingface.co/vcruz305/DSV4.1-Flash-SAGE-EXL3-1.59bpw/resolve/eca94a388a70841858feed8f057a9862e897aba4/generation_config.json",
+    "https://huggingface.co/vcruz305/DSV4.1-Flash-SAGE-EXL3-1.59bpw/resolve/eca94a388a70841858feed8f057a9862e897aba4/model-00001-of-00017.safetensors",
+    "https://huggingface.co/vcruz305/DSV4.1-Flash-SAGE-EXL3-1.59bpw/resolve/eca94a388a70841858feed8f057a9862e897aba4/model-00002-of-00017.safetensors",
+    "https://huggingface.co/vcruz305/DSV4.1-Flash-SAGE-EXL3-1.59bpw/resolve/eca94a388a70841858feed8f057a9862e897aba4/model-00003-of-00017.safetensors",
+    "https://huggingface.co/vcruz305/DSV4.1-Flash-SAGE-EXL3-1.59bpw/resolve/eca94a388a70841858feed8f057a9862e897aba4/model-00004-of-00017.safetensors",
+    "https://huggingface.co/vcruz305/DSV4.1-Flash-SAGE-EXL3-1.59bpw/resolve/eca94a388a70841858feed8f057a9862e897aba4/model-00005-of-00017.safetensors",
+    "https://huggingface.co/vcruz305/DSV4.1-Flash-SAGE-EXL3-1.59bpw/resolve/eca94a388a70841858feed8f057a9862e897aba4/model-00006-of-00017.safetensors",
+    "https://huggingface.co/vcruz305/DSV4.1-Flash-SAGE-EXL3-1.59bpw/resolve/eca94a388a70841858feed8f057a9862e897aba4/model-00007-of-00017.safetensors",
+    "https://huggingface.co/vcruz305/DSV4.1-Flash-SAGE-EXL3-1.59bpw/resolve/eca94a388a70841858feed8f057a9862e897aba4/model-00008-of-00017.safetensors",
+    "https://huggingface.co/vcruz305/DSV4.1-Flash-SAGE-EXL3-1.59bpw/resolve/eca94a388a70841858feed8f057a9862e897aba4/model-00009-of-00017.safetensors",
+    "https://huggingface.co/vcruz305/DSV4.1-Flash-SAGE-EXL3-1.59bpw/resolve/eca94a388a70841858feed8f057a9862e897aba4/model-00010-of-00017.safetensors",
+    "https://huggingface.co/vcruz305/DSV4.1-Flash-SAGE-EXL3-1.59bpw/resolve/eca94a388a70841858feed8f057a9862e897aba4/model-00011-of-00017.safetensors",
+    "https://huggingface.co/vcruz305/DSV4.1-Flash-SAGE-EXL3-1.59bpw/resolve/eca94a388a70841858feed8f057a9862e897aba4/model-00012-of-00017.safetensors",
+    "https://huggingface.co/vcruz305/DSV4.1-Flash-SAGE-EXL3-1.59bpw/resolve/eca94a388a70841858feed8f057a9862e897aba4/model-00013-of-00017.safetensors",
+    "https://huggingface.co/vcruz305/DSV4.1-Flash-SAGE-EXL3-1.59bpw/resolve/eca94a388a70841858feed8f057a9862e897aba4/model-00014-of-00017.safetensors",
+    "https://huggingface.co/vcruz305/DSV4.1-Flash-SAGE-EXL3-1.59bpw/resolve/eca94a388a70841858feed8f057a9862e897aba4/model-00015-of-00017.safetensors",
+    "https://huggingface.co/vcruz305/DSV4.1-Flash-SAGE-EXL3-1.59bpw/resolve/eca94a388a70841858feed8f057a9862e897aba4/model-00016-of-00017.safetensors",
+    "https://huggingface.co/vcruz305/DSV4.1-Flash-SAGE-EXL3-1.59bpw/resolve/eca94a388a70841858feed8f057a9862e897aba4/model-00017-of-00017.safetensors",
+    "https://huggingface.co/vcruz305/DSV4.1-Flash-SAGE-EXL3-1.59bpw/resolve/eca94a388a70841858feed8f057a9862e897aba4/model.safetensors.index.json",
+    "https://huggingface.co/vcruz305/DSV4.1-Flash-SAGE-EXL3-1.59bpw/resolve/eca94a388a70841858feed8f057a9862e897aba4/tokenizer.json",
+    "https://huggingface.co/vcruz305/DSV4.1-Flash-SAGE-EXL3-1.59bpw/resolve/eca94a388a70841858feed8f057a9862e897aba4/tokenizer.model",
+    "https://huggingface.co/vcruz305/DSV4.1-Flash-SAGE-EXL3-1.59bpw/resolve/eca94a388a70841858feed8f057a9862e897aba4/tokenizer_config.json"
+  ],
+  "starts": [
+    [
+      "/opt/homebrew/opt/python@3.14/bin/python3.14",
+      "/private/tmp/strata-deepseek-setup-evidence-final/serve/server.py",
+      "--engine",
+      "strata",
+      "--config",
+      "/private/tmp/strata-deepseek-setup-evidence-final/strata-deepseek-sage-1.59bpw.json",
+      "--port",
+      "8091"
+    ],
+    [
+      "/opt/homebrew/opt/python@3.14/bin/python3.14",
+      "/private/tmp/strata-deepseek-setup-evidence-final/serve/server.py",
+      "--engine",
+      "strata",
+      "--config",
+      "/private/tmp/strata-deepseek-setup-evidence-final/strata-deepseek-sage-1.59bpw.json",
+      "--port",
+      "8091"
+    ]
+  ],
+  "config": {
+    "exe": "/private/tmp/strata-deepseek-setup-evidence-final/engine/ds41_serve",
+    "args": [
+      "--pack",
+      "/private/tmp/strata-deepseek-setup-evidence-final/data/packs/deepseek-sage-1.59bpw",
+      "--max-context",
+      "32768",
+      "--expert-profile",
+      "/private/tmp/strata-deepseek-setup-evidence-final/ds41/data/expert-profile.bin",
+      "--threads",
+      "8",
+      "--ram-budget-gib",
+      "96"
+    ],
+    "cwd": "/private/tmp/strata-deepseek-setup-evidence-final",
+    "tokenizer": "/private/tmp/strata-deepseek-setup-evidence-final/data/packs/deepseek-sage-1.59bpw",
+    "format": "deepseek_v41",
+    "model_name": "deepseek-v4.1-flash",
+    "log": "/private/tmp/strata-deepseek-setup-evidence-final/strata-deepseek-sage-1.59bpw.log",
+    "lib_dirs": [],
+    "port": 8091,
+    "gpu": 0,
+    "gpus_asked": true,
+    "cuda": 13,
+    "open_browser": false
+  },
+  "run_script": "#!/bin/sh\ncd \"/private/tmp/strata-deepseek-setup-evidence-final\"\nexec \"/opt/homebrew/opt/python@3.14/bin/python3.14\" \"/private/tmp/strata-deepseek-setup-evidence-final/serve/server.py\" \"--engine\" \"strata\" \"--config\" \"/private/tmp/strata-deepseek-setup-evidence-final/strata-deepseek-sage-1.59bpw.json\" \"--port\" \"8091\"\n",
+  "events": [
+    "{\"event\": \"mock_server_start\", \"mock\": true, \"config\": \"/private/tmp/strata-deepseek-setup-evidence-final/strata-deepseek-sage-1.59bpw.json\", \"model_name\": \"deepseek-v4.1-flash\", \"format\": \"deepseek_v41\", \"args\": [\"--pack\", \"/private/tmp/strata-deepseek-setup-evidence-final/data/packs/deepseek-sage-1.59bpw\", \"--max-context\", \"32768\", \"--expert-profile\", \"/private/tmp/strata-deepseek-setup-evidence-final/ds41/data/expert-profile.bin\", \"--threads\", \"8\", \"--ram-budget-gib\", \"96\"]}",
+    "{\"event\": \"mock_server_start\", \"mock\": true, \"config\": \"/private/tmp/strata-deepseek-setup-evidence-final/strata-deepseek-sage-1.59bpw.json\", \"model_name\": \"deepseek-v4.1-flash\", \"format\": \"deepseek_v41\", \"args\": [\"--pack\", \"/private/tmp/strata-deepseek-setup-evidence-final/data/packs/deepseek-sage-1.59bpw\", \"--max-context\", \"32768\", \"--expert-profile\", \"/private/tmp/strata-deepseek-setup-evidence-final/ds41/data/expert-profile.bin\", \"--threads\", \"8\", \"--ram-budget-gib\", \"96\"]}"
+  ],
+  "stdout": "Strata - DeepSeek V4.1 Flash (Linux + NVIDIA)\n  [ok] DeepSeek V4.1 Flash SAGE 1.59bpw: GPU 0 (RTX 4090, 24 GB); RAM 119.9 GiB; 128 GB PC recommended\n  [!]  below 120 GiB usable RAM is not tested and may be slow or run out of RAM\n  Disk: about 462 GB total (341.8 GB download + 120.2 GB pack). Keep the source shards: Engram reads them in place.\n  [ok] start script: run-deepseek-sage-1.59bpw.sh\n  [ok] --max-context 32768 --threads 8 --ram-budget-gib 96; server 127.0.0.1:8091, no browser, gpu 0\n  [ok] Starting DeepSeek V4.1 Flash: --max-context 32768 --threads 8 --ram-budget-gib 96; server 127.0.0.1:8091, no browser, gpu 0\n\nSECOND RUN\nStrata - Qwen3.8-Flash-Next on a normal PC (a GPU + system RAM + CPU)\n  [ok] Starting DeepSeek V4.1 Flash: --max-context 32768 --threads 8 --ram-budget-gib 96; server 127.0.0.1:8091, no browser, gpu 0\n"
+}

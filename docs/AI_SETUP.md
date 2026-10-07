@@ -2,8 +2,8 @@
 
 This page is written for an AI coding assistant (Claude Code, Cursor, Codex, GitHub Copilot, ...) that a user asked to
 set up Strata on their PC. Strata runs the Qwen3.8-Flash-Next model locally on one NVIDIA or AMD graphics card plus
-system RAM, and serves an OpenAI- and Anthropic-compatible API on `http://127.0.0.1:8080`. The human-oriented
-version of everything below is [INSTALL.md](INSTALL.md).
+system RAM. DeepSeek V4.1 Flash SAGE 1.59bpw also runs on Linux + NVIDIA. Strata serves an OpenAI- and
+Anthropic-compatible API on `http://127.0.0.1:8080`. The human-oriented version of everything below is [INSTALL.md](INSTALL.md).
 
 Work through the steps in order. Tell the user what you are doing in plain words; they may not be technical.
 
@@ -14,8 +14,8 @@ Work through the steps in order. Tell the user what you are doing in plain words
   user the key. Never put a tunnel or port forward in front of a server without a key.
 - Do not change the user's system beyond what setup does (setup installs Python for the user account if needed,
   and everything else inside the Strata folder and its `Strata-data` folder). Ask before installing drivers.
-- The model download is ~70 GB (94 GB for Unsloth's UD-IQ4_XS, 111 GB for UD-Q4_K_XL). Confirm the user is fine with that before you
-  start, especially on a metered connection.
+- The model download is ~70 GB (94 GB for Unsloth's UD-IQ4_XS, 111 GB for UD-Q4_K_XL, 341.8 GB for DeepSeek).
+  Confirm the user is fine with that before you start, especially on a metered connection.
 - Setup is long-running (an hour or more on a slow connection). Run it in the background or with a long timeout and
   poll its output; do not kill it because it is quiet for a while. It is resumable: running the same command again
   continues where it stopped.
@@ -52,7 +52,12 @@ Requirements (details: [INSTALL.md](INSTALL.md#what-you-need)):
 - **RAM:** 32 GB or more (see step 3). **Disk:** ~80 GB free, ideally on an NVMe SSD. **CPU:** x86-64 with AVX2. Without AVX2 (Xeon E5 v1/v2 and older) setup still installs, as an experimental and slow build it compiles on the PC (10-20 minutes): tell the user that before starting ([INSTALL.md](INSTALL.md#older-cpus-experimental)).
 - **OS:** Windows 10/11 or Linux (Ubuntu 22.04/24.04 are fully automatic).
 
-If the PC does not meet them, say which part is missing and stop.
+These are the Qwen requirements. DeepSeek needs Linux, one NVIDIA GPU with at least 16 GB VRAM and compute
+capability 8.6 or higher, and about 462 GB free disk space. A 128 GB PC is recommended. Below 120 GiB usable RAM,
+setup warns that the model is not tested and may be slow. `--family deepseek --yes` accepts that risk explicitly.
+Windows, AMD and Mac are not supported for DeepSeek. Run `./setup.sh --family deepseek --check` first.
+
+If the PC does not meet the selected model's requirements, say which part is missing.
 
 ## 2. Get Strata
 
@@ -75,6 +80,18 @@ By the PC's RAM (ask the user whether they mainly want it for code - then the Co
 | 64 GB | `--family qwen --model IQ2_XS` (recommended) | `IQ3_XXS` / `IQ3_S` are slower and a bit better |
 | 96 GB+ | `--family qwen --model IQ3_S` | `--family unsloth --model UD-IQ4_XS` (~4-bit, 94 GB, part of the experts read from the SSD under ~80 GB of RAM); `--model UD-Q4_K_XL` is experimental: NVIDIA only, NVMe SSD, 7-8.5 tokens/s on 64 GB |
 
+DeepSeek is an explicit choice. Setup never selects it by default:
+
+| RAM | `--family` / `--model` | Notes |
+| --- | --- | --- |
+| 128 GB recommended | `--family deepseek --model SAGE-1.59BPW` | Linux + NVIDIA only; 341.8 GB download plus about 120 GB pack; about 462 GB disk in total |
+
+Measured on Linux with an RTX 4090 (24 GB) and 119.9 GiB usable RAM (a 128 GB PC): decode 24-29 tokens/s on code
+text, 15-20 tokens/s in the chat requests of the server test (ds41/bench/results/2026-10-07-serve). Long prompts ran
+at 1,100-1,260 tokens/s at 32K-128K and 967 tokens/s at 256K; a short prompt takes about 3-5 s. The engine also builds and passes its tests
+on sm_86 (RTX 3060), which had too little RAM for the model. Model inference below 120 GiB usable RAM or with GPUs
+under 24 GB VRAM is not tested beyond the measured 119.9 GiB setup. Windows and AMD are not tested.
+
 `--family swift` (Swift 1.5, a fine-tune that thinks shorter; sizes Q2_0, IQ2_XS, IQ3_XXS) is the alternative to
 `qwen`. With `--yes` and no `--model`, setup picks the recommended size for the RAM itself. More: [MODELS.md](MODELS.md).
 
@@ -92,18 +109,33 @@ The flags (all of them: `START-HERE.bat --help`):
 | Flag | Meaning |
 | --- | --- |
 | `--yes` | take the recommended answer to every question (no prompts) |
-| `--family qwen\|swift\|coder\|unsloth` | the model version |
-| `--model Q2_0\|IQ2_XS\|IQ3_XXS\|IQ3_S\|IQ1_M\|UD-IQ4_XS\|UD-Q4_K_XL` | the size (the Coder is IQ1_M, Unsloth UD-IQ4_XS or UD-Q4_K_XL) |
-| `--context N` | context in tokens; default by VRAM: 32768 under 14 GB, 65536 under 20 GB, else 131072 |
+| `--family qwen\|swift\|coder\|unsloth\|deepseek` | the model version |
+| `--model Q2_0\|IQ2_XS\|IQ3_XXS\|IQ3_S\|IQ1_M\|UD-IQ4_XS\|UD-Q4_K_XL\|SAGE-1.59BPW` | the size (the Coder is IQ1_M, Unsloth UD-IQ4_XS or UD-Q4_K_XL) |
+| `--context N` | context in tokens; default by VRAM: 32768 under 14 GB, 65536 under 20 GB, else 131072. DeepSeek: default 32768, maximum 262144; no RoPE extension |
 | `--vision yes\|no\|gpu\|cpu` | read pictures; `--yes` leaves images off. AMD cards: `cpu` |
 | `--gpu N` / `--gpus 0,1` / `--gpus all` | one card, or several sharing the model (default: the card with the most VRAM) |
 | `--backend cuda\|hip` | NVIDIA or AMD engine; chosen by itself on a PC with only one kind of card |
-| `--data-dir PATH` | where the 70-120 GB of model files go |
+| `--data-dir PATH` | where the model files and packs go (DeepSeek: about 462 GB total) |
+| `--models-dir PATH` | source files go in a model subfolder here; packs stay under `--data-dir` |
+| `--resident-budget-gib N` | DeepSeek: pass `--ram-budget-gib N` to the engine; omit it to use the engine default. Unsloth: limit resident experts |
 | `--port N` | the server port (default 8080) |
 | `--host H --api-key K` | listen beyond this PC; **only together with a key** |
 | `--no-start` | install only, do not start the server |
 | `--setup` | install another model or change settings of an installed one |
 | `--check` | only check the PC |
+
+DeepSeek example (the model flag is optional because SAGE is its only size):
+
+```sh
+./setup.sh --yes --family deepseek --context 32768 --vision no --no-browser --no-start
+```
+
+DeepSeek skips Qwen's GGUF conversion, PLE, MTP draft layer, speed projection, low-RAM mode, KV precision and
+streaming rules, image encoder, calibration and multi-GPU layer split. `--gpu N` selects one NVIDIA card.
+The installer rejects `--gpus`, `--layer-split`, `--gguf-dir` and RoPE extension for this family.
+Qwen-only image, KV, low-RAM and tuning flags produce a message and do not enter the engine config.
+Setup builds the CMake target `ds41_serve` from source because the release zip has no such binary.
+It uses the existing CUDA build-tool installer. A CUDA toolkit and a C++ compiler are required.
 
 `--no-start` is recommended for agents: the server runs in the foreground until its window is closed, which would
 block your shell. Start it separately in step 6.
@@ -123,6 +155,19 @@ Notes:
 
 ## 5. While it downloads, tell the user
 
+For DeepSeek, setup uses `vcruz305/DSV4.1-Flash-SAGE-EXL3-1.59bpw` at commit
+`eca94a388a70841858feed8f057a9862e897aba4`. It downloads root `*.json`, `tokenizer*` and the 17
+`model-*.safetensors` shards. It skips `README.md` and `exllamav3/`. It does not fall back to another revision.
+Downloads resume and keep `.done` marks.
+
+The source is about 341.8 GB. The pack adds about 120 GB: dense.bin 10.6 GB and experts.bin 108.9 GB.
+Packing the experts took about 100 seconds on a fast NVMe. Other disks can take longer.
+**Keep the source shards after packing.** Shards 16 and 17 hold about 196 GB of Engram tables. The pack reads them
+in place. Setup copies the shipped Engram hash files and checks their SHA-256 values; this path needs numpy,
+not torch, transformers or sympy.
+
+The following download and startup sizes apply to Qwen:
+
 - It downloads about 70 GB from Hugging Face; how long depends on their connection (at 100 Mbit/s roughly 1.5-2
   hours). It can be stopped and continues where it left off.
 - Then it prepares the model for their PC (a few minutes) and, on AMD on Linux, compiles the engine.
@@ -133,7 +178,7 @@ Notes:
 ## 6. Start the server
 
 Setup prints the start script it wrote (`start script: run-<model>.bat`). The name is the family tag plus the size,
-lower case: `run-iq2_xs`, `run-swift-iq2_xs`, `run-coder-iq1_m`, `run-unsloth-ud-iq4_xs`.
+lower case: `run-iq2_xs`, `run-swift-iq2_xs`, `run-coder-iq1_m`, `run-unsloth-ud-iq4_xs`, `run-deepseek-sage-1.59bpw`.
 
 ```
 Windows (PowerShell):  Start-Process -FilePath ".\run-iq2_xs.bat"            (opens its own window)
@@ -146,7 +191,8 @@ ready. Closing its window (or stopping the process) stops the model.
 
 ## 7. Verify
 
-The HTTP server answers once the model is loaded (30-90 s on later starts, a few minutes the first time). Poll:
+The HTTP server answers once the model is loaded (Qwen: 30-90 s on later starts, a few minutes the first time).
+DeepSeek: about 30 s on the measured PC with the model files in the OS file cache. Poll:
 
 ```
 curl http://127.0.0.1:8080/health
