@@ -259,6 +259,7 @@ struct Engine::Impl {
     // leaves the KV caches and the history out of step: every later call is refused
     bool broken = false;
     bool pf_started = false;           // the running prefill has begun changing the state
+    PrefillProgress progress;          // prefill progress (set_prefill_progress); a false return cancels
     std::exception_ptr worker_error;   // set by the CPU worker; rethrown by the step that ran into it
     void usable() const {
         if (broken) throw std::runtime_error("ds41 engine: unusable after an earlier failure; create a new Engine");
@@ -1474,6 +1475,8 @@ struct Engine::Impl {
             if (is_engram_layer(l)) ++eng_i;
             moe_experts(l, S);
             for (int b0 = 0; b0 < S; b0 += B) moe_finish(l, std::min(B, S - b0), b0);
+            if (progress && !progress(c0 + (int) ((int64_t) S * (l + 1) / kLayers), (int) tokens.size()))
+                throw PrefillCancelled();   // prefill_end stops the stream and syncs; prefill() resets
         }
         const int n = (int) tokens.size();
         if (nll) {
@@ -1514,10 +1517,22 @@ struct Engine::Impl {
         if (n == 0) throw std::runtime_error("prefill of no tokens");
         if (pos + n > max_seq) throw std::runtime_error("prefill past max_seq");
         for (int t : tokens) check_token(t);
-        if (opt.prefill_chunk <= 0) return prefill_steps(tokens, pos, nll, pt);
+        if (opt.prefill_chunk <= 0) {
+            try {
+                return prefill_steps(tokens, pos, nll, pt);
+            } catch (const PrefillCancelled&) {
+                reset();
+                throw;
+            }
+        }
         pf_started = false;
         try {
             return prefill_batched(tokens, pos, nll, pt);
+        } catch (const PrefillCancelled&) {
+            // the pass stopped between layers and prefill_end synced the device: the caches hold rows past the old
+            // position, which a reset makes harmless (every row is written again before it is read)
+            reset();
+            throw;
         } catch (...) {
             if (pf_started) broken = true;   // a pass may have written part of the layers' caches and the history
             throw;
@@ -1535,6 +1550,7 @@ struct Engine::Impl {
             Timing tm;
             for (int i = 0; i < n; ++i) {
                 next = step(tokens[i], pos + i, nullptr, tm);
+                if (progress && !progress(i + 1, n)) throw PrefillCancelled();
                 if (nll && i + 1 < n) {
                     double mx = -1e300, se = 0;
                     for (float v : lg) mx = std::max(mx, (double) v);
@@ -1634,6 +1650,12 @@ struct Engine::Impl {
         int64_t c = 1;
         while (c < t) c <<= 1;
         return std::min(c, rows);
+    }
+
+    void reset() {
+        usable();
+        history.clear();
+        verify_pending = verify_failed = false;
     }
 
     int step(int token, int pos, StepDump* dump, Timing& tm) {
@@ -1776,5 +1798,11 @@ int Engine::prefill(const std::vector<int>& tokens, int pos, std::vector<float>*
 }
 
 const std::vector<float>& Engine::last_logits() const { return impl_->lg; }
+
+void Engine::set_prefill_progress(PrefillProgress fn) { impl_->progress = std::move(fn); }
+
+void Engine::reset() { impl_->reset(); }
+
+int Engine::position() const { return (int) impl_->history.size(); }
 
 }  // namespace strata::ds41
