@@ -11,7 +11,9 @@
 
 #include <array>
 #include <cstdint>
+#include <functional>
 #include <memory>
+#include <stdexcept>
 #include <string>
 #include <vector>
 
@@ -59,6 +61,15 @@ struct PrefillTiming {
     int64_t streamed = 0, from_ram = 0, from_cache = 0, from_ssd = 0;   ///< pairs copied through the ring, by source
 };
 
+/// Thrown by prefill() when the progress callback returned false. The engine is then back at position 0.
+struct PrefillCancelled : std::runtime_error {
+    PrefillCancelled() : std::runtime_error("ds41 prefill: cancelled") {}
+};
+
+/// prefill() progress: tokens of the call done and the call's total. Inside a pass, which runs layer by layer, done
+/// is the share of the layers enqueued. Return false to stop the prefill.
+using PrefillProgress = std::function<bool(int done, int total)>;
+
 class Engine {
 public:
     Engine(const std::string& pack_dir, const EngineOptions& opt);
@@ -83,6 +94,15 @@ public:
     /// nll non-null: (*nll)[i] = -log p(tokens[i + 1] | tokens[0..i]) for i < n - 1.
     int prefill(const std::vector<int>& tokens, int pos, std::vector<float>* nll = nullptr);
     const PrefillTiming& last_prefill() const { return prefill_timing_; }
+    /// Called after every layer of a prefill pass (token by token without passes); null: none. A false return makes
+    /// prefill() stop where it is, reset the engine and throw PrefillCancelled.
+    void set_prefill_progress(PrefillProgress fn);
+
+    /// Forget every token fed so far: the next call feeds position 0. A pending verify window is dropped. The caches
+    /// need no clearing: each row is written before it is read, and the lengths come from the position.
+    void reset();
+    /// Tokens fed so far: the position of the next step or prefill
+    int position() const;
 
     /// FP32 logits of the last step (all 129280)
     const std::vector<float>& last_logits() const;

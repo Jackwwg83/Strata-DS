@@ -1,8 +1,9 @@
 # Which model? Sizes, versions and what fits
 
-Strata runs one model, [Qwen3.8-Flash-Next](https://huggingface.co/Qwen/Qwen3.8-Flash-Next), in several **sizes**
+Strata runs [Qwen3.8-Flash-Next](https://huggingface.co/Qwen/Qwen3.8-Flash-Next), in several **sizes**
 (the same model, compressed more or less) and several **versions** (the original, a coding version, a fine-tune).
-The installer recommends one for your PC; this page explains the choice. Back to the [README](../README.md).
+It also offers DeepSeek V4.1 Flash SAGE 1.59bpw on Linux + NVIDIA.
+The installer recommends a Qwen choice for your PC; this page explains the choice. Back to the [README](../README.md).
 
 > **On this page:** [Pick by RAM](#pick-by-ram) · [Speed](#how-fast-is-each-size) · [The sizes](#the-sizes) ·
 > [Will it fit?](#will-it-fit) · [The versions](#the-versions) · [Adding another model](#adding-or-switching-models)
@@ -146,6 +147,36 @@ START-HERE.bat --setup --family unsloth --model UD-Q4_K_XL
 
 For **OrcaRouter's Flash-Next Uncensored IQ3_XXS**, see the [manual compatibility setup](ORCA.md). It needs an
 explicit packing conversion and is not an installer menu option.
+
+### DeepSeek V4.1 Flash (SAGE 1.59bpw)
+
+`--family deepseek` selects only the SAGE 1.59bpw EXL3 checkpoint. It is never the default family.
+The source is `vcruz305/DSV4.1-Flash-SAGE-EXL3-1.59bpw`, pinned to
+`eca94a388a70841858feed8f057a9862e897aba4`.
+
+- Linux and one NVIDIA GPU only. At least 16 GB VRAM and compute capability 8.6 or higher.
+- A 128 GB PC is recommended. Below 120 GiB usable RAM, setup warns that this is not tested and may be slow.
+  An explicit `--family deepseek --yes` accepts the risk.
+- About 462 GB disk space: 341.8 GB of source files plus about 120 GB of pack files.
+  Keep all source shards. Shards 16 and 17 hold about 196 GB of Engram tables that the engine reads in place.
+- Context choices: 8K, 32K, 64K, 128K and 256K. Default: 32K. No RoPE extension.
+- No images, Qwen draft layer, speed projection, KV tuning or multi-GPU layer split in this installer path.
+
+Measured on Linux, RTX 4090 (24 GB), 119.9 GiB usable RAM (a 128 GB PC): 24-29 tokens/s decode on code text and
+15-20 tokens/s in chat requests through the server; 1,100-1,260 tokens/s prompt at 32K-128K; 967 tokens/s prompt at
+256K. Packing experts took about 100 seconds
+on a fast NVMe. The pack writes dense.bin (10.6 GB) and experts.bin (108.9 GB).
+The engine also builds and passes its tests on sm_86 (RTX 3060), but that PC had too little RAM for the model.
+Windows, AMD, GPUs under 24 GB and lower RAM configurations are not tested for model inference.
+
+```sh
+./setup.sh --setup --yes --family deepseek --context 32768 --no-start
+./run-deepseek-sage-1.59bpw.sh
+```
+
+Setup builds `ds41_serve` from source. The release zip does not contain it. Optional `--resident-budget-gib N`
+sets the engine's RAM budget. The pack uses verified Engram hash files from `ds41/data/engram/`; it needs numpy
+and does not import torch, transformers or sympy. See [AI_SETUP.md](AI_SETUP.md) for the full flow.
 
 ## Adding or switching models
 

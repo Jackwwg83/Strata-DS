@@ -1,0 +1,27 @@
+{
+ "exe": "/workspace/strata-release/engine/ds41_serve",
+ "args": [
+  "--pack",
+  "/workspace/sdata/packs/deepseek-sage-1.59bpw",
+  "--max-context",
+  "32768",
+  "--expert-profile",
+  "/workspace/strata-release/ds41/data/expert-profile.bin",
+  "--threads",
+  "16"
+ ],
+ "cwd": "/workspace/strata-release",
+ "tokenizer": "/workspace/sdata/packs/deepseek-sage-1.59bpw",
+ "format": "deepseek_v41",
+ "model_name": "deepseek-v4.1-flash",
+ "log": "/workspace/strata-release/strata-deepseek-sage-1.59bpw.log",
+ "lib_dirs": [
+  "/usr/local/cuda/bin",
+  "/usr/local/cuda/lib64"
+ ],
+ "port": 8080,
+ "gpu": 0,
+ "gpus_asked": true,
+ "cuda": 13,
+ "open_browser": false
+}

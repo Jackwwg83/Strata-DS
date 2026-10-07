@@ -20,7 +20,7 @@ What the first run does (each step is skipped when it is already done):
   6. prepares the model for Strata and fetches the MTP draft layer (~5 GB, from the original Qwen checkpoint)
   7. writes run-<model>.bat / run-<model>.sh and starts the model
 
-Options: --family qwen|swift, --model Q2_0|IQ2_XS|IQ3_XXS|IQ3_S, --context 32768, --rope-scaling none|linear|yarn
+Options: --family qwen|swift|coder|unsloth|deepseek, --model Q2_0|IQ2_XS|IQ3_XXS|IQ3_S, --context 32768, --rope-scaling none|linear|yarn
 (--rope-scale F; past the trained 262144 the setup adds yarn and the factor is the final context over 262144,
 at least 1 - an explicit --rope-scaling none is refused for such a context), --vision yes|no|gpu|cpu, --port
 8080, --yes (recommended
@@ -63,6 +63,7 @@ WIN = os.name == "nt"
 # https://huggingface.co/api/models/<repo> when this was pinned), so a checkout installs the same files on any
 # day.  A revision the repository no longer has falls back to its current files, with a message (download()).
 HF_REVISIONS = {
+    "vcruz305/DSV4.1-Flash-SAGE-EXL3-1.59bpw": "eca94a388a70841858feed8f057a9862e897aba4",
     "ISTA-DASLab/Qwen3.8-Flash-Next-GSQ-RCO-GGUF": "ed59f92082b1e93c0e96d60a8b11aab089b52f09",        # 2026-09-29
     "ukisai/Swift-1.5-Qwen3.8-Flash-Next-GSQ-RCO-GGUF": "b22d729eae29b5796f76fb70f91aef549b9fc52c",   # 2026-09-24
     "ISTA-DASLab/Qwen3.8-Flash-Next-GSQ-RCO-Coder-GGUF": "5348543e0147355ac9cbcb031184a3546350988e",  # 2026-09-29
@@ -86,6 +87,8 @@ def hf(repo: str) -> str:
 
 def hf_unpinned(url: str) -> str:
     """The same file at the repository's current revision (main)."""
+    if "/vcruz305/DSV4.1-Flash-SAGE-EXL3-1.59bpw/resolve/" in url:
+        return url                                    # SAGE must match the shipped Engram hashes
     return re.sub(r"^(https?://[^/]+/.+?/resolve/)[0-9a-f]{40}/", r"\1main/", url, count=1)
 
 
@@ -149,6 +152,8 @@ MODELS = {
                   "download_gb": 93.7, "ram_gb": 48, "arena_gb": 59.5, "families": ("unsloth",), "budget": True,
                   "shards": 3, "file": "Qwen3.8-Flash-Next-{q}-0000{i}-of-00003.gguf", "engine": (0, 1, 38),
                   "vision": True},
+    "SAGE-1.59BPW": {"about": "DeepSeek V4.1 Flash, SAGE EXL3 1.59bpw", "download_gb": 341.8,
+                     "ram_gb": 128, "arena_gb": 108.9, "families": ("deepseek",), "nvidia_only": True},
 }
 # The experimental Unsloth file's four shards at the pinned revision: name -> (bytes, sha256), checked after the
 # download (setup trusts no other model file by name and size alone either: check_shards reads their directories).
@@ -214,6 +219,11 @@ FAMILIES = {
                 "mmproj": "mmproj-Qwen3.8-Flash-Next-BF16.gguf", "name": "qwen3.8-flash-next-unsloth",
                 "vision": False, "pack_args": ["--compat-bf16"],
                 "sha256": {**UNSLOTH_SHARDS, **UNSLOTH_IQ4_XS_SHARDS}},
+    "deepseek": {"title": "DeepSeek V4.1 Flash", "by": "SAGE EXL3 1.59bpw by vcruz305",
+                 "about": "Linux + NVIDIA only; 128 GB RAM recommended; 462 GB disk",
+                 "hf": hf("vcruz305/DSV4.1-Flash-SAGE-EXL3-1.59bpw"), "tag": "deepseek-",
+                 "file": "model-{i:05d}-of-00017.safetensors", "shards": 17,
+                 "name": "deepseek-v4.1-flash", "vision": False, "nvidia_only": True},
 }
 MMPROJ = "mmproj-Qwen3.8-Flash-Next-BF16.gguf"
 # EXPERIMENTAL, off by default (setup asks): a control vector shipped with the repository, see its README
@@ -2599,6 +2609,19 @@ def move_into(src: Path, dst: Path) -> None:
             pass
 
 
+def moved_path(v: str, old: Path, new: Path) -> str:
+    """`v` at its new place when its file moved from `old` to `new` (only if it is there and no longer at the old
+    place), else `v`."""
+    for d in DATA_ITEMS:
+        o = str(old / d)
+        nv, no = os.path.normcase(v), os.path.normcase(o)   # Windows: C:\ and c:\ are the same place
+        if nv == no or nv.startswith(no + os.sep):
+            n = str(new / d) + v[len(o):]
+            if Path(n).exists() and not Path(v).exists():
+                return n
+    return v
+
+
 def repoint_config(cfg_file: Path, old: Path, new: Path) -> None:
     """A config whose model files moved from `old` to `new` points at them there (each path only if its file is
     now there and no longer at the old place)."""
@@ -2613,18 +2636,31 @@ def repoint_config(cfg_file: Path, old: Path, new: Path) -> None:
         if isinstance(v, dict):
             return {k: fix(x) for k, x in v.items()}
         if isinstance(v, str):
-            for d in DATA_ITEMS:
-                o = str(old / d)
-                nv, no = os.path.normcase(v), os.path.normcase(o)   # Windows: C:\ and c:\ are the same place
-                if nv == no or nv.startswith(no + os.sep):
-                    n = str(new / d) + v[len(o):]
-                    if Path(n).exists() and not Path(v).exists():
-                        return n
+            return moved_path(v, old, new)
         return v
 
     new_cfg = fix(cfg)
     if new_cfg != cfg:
         write_config(cfg_file, new_cfg)
+
+
+def repoint_ds41_pack(pack: Path, old: Path, new: Path) -> None:
+    """A DeepSeek pack reads its Engram tables from the source shards by absolute path (engram.txt) and names its
+    source (pack_info.txt): when the shards moved from `old` to `new`, both point at them there."""
+    for name, column in (("engram.txt", 5), ("pack_info.txt", 1)):
+        f = pack / name
+        try:
+            lines = f.read_text(encoding="utf-8").splitlines(keepends=True)
+        except OSError:
+            continue
+        out = []
+        for line in lines:
+            fields = line.rstrip("\n").split(None, column)
+            keep = line.startswith("#") or len(fields) != column + 1 or (name == "pack_info.txt" and fields[0] != "source")
+            out.append(line if keep else line[:len(line.rstrip("\n")) - len(fields[column])] +
+                       moved_path(fields[column], old, new) + line[len(line.rstrip("\n")):])
+        if out != lines:
+            f.write_text("".join(out), encoding="utf-8")
 
 
 def data_folder(requested: str | None) -> tuple:
@@ -2671,6 +2707,9 @@ def data_folder(requested: str | None) -> tuple:
                 pass
         for c in folder.glob("strata-*.json"):
             repoint_config(c, folder, dest)
+        for p in ((dest / "packs").glob("*") if (dest / "packs").is_dir() else []):
+            if (p / "engram.txt").is_file():
+                repoint_ds41_pack(p, folder, dest)
         if has_data(folder):
             elsewhere.append(folder)                    # in use, or a copy the data folder already has
             warn(f"some model files are still in {folder} (in use, or already in {dest})")
@@ -3022,16 +3061,31 @@ def update_install(have: list, a) -> int:
         return 0
     pip_install(requirement_lines() if REQUIREMENTS.exists() else PY_PACKAGES,
                 "numpy, jinja2, regex, pyyaml, tqdm, requests, cmake, ninja, pillow, psutil")
-    if not a.build:
+    if not a.build and any(not deepseek_config(p) for p in have):
         update_installed_engine(a.prebuilt)
+    deepseek_failed = False
     for cfg_path in have:
+        if deepseek_config(cfg_path):
+            cfg = json.loads(cfg_path.read_text(encoding="utf-8-sig"))
+            gpu = deepseek_gpu(cfg.get("gpu"))
+            updated = update_deepseek_engine(cfg, gpu, a.yes, force=a.build)
+            write_config(cfg_path, cfg)
+            if updated:
+                ok(f"{cfg['model_name']}: up to date")
+            else:
+                deepseek_failed = True
+            continue
         cfg = upgrade_config(cfg_path, json.loads(cfg_path.read_text(encoding="utf-8-sig")))
         if "--mtp" in cfg["args"][:-1]:
             refresh_draft_vocab(Path(cfg["args"][cfg["args"].index("--mtp") + 1]), cfg.get("draft_vocab", "cjk"))
         if cfg.get("backend") == "hip" and WIN:
             hip_runtime_beside_exe(Path(cfg["exe"]).parent)   # #468 #461
         ok(f"{cfg.get('model_name', cfg_path.stem)}: up to date")
-    ver = engine_version(Path(json.loads(have[0].read_text(encoding="utf-8-sig"))["exe"]))
+    if deepseek_failed:
+        warn("DeepSeek engine update failed; the installed model config is kept")
+        return 1
+    ver = () if deepseek_config(have[0]) else engine_version(
+        Path(json.loads(have[0].read_text(encoding="utf-8-sig"))["exe"]))
     say()
     ok("Strata is updated" + (f" (engine {'.'.join(map(str, ver))})" if any(ver) else "") +
        ". Start the model with " + ("START-HERE.bat" if WIN else "./setup.sh") + " when you want it.")
@@ -3067,7 +3121,10 @@ def start(cfg_path: Path, port: int | None, gpu: int | list | None = None, open_
           layer_split=None, keep=None) -> int:
     """keep: settings given on this start that the model keeps from now on (--host, --api-key, --draft-vocab,
     --vram-reserve-mib)."""
-    cfg = upgrade_config(cfg_path, json.loads(cfg_path.read_text(encoding="utf-8-sig")))
+    original = json.loads(cfg_path.read_text(encoding="utf-8-sig"))
+    if original.get("format") == "deepseek_v41":
+        return start_deepseek(cfg_path, original, port, gpu, open_browser, yes, layer_split, keep)
+    cfg = upgrade_config(cfg_path, original)
     missing = [p for p in [cfg["exe"], *[a for a in cfg["args"] if a.endswith(".gguf")]] if not Path(p).exists()]
     if missing:
         fail(f"{cfg_path.name} refers to missing files: {missing[0]}", "run it again with --setup to repair")
@@ -3503,6 +3560,303 @@ def resolve_rope(ctx: int, scaling, scale, trained: int = 262144):
     return scaling or "yarn", scale if scale is not None else derived_factor(ctx, trained)
 
 
+# ------------------------------------------------------------------------------------------------ DeepSeek
+DEEPSEEK_REPO = "vcruz305/DSV4.1-Flash-SAGE-EXL3-1.59bpw"
+DEEPSEEK_MODEL = "SAGE-1.59BPW"
+DEEPSEEK_TAG = "deepseek-sage-1.59bpw"
+DEEPSEEK_PACK_GB = 120.2
+DEEPSEEK_SOURCES = (*ENGINE_SOURCES, "cmake", "third_party/exllamav3_moe")
+
+
+def deepseek_config(path):
+    return json.loads(path.read_text(encoding="utf-8-sig")).get("format") == "deepseek_v41"
+
+
+def deepseek_problem(gpu):
+    if WIN or not sys.platform.startswith("linux") or not gpu or gpu.get("vendor") == "amd":
+        return "DeepSeek is available on Linux + NVIDIA only"
+    if not str(gpu.get("arch", "")).isdigit() or int(gpu["arch"]) < 86:
+        return "DeepSeek needs NVIDIA compute capability 8.6 or higher"
+    if gpu["vram_gb"] < 15.9:                           # nominal 16 GB cards report slightly less
+        return "DeepSeek needs at least 16 GB VRAM (GPUs under 24 GB are not tested)"
+    return None
+
+
+def deepseek_gpu(pick=None):
+    if isinstance(pick, list):
+        fail("DeepSeek supports one NVIDIA GPU only; use --gpu N")
+    found = gpus()
+    candidates = [g for g in found if deepseek_problem(g) is None]
+    gpu = next((g for g in found if g["index"] == pick), None) if pick is not None else \
+        max(candidates or found, key=lambda g: g["vram_gb"], default=None)
+    problem = deepseek_problem(gpu)
+    if problem:
+        fail(problem)
+    return gpu
+
+
+def deepseek_threads():
+    hybrid = cpu_cores()
+    if hybrid:
+        return max(1, min(16, hybrid[0]))
+    # Linux exposes physical package/core pairs even when cpu_capacity is absent.
+    cores = set()
+    for cpu in Path("/sys/devices/system/cpu").glob("cpu[0-9]*"):
+        try:
+            cores.add(((cpu / "topology/physical_package_id").read_text().strip(),
+                       (cpu / "topology/core_id").read_text().strip()))
+        except OSError:
+            pass
+    if not cores:
+        import psutil
+        return max(1, min(16, psutil.cpu_count(logical=False) or 1))
+    return min(16, len(cores))
+
+
+def build_deepseek_engine(gpu, yes, force=False):
+    """The release zip has no ds41_serve. Build it with separate metadata."""
+    eng = ROOT / "engine"
+    eng.mkdir(parents=True, exist_ok=True)
+    stamp = eng / "DS41_BUILD.json"
+    try:
+        meta = json.loads(stamp.read_text())
+    except (OSError, ValueError):
+        meta = {}
+    src = source_hash(DEEPSEEK_SOURCES)
+    toolkit = int(gpu.get("toolkit") or 13)
+    if not force and (eng / "ds41_serve").is_file() and meta.get("src") == src and \
+            gpu["arch"] in meta.get("archs", []) and meta.get("toolkit", 13) == toolkit:
+        return eng, meta.get("lib_dirs", [])
+    nvcc, vcvars = install_build_tools(gpu, yes)
+    llama = get_llama_cpp()
+    bdir = ROOT / "build-ds41"
+    cmake_build(ROOT, bdir, "ds41_serve",
+                ["-DSTRATA_ENABLE_CUDA=ON", "-DSTRATA_ENABLE_HIP=OFF", "-DSTRATA_BUILD_TESTS=OFF",
+                 f"-DCMAKE_CUDA_ARCHITECTURES={gpu['arch']}", f"-DCMAKE_CUDA_COMPILER={nvcc}",
+                 f"-DSTRATA_GGML_DIR={llama}"], vcvars, "")
+    shutil.copy2(bdir / "ds41_serve", eng / "ds41_serve")
+    (eng / "ds41_serve").chmod(0o755)
+    bindir = Path(nvcc).parent
+    dirs = [str(d) for d in (bindir, bindir.parent / "lib64") if d.is_dir()]
+    stamp.write_text(json.dumps({"src": src, "archs": [gpu["arch"]], "lib_dirs": dirs,
+                                 "toolkit": toolkit}, indent=1))
+    return eng, dirs
+
+
+def update_deepseek_engine(cfg, gpu, yes, force=False):
+    """Keep a working binary if an automatic source update fails."""
+    try:
+        eng, dirs = build_deepseek_engine({**gpu, "toolkit": cfg.get("cuda", 13)}, yes, force=force)
+        cfg["exe"], cfg["lib_dirs"] = str(eng / "ds41_serve"), dirs
+        return True
+    except (OSError, SystemExit) as e:
+        try:
+            meta = json.loads((Path(cfg["exe"]).parent / "DS41_BUILD.json").read_text())
+        except (OSError, ValueError):
+            meta = {}
+        if force or not Path(cfg["exe"]).is_file() or gpu["arch"] not in meta.get("archs", []):
+            raise
+        warn(f"could not update DeepSeek ({e}); starting the installed engine when requested")
+        return False
+
+
+def deepseek_files(folder):
+    """List root checkpoint files at the pinned revision. Keep the list for retries."""
+    revision = HF_REVISIONS[DEEPSEEK_REPO]
+    cache = folder / ".strata-files.json"
+    try:
+        saved = json.loads(cache.read_text())
+    except (OSError, ValueError):
+        saved = {}
+    if saved.get("revision") == revision:
+        files = saved.get("files", [])
+    else:
+        url = f"{hf_endpoint()}/api/models/{DEEPSEEK_REPO}/revision/{revision}"
+        try:
+            with urllib.request.urlopen(url, timeout=60) as response:
+                names = [x["rfilename"] for x in json.load(response)["siblings"]]
+        except (OSError, ValueError, KeyError) as e:
+            fail(f"cannot list the pinned DeepSeek checkpoint: {e}")
+        files = sorted(n for n in names if "/" not in n and (n.endswith(".json") or n.startswith("tokenizer")
+                       or (n.startswith("model-") and n.endswith(".safetensors"))))
+    required = {"config.json", "model.safetensors.index.json", "tokenizer.json", "tokenizer_config.json"}
+    shards = {f"model-{i:05d}-of-00017.safetensors" for i in range(1, 18)}
+    if not required | shards <= set(files) or any("/" in n or "\\" in n or n in (".", "..") for n in files):
+        fail("the pinned DeepSeek file list is incomplete or invalid")
+    folder.mkdir(parents=True, exist_ok=True)
+    cache.write_text(json.dumps({"revision": revision, "files": files}, indent=1))
+    return files
+
+
+def deepseek_pack_ready(pack, src=None):
+    try:
+        info = dict(l.split(None, 1) for l in (pack / "pack_info.txt").read_text().splitlines() if l.strip())
+        if info.get("finished") != "1" or (src is not None and info.get("source") != str(src.resolve())):
+            return False
+        return all((pack / n).is_file() for n in ("dense.bin", "experts.bin", "index.txt", "experts.txt",
+                   "engram.txt", "engram_hash.txt", "engram_tokenmap.bin", "tokenizer.json", "tokenizer_config.json"))
+    except (OSError, ValueError):
+        return False
+
+
+def setup_deepseek(a, data, elsewhere, adopted=None):
+    if a.backend in ("hip", "sycl"):
+        fail("DeepSeek is available on Linux + NVIDIA only")
+    if a.gpus or a.layer_split:
+        fail("DeepSeek supports one NVIDIA GPU only; use --gpu N")
+    if a.model not in (None, DEEPSEEK_MODEL):
+        fail(f"DeepSeek supports only --model {DEEPSEEK_MODEL}")
+    if a.gguf_dir:
+        fail("DeepSeek uses EXL3 safetensors, not --gguf-dir; use --models-dir")
+    if a.rope_scaling not in (None, "none") or a.rope_scale is not None:
+        fail("DeepSeek has no RoPE extension in setup; use --context 262144 or lower")
+    if a.calibrate:
+        fail("DeepSeek has no installer calibration yet")
+    previous = ROOT / f"strata-{DEEPSEEK_TAG}.json"
+    network = json.loads(previous.read_text(encoding="utf-8-sig")) if previous.is_file() else \
+        json.loads(adopted.read_text(encoding="utf-8-sig")) if adopted is not None else {}
+    for key in ("host", "api_key"):
+        if getattr(a, key) is not None:
+            network[key] = getattr(a, key)
+    deepseek_network(network)
+    gpu = deepseek_gpu(a.gpu)
+    if driver_major(gpu) < (CUDA12_MIN_DRIVER if a.cuda == "12" else MIN_DRIVER):
+        fail("the NVIDIA driver is too old for DeepSeek; update it or select --cuda 12")
+    ram = ram_gb()
+    ok(f"DeepSeek V4.1 Flash SAGE 1.59bpw: {gpu_name(gpu)}; RAM {ram:.1f} GiB; 128 GB PC recommended")
+    note = "below 120 GiB usable RAM is not tested and may be slow or run out of RAM"
+    if ram < 120:
+        if a.check:
+            warn(note)
+        else:
+            confirm_risk(note, a.family == "deepseek", a.yes, "DeepSeek RAM risk was not accepted",
+                         "choose --family deepseek --yes to continue on purpose")
+    if gpu["vram_gb"] < 23.5:                          # an RTX 4090 reports 23.99 GB
+        warn("DeepSeek GPUs under 24 GB VRAM are not tested")
+    say("  Disk: about 462 GB total (341.8 GB download + 120.2 GB pack). Keep the source shards: Engram reads them in place.")
+    if a.check:
+        return 0
+    contexts = [c for c in CONTEXTS if c <= 262144]
+    if a.context is None:
+        for i, ctx in enumerate(contexts, 1):
+            say(f"  {i}) {ctx // 1024}K tokens" + (" (recommended)" if ctx == 32768 else ""))
+        ctx = contexts[int(ask("Context?", [str(i) for i in range(1, len(contexts) + 1)], "2", a.yes)) - 1]
+    else:
+        ctx = a.context
+    if not 64 <= ctx <= 262144:                         # ds41_serve refuses a context under 64
+        fail("DeepSeek context must be between 64 and 262144 tokens; no RoPE extension")
+    if a.vision not in (None, "no", "none") or a.kv or a.low_ram != "auto" or \
+            a.experimental_speed_projection not in (None, "off") or a.draft_vocab or a.parallel or \
+            a.kv_streaming != "auto" or a.vram_reserve_mib is not None:
+        warn("DeepSeek skips images, KV settings, low-RAM mode, speed projection, draft layers, and parallel tuning")
+    src = Path(a.models_dir).expanduser().resolve() / DEEPSEEK_TAG
+    pack = find_in([data, *elsewhere], f"packs/{DEEPSEEK_TAG}") or data / "packs" / DEEPSEEK_TAG
+    if adopted is not None:
+        old = json.loads(adopted.read_text(encoding="utf-8-sig"))
+        old_pack = Path(old["tokenizer"])
+        if deepseek_pack_ready(old_pack):
+            pack = old_pack
+    try:
+        info = dict(l.split(None, 1) for l in (pack / "pack_info.txt").read_text().splitlines() if l.strip())
+        old_src = Path(info["source"])
+    except (OSError, ValueError, KeyError):
+        old_src = src
+    candidates = [src, old_src, *(r / "models" / DEEPSEEK_TAG for r in elsewhere)]
+
+    def shards_done(folder):
+        return sum(1 for i in range(1, 18) if done(folder / f"model-{i:05d}-of-00017.safetensors"))
+
+    # the folder with the most finished shards (the first one on a tie); the download resumes there
+    best = max(candidates, key=shards_done)
+    if shards_done(best):
+        src = best.resolve()
+    # Source paths in engram.txt are absolute. A moved source needs a fresh pack.
+    ready = deepseek_pack_ready(pack, src)
+    on_disk = sum(p.stat().st_size for p in src.glob("*") if p.is_file() and
+                  (p.name.startswith("model-") or p.name.endswith(".json") or p.name.startswith("tokenizer"))) / 1e9
+    to_fetch = max(0, 341.8 - on_disk)
+    to_pack = 0 if ready else DEEPSEEK_PACK_GB
+    src_free, pack_free = free_gb(src), free_gb(pack)
+    if same_drive(src, pack):
+        enough = src_free >= to_fetch + to_pack
+    else:
+        enough = src_free >= to_fetch and pack_free >= to_pack
+    if not enough:
+        fail(f"DeepSeek needs about 462 GB (341.8 GB download + 120.2 GB pack); still need "
+             f"{to_fetch:.1f} GB in {src} and {to_pack:.1f} GB in {pack}",
+             "use --data-dir and --models-dir on drives with enough free space")
+    files = deepseek_files(src)
+    pip_install(requirement_lines() if REQUIREMENTS.exists() else PY_PACKAGES, "Strata Python packages (pack: numpy)")
+    eng, dirs = build_deepseek_engine({**gpu, **({"toolkit": 12} if a.cuda == "12" else {})}, a.yes, force=a.build)
+    for name in files:
+        download(hf(DEEPSEEK_REPO) + name, src / name)
+    if not ready:
+        run([sys.executable, str(ROOT / "tools/ds41/pack.py"), "--src", str(src), "--out", str(pack),
+             "--engram-from", str(ROOT / "ds41/data/engram")])
+    if not deepseek_pack_ready(pack, src):
+        fail("DeepSeek pack is incomplete; run setup again")
+    args = ["--pack", str(pack), "--max-context", str(ctx), "--expert-profile",
+            str(ROOT / "ds41/data/expert-profile.bin"), "--threads", str(deepseek_threads())]
+    if a.resident_budget_gib is not None:
+        args += ["--ram-budget-gib", f"{a.resident_budget_gib:g}"]
+    port = a.port or network.get("port") or 8080       # a run again keeps the saved port, host and key
+    cfg = {"exe": str(eng / "ds41_serve"), "args": args, "cwd": str(ROOT), "tokenizer": str(pack),
+           "format": "deepseek_v41", "model_name": "deepseek-v4.1-flash",
+           "log": str(ROOT / f"strata-{DEEPSEEK_TAG}.log"), "lib_dirs": dirs, "port": port,
+           "gpu": gpu["index"], "gpus_asked": True, "cuda": 12 if a.cuda == "12" else 13}
+    for key, value in (("host", network.get("host")), ("api_key", network.get("api_key")), ("open_browser", a.browser)):
+        if value is not None:
+            cfg[key] = value
+    cfg_path = ROOT / f"strata-{DEEPSEEK_TAG}.json"
+    if cfg_path.is_file() or adopted is not None:
+        old = cfg_path if cfg_path.is_file() else adopted
+        carry_over(json.loads(old.read_text(encoding="utf-8-sig")), cfg)
+    deepseek_network(cfg)
+    write_setup_config(cfg_path, cfg, adopted)
+    script = write_run_script(DEEPSEEK_TAG, cfg_path, port, cfg.get("open_browser") is not False)
+    ok(f"start script: {script.name}")
+    ok(settings_summary(cfg))
+    return 0 if a.no_start else start(cfg_path, port, yes=a.yes)
+
+
+def deepseek_network(cfg):
+    if cfg.get("host", "127.0.0.1") not in ("127.0.0.1", "localhost", "::1") and not cfg.get("api_key"):
+        fail("DeepSeek needs --api-key when --host listens beyond 127.0.0.1")
+
+
+def start_deepseek(cfg_path, cfg, port, gpu, open_browser, yes, layer_split, keep):
+    if isinstance(gpu, list) or layer_split:
+        fail("DeepSeek supports one NVIDIA GPU only; use --gpu N")
+    keep = {k: v for k, v in (keep or {}).items() if v is not None}
+    for key in ("draft_vocab", "vram_reserve_mib"):
+        if key in keep:
+            warn(f"DeepSeek ignores {key}")
+            del keep[key]
+    cfg.update(keep)
+    deepseek_network(cfg)
+    card = deepseek_gpu(gpu if gpu is not None else cfg.get("gpu"))
+    if not deepseek_pack_ready(Path(cfg["tokenizer"])):
+        fail("DeepSeek pack is incomplete; run --setup --family deepseek")
+    for line in (Path(cfg["tokenizer"]) / "engram.txt").read_text().splitlines():
+        if not line.strip() or line.startswith("#"):
+            continue
+        fields = line.split(maxsplit=5)
+        if len(fields) != 6 or not Path(fields[5]).is_file():
+            fail("DeepSeek Engram source shard is missing; restore the source or run --setup --family deepseek")
+    update_deepseek_engine(cfg, card, yes)
+    write_config(cfg_path, cfg)
+    cmd = [sys.executable, str(ROOT / "serve/server.py"), "--engine", "strata", "--config", str(cfg_path),
+           "--port", str(port or cfg.get("port", 8080))]
+    if gpu is not None:
+        cmd += ["--gpu", str(gpu)]
+    if open_browser and cfg.get("open_browser") is not False:
+        cmd.append("--open")
+    ok(f"Starting DeepSeek V4.1 Flash: {settings_summary(cfg, port)}")
+    if os.environ.get("STRATA_EXECV"):
+        os.execv(cmd[0], cmd)
+    return subprocess.call(cmd)
+
+
 # ------------------------------------------------------------------------------------------------ main
 def sycl_setup(argv) -> int:
     """--backend sycl: the Intel Arc engine (the SYCL port in sycl/, PR #423), experimental. There is no ready-made
@@ -3532,7 +3886,7 @@ def sycl_setup(argv) -> int:
 
 def main() -> int:
     ap = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
-    ap.add_argument("--family", choices=list(FAMILIES), help="qwen = Qwen3.8-Flash-Next, swift = Swift 1.5")
+    ap.add_argument("--family", choices=list(FAMILIES), help="model family; deepseek = SAGE 1.59bpw, Linux + NVIDIA only")
     ap.add_argument("--model", choices=list(MODELS))
     ap.add_argument("--context", type=int)
     ap.add_argument("--rope-scaling", choices=["none", "linear", "yarn"],
@@ -3605,7 +3959,7 @@ def main() -> int:
                          "this mode the experts the GPU does not hold are copied into RAM once when they fit (resident), "
                          "else read through the OS file cache (mmap); resident / mmap force one of the two")
     ap.add_argument("--resident-budget-gib", type=float, metavar="N",
-                    help="UD-Q4_K_XL, UD-IQ4_XS: the GiB of its experts kept in RAM (default: the RAM less 24 GB, 40 on 64 GB; "
+                    help="DeepSeek: engine RAM budget (--ram-budget-gib). UD-Q4_K_XL, UD-IQ4_XS: the GiB of its experts kept in RAM (default: the RAM less 24 GB, 40 on 64 GB; "
                          "more is kept as you choose, with a note)")
     ap.add_argument("--vram-reserve-mib", type=int, metavar="N",
                     help="VRAM in MiB the engine leaves free for other programs (a game, another model; the engine's "
@@ -3622,6 +3976,8 @@ def main() -> int:
                          "sycl = Intel Arc, EXPERIMENTAL: Linux, built from source (docs/INTEL_ARC.md)")
     ap.add_argument("--skip-build", action="store_true", help=argparse.SUPPRESS)
     a = ap.parse_args()
+    if a.family == "deepseek" and (WIN or not sys.platform.startswith("linux") or a.backend in ("hip", "sycl")):
+        fail("DeepSeek is available on Linux + NVIDIA only")
     if a.backend == "sycl":                            # Intel Arc: the SYCL port's own setup (sycl/setup_intel.py)
         return sycl_setup(sys.argv[1:])
     if a.resident_budget_gib is not None and not a.resident_budget_gib > 0:
@@ -3637,7 +3993,8 @@ def main() -> int:
             a.gpu = int(a.gpu)
         else:
             ap.error(f"--gpu takes a GPU number as nvidia-smi numbers them, e.g. --gpu 1 (or --gpus 0,2), not {a.gpu!r}")
-    say("Strata - Qwen3.8-Flash-Next on a normal PC (a GPU + system RAM + CPU)")
+    say("Strata - DeepSeek V4.1 Flash (Linux + NVIDIA)" if a.family == "deepseek" else
+        "Strata - Qwen3.8-Flash-Next on a normal PC (a GPU + system RAM + CPU)")
     data, elsewhere = data_folder(a.data_dir)          # the model files: in the data folder, found from any copy
     roots = [data, *elsewhere]
     if a.models_dir is None:
@@ -3672,15 +4029,21 @@ def main() -> int:
                     a.layer_split = a.layer_split or ch.get("layer_split")
                 else:
                     a.gpu = a.gpu if a.gpu is not None else ch.get("gpu")
+                if ch["family"] == "deepseek" and a.resident_budget_gib is None:
+                    old_args = json.loads(prev.read_text(encoding="utf-8-sig")).get("args", [])
+                    if "--ram-budget-gib" in old_args:
+                        a.resident_budget_gib = float(old_args[old_args.index("--ram-budget-gib") + 1])
                 a.yes = True
     global GPU_PICK, OLD_GPUS
     # starting an installed model: --gpus 0,2 (or all) saves those cards for it and starts on them (it used to start
     # on the first one alone unless given with --setup), --gpu N runs this start on one card; neither: the saved
     # choice, and asked once when the PC has cards that could share the model
+    if a.family == "deepseek":
+        return setup_deepseek(a, data, elsewhere, adopted)
     run_gpu = start_gpus(a.gpus) or a.gpu
     port = a.port or 8080                              # a new install's port (issue #32: --port for an existing one)
     if have and a.calibrate and not (a.setup or a.model or a.family or a.check):
-        if not a.build:
+        if not a.build and any(not deepseek_config(p) for p in have):
             update_installed_engine(a.prebuilt)
         pick_cfg = have[0]
         if len(have) > 1:
@@ -3688,6 +4051,8 @@ def main() -> int:
             for i, c in enumerate(have, 1):
                 say(f"  {i}) {json.loads(c.read_text(encoding='utf-8-sig')).get('model_name', c.stem)}")
             pick_cfg = have[int(ask("Tune which one?", [str(i) for i in range(1, len(have) + 1)], "1", a.yes)) - 1]
+        if deepseek_config(pick_cfg):
+            fail("DeepSeek has no installer calibration yet")
         if not calibrate_config(pick_cfg):             # #447: said again where it is not lost above the start
             say()
             warn("this PC is NOT tuned: the tuning failed (the reason is above); the model "
@@ -3696,7 +4061,7 @@ def main() -> int:
                      keep={"host": a.host, "api_key": a.api_key, "draft_vocab": a.draft_vocab,
                            "vram_reserve_mib": a.vram_reserve_mib, "open_browser": a.browser})
     if have and not (a.setup or a.model or a.family or a.check or a.no_start):
-        if not a.build:
+        if not a.build and any(not deepseek_config(p) for p in have):
             update_installed_engine(a.prebuilt)
         if len(have) == 1:
             return start(have[0], a.port, run_gpu, yes=a.yes, layer_split=a.layer_split,
@@ -3838,6 +4203,10 @@ def main() -> int:
     if a.check:
         say()
         for m, d in MODELS.items():
+            if "deepseek" in d.get("families", ()):
+                say("  DeepSeek: " + (deepseek_problem(gpu) or
+                    "Linux + NVIDIA; 128 GB RAM recommended; below 120 GiB not tested; 462 GB disk"))
+                continue
             verdict = "fits" if ram >= d["ram_gb"] else "tight" if ram >= d["ram_gb"] - 8 else "does not fit"
             if d.get("budget"):
                 verdict = (("EXPERIMENTAL, " if d.get("experimental") else "") +
@@ -3855,7 +4224,7 @@ def main() -> int:
 
     # ---- 2. the questions
     step(2, "your choices")
-    fams = list(FAMILIES)
+    fams = [f for f in FAMILIES if f != "deepseek" or deepseek_problem(gpu) is None]
     if a.family:
         family = a.family
     else:
@@ -3863,6 +4232,8 @@ def main() -> int:
             d = FAMILIES[f]
             say(f"  {i}) {d['title']:20s} {d['by']} - {d['about']}" + ("   [experimental]" if d.get("experimental") else ""))
         family = fams[int(ask("Which model?", [str(i) for i in range(1, len(fams) + 1)], "1", a.yes)) - 1]
+    if family == "deepseek":
+        return setup_deepseek(a, data, elsewhere, adopted)
     fam = FAMILIES[family]
     ok(f"model: {fam['title']}")
     if fam.get("license"):
