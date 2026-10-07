@@ -22,42 +22,51 @@ void ck(cudaError_t e, const char* what) {
 ExpertStream::ExpertStream(const Pack& pack, const HostExperts* host, uint8_t* ring, int slots, size_t slot_bytes,
                            int readers, int host_buffers, bool unbuffered)
     : pack_(pack), host_(host), ring_(ring), slots_(slots), n_host_(host_buffers), slot_bytes_(slot_bytes) {
-    if (slots < 1 || readers < 1 || host_buffers < 1)
-        throw std::invalid_argument("ds41 expert stream: needs a slot, a reader and a host buffer");
-    ck(cudaGetDevice(&device_), "cudaGetDevice");
-    const std::string path = pack.dir() + "/experts.bin";
-    if (unbuffered) {
-        fd_ = open(path.c_str(), O_RDONLY | O_DIRECT);
-        direct_ = fd_ >= 0;
-        if (!direct_) std::fprintf(stderr, "ds41 expert stream: %s refuses O_DIRECT; plain reads\n", path.c_str());
+    try {
+        if (slots < 1 || readers < 1 || host_buffers < 1)
+            throw std::invalid_argument("ds41 expert stream: needs a slot, a reader and a host buffer");
+        ck(cudaGetDevice(&device_), "cudaGetDevice");
+        const std::string path = pack.dir() + "/experts.bin";
+        if (unbuffered) {
+            fd_ = open(path.c_str(), O_RDONLY | O_DIRECT);
+            direct_ = fd_ >= 0;
+            if (!direct_) std::fprintf(stderr, "ds41 expert stream: %s refuses O_DIRECT; plain reads\n", path.c_str());
+        }
+        if (fd_ < 0) fd_ = open(path.c_str(), O_RDONLY);
+        if (fd_ < 0) throw std::runtime_error("ds41 expert stream: cannot open " + path);
+        ck(cudaStreamCreateWithFlags(&copy_, cudaStreamNonBlocking), "copy stream");
+        auto events = [&](std::vector<cudaEvent_t>& v, size_t n) {
+            v.resize(n);
+            for (auto& e : v) ck(cudaEventCreateWithFlags(&e, cudaEventDisableTiming), "event");
+        };
+        events(dma_done_, (size_t) n_host_);
+        events(copied_, (size_t) slots_);
+        events(used_, (size_t) slots_);
+        host_buf_.assign((size_t) n_host_, nullptr);
+        // an O_DIRECT window starts up to 4 KiB before the expert and ends up to 4 KiB after it
+        for (auto& b : host_buf_) ck(cudaHostAlloc((void**) &b, slot_bytes_ + 8192, cudaHostAllocDefault), "pinned staging");
+        for (int i = 0; i < readers; ++i) threads_.emplace_back([this] { reader(); });
+        threads_.emplace_back([this] { issuer(); });
+    } catch (...) {
+        cleanup();
+        throw;
     }
-    if (fd_ < 0) fd_ = open(path.c_str(), O_RDONLY);
-    if (fd_ < 0) throw std::runtime_error("ds41 expert stream: cannot open " + path);
-    ck(cudaStreamCreateWithFlags(&copy_, cudaStreamNonBlocking), "copy stream");
-    auto events = [&](std::vector<cudaEvent_t>& v, size_t n) {
-        v.resize(n);
-        for (auto& e : v) ck(cudaEventCreateWithFlags(&e, cudaEventDisableTiming), "event");
-    };
-    events(dma_done_, (size_t) n_host_);
-    events(copied_, (size_t) slots_);
-    events(used_, (size_t) slots_);
-    host_buf_.assign((size_t) n_host_, nullptr);
-    // an O_DIRECT window starts up to 4 KiB before the expert and ends up to 4 KiB after it
-    for (auto& b : host_buf_) ck(cudaHostAlloc((void**) &b, slot_bytes_ + 8192, cudaHostAllocDefault), "pinned staging");
-    for (int i = 0; i < readers; ++i) threads_.emplace_back([this] { reader(); });
-    threads_.emplace_back([this] { issuer(); });
 }
 
-ExpertStream::~ExpertStream() {
+ExpertStream::~ExpertStream() { cleanup(); }
+
+void ExpertStream::cleanup() noexcept {
     {
         std::lock_guard<std::mutex> lk(mu_);
         stop_ = true;
     }
     cv_.notify_all();
-    for (auto& t : threads_) t.join();
+    for (auto& t : threads_)
+        if (t.joinable()) t.join();
     if (copy_) cudaStreamSynchronize(copy_);
     for (auto* v : {&dma_done_, &copied_, &used_})
-        for (auto& e : *v) cudaEventDestroy(e);
+        for (auto& e : *v)
+            if (e) cudaEventDestroy(e);
     for (auto* b : host_buf_)
         if (b) cudaFreeHost(b);
     if (copy_) cudaStreamDestroy(copy_);
