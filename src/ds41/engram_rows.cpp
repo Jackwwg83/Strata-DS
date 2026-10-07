@@ -56,16 +56,24 @@ EngramRows::~EngramRows() {
 
 void EngramRows::read(const std::vector<const int64_t*>& ids, int n_rows, const std::vector<uint8_t*>& w_out,
                       const std::vector<uint8_t*>& s_out) {
+    prepare(ids, n_rows, w_out, s_out);
+    for (size_t t = 0; t < tables_.size(); ++t) submit(t);   // all reads are in flight together
+    for (size_t t = 0; t < tables_.size(); ++t) finish(t);
+}
+
+void EngramRows::prepare(const std::vector<const int64_t*>& ids, int n_rows, const std::vector<uint8_t*>& w_out,
+                         const std::vector<uint8_t*>& s_out) {
     if (failed_) throw std::runtime_error("EngramRows::read: failed state; create a new reader");
+    for (State s : state_)
+        if (s == State::kPrepared || s == State::kSubmitted)
+            throw std::logic_error("EngramRows::prepare: a table of the previous read is not finished");
     if (ids.size() != tables_.size() || w_out.size() != tables_.size() || s_out.size() != tables_.size() ||
         n_rows < 0 || n_rows > max_rows_)
         throw std::invalid_argument("EngramRows::read: bad arguments");
-    std::string err;
-    // every request of every table first, then the waits: all reads are in flight together
     reqs_.clear();
-    std::vector<size_t> first(tables_.size() + 1, 0);
+    first_.assign(tables_.size() + 1, 0);
     for (size_t t = 0; t < tables_.size(); ++t) {
-        first[t] = reqs_.size();
+        first_[t] = reqs_.size();
         for (int i = 0; i < n_rows; ++i) {
             const int64_t id = ids[t][i];
             if (id < 0) throw std::invalid_argument("EngramRows::read: negative row");
@@ -79,47 +87,75 @@ void EngramRows::read(const std::vector<const int64_t*>& ids, int n_rows, const 
                 s_out[t] + (size_t) i * scale_bytes_);
         }
     }
-    first[tables_.size()] = reqs_.size();
+    first_[tables_.size()] = reqs_.size();
+    state_.assign(tables_.size(), State::kPrepared);
+}
+
+void EngramRows::submit(size_t t) {
+    if (t >= tables_.size()) throw std::invalid_argument("EngramRows::submit: no such table");
+    if (state_.size() != tables_.size() || state_[t] != State::kPrepared)
+        throw std::logic_error("EngramRows::submit: table not prepared");
     // Any exception after submission poisons the reader. Destruction joins the I/O workers
     // before it frees their buffers. No later read can consume old completions.
     failed_ = true;
-    for (size_t t = 0; t < tables_.size(); ++t) {
-        if (!files_[t]) continue;
-        for (size_t r = first[t]; r < first[t + 1]; ++r)
+    std::string err;
+    if (files_[t])
+        for (size_t r = first_[t]; r < first_[t + 1]; ++r)
             if (!files_[t]->submit(reqs_[r].aligned, buf_ + r * kBlock, reqs_[r].length, r, err))
                 throw std::runtime_error("EngramRows: " + err);
-    }
-    for (size_t t = 0; t < tables_.size(); ++t) {
-        if (files_[t]) {
-            platform::Completion c[64];
-            size_t got = 0;
-            bool ok = true;
-            while (got < first[t + 1] - first[t]) {
-                const int n = files_[t]->wait(c, 64, -1);
-                for (int k = 0; k < n; ++k) {
-                    if (c[k].tag == platform::DirectFile::WAKE_TAG) continue;
-                    const Req& q = reqs_[c[k].tag];
-                    if (!c[k].ok || c[k].bytes < q.skip + q.bytes) ok = false;
-                    else std::memcpy(q.dst, buf_ + c[k].tag * kBlock + q.skip, q.bytes);
-                    ++got;
-                }
+    state_[t] = State::kSubmitted;
+    failed_ = false;
+}
+
+void EngramRows::finish(size_t t) {
+    if (t >= tables_.size()) throw std::invalid_argument("EngramRows::finish: no such table");
+    if (state_.size() != tables_.size() || state_[t] == State::kIdle || state_[t] == State::kFinished)
+        throw std::logic_error("EngramRows::finish: table not prepared");
+    if (state_[t] == State::kPrepared) submit(t);
+    failed_ = true;
+    if (files_[t]) {
+        platform::Completion c[64];
+        size_t got = 0;
+        bool ok = true;
+        while (got < first_[t + 1] - first_[t]) {
+            const int n = files_[t]->wait(c, 64, -1);
+            for (int k = 0; k < n; ++k) {
+                if (c[k].tag == platform::DirectFile::WAKE_TAG) continue;
+                const Req& q = reqs_[c[k].tag];
+                if (!c[k].ok || c[k].bytes < q.skip + q.bytes) ok = false;
+                else std::memcpy(q.dst, buf_ + c[k].tag * kBlock + q.skip, q.bytes);
+                ++got;
             }
-            if (!ok) throw std::runtime_error("EngramRows: a direct read failed: " + tables_[t].path);
-        } else {
-            // plain reads (through the file cache), in parallel: a row the cache does not hold is a random SSD read
-            const size_t n = first[t + 1] - first[t];
-            const size_t workers = std::min<size_t>(std::max<size_t>(n / 4, 1), 64);
-            std::atomic<bool> bad{false};
-            run_parallel(workers, [&](size_t w) {
-                for (size_t r = first[t] + w; r < first[t + 1]; r += workers) {
-                    const Req& q = reqs_[r];
-                    if (pread(fds_[t], q.dst, q.bytes, (off_t) (q.aligned + q.skip)) != (ssize_t) q.bytes) bad = true;
-                }
-            });
-            if (bad) throw std::runtime_error("EngramRows: a read failed: " + tables_[t].path);
         }
+        state_[t] = State::kFinished;   // every completion is in: nothing of this table is in flight any more
+        if (!ok) throw std::runtime_error("EngramRows: a direct read failed: " + tables_[t].path);
+    } else {
+        // plain reads (through the file cache), in parallel: a row the cache does not hold is a random SSD read
+        const size_t n = first_[t + 1] - first_[t];
+        const size_t workers = std::min<size_t>(std::max<size_t>(n / 4, 1), 64);
+        std::atomic<bool> bad{false};
+        run_parallel(workers, [&](size_t w) {
+            for (size_t r = first_[t] + w; r < first_[t + 1]; r += workers) {
+                const Req& q = reqs_[r];
+                if (pread(fds_[t], q.dst, q.bytes, (off_t) (q.aligned + q.skip)) != (ssize_t) q.bytes) bad = true;
+            }
+        });
+        state_[t] = State::kFinished;
+        if (bad) throw std::runtime_error("EngramRows: a read failed: " + tables_[t].path);
     }
     failed_ = false;
+}
+
+void EngramRows::abandon() noexcept {
+    for (size_t t = 0; t < state_.size(); ++t) {
+        if (state_[t] == State::kSubmitted) {
+            try {
+                finish(t);   // the reads in flight write into buf_ and the caller's outputs: wait for them
+            } catch (...) {
+            }
+        }
+        state_[t] = State::kIdle;
+    }
 }
 
 }  // namespace strata::ds41
