@@ -259,6 +259,7 @@ struct Engine::Impl {
     // leaves the KV caches and the history out of step: every later call is refused
     bool broken = false;
     bool pf_started = false;           // the running prefill has begun changing the state
+    int file_trace = [] { const char* v = std::getenv("DS41_FILE_TRACE"); return v ? std::atoi(v) : 0; }();
     PrefillProgress progress;          // prefill progress (set_prefill_progress); a false return cancels
     // snapshot slots: the window rings of all layers, then the compressor states of the kv sources with ratio > 1
     struct Snapshot { int pos = -1; bf16* win = nullptr; float* comp = nullptr; };
@@ -585,8 +586,14 @@ struct Engine::Impl {
                     const int32_t e = db->ids()[i];
                     if (e < 0) continue;
                     ++misses;
-                    if (host && host->slot_of(l, e) >= 0) { ++worker_ram; continue; }
+                    if (host && host->in_memory(l, e)) { ++worker_ram; continue; }
                     ++worker_file;
+                    if (file_trace > 0) {   // DS41_FILE_TRACE=N: the first N CPU experts read from the file
+                        --file_trace;
+                        std::fprintf(stderr, "ds41 file expert: layer %d expert %d vram %d ram %d step pos %d\n", l, e,
+                                     vram ? vram->res_host()[(size_t) l * kExperts + e] : -2,
+                                     host ? host->slot_of(l, e) : -2, (int) history.size() - 1);
+                    }
                     file_ids[n_file++] = e;
                     if (file_pages_missing(l, e)) {
                         ++worker_ssd;

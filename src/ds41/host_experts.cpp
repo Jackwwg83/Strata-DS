@@ -226,7 +226,15 @@ void HostExperts::publish_descriptor(int layer, int expert, int slot) {
     ck(cudaStreamSynchronize(nullptr), "descriptor publication");
 }
 
+void HostExperts::point_to(int layer, int expert, const uint8_t* bytes) {
+    publish_descriptor(layer, expert, -1);
+    point(layer, expert, bytes);
+    if (held_.empty()) held_.assign(slot_.size(), 0);
+    held_[(size_t) layer * n_experts_ + expert] = 1;
+}
+
 void HostExperts::point_to_file(int layer, int expert) {
+    if (!held_.empty()) held_[(size_t) layer * n_experts_ + expert] = 0;
     publish_descriptor(layer, expert, -1);
     point(layer, expert, pack_.expert_base() + pack_.expert(layer, expert).offset);
     // Read from the file now. Keep its slot reserved until assign().
@@ -241,6 +249,7 @@ void HostExperts::assign(int slot, int layer, int expert) {
     publish_descriptor(ol, oe, -1);
     publish_residency(slot_[(size_t) ol * n_experts_ + oe], -1);
     holder_[slot] = {layer, expert};
+    if (!held_.empty()) held_[(size_t) layer * n_experts_ + expert] = 0;
     publish_residency(slot_[(size_t) layer * n_experts_ + expert], slot);
     point(layer, expert, slot_ptr(slot));
     publish_descriptor(layer, expert, slot);

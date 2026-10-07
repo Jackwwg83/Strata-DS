@@ -9,8 +9,8 @@
 //
 // The adaptive tier (upstream src/program/generate.cpp, adapt()) makes the slots follow the conversation: decayed
 // routing counts per (layer, expert); every few steps, per layer, the most-routed missing experts replace the
-// least-routed resident ones when they were routed clearly more often. An evicted expert leaves the table at once
-// (the CPU computes it); the new one enters once its copy has landed. The copies run on their own thread and
+// least-routed resident ones when they were routed clearly more often. With a RAM tier a swap runs in three copies
+// switched in between steps (copy_worker), so the CPU never reads a swapped expert from the file. The copies run on their own thread and
 // stream, because the pack is mmap'ed (pageable) and a pageable copy holds the calling thread. A swap needs the new
 // expert to fit the old one's slot (upstream swaps only within a layer, whose experts have one size there; here a
 // layer mixes sizes, so the plan checks it).
@@ -118,8 +118,10 @@ private:
         int32_t layer, in, out;
         int32_t vram_slot;   ///< the slot `out` leaves and `in` takes
         int32_t ram_slot;    ///< `in`'s RAM slot, which `out` takes; -1: `in` came from the file
+        size_t staged;       ///< offset of `out` in the swap buffer (with a RAM slot)
     };
-    void copy_worker(std::vector<Pending> work);
+    void copy_worker(std::vector<Pending> work, int phase);
+    void start_phase(int phase);
 
     const Pack& pack_;
     Adapt adapt_;
@@ -141,8 +143,10 @@ private:
     std::atomic<bool> copies_done_{false};
     bool copy_error_ = false;
     std::vector<Pending> pending_;     ///< swaps in flight
+    int phase_ = 0;                    ///< 0: none in flight; 1, 2, 3: the copy running (see copy_worker)
     HostExperts* host_ = nullptr;
-    uint8_t* staging_ = nullptr;       ///< pinned, one slot: `out` on its way from VRAM to RAM
+    uint8_t* staging_ = nullptr;       ///< pinned swap buffer: the evicted experts on their way from VRAM to RAM
+    size_t staging_bytes_ = 0;
     int lent_ = 0;                     ///< slots lent to prefill: the last lent_ slots
     std::vector<std::pair<int, int>> lent_owner_;   ///< (layer, expert) of each lent slot, -1 for an empty slot
 };
