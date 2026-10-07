@@ -1,6 +1,7 @@
 // src/ds41/tests/k15_hc_prefill_test.cu - task K15 acceptance: parity with ops::hc_mixes + ops::hc_pre for every
 // token (as K7's test), then speed on a 4096-token sub-batch. Fixed by ds41/tasks/K15.md.
 #include "bench_util.hpp"
+#include "test_validation.hpp"
 
 #include "strata/ds41/config.hpp"
 #include "strata/ds41/kernels/k15_hc_prefill.hpp"
@@ -37,7 +38,7 @@ int main() {
         const auto gy = y.down(), wy = ry.down();
         double worst = 0;   // per token: one bad token must not hide in the average
         for (int t = 0; t < m; ++t)
-            worst = std::max(worst, rel_l2(std::vector<__nv_bfloat16>(gy.begin() + (size_t) t * sd::kDim,
+            worst = max_error(worst, rel_l2(std::vector<__nv_bfloat16>(gy.begin() + (size_t) t * sd::kDim,
                                                                       gy.begin() + (size_t) (t + 1) * sd::kDim),
                                            std::vector<__nv_bfloat16>(wy.begin() + (size_t) t * sd::kDim,
                                                                       wy.begin() + (size_t) (t + 1) * sd::kDim)));

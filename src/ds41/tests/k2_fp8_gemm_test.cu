@@ -1,6 +1,7 @@
 // src/ds41/tests/k2_fp8_gemm_test.cu - task K2 acceptance: sampled rows against ops::fp8_linear, then speed.
 // Fixed by the task spec (ds41/tasks/K2.md); implementations may not change it.
 #include "bench_util.hpp"
+#include "test_validation.hpp"
 
 #include "strata/ds41/kernels/k2_fp8_gemm.hpp"
 #include "strata/ds41/ops.hpp"
@@ -45,7 +46,7 @@ int main() {
             sd::ops::fp8_linear(x.p + r * s.K, s.K, w.p, ws.p, s.N, ry.p, act.p);
             const auto rr = ry.down();
             std::vector<__nv_bfloat16> got(yh.begin() + r * s.N, yh.begin() + (r + 1) * s.N);
-            worst = std::max(worst, rel_l2(got, rr));
+            worst = max_error(worst, rel_l2(got, rr));
         }
         const double us = median_us([&] { sd::kernels::fp8_block_gemm(x.p, s.M, s.K, w.p, ws.p, s.N, y.p, work.p, 0); },
                                     s.M >= 512 ? 5 : 15);
