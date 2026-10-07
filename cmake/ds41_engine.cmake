@@ -7,6 +7,7 @@ add_library(strata_ds41_engine STATIC
   src/ds41/prefill_ops.cu
   src/ds41/doorbell.cu
   src/ds41/expert_staging.cu
+  src/ds41/expert_prefetch.cu
   src/ds41/vram_experts.cu
   src/ds41/engram_rows.cpp
   src/ds41/host_experts.cpp
@@ -58,6 +59,12 @@ if(STRATA_BUILD_TESTS)
   target_link_libraries(doorbell_test PRIVATE strata_ds41_engine)
   add_test(NAME doorbell_test COMMAND doorbell_test)
   set_tests_properties(doorbell_test PROPERTIES SKIP_RETURN_CODE 77 TIMEOUT 300)
+  # run_parallel: every part once, also when a thread cannot start
+  add_executable(parallel_test src/ds41/tests/parallel_test.cpp)
+  target_include_directories(parallel_test PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/include)
+  target_compile_features(parallel_test PRIVATE cxx_std_17)
+  target_link_libraries(parallel_test PRIVATE Threads::Threads)
+  add_test(NAME parallel_test COMMAND parallel_test)
   # ds41_serve's line protocol on the host
   add_executable(serve_request_test src/ds41/tests/serve_request_test.cpp)
   target_include_directories(serve_request_test PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/include)
@@ -93,6 +100,14 @@ if(STRATA_BUILD_TESTS)
   target_link_libraries(prefill_ops_test PRIVATE strata_ds41_engine)
   add_test(NAME prefill_ops_test COMMAND prefill_ops_test)
   set_tests_properties(prefill_ops_test PROPERTIES SKIP_RETURN_CODE 77 TIMEOUT 300)
+  add_executable(expert_prefetch_test src/ds41/tests/expert_prefetch_test.cu)
+  target_link_libraries(expert_prefetch_test PRIVATE strata_ds41_engine)
+  add_test(NAME expert_prefetch_test COMMAND expert_prefetch_test)
+  set_tests_properties(expert_prefetch_test PROPERTIES SKIP_RETURN_CODE 77 TIMEOUT 300)
+  add_executable(vram_swap_test src/ds41/tests/vram_swap_test.cu)
+  target_link_libraries(vram_swap_test PRIVATE strata_ds41_engine)
+  add_test(NAME vram_swap_test COMMAND vram_swap_test)
+  set_tests_properties(vram_swap_test PROPERTIES SKIP_RETURN_CODE 77 TIMEOUT 300)
   add_executable(vram_lend_test src/ds41/tests/vram_lend_test.cu)
   target_link_libraries(vram_lend_test PRIVATE strata_ds41_engine)
   add_test(NAME vram_lend_test COMMAND vram_lend_test)

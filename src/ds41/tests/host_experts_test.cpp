@@ -7,7 +7,11 @@
 #include "fake_pack.hpp"
 
 #include <cstdio>
+#include <cstdlib>
 #include <cstring>
+
+#include <fcntl.h>
+#include <unistd.h>
 #include <fstream>
 #include <string>
 
@@ -53,6 +57,25 @@ int main() {
         const std::vector<int32_t> res((size_t) ds41test::L * ds41test::E, -1);
         uint64_t want = 0;
         for (int i = 0; i < 20; ++i) want += pack.expert(ranked[i].first, ranked[i].second).bytes;
+        // the fill reads the slots with O_DIRECT where the file system allows it (as the expert stream does), else it
+        // copies from the mapped pack (DS41_FILL_DIRECT=0 forces that path); both must give the same bytes
+        for (const char* direct : {"0", "1"}) {
+            setenv("DS41_FILL_DIRECT", direct, 1);
+            HostExperts h(pack, ranked, res, want, {}, 2);
+            const int fd = open((dir + "/experts.bin").c_str(), O_RDONLY | O_DIRECT);
+            const bool can = fd >= 0;
+            if (fd >= 0) close(fd);
+            check(h.filled_direct() == (direct[0] == '1' && can),
+                  std::string("DS41_FILL_DIRECT=") + direct + ": O_DIRECT fill " + (h.filled_direct() ? "on" : "off"));
+            bool same = h.slots() == 20;
+            for (int i = 0; i < h.slots(); ++i) {
+                const ExpertSlot& x = pack.expert(ranked[i].first, ranked[i].second);
+                same &= std::memcmp(h.slot_ptr(h.slot_of(ranked[i].first, ranked[i].second)),
+                                    pack.expert_base() + x.offset, x.bytes) == 0;
+            }
+            check(same, std::string("DS41_FILL_DIRECT=") + direct + ": every slot holds its expert's bytes");
+        }
+        unsetenv("DS41_FILL_DIRECT");
         HostExperts host(pack, ranked, res, want, {}, 2);
         check(host.slots() == 20, "the budget of the first 20 experts' bytes holds 20 of them, got " +
                                       std::to_string(host.slots()));

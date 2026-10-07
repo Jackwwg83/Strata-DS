@@ -162,11 +162,20 @@ The source is `vcruz305/DSV4.1-Flash-SAGE-EXL3-1.59bpw`, pinned to
 - Context choices: 8K, 32K, 64K, 128K and 256K. Default: 32K. No RoPE extension.
 - No images, Qwen draft layer, speed projection, KV tuning or multi-GPU layer split in this installer path.
 
-Measured on Linux, RTX 4090 (24 GB), 119.9 GiB usable RAM (a 128 GB PC): 24-29 tokens/s decode on code text and
-15-20 tokens/s in chat requests through the server; 1,100-1,260 tokens/s prompt at 32K-128K; 967 tokens/s prompt at
-256K. Packing experts took about 100 seconds
-on a fast NVMe. The pack writes dense.bin (10.6 GB) and experts.bin (108.9 GB).
-The engine also builds and passes its tests on sm_86 (RTX 3060), but that PC had too little RAM for the model.
+Measured on Linux with 119.9-120.6 GiB of usable RAM (a 128 GB PC), SAGE 1.59bpw, 2026-10-07 (raw data:
+[ds41/bench/results/2026-10-07-decode-5090](../ds41/bench/results/2026-10-07-decode-5090)):
+
+| GPU (PCIe) | CPU | Writes answers | Notes |
+| --- | --- | ---: | --- |
+| RTX 5090 32 GB (5.0 x16) | Threadripper PRO 7965WX | 26-32 tokens/s | four chats; the rented disk's slow random reads cost 6-13 ms per token in Engram reads, which a local NVMe SSD should mostly save |
+| RTX 3090 24 GB (4.0 x16) | EPYC 7D12 | 16-17 tokens/s | a coding chat; the copies of experts over PCIe 4.0 are the limit |
+
+A 2000-token prompt took 13.4 s on the RTX 3090 PC (its disk reads ~56,000 random 4 KiB blocks per s at depth 64;
+Engram rows are such reads); a short new part of a chat is read in under a second. The model loads in about one
+minute (an SSD that reads 5 GB/s). Earlier runs on a PC with 1 TB of RAM (everything in the file cache, so not a 128 GB
+PC) read long prompts at 1,100-1,260 tokens/s at 32K-128K and 967 tokens/s at 256K. Packing took 3-8 minutes; the
+pack writes dense.bin (10.6 GB) and experts.bin (108.9 GB).
+The model ran on sm_86 (RTX 3090) and sm_120 (RTX 5090).
 Windows, AMD, GPUs under 24 GB and lower RAM configurations are not tested for model inference.
 
 ```sh

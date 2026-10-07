@@ -11,6 +11,7 @@
 #include "strata/ds41/config.hpp"
 #include "strata/ds41/doorbell.hpp"
 #include "strata/ds41/engram_rows.hpp"
+#include "strata/ds41/expert_prefetch.hpp"
 #include "strata/ds41/expert_stream.hpp"
 #include "strata/ds41/host_experts.hpp"
 #include "strata/ds41/lookahead.hpp"
@@ -165,6 +166,8 @@ struct Engine::Impl {
     std::shared_ptr<void> zc_workspace; // used when there is no VRAM tier
     std::unique_ptr<ExpertStaging> zc_stage;
     std::shared_ptr<ExpertBlob> zc_blobs; // immutable [layers][experts] pack metadata
+    std::unique_ptr<ExpertPrefetch> prefetch;   // DS41_PREFETCH=N: the next layer's N guessed experts, copied ahead
+    std::atomic<int> worker_prefetched{0};
     int32_t* routes_dev = nullptr;     // [40][6]
     float* weights_dev = nullptr;      // [40][6]
     uint8_t* cand_dev = nullptr;       // [max_seq] candidate mask of the candidate layer
@@ -259,7 +262,40 @@ struct Engine::Impl {
     // leaves the KV caches and the history out of step: every later call is refused
     bool broken = false;
     bool pf_started = false;           // the running prefill has begun changing the state
+    int file_trace = [] { const char* v = std::getenv("DS41_FILE_TRACE"); return v ? std::atoi(v) : 0; }();
+    // DS41_PREDICT_STATS=1: how well layer l+1's router on layer l's expert input predicts layer l+1's experts (the
+    // basis of a prefetch). Recall of all routed experts and of the misses (not in VRAM), with 6, 9 and 12 guesses.
+    static constexpr int kPredK = 12;
+    bool pred_stats = [] { const char* v = std::getenv("DS41_PREDICT_STATS"); return v && v[0] == '1'; }();
+    std::vector<int32_t> pred_ids = std::vector<int32_t>(kLayers * kPredK, -1);
+    int64_t pred_all[3] = {}, pred_miss[3] = {}, pred_n_all = 0, pred_n_miss = 0;
+    void predict_tally() {
+        static constexpr int ks[3] = {6, 9, 12};
+        for (int l = 1; l < kLayers; ++l)
+            for (int i = 0; i < kTopK; ++i) {
+                const int32_t e = routes_pinned[l * kTopK + i];
+                const bool miss = !vram || vram->res_host()[(size_t) l * kExperts + e] < 0;
+                ++pred_n_all;
+                pred_n_miss += miss;
+                for (int k = 0; k < 3; ++k) {
+                    const int32_t* p = pred_ids.data() + l * kPredK;
+                    const bool found = std::find(p, p + ks[k], e) != p + ks[k];
+                    pred_all[k] += found;
+                    pred_miss[k] += found && miss;
+                }
+            }
+        if (pred_n_all && pred_n_all % (kTopK * (kLayers - 1) * 64) == 0)
+            std::fprintf(stderr, "ds41 predict: recall all %.3f %.3f %.3f, misses %.3f %.3f %.3f (6 / 9 / 12 guesses, "
+                                 "%lld uses)\n", pred_all[0] / (double) pred_n_all, pred_all[1] / (double) pred_n_all,
+                         pred_all[2] / (double) pred_n_all, pred_miss[0] / (double) std::max<int64_t>(1, pred_n_miss),
+                         pred_miss[1] / (double) std::max<int64_t>(1, pred_n_miss),
+                         pred_miss[2] / (double) std::max<int64_t>(1, pred_n_miss), (long long) pred_n_all);
+    }
     PrefillProgress progress;          // prefill progress (set_prefill_progress); a false return cancels
+    // snapshot slots: the window rings of all layers, then the compressor states of the kv sources with ratio > 1
+    struct Snapshot { int pos = -1; bf16* win = nullptr; float* comp = nullptr; };
+    std::vector<Snapshot> snaps;
+    size_t snap_comp_floats = 0;
     std::exception_ptr worker_error;   // set by the CPU worker; rethrown by the step that ran into it
     void usable() const {
         if (broken) throw std::runtime_error("ds41 engine: unusable after an earlier failure; create a new Engine");
@@ -361,7 +397,9 @@ struct Engine::Impl {
             std::vector<EngramRows::Table> tabs;
             for (const auto& t : pack.engram_tables()) tabs.push_back({t.path, t.weight_offset, t.scale_offset});
             n_eng = (int) tabs.size();
-            if (n_eng) eng_rows = std::make_unique<EngramRows>(tabs, kEngRows);
+            // every request of a step in flight at once: 24 rows x (weight, scale) per table, one thread each (on a disk
+            // with 0.6 ms random-read latency, 16 threads made it 5.9 ms per token)
+            if (n_eng) eng_rows = std::make_unique<EngramRows>(tabs, kEngRows, 256, 8, 2 * kEngRows);   // per table
             eng_ids.assign(n_eng, std::vector<int64_t>(kEngRows, 0));
         }
         const size_t eng_bytes = (size_t) n_eng * kEngRows * (256 + 8);
@@ -413,6 +451,7 @@ struct Engine::Impl {
         weights_dev = dalloc_own<float>(kLayers * kTopK);
         cand_dev = dalloc_own<uint8_t>(max_seq + 1);
         history.reserve(max_seq);
+        alloc_snapshots();   // before the VRAM tier sizes itself from the free memory
         db = std::make_unique<ExpertDoorbell>(1, kTopK, kDim);
         gpu_sel = dalloc_own<int32_t>(kTopK);
         // decode stream, graph staging, outputs
@@ -454,6 +493,16 @@ struct Engine::Impl {
             ck(cudaStreamSynchronize(nullptr), "staging initialization");
             std::fprintf(stderr, "ds41: zero-copy staging %d slots x %zu bytes (pack max %zu)\n",
                          kTopK, zc_stage->stride(), largest);
+            // the prefetch buffers before the VRAM tier takes the free memory (DS41_PREFETCH_MB per layer parity)
+            const char* pf_env = std::getenv("DS41_PREFETCH");
+            const int guesses = pf_env ? std::atoi(pf_env) : 0;
+            if (guesses > 0) {
+                const char* mb_env = std::getenv("DS41_PREFETCH_MB");
+                const size_t mb = mb_env ? (size_t) std::atoi(mb_env) : 96;
+                prefetch = std::make_unique<ExpertPrefetch>(std::min(guesses, ExpertPrefetch::kMaxGuesses),
+                                                            std::max<size_t>(mb, 1) << 20, kExperts, kDim);
+                std::fprintf(stderr, "ds41: prefetch %d guesses per layer, 2 x %zu MiB\n", prefetch->guesses(), mb);
+            }
         }
         // the VRAM expert tier last: an automatic slot count takes what the rest left free
         if (!opt.expert_profile.empty() && opt.vram_expert_slots != 0) {
@@ -569,6 +618,8 @@ struct Engine::Impl {
             for (int l = 0; l < kLayers; ++l) {
                 if (!db->wait_published(l + 1, stop)) return;
                 if (lookahead) lookahead->post(l, db->x());   // predict layer l+1 while this layer computes
+                if (lookahead && pred_stats && l + 1 < kLayers)   // DS41_PREDICT_STATS: layer l+1's top 12 from x_l
+                    lookahead->predict_now(l + 1, (const uint16_t*) db->x(), kPredK, pred_ids.data() + (l + 1) * kPredK);
                 c10::Half wh[kTopK];
                 for (int i = 0; i < kTopK; ++i) {
                     const __half hv = __float2half_rn(db->w()[i]);
@@ -580,8 +631,14 @@ struct Engine::Impl {
                     const int32_t e = db->ids()[i];
                     if (e < 0) continue;
                     ++misses;
-                    if (host && host->slot_of(l, e) >= 0) { ++worker_ram; continue; }
+                    if (host && host->in_memory(l, e)) { ++worker_ram; continue; }
                     ++worker_file;
+                    if (file_trace > 0) {   // DS41_FILE_TRACE=N: the first N CPU experts read from the file
+                        --file_trace;
+                        std::fprintf(stderr, "ds41 file expert: layer %d expert %d vram %d ram %d step pos %d\n", l, e,
+                                     vram ? vram->res_host()[(size_t) l * kExperts + e] : -2,
+                                     host ? host->slot_of(l, e) : -2, (int) history.size() - 1);
+                    }
                     file_ids[n_file++] = e;
                     if (file_pages_missing(l, e)) {
                         ++worker_ssd;
@@ -592,7 +649,8 @@ struct Engine::Impl {
                 }
                 if (lookahead) lookahead->observe(l, file_ids, n_file);
                 // Keep expert_hits as VRAM hits. Timing derives CPU and zero-copy counts from the partition.
-                worker_misses += misses + db->counts().zero_copy;
+                worker_misses += misses + db->counts().zero_copy + db->counts().prefetched;
+                worker_prefetched += db->counts().prefetched;
                 const double t0 = now_ms();
                 try {
                     if (fault("worker")) throw std::runtime_error("ds41 test fault: CPU expert worker");
@@ -777,13 +835,24 @@ struct Engine::Impl {
         ops::to_half_fp8q(xf, x_half_dev, kDim, st);
         const bool tier = vram && vram->slots() > 0;
         const auto* ram = host && host->experts_dev() ? host->experts_dev() + (size_t) l * kExperts : nullptr;
+        // prefetch: layer l's guesses were planned and copied during layer l - 1 (none for layer 0)
+        const bool pf = prefetch && ram && zc_blobs;
         db->publish(x_half_dev, ids, w, 1, tier ? vram->res_dev() + (size_t) l * kExperts : nullptr, gpu_sel,
                     (uint32_t) (l + 1), st, tier ? vram->experts_dev() : nullptr, ram,
                     zc_quota ? zc_quota.get() + l : nullptr,
-                    ram ? zc_stage.get() : nullptr, ram && zc_blobs ? zc_blobs.get() + (size_t) l * kExperts : nullptr);
+                    ram ? zc_stage.get() : nullptr, ram && zc_blobs ? zc_blobs.get() + (size_t) l * kExperts : nullptr,
+                    pf && l > 0 ? prefetch->ids(l) : nullptr, pf && l > 0 ? prefetch->descs(l) : nullptr,
+                    pf ? prefetch->guesses() : 0);
+        // layer l + 1's guesses from this layer's expert input; their copy starts after this layer's own copies
+        if (pf && l + 1 < kLayers)
+            prefetch->plan(l + 1, xf, L[l + 1].gate_w, L[l + 1].gate_bias,
+                           tier ? vram->res_dev() + (size_t) (l + 1) * kExperts : nullptr,
+                           host->experts_dev() + (size_t) (l + 1) * kExperts,
+                           zc_blobs.get() + (size_t) (l + 1) * kExperts, st);
         const bool staged = ram && zc_stage;
         if (staged) zc_stage->fork_copy(st);
         ck(cudaMemsetAsync(routed, 0, kDim * sizeof(float), st), "routed");
+        if (pf && l > 0) prefetch->join(l, st);   // the GPU computes the prefetched experts below
         if (!staged && (tier || ram))
             kernels::exl3_moe_decode((const __half*) x_half_dev, 1, gpu_sel, w, kTopK, db->gpu_experts(), routed,
                                      vram ? vram->workspace() : zc_workspace.get(), VramExperts::kWorkspaceBytes, st);
@@ -797,6 +866,7 @@ struct Engine::Impl {
             kernels::exl3_moe_decode((const __half*) x_half_dev, 1, gpu_sel, w, kTopK, db->gpu_experts(), routed,
                                      vram ? vram->workspace() : zc_workspace.get(), VramExperts::kWorkspaceBytes, st);
         }
+        if (pf && l + 1 < kLayers) prefetch->copy(l + 1, st);
         db->wait_add(routed, 1, (uint32_t) (l + 1), st);
         ops::add_f32_bf16(routed, sh_out, ffn_out, kDim, st);
     }
@@ -816,7 +886,7 @@ struct Engine::Impl {
     static constexpr int kEngBatch = 256;     ///< tokens per engram read (its O_DIRECT buffers: 16 KiB per row)
     /// engram reads in flight per table: the rows are small random reads, an NVMe needs a deep queue. Measured on
     /// the 7950X + 4090 box, 32K prompt: 16 (the decode default) 14.9 s of GPU wait, 64 2.6 s (1,148 tok/s).
-    static constexpr int kEngIoThreads = 64;
+    static constexpr int kEngIoThreads = 128;   ///< per table; both tables read at once
 
     /// DS41_PF_PROFILE=1: the GPU time of prefill by phase, printed at its end. Events in stream order; the time
     /// between two marks goes to the phase of the first one, so host waits (the routes' sort, expert copies not yet
@@ -1350,44 +1420,61 @@ struct Engine::Impl {
     /// table t is in the buffer (or carries the read error).
     void engram_pass(int S, int p0, std::vector<std::promise<void>>& done, double& ms) {
         const double t0 = now_ms();
-        size_t t = 0;
+        const size_t eng_table = (size_t) pf.cap * kEngRows * (256 + 8);
+        // the rows of each table first (cheap), then both tables' reads at once, each on its reader's threads: the
+        // reads are random 4 KiB ones, so the depth of the queue sets the speed
+        std::vector<std::vector<int64_t>> uniq(done.size());
+        std::vector<std::thread> readers;
+        std::vector<char> started(done.size(), 0);
         try {
             const auto& hs = pack.engram_hash();
             const int cols = (hs.max_ngram - 1) * hs.n_heads;
             if (cols != kEngRows) throw std::runtime_error("engram: the prefill buffers assume 24 rows per token");
-            const size_t eng_table = (size_t) pf.cap * kEngRows * (256 + 8);
+            size_t t = 0;
             for (int l = 0; l < kLayers; ++l) {
                 if (!is_engram_layer(l)) continue;
-                const int li = (int) t;
+                const int li = (int) t++;
                 std::vector<int64_t>& all = eng_ids_pf[li];
                 for (int i = 0; i < S; ++i) {
                     engram_ids(l, li, p0 + i);
                     std::copy(eng_ids[li].begin(), eng_ids[li].begin() + cols, all.begin() + (size_t) i * cols);
                 }
-                const size_t n = (size_t) S * cols;
-                std::vector<int64_t> uniq(all.begin(), all.begin() + n);
-                std::sort(uniq.begin(), uniq.end());
-                uniq.erase(std::unique(uniq.begin(), uniq.end()), uniq.end());
-                std::vector<uint8_t> uw(uniq.size() * 256), us(uniq.size() * 8);
-                const size_t batch = (size_t) kEngBatch * kEngRows;
-                for (size_t r = 0; r < uniq.size(); r += batch)
-                    eng_rows_pf[li]->read({uniq.data() + r}, (int) std::min(batch, uniq.size() - r), {uw.data() + r * 256},
-                                          {us.data() + r * 8});
-                uint8_t* w = pfh.eng + (size_t) li * eng_table;
-                uint8_t* sc = w + (size_t) pf.cap * kEngRows * 256;
-                for (size_t i = 0; i < n; ++i) {
-                    const size_t u = (size_t) (std::lower_bound(uniq.begin(), uniq.end(), all[i]) - uniq.begin());
-                    std::memcpy(w + i * 256, uw.data() + u * 256, 256);
-                    std::memcpy(sc + i * 8, us.data() + u * 8, 8);
-                }
-                ptm->engram_rows += (int64_t) n;
-                ptm->engram_unique += (int64_t) uniq.size();
-                done[li].set_value();
-                ++t;
+                std::vector<int64_t>& u = uniq[li];
+                u.assign(all.begin(), all.begin() + (size_t) S * cols);
+                std::sort(u.begin(), u.end());
+                u.erase(std::unique(u.begin(), u.end()), u.end());
+                ptm->engram_rows += (int64_t) S * cols;
+                ptm->engram_unique += (int64_t) u.size();
+            }
+            for (size_t li = 0; li < done.size(); ++li) {
+                readers.emplace_back([&, li, cols] {
+                    try {
+                        const std::vector<int64_t>& u = uniq[li];
+                        const std::vector<int64_t>& all = eng_ids_pf[li];
+                        std::vector<uint8_t> uw(u.size() * 256), us(u.size() * 8);
+                        const size_t batch = (size_t) kEngBatch * kEngRows;
+                        for (size_t r = 0; r < u.size(); r += batch)
+                            eng_rows_pf[li]->read({u.data() + r}, (int) std::min(batch, u.size() - r),
+                                                  {uw.data() + r * 256}, {us.data() + r * 8});
+                        uint8_t* w = pfh.eng + li * eng_table;
+                        uint8_t* sc = w + (size_t) pf.cap * kEngRows * 256;
+                        for (size_t i = 0; i < (size_t) S * cols; ++i) {
+                            const size_t k = (size_t) (std::lower_bound(u.begin(), u.end(), all[i]) - u.begin());
+                            std::memcpy(w + i * 256, uw.data() + k * 256, 256);
+                            std::memcpy(sc + i * 8, us.data() + k * 8, 8);
+                        }
+                        done[li].set_value();
+                    } catch (...) {
+                        done[li].set_exception(std::current_exception());
+                    }
+                });
+                started[li] = 1;
             }
         } catch (...) {
-            for (; t < done.size(); ++t) done[t].set_exception(std::current_exception());
+            for (size_t li = 0; li < done.size(); ++li)
+                if (!started[li]) done[li].set_exception(std::current_exception());
         }
+        for (auto& r : readers) r.join();
         ms = now_ms() - t0;
     }
 
@@ -1658,6 +1745,65 @@ struct Engine::Impl {
         verify_pending = verify_failed = false;
     }
 
+    void alloc_snapshots() {
+        snap_comp_floats = 0;
+        for (auto& y : L)
+            if (y.kv_state) snap_comp_floats += 2 * (size_t) y.ratio * kHeadDim;
+        snaps.resize(std::max(0, opt.snapshots));
+        for (auto& sn : snaps) {
+            sn.win = dalloc_own<bf16>((size_t) kLayers * kWindow * kHeadDim);
+            sn.comp = dalloc_own<float>(std::max<size_t>(1, snap_comp_floats));
+        }
+    }
+
+    Snapshot& snapshot_slot(int slot) {
+        if (slot < 0 || slot >= (int) snaps.size())
+            throw std::invalid_argument("ds41 snapshot: slot " + std::to_string(slot) + " does not exist");
+        return snaps[slot];
+    }
+
+    /// Copies the window rings and compressor states between the layers and a slot (to_slot: save). The device is
+    /// idle between calls (each step ends in a sync, a prefill in prefill_end's), so one stream and one sync suffice.
+    void snapshot_copy(Snapshot& sn, bool to_slot) {
+        const size_t win = (size_t) kWindow * kHeadDim * sizeof(bf16);
+        size_t c = 0;
+        for (int l = 0; l < kLayers; ++l) {
+            auto& y = L[l];
+            uint8_t* slot_win = (uint8_t*) sn.win + (size_t) l * win;
+            ck(cudaMemcpyAsync(to_slot ? (void*) slot_win : (void*) y.window, to_slot ? (void*) y.window : (void*) slot_win,
+                               win, cudaMemcpyDeviceToDevice, st), "snapshot window");
+            if (!y.kv_state) continue;
+            const size_t n = (size_t) y.ratio * kHeadDim;
+            for (float* state : {y.kv_state, y.score_state}) {
+                ck(cudaMemcpyAsync(to_slot ? sn.comp + c : state, to_slot ? state : sn.comp + c, n * sizeof(float),
+                                   cudaMemcpyDeviceToDevice, st), "snapshot compressor");
+                c += n;
+            }
+        }
+        ck(cudaStreamSynchronize(st), "snapshot");
+    }
+
+    void save_snapshot(int slot) {
+        usable();
+        if (verify_pending) throw std::logic_error("commit the pending verify window first");
+        Snapshot& sn = snapshot_slot(slot);
+        sn.pos = -1;   // a failed copy leaves the slot empty
+        snapshot_copy(sn, true);
+        sn.pos = (int) history.size();
+    }
+
+    int restore_snapshot(int slot) {
+        usable();
+        Snapshot& sn = snapshot_slot(slot);
+        if (sn.pos < 0) throw std::logic_error("ds41 snapshot: slot " + std::to_string(slot) + " is empty");
+        if (sn.pos > (int) history.size())
+            throw std::logic_error("ds41 snapshot: slot " + std::to_string(slot) + " is past the current position");
+        verify_pending = verify_failed = false;
+        snapshot_copy(sn, false);
+        history.resize(sn.pos);
+        return sn.pos;
+    }
+
     int step(int token, int pos, StepDump* dump, Timing& tm) {
         usable();
         check_token(token);
@@ -1692,6 +1838,7 @@ struct Engine::Impl {
         worker_us = 0;
         worker_misses = 0;
         worker_ram = worker_file = worker_ssd = 0;
+        worker_prefetched = 0;
         {
             std::lock_guard<std::mutex> lk(mu);
             ++go;
@@ -1737,6 +1884,7 @@ struct Engine::Impl {
         }
         const int best = *hp_next;
         lg.assign(lg_pinned, lg_pinned + kVocab);
+        if (pred_stats && lookahead) predict_tally();
         if (vram) vram->count(routes_pinned, kTopK);
         if (dump) {
             float wv[kLayers * kTopK];
@@ -1759,6 +1907,7 @@ struct Engine::Impl {
         tm.ram_experts = worker_ram.load();
         tm.file_experts = worker_file.load();
         tm.ssd_experts = worker_ssd.load();
+        tm.prefetched = worker_prefetched.load();
         if (lookahead) {
             const auto st_ = lookahead->take_stats();
             tm.warmed = (int) st_.warmed;
@@ -1802,6 +1951,12 @@ const std::vector<float>& Engine::last_logits() const { return impl_->lg; }
 void Engine::set_prefill_progress(PrefillProgress fn) { impl_->progress = std::move(fn); }
 
 void Engine::reset() { impl_->reset(); }
+
+void Engine::save_snapshot(int slot) { impl_->save_snapshot(slot); }
+
+int Engine::restore_snapshot(int slot) { return impl_->restore_snapshot(slot); }
+
+int Engine::snapshot_slots() const { return (int) impl_->snaps.size(); }
 
 int Engine::position() const { return (int) impl_->history.size(); }
 

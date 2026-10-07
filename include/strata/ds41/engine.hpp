@@ -47,6 +47,10 @@ struct EngineOptions {
     int prefill_chunk = 65536;
     int prefill_batch = 4096;   ///< sub-batch tokens (halved down to 512 when the scratch does not fit)
     int prefill_ring = 256;     ///< expert ring slots at most (halved down to 16 when they do not fit)
+    /// snapshot slots (save_snapshot): the sliding-window rings and compressor states of all layers, ~5.3 MB of VRAM
+    /// each. ds41_serve keeps one before each prompt's last token, so a chat whose next prompt changes the last
+    /// answer's start (DeepSeek drops earlier reasoning) goes back there instead of reading everything again.
+    int snapshots = 4;
     int prefill_threads = 16;       ///< expert stream readers (pread from the pack)
     int prefill_host_buffers = 64;  ///< pinned staging buffers of the expert stream (how far reads run ahead)
 };
@@ -104,6 +108,16 @@ public:
     /// Tokens fed so far: the position of the next step or prefill
     int position() const;
 
+    /// Save the state at the current position in `slot` (0 .. snapshot_slots() - 1). Only the state that the position
+    /// does not determine is copied (the window rings and the compressor states); the compressed rows are written
+    /// before they are read, so they need no copy.
+    void save_snapshot(int slot);
+    /// Go back to the position saved in `slot`; returns it. The caller makes sure that the tokens fed before that
+    /// position are still the ones fed when it was saved. Refused when the slot is empty or past position(). A pending
+    /// verify window is dropped. The slot stays valid.
+    int restore_snapshot(int slot);
+    int snapshot_slots() const;
+
     /// FP32 logits of the last step (all 129280)
     const std::vector<float>& last_logits() const;
 
@@ -120,6 +134,7 @@ public:
         /// missing from RAM when computed (read from the SSD)
         int ram_experts = 0, file_experts = 0, ssd_experts = 0;
         int warmed = 0, warmed_useful = 0;   ///< lookahead: file-tier experts warmed, and of those, used next layer
+        int prefetched = 0;   ///< misses the GPU computed from the prefetch buffer (DS41_PREFETCH), in zero_copy_experts()
     };
     /// VRAM expert slots in use (0: no tier)
     int vram_expert_slots() const;

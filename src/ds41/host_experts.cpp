@@ -1,5 +1,6 @@
 // src/ds41/host_experts.cpp - see include/strata/ds41/host_experts.hpp.
 #include "strata/ds41/host_experts.hpp"
+#include "strata/ds41/parallel.hpp"
 
 #include "strata/ds41/config.hpp"
 #include "strata/ds41/residency.hpp"
@@ -8,6 +9,7 @@
 #include "moe_mul1.h"   // third_party/exllamav3_moe
 
 #include <cuda_runtime.h>
+#include <fcntl.h>
 #include <sys/mman.h>
 #include <unistd.h>
 
@@ -106,22 +108,45 @@ HostExperts::HostExperts(const Pack& pack, const std::vector<std::pair<int, int>
     void* p = mmap(nullptr, arena_bytes_, PROT_READ | PROT_WRITE, MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
     if (p == MAP_FAILED) throw std::runtime_error("ds41 RAM tier: cannot reserve " + std::to_string(arena_bytes_) + " B");
     arena_ = (uint8_t*) p;
-    // copy with several readers: the source pages come from the SSD the first time
     holder_ = plan;
+    // Read the slots with O_DIRECT, 16 readers: the file cache cannot keep a pack beside a RAM tier this large, and
+    // filling the tier through it (page faults on the mapped pack) ran at 0.5 GB/s on a 120 GiB container whose SSD
+    // reads 5.2 GB/s with 8 parallel O_DIRECT readers (RTX 3090 + EPYC 7D12 box, 2026-10-07). Slots and expert
+    // offsets are 4 KiB aligned in a pack (an expert that is not is copied) and slot lengths 4 KiB multiples. DS41_FILL_DIRECT=0, or a file
+    // system that refuses O_DIRECT, copies from the mapped pack as before.
+    const char* fill_env = std::getenv("DS41_FILL_DIRECT");
+    const int dfd = fill_env && fill_env[0] == '0' ? -1 : open((pack.dir() + "/experts.bin").c_str(), O_RDONLY | O_DIRECT);
+    filled_direct_ = dfd >= 0;
     const uint8_t* base = pack.expert_base();
     std::atomic<int> next{0};
-    std::vector<std::thread> pool;
-    for (int t = 0; t < std::max(threads, 1); ++t)
-        pool.emplace_back([&] {
-            for (int s; (s = next++) < slots_;) {
-                const ExpertSlot& x = pack.expert(holder_[s].first, holder_[s].second);
-                std::memcpy(arena_ + off_[s], base + x.offset, x.bytes);
-                // the file pages are not needed any more: unmap them, so the OS reclaims them first
-                const uintptr_t a = ((uintptr_t) (base + x.offset)) & ~(uintptr_t) 4095;
-                madvise((void*) a, (uintptr_t) (base + x.offset + x.bytes) - a, MADV_DONTNEED);
+    std::atomic<bool> failed{false};
+    const int readers = filled_direct_ ? std::max(threads, 16) : std::max(threads, 1);
+    run_parallel((size_t) readers, [&](size_t) {
+        for (int s; (s = next++) < slots_ && !failed;) {
+            const ExpertSlot& x = pack.expert(holder_[s].first, holder_[s].second);
+            if (filled_direct_ && x.offset % 4096 == 0) {   // an unaligned expert (not in a real pack): copied
+                const size_t len = (size_t) (off_[s + 1] - off_[s]);   // the slot: the expert rounded to 4 KiB
+                size_t got = 0;
+                while (got < x.bytes) {
+                    const ssize_t r = pread(dfd, arena_ + off_[s] + got, len - got, (off_t) (x.offset + got));
+                    if (r <= 0) break;
+                    got += (size_t) r;
+                }
+                if (got < x.bytes) failed = true;
+                continue;
             }
-        });
-    for (auto& t : pool) t.join();
+            std::memcpy(arena_ + off_[s], base + x.offset, x.bytes);
+            // the file pages are not needed any more: unmap them, so the OS reclaims them first
+            const uintptr_t a = ((uintptr_t) (base + x.offset)) & ~(uintptr_t) 4095;
+            madvise((void*) a, (uintptr_t) (base + x.offset + x.bytes) - a, MADV_DONTNEED);
+        }
+    });
+    if (dfd >= 0) close(dfd);
+    if (failed) {
+        munmap(arena_, arena_bytes_);
+        arena_ = nullptr;
+        throw std::runtime_error("ds41 RAM tier: a read of " + pack.dir() + "/experts.bin failed");
+    }
     // Map the anonymous arena only. Pageable file experts must stay CPU-only.
     if (cudaHostRegister(arena_, arena_bytes_, cudaHostRegisterMapped | cudaHostRegisterPortable) == cudaSuccess) {
         locked_ = registered_ = true;
@@ -200,7 +225,15 @@ void HostExperts::publish_descriptor(int layer, int expert, int slot) {
     ck(cudaStreamSynchronize(nullptr), "descriptor publication");
 }
 
+void HostExperts::point_to(int layer, int expert, const uint8_t* bytes) {
+    publish_descriptor(layer, expert, -1);
+    point(layer, expert, bytes);
+    if (held_.empty()) held_.assign(slot_.size(), 0);
+    held_[(size_t) layer * n_experts_ + expert] = 1;
+}
+
 void HostExperts::point_to_file(int layer, int expert) {
+    if (!held_.empty()) held_[(size_t) layer * n_experts_ + expert] = 0;
     publish_descriptor(layer, expert, -1);
     point(layer, expert, pack_.expert_base() + pack_.expert(layer, expert).offset);
     // Read from the file now. Keep its slot reserved until assign().
@@ -215,6 +248,7 @@ void HostExperts::assign(int slot, int layer, int expert) {
     publish_descriptor(ol, oe, -1);
     publish_residency(slot_[(size_t) ol * n_experts_ + oe], -1);
     holder_[slot] = {layer, expert};
+    if (!held_.empty()) held_[(size_t) layer * n_experts_ + expert] = 0;
     publish_residency(slot_[(size_t) layer * n_experts_ + expert], slot);
     point(layer, expert, slot_ptr(slot));
     publish_descriptor(layer, expert, slot);

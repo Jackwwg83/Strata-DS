@@ -126,6 +126,20 @@ def main() -> int:
     print(f"  continued {out2} fresh {out3}", flush=True)
     check(out2[0] == out3[0], "the reused session gives the first token a fresh start gives")
 
+    # a snapshot before the last prompt token: the next turn changes the last answer's start (DeepSeek drops its
+    # reasoning), so it differs from the session at the old prompt's last token - for a pass (400) and windows (60)
+    for size, seed in ((400, 21), (60, 22)):
+        e.request(prompt(30, 900 + seed), 1)               # another conversation: the session starts over
+        Pa = prompt(size, seed)
+        lines, outa, done, err = e.request(Pa, 4)
+        Q = Pa[:-1] + prompt(31, 100 + seed)[1:]           # the old prompt but its last token, then 30 new tokens
+        lines, outq, done, err = e.request(Q, 3)
+        check(lines[0] == f"RESUME {len(Pa) - 1}", f"{size}: the next turn goes back to the snapshot ({lines[0]})")
+        check(done is not None and done[14] == "30", f"{size}: it reads only the 30 new tokens ({done and done[14]})")
+        e.request(prompt(30, 950 + seed), 1)
+        _, fresh, _, _ = e.request(Q, 3)
+        print(f"  {size}: from the snapshot {outq}, fresh {fresh}", flush=True)
+
     # STOP while the prompt is read: cancel, nothing generated, the next request works
     long_p = prompt(6000, 3)
     lines, out, done, err = e.request(long_p, 4, stop_after_pp=2)
@@ -164,8 +178,21 @@ def main() -> int:
     code = e.p.wait(timeout=120)
     check(code == 0, f"QUIT ends the engine with code 0 ({code})")
 
-    # static residency (--adapt-every 0, upstream: --adapt-every 100000): a seeded sampled request repeats
+    # static residency (--adapt-every 0, upstream: --adapt-every 100000): the same experts on the same path in every
+    # run, so a turn resumed from a snapshot gives exactly the tokens of a fresh start, and a seeded sampled request
+    # repeats (with the adaptive tier, which experts the CPU computes depends on the run)
     e = Engine(cmd + ["--adapt-every", "0"])
+    for size, seed in ((400, 31), (60, 32)):
+        e.request(prompt(30, 900 + seed), 1)
+        Pa = prompt(size, seed)
+        e.request(Pa, 4)
+        Q = Pa[:-1] + prompt(31, 100 + seed)[1:]
+        lines, outq, _, _ = e.request(Q, 3)
+        e.request(prompt(30, 950 + seed), 1)
+        _, fresh, _, _ = e.request(Q, 3)
+        print(f"  static, {size}: from the snapshot {outq}, fresh {fresh} ({lines[0]})", flush=True)
+        check(lines[0] == f"RESUME {len(Pa) - 1}" and outq == fresh,
+              f"static residency, {size}: the snapshot gives the tokens of a fresh start")
     e.request(prompt(20, 11), 1)
     _, s1, _, _ = e.request(P, 12, keys)
     e.request(prompt(20, 12), 1)   # another conversation: both runs below start fresh

@@ -1,0 +1,126 @@
+data: {"id": "chatcmpl-0134a2bd9c384c44baca64b0", "object": "chat.completion.chunk", "created": 1791384674, "model": "deepseek-v4.1-flash", "choices": [{"index": 0, "delta": {"role": "assistant", "content": ""}, "finish_reason": null}]}
+
+: keep-alive
+
+: keep-alive
+
+: keep-alive
+
+: keep-alive
+
+: keep-alive
+
+: keep-alive
+
+: keep-alive
+
+: keep-alive
+
+: keep-alive
+
+: keep-alive
+
+: keep-alive
+
+: keep-alive
+
+: keep-alive
+
+: keep-alive
+
+: keep-alive
+
+: keep-alive
+
+: keep-alive
+
+: keep-alive
+
+: keep-alive
+
+: keep-alive
+
+: keep-alive
+
+: keep-alive
+
+: keep-alive
+
+: keep-alive
+
+: keep-alive
+
+: keep-alive
+
+: keep-alive
+
+: keep-alive
+
+: keep-alive
+
+: keep-alive
+
+: keep-alive
+
+: keep-alive
+
+: keep-alive
+
+: keep-alive
+
+: keep-alive
+
+: keep-alive
+
+: keep-alive
+
+: keep-alive
+
+: keep-alive
+
+: keep-alive
+
+: keep-alive
+
+data: {"id": "chatcmpl-0134a2bd9c384c44baca64b0", "object": "chat.completion.chunk", "created": 1791384674, "model": "deepseek-v4.1-flash", "choices": [{"index": 0, "delta": {"reasoning_content": "We"}, "finish_reason": null}]}
+
+data: {"id": "chatcmpl-0134a2bd9c384c44baca64b0", "object": "chat.completion.chunk", "created": 1791384674, "model": "deepseek-v4.1-flash", "choices": [{"index": 0, "delta": {"reasoning_content": " need"}, "finish_reason": null}]}
+
+data: {"id": "chatcmpl-0134a2bd9c384c44baca64b0", "object": "chat.completion.chunk", "created": 1791384674, "model": "deepseek-v4.1-flash", "choices": [{"index": 0, "delta": {"reasoning_content": " answer"}, "finish_reason": null}]}
+
+data: {"id": "chatcmpl-0134a2bd9c384c44baca64b0", "object": "chat.completion.chunk", "created": 1791384674, "model": "deepseek-v4.1-flash", "choices": [{"index": 0, "delta": {"reasoning_content": " weather"}, "finish_reason": null}]}
+
+data: {"id": "chatcmpl-0134a2bd9c384c44baca64b0", "object": "chat.completion.chunk", "created": 1791384674, "model": "deepseek-v4.1-flash", "choices": [{"index": 0, "delta": {"reasoning_content": " in"}, "finish_reason": null}]}
+
+data: {"id": "chatcmpl-0134a2bd9c384c44baca64b0", "object": "chat.completion.chunk", "created": 1791384674, "model": "deepseek-v4.1-flash", "choices": [{"index": 0, "delta": {"reasoning_content": " Paris"}, "finish_reason": null}]}
+
+data: {"id": "chatcmpl-0134a2bd9c384c44baca64b0", "object": "chat.completion.chunk", "created": 1791384674, "model": "deepseek-v4.1-flash", "choices": [{"index": 0, "delta": {"reasoning_content": "."}, "finish_reason": null}]}
+
+data: {"id": "chatcmpl-0134a2bd9c384c44baca64b0", "object": "chat.completion.chunk", "created": 1791384674, "model": "deepseek-v4.1-flash", "choices": [{"index": 0, "delta": {"reasoning_content": " Need"}, "finish_reason": null}]}
+
+data: {"id": "chatcmpl-0134a2bd9c384c44baca64b0", "object": "chat.completion.chunk", "created": 1791384674, "model": "deepseek-v4.1-flash", "choices": [{"index": 0, "delta": {"reasoning_content": " call"}, "finish_reason": null}]}
+
+data: {"id": "chatcmpl-0134a2bd9c384c44baca64b0", "object": "chat.completion.chunk", "created": 1791384674, "model": "deepseek-v4.1-flash", "choices": [{"index": 0, "delta": {"reasoning_content": " get"}, "finish_reason": null}]}
+
+data: {"id": "chatcmpl-0134a2bd9c384c44baca64b0", "object": "chat.completion.chunk", "created": 1791384674, "model": "deepseek-v4.1-flash", "choices": [{"index": 0, "delta": {"reasoning_content": "_"}, "finish_reason": null}]}
+
+data: {"id": "chatcmpl-0134a2bd9c384c44baca64b0", "object": "chat.completion.chunk", "created": 1791384674, "model": "deepseek-v4.1-flash", "choices": [{"index": 0, "delta": {"reasoning_content": "weather"}, "finish_reason": null}]}
+
+data: {"id": "chatcmpl-0134a2bd9c384c44baca64b0", "object": "chat.completion.chunk", "created": 1791384674, "model": "deepseek-v4.1-flash", "choices": [{"index": 0, "delta": {"reasoning_content": " city"}, "finish_reason": null}]}
+
+data: {"id": "chatcmpl-0134a2bd9c384c44baca64b0", "object": "chat.completion.chunk", "created": 1791384674, "model": "deepseek-v4.1-flash", "choices": [{"index": 0, "delta": {"reasoning_content": " Paris"}, "finish_reason": null}]}
+
+data: {"id": "chatcmpl-0134a2bd9c384c44baca64b0", "object": "chat.completion.chunk", "created": 1791384674, "model": "deepseek-v4.1-flash", "choices": [{"index": 0, "delta": {"reasoning_content": "."}, "finish_reason": null}]}
+
+data: {"id": "chatcmpl-0134a2bd9c384c44baca64b0", "object": "chat.completion.chunk", "created": 1791384674, "model": "deepseek-v4.1-flash", "choices": [{"index": 0, "delta": {"tool_calls": [{"index": 0, "id": "call_5d73263f4dec475d86fa1a8e", "type": "function", "function": {"name": "get_weather", "arguments": ""}}]}, "finish_reason": null}]}
+
+data: {"id": "chatcmpl-0134a2bd9c384c44baca64b0", "object": "chat.completion.chunk", "created": 1791384674, "model": "deepseek-v4.1-flash", "choices": [{"index": 0, "delta": {"tool_calls": [{"index": 0, "function": {"arguments": "{"}}]}, "finish_reason": null}]}
+
+data: {"id": "chatcmpl-0134a2bd9c384c44baca64b0", "object": "chat.completion.chunk", "created": 1791384674, "model": "deepseek-v4.1-flash", "choices": [{"index": 0, "delta": {"tool_calls": [{"index": 0, "function": {"arguments": "\"city\":\"Paris\""}}]}, "finish_reason": null}]}
+
+data: {"id": "chatcmpl-0134a2bd9c384c44baca64b0", "object": "chat.completion.chunk", "created": 1791384674, "model": "deepseek-v4.1-flash", "choices": [{"index": 0, "delta": {"tool_calls": [{"index": 0, "function": {"arguments": "}"}}]}, "finish_reason": null}]}
+
+data: {"id": "chatcmpl-0134a2bd9c384c44baca64b0", "object": "chat.completion.chunk", "created": 1791384674, "model": "deepseek-v4.1-flash", "choices": [{"index": 0, "delta": {}, "finish_reason": "tool_calls"}], "usage": {"prompt_tokens": 295, "completion_tokens": 55, "total_tokens": 350, "prompt_tokens_details": {"cached_tokens": 0}}, "timings": {"cache_n": 0, "prompt_n": 295, "prompt_ms": 6655.7, "prompt_per_token_ms": 22.562, "prompt_per_second": 44.3, "predicted_n": 55, "predicted_ms": 2039.0, "predicted_per_token_ms": 37.073, "predicted_per_second": 27.0, "draft_n": 0, "draft_n_accepted": 0}}
+
+data: [DONE]
+

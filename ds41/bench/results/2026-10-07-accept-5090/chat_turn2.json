@@ -1,0 +1,38 @@
+{
+ "id": "chatcmpl-8c7c48c5b9c84f0fba8d11c8",
+ "object": "chat.completion",
+ "created": 1791384667,
+ "model": "deepseek-v4.1-flash",
+ "choices": [
+  {
+   "index": 0,
+   "message": {
+    "role": "assistant",
+    "content": "19",
+    "reasoning_content": "We need answer. Need parse. User asks: \"Now double that number and add 7.\" Previous answer 6 apples. Double that number = 12, add 7 = 19. Answer briefly. Need maybe \"19\". Ensure no confusion. Final."
+   },
+   "finish_reason": "stop"
+  }
+ ],
+ "usage": {
+  "prompt_tokens": 70,
+  "completion_tokens": 57,
+  "total_tokens": 127,
+  "prompt_tokens_details": {
+   "cached_tokens": 53
+  }
+ },
+ "timings": {
+  "cache_n": 53,
+  "prompt_n": 17,
+  "prompt_ms": 1372.6,
+  "prompt_per_token_ms": 80.741,
+  "prompt_per_second": 12.4,
+  "predicted_n": 57,
+  "predicted_ms": 2367.9,
+  "predicted_per_token_ms": 41.542,
+  "predicted_per_second": 24.1,
+  "draft_n": 0,
+  "draft_n_accepted": 0
+ }
+}

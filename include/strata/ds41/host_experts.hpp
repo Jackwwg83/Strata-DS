@@ -58,6 +58,8 @@ public:
     /// the largest slot
     size_t max_slot_bytes() const { return max_slot_bytes_; }
     bool locked() const { return locked_; }
+    /// the slots were read with O_DIRECT (else copied from the mapped pack, through the file cache)
+    bool filled_direct() const { return filled_direct_; }
     /// [n_layers][n_experts] on the device. Null when mapping is unavailable.
     /// An entry with w1.trellis == nullptr is CPU-only. The address stays fixed.
     const kernels::Exl3Expert* experts_dev() const { return experts_dev_; }
@@ -76,6 +78,15 @@ public:
     /// the slot's capacity.
     /// Call only between steps, after the slot copy has completed.
     void assign(int slot, int layer, int expert);
+    /// Point the CPU kernel's (layer, expert) at bytes held elsewhere in host memory (an expert on its way from a
+    /// VRAM slot to a RAM slot, held in a swap buffer); held() is true until assign() or point_to_file(). The device
+    /// descriptor is revoked: the GPU does not read it from there. Call only between steps.
+    void point_to(int layer, int expert, const uint8_t* bytes);
+    /// the CPU reads (layer, expert) from host memory: its RAM slot or a swap buffer (not the file)
+    bool in_memory(int layer, int expert) const {
+        const size_t i = (size_t) layer * n_experts_ + expert;
+        return slot_[i] >= 0 || (!held_.empty() && held_[i]);
+    }
 
 private:
     void point(int layer, int expert, const uint8_t* bytes);
@@ -90,6 +101,8 @@ private:
     uint8_t* arena_ = nullptr;
     size_t arena_bytes_ = 0;
     bool locked_ = false;
+    bool filled_direct_ = false;
+    std::vector<uint8_t> held_;   ///< [n_layers][n_experts] pointed at a swap buffer (point_to)
     bool registered_ = false;
     uint8_t* device_alias_ = nullptr;
     kernels::Exl3Expert* experts_dev_ = nullptr;

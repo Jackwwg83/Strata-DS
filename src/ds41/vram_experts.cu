@@ -198,33 +198,42 @@ void VramExperts::count(const int32_t* routes, int topk) {
 
 void VramExperts::set_host(HostExperts* host) {
     host_ = host;
-    if (host_ && host_->slots() > 0 && !staging_)
-        ck(cudaMallocHost((void**) &staging_, max_slot_bytes_), "swap staging");
+    if (host_ && host_->slots() > 0 && !staging_) {
+        // the swap buffer: the evicted experts on their way from VRAM to RAM (a batch's evicted bytes fit in it)
+        staging_bytes_ = std::min<size_t>((size_t) std::max(adapt_.max_swaps, 1) * max_slot_bytes_, 1ull << 30);
+        staging_bytes_ = std::max(staging_bytes_, max_slot_bytes_);
+        ck(cudaMallocHost((void**) &staging_, staging_bytes_), "swap staging");
+    }
 }
 
-void VramExperts::copy_worker(std::vector<Pending> work) {
+// A swap with a RAM tier runs in three copies, each started between two steps and switched in only between steps,
+// so the CPU never reads a swapped expert from the file (on a 128 GB PC those page faults went to the SSD and the
+// GPU waited for them):
+//   phase 1  `out`: its VRAM slot -> the swap buffer (both stay valid; the GPU keeps computing `out`)
+//   phase 2  `out` leaves VRAM, the CPU reads it from the swap buffer; `in`: its RAM slot -> the VRAM slot (the CPU
+//            keeps reading `in` from its RAM slot)
+//   phase 3  `in` enters VRAM (its RAM slot is free now); `out`: the swap buffer -> that RAM slot
+//   done     the CPU reads `out` from its RAM slot
+// Without a RAM tier (`in` from the file), phase 1 copies nothing, `out` goes to the file in phase 2, and `in` is
+// copied from the mapped pack.
+void VramExperts::copy_worker(std::vector<Pending> work, int phase) {
     bool ok = cudaSetDevice(device_) == cudaSuccess;
     const uint8_t* base = pack_.expert_base();
     for (size_t i = 0; ok && i < work.size(); ++i) {
         const Pending& w = work[i];
         uint8_t* vslot = arena_ + off_[w.vram_slot];
         const ExpertSlot& xin = pack_.expert(w.layer, w.in);
-        if (w.ram_slot >= 0) {
-            // out: VRAM -> staging; in: its RAM slot -> VRAM; then out: staging -> the RAM slot
-            const ExpertSlot& xout = pack_.expert(w.layer, w.out);
-            uint8_t* rslot = host_->slot_ptr(w.ram_slot);
-            ok = cudaMemcpyAsync(staging_, vslot, xout.bytes, cudaMemcpyDeviceToHost, copy_stream_) == cudaSuccess &&
-                 cudaMemcpyAsync(vslot, rslot, xin.bytes, cudaMemcpyHostToDevice, copy_stream_) == cudaSuccess &&
-                 cudaMemcpyAsync(experts_dev_ + w.vram_slot, &desc_host_[w.vram_slot], sizeof(kernels::Exl3Expert),
-                                 cudaMemcpyHostToDevice, copy_stream_) == cudaSuccess &&
-                 cudaStreamSynchronize(copy_stream_) == cudaSuccess;
-            if (ok) std::memcpy(rslot, staging_, xout.bytes);
-        } else {
-            // pageable source: the call returns once the bytes are staged; the stream then finishes the DMA
-            ok = cudaMemcpyAsync(vslot, base + xin.offset, xin.bytes, cudaMemcpyHostToDevice, copy_stream_) ==
-                     cudaSuccess &&
+        const ExpertSlot& xout = pack_.expert(w.layer, w.out);
+        if (phase == 1 && w.ram_slot >= 0) {
+            ok = cudaMemcpyAsync(staging_ + w.staged, vslot, xout.bytes, cudaMemcpyDeviceToHost, copy_stream_) ==
+                 cudaSuccess;
+        } else if (phase == 2) {
+            const uint8_t* src = w.ram_slot >= 0 ? host_->slot_ptr(w.ram_slot) : base + xin.offset;
+            ok = cudaMemcpyAsync(vslot, src, xin.bytes, cudaMemcpyHostToDevice, copy_stream_) == cudaSuccess &&
                  cudaMemcpyAsync(experts_dev_ + w.vram_slot, &desc_host_[w.vram_slot], sizeof(kernels::Exl3Expert),
                                  cudaMemcpyHostToDevice, copy_stream_) == cudaSuccess;
+        } else if (phase == 3 && w.ram_slot >= 0) {
+            std::memcpy(host_->slot_ptr(w.ram_slot), staging_ + w.staged, xout.bytes);
         }
     }
     ok = ok && cudaStreamSynchronize(copy_stream_) == cudaSuccess;
@@ -232,20 +241,47 @@ void VramExperts::copy_worker(std::vector<Pending> work) {
     copies_done_.store(true, std::memory_order_release);
 }
 
+void VramExperts::start_phase(int phase) {
+    phase_ = phase;
+    copies_done_.store(false, std::memory_order_relaxed);
+    copier_ = std::thread(&VramExperts::copy_worker, this, pending_, phase);
+}
+
 int VramExperts::commit_pending(bool wait) {
-    if (pending_.empty()) return 0;
-    if (!wait && !copies_done_.load(std::memory_order_acquire)) return 0;   // still copying: the next step checks again
-    const int E = pack_.n_experts();
-    copier_.join();
-    if (copy_error_) throw std::runtime_error("ds41 vram experts: an adaptive expert copy failed");
-    for (const Pending& w : pending_) {
-        publish_residency(res_host_[(size_t) w.layer * E + w.in], w.vram_slot);
-        if (w.ram_slot >= 0) host_->assign(w.ram_slot, w.layer, w.out);   // the CPU now reads `out` from RAM
+    int committed = 0;
+    while (phase_ != 0) {
+        if (!wait && !copies_done_.load(std::memory_order_acquire)) return committed;   // the next step checks again
+        copier_.join();
+        if (copy_error_) throw std::runtime_error("ds41 vram experts: an adaptive expert copy failed");
+        const int E = pack_.n_experts();
+        if (phase_ == 1) {
+            // `out` leaves VRAM: the CPU reads it from the swap buffer (or the file); the slot now describes `in`
+            for (const Pending& w : pending_) {
+                publish_residency(res_host_[(size_t) w.layer * E + w.out], -1);
+                desc_host_[w.vram_slot] = describe(w.layer, w.in, w.vram_slot);
+                if (w.ram_slot >= 0) host_->point_to(w.layer, w.out, staging_ + w.staged);
+                else if (host_) host_->point_to_file(w.layer, w.out);
+            }
+            upload_res();   // before the copy into the slots: no step reads a slot that is being overwritten
+            start_phase(2);
+        } else if (phase_ == 2) {
+            // `in` enters VRAM; its RAM slot is free (a VRAM hit is never read from RAM)
+            for (const Pending& w : pending_) {
+                publish_residency(res_host_[(size_t) w.layer * E + w.in], w.vram_slot);
+                if (w.ram_slot >= 0) host_->point_to_file(w.layer, w.in);   // revokes its RAM descriptor
+            }
+            upload_res();
+            committed += (int) pending_.size();
+            swaps_total_ += (int) pending_.size();
+            start_phase(3);
+        } else {
+            for (const Pending& w : pending_)
+                if (w.ram_slot >= 0) host_->assign(w.ram_slot, w.layer, w.out);   // the CPU reads `out` from RAM
+            pending_.clear();
+            phase_ = 0;
+        }
+        if (!wait) return committed;   // one phase per call: each switch happens between two steps
     }
-    const int committed = (int) pending_.size();
-    swaps_total_ += committed;
-    pending_.clear();
-    upload_res();
     return committed;
 }
 
@@ -253,9 +289,8 @@ int VramExperts::between_steps() {
     if (slots_ == 0 || adapt_.every <= 0) return 0;
     if (lent_) throw std::logic_error("ds41 vram experts: a step while slots are lent to prefill");
     const int L = pack_.n_layers(), E = pack_.n_experts();
-    const bool was_pending = !pending_.empty();
     const int committed = commit_pending(false);
-    if (was_pending && !pending_.empty()) return 0;   // still copying
+    if (phase_ != 0) return committed;   // a batch is still on its way
     if (++calls_ % adapt_.every != 0) return committed;
     // `in` must fit the VRAM slot of `out`; with a RAM tier, `out` then takes the RAM slot of `in`, and must fit it
     auto fits = [&](int l, int in, int out) {
@@ -266,20 +301,16 @@ int VramExperts::between_steps() {
     };
     const auto swaps = plan_expert_swaps(usage_, res_host_, L, E, adapt_.max_swaps, fits);
     for (float& v : usage_) v *= adapt_.decay;
-    if (swaps.empty()) return committed;
-    for (const ExpertSwap& s : swaps) {
-        const size_t out = (size_t) s.layer * E + s.out;
-        const int32_t slot = res_host_[out];
-        // The CPU reads the evicted expert from the file on the next step.
-        publish_residency(res_host_[out], -1);
-        desc_host_[slot] = describe(s.layer, s.in, slot);
+    size_t staged = 0;
+    for (const ExpertSwap& s : swaps) {   // largest gain first: the batch ends when the swap buffer is full
         const int32_t ram = host_ ? host_->slot_of(s.layer, s.in) : -1;
-        if (ram >= 0) host_->point_to_file(s.layer, s.in);   // its RAM slot is about to be overwritten
-        pending_.push_back(Pending{s.layer, s.in, s.out, slot, ram});
+        const size_t need = ram >= 0 ? (pack_.expert(s.layer, s.out).bytes + 255) / 256 * 256 : 0;
+        if (staged + need > staging_bytes_) break;
+        pending_.push_back(Pending{s.layer, s.in, s.out, res_host_[(size_t) s.layer * E + s.out], ram, staged});
+        staged += need;
     }
-    upload_res();   // before the copies start: no step reads a slot that is being overwritten
-    copies_done_.store(false, std::memory_order_relaxed);
-    copier_ = std::thread(&VramExperts::copy_worker, this, pending_);
+    if (pending_.empty()) return committed;
+    start_phase(1);
     return committed;
 }
 

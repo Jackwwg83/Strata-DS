@@ -34,7 +34,8 @@ __global__ void publish_k(const uint4* __restrict__ x, int n_x16, const int32_t*
                           uint32_t round, const kernels::Exl3Expert* vram, const kernels::Exl3Expert* ram,
                           const int* quota, kernels::Exl3Expert* call, ExpertDoorbell::Counts* counts,
                           const ExpertBlob* blobs, uint8_t* staging, size_t stride,
-                          ExpertCopy* jobs, int* copy_count) {
+                          ExpertCopy* jobs, int* copy_count, const int32_t* pf_ids,
+                          const kernels::Exl3Expert* pf_desc, int pf_n) {
     for (int i = threadIdx.x; i < n_x16; i += blockDim.x) mx[i] = x[i];
     // At most 48 route uses in decode/verify. One lane makes the prefix rule explicit.
     if (threadIdx.x == 0) {
@@ -48,12 +49,16 @@ __global__ void publish_k(const uint4* __restrict__ x, int n_x16, const int32_t*
                 const int32_t id = ids[i];
                 const int32_t slot = (res && id >= 0) ? res[id] : -1;
                 const bool hit = slot >= 0;
-                const bool zc = !hit && id >= 0 && ram && used < q && ram[id].w1.trellis;
-                mids[i] = (id < 0 || hit || zc) ? -1 : id;
+                int pf = -1;   // a miss the prefetch already copied: the GPU computes it from the buffer
+                if (!hit && id >= 0 && pf_ids)
+                    for (int k = 0; k < pf_n && pf < 0; ++k)
+                        if (pf_ids[k] == id) pf = k;
+                const bool zc = !hit && pf < 0 && id >= 0 && ram && used < q && ram[id].w1.trellis;
+                mids[i] = (id < 0 || hit || zc || pf >= 0) ? -1 : id;
                 mw[i] = w[i];
-                if (gpu_sel) gpu_sel[i] = descriptors ? ((hit || zc) ? i : -1) : slot;
+                if (gpu_sel) gpu_sel[i] = descriptors ? ((hit || zc || pf >= 0) ? i : -1) : slot;
                 if (descriptors) {
-                    call[i] = hit ? vram[slot] : (zc ? ram[id] : kernels::Exl3Expert{});
+                    call[i] = hit ? vram[slot] : pf >= 0 ? pf_desc[pf] : (zc ? ram[id] : kernels::Exl3Expert{});
                     if (zc && staging) {
                         const ExpertBlob blob = blobs[id];
                         const auto* src = reinterpret_cast<const uint8_t*>(call[i].w1.trellis) - blob.first_trellis;
@@ -65,6 +70,7 @@ __global__ void publish_k(const uint4* __restrict__ x, int n_x16, const int32_t*
                     }
                 }
                 if (hit) ++c.vram;
+                else if (pf >= 0) ++c.prefetched;
                 else if (zc) { ++used; ++c.zero_copy; }
                 else if (id >= 0) ++c.cpu;
             }
@@ -137,7 +143,8 @@ ExpertDoorbell::~ExpertDoorbell() {
 void ExpertDoorbell::publish(const uint16_t* x, const int32_t* ids, const float* w, int m, const int32_t* res,
                              int32_t* gpu_sel, uint32_t round, cudaStream_t stream,
                              const kernels::Exl3Expert* vram, const kernels::Exl3Expert* ram, const int* quota,
-                             ExpertStaging* stage, const ExpertBlob* blobs) {
+                             ExpertStaging* stage, const ExpertBlob* blobs, const int32_t* pf_ids,
+                             const kernels::Exl3Expert* pf_desc, int pf_n) {
     if (m < 1 || m > max_m_) throw std::invalid_argument("ExpertDoorbell::publish: bad m");
     if (res && ram && !vram) throw std::invalid_argument("ExpertDoorbell::publish: missing VRAM descriptors");
     if (stage && (!blobs || stage->capacity() < m * topk_))
@@ -145,7 +152,8 @@ void ExpertDoorbell::publish(const uint16_t* x, const int32_t* ids, const float*
     publish_k<<<1, 512, 0, stream>>>((const uint4*) x, m * dim_ / 8, ids, w, m, topk_, res, gpu_sel, (uint4*) d_x_,
                                      d_ids_, d_w_, d_seq_, round, vram, ram, quota, gpu_experts_, d_counts_,
                                      blobs, stage ? stage->data() : nullptr, stage ? stage->stride() : 0,
-                                     stage ? stage->jobs() : nullptr, stage ? stage->count() : nullptr);
+                                     stage ? stage->jobs() : nullptr, stage ? stage->count() : nullptr, pf_ids,
+                                     pf_desc, pf_n);
     ck(cudaGetLastError(), "publish");
 }
 

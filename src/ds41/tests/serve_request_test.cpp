@@ -1,5 +1,5 @@
-// src/ds41/tests/serve_request_test.cpp - ds41_serve's line protocol on the host: the GEN line, the prefix reuse
-// and the DONE line. No GPU and no pack.
+// src/ds41/tests/serve_request_test.cpp - ds41_serve's line protocol on the host: the GEN line, the prefix reuse,
+// the snapshot choice and the DONE line. No GPU and no pack.
 //   c++ -std=c++17 -Iinclude src/ds41/tests/serve_request_test.cpp -o /tmp/srt && /tmp/srt
 #include "strata/ds41/serve_request.hpp"
 
@@ -66,6 +66,22 @@ int main() {
         check(reusable(live, {1, 2, 9, 4, 5}) == 0, "a prompt that differs inside the session starts over");
         check(reusable(live, {1, 2}) == 0, "a shorter prompt starts over");
         check(reusable({}, {1, 2}) == 0, "an empty session reuses nothing");
+    }
+    {
+        // snapshots: tokens fed before each saved position; the session is 1..6 now
+        const std::vector<int> live = {1, 2, 3, 4, 5, 6};
+        const std::vector<std::vector<int>> snaps = {{}, {1, 2, 3}, {1, 2, 3, 4}, {1, 9}};
+        check(pick_snapshot(snaps, live, {1, 2, 3, 4, 7, 8}, 0) == 2,
+              "the longest snapshot the prompt starts with (the last answer's start changed)");
+        check(pick_snapshot(snaps, live, {1, 2, 3, 7}, 0) == 1, "a shorter one when the longer does not match");
+        check(pick_snapshot(snaps, live, {1, 2, 3, 4, 5, 6, 7}, 6) == -1, "none when the session itself reuses more");
+        check(pick_snapshot(snaps, live, {1, 2, 3, 4}, 0) == 1,
+              "never all of the prompt: its last token must be read again");
+        check(pick_snapshot(snaps, {1, 2}, {1, 2, 3, 4, 7}, 0) == -1,
+              "none past the session (the session was restarted since they were saved)");
+        check(pick_snapshot(snaps, {1, 2, 8, 4, 5}, {1, 2, 3, 4, 7}, 0) == -1,
+              "none whose tokens the session no longer has");
+        check(pick_snapshot({{1, 9}}, {1, 9, 4}, {1, 9, 5}, 0) == 0, "a two-token snapshot");
     }
     {
         DoneStats d;

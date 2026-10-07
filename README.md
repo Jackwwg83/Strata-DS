@@ -130,6 +130,10 @@ sizes are faster. Larger sizes are a bit smarter.
   while it answers, so it is slower there (an NVMe SSD helps).
 - **[Unsloth UD-Q4_K_XL](docs/MODELS.md#unsloth-ud-q4_k_xl-experimental)** (experimental): the closest to the full
   model. But Strata reads most of it from the SSD while it answers, so it writes only 7-8.5 tokens/s on a 64 GB PC.
+- **[DeepSeek V4.1 Flash](docs/MODELS.md#deepseek-v41-flash-sage-159bpw)** (Linux + NVIDIA only): a much larger model
+  (763B parameters with its Engram memory), as the SAGE 1.59bpw quantization. It needs a 128 GB PC, an NVIDIA GPU
+  with 24 GB or more and about 462 GB of disk; `./setup.sh --setup --family deepseek`. It writes 17-32 tokens/s
+  depending on the GPU (measured on an RTX 3090 and an RTX 5090, [details](docs/MODELS.md#deepseek-v41-flash-sage-159bpw)).
 - **[OrcaRouter's Uncensored IQ3_XXS](docs/MODELS.md#orcarouter-uncensored-iq3_xxs):** you set it up by hand. It is
   not in the installer's menu.
 

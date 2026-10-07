@@ -111,6 +111,10 @@ void RouterLookahead::run() {
     }
 }
 
+void RouterLookahead::predict_now(int layer, const uint16_t* x, int k, int32_t* ids) const {
+    cpu_router_topk(x, w_[layer].data(), bias_[layer].data(), n_experts_, dim_, k, ids);
+}
+
 void RouterLookahead::observe(int layer, const int32_t* file_ids, int n) {
     std::lock_guard<std::mutex> lk(mu_);
     auto& w = warmed_[layer];

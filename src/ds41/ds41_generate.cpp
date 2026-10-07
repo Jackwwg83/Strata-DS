@@ -55,6 +55,9 @@ static void print_prefill(const Engine& engine, size_t n) {
 }
 
 // Output history contains raw IDs. It includes the pending target prediction.
+/// --step-log: one line per decode step (where the step's time went), for the decode profile
+static std::FILE* step_log = nullptr;
+
 static void generate(Engine& engine, const EngineOptions& opt, const std::vector<int>& prompt,
                      int count, bool batched, bool suffix, int max_t, int eos) {
     if (prompt.empty()) throw std::invalid_argument("generation needs a nonempty prompt");
@@ -79,6 +82,11 @@ static void generate(Engine& engine, const EngineOptions& opt, const std::vector
         if (!suffix) {
             next = engine.step(next, pos++);
             const auto& tm = engine.last_timing();
+            if (step_log)
+                std::fprintf(step_log, "%d %.3f %.3f %.3f %.3f %d %d %d %d %d %d %d %d %d\n", pos - 1, tm.total_ms,
+                             tm.gpu_ms, tm.cpu_experts_ms, tm.engram_ms, tm.expert_total, tm.expert_hits,
+                             tm.zero_copy_experts(), tm.ram_experts, tm.file_experts, tm.ssd_experts, tm.vram_swaps,
+                             tm.warmed_useful, tm.prefetched);
             step_ms += tm.total_ms;
             hits += tm.expert_hits;
             routed += tm.expert_total;
@@ -141,6 +149,13 @@ int main(int argc, char** argv) {
         else if (a == "--prefill-batch") opt.prefill_batch = std::stoi(next());
         else if (a == "--prefill-threads") opt.prefill_threads = std::stoi(next());
         else if (a == "--dump") dump_path = next();
+        else if (a == "--step-log") {
+            const std::string f = next();
+            step_log = std::fopen(f.c_str(), "w");
+            if (!step_log) { std::fprintf(stderr, "cannot write --step-log %s\n", f.c_str()); return 2; }
+            std::fprintf(step_log, "# pos total_ms gpu_ms cpu_experts_ms engram_ms routed vram_hits zero_copy ram_cpu "
+                                   "file_cpu ssd swaps warmed_useful prefetched\n");
+        }
         else if (a == "--force-ids") force_path = next();
         else { std::fprintf(stderr, "unknown argument %s\n", a.c_str()); return 2; }
     }

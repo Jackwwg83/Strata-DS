@@ -1,0 +1,38 @@
+{
+ "id": "chatcmpl-d16870fb25f74e108dd912eb",
+ "object": "chat.completion",
+ "created": 1791384670,
+ "model": "deepseek-v4.1-flash",
+ "choices": [
+  {
+   "index": 0,
+   "message": {
+    "role": "assistant",
+    "content": "Yes, 19 is a prime number.",
+    "reasoning_content": "We need answer. Need comply. User asks: \"Is the result a prime number? One sentence.\" Result from previous: 6 apples doubled =12 add7=19. 19 is prime. One sentence. Need brief."
+   },
+   "finish_reason": "stop"
+  }
+ ],
+ "usage": {
+  "prompt_tokens": 85,
+  "completion_tokens": 58,
+  "total_tokens": 143,
+  "prompt_tokens_details": {
+   "cached_tokens": 69
+  }
+ },
+ "timings": {
+  "cache_n": 69,
+  "prompt_n": 16,
+  "prompt_ms": 1262.6,
+  "prompt_per_token_ms": 78.912,
+  "prompt_per_second": 12.7,
+  "predicted_n": 58,
+  "predicted_ms": 2227.6,
+  "predicted_per_token_ms": 38.407,
+  "predicted_per_second": 26.0,
+  "draft_n": 0,
+  "draft_n_accepted": 0
+ }
+}
