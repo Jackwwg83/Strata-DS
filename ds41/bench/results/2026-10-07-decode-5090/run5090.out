@@ -1,0 +1,16 @@
+balloon 50.61953125055879 GiB
+== quota sweep
+DS41_ZC_QUOTA=0                               40.6 ms (24.6 tok/s) gpu  28.9 cpu  18.1 engram 11.7 zc   0.0 ram_cpu 74.7 file  0.0 hits 0.69 pf  0.0
+DS41_ZC_QUOTA=2                               38.6 ms (25.9 tok/s) gpu  26.2 cpu   7.2 engram 12.5 zc  52.8 ram_cpu 15.0 file  0.0 hits 0.72 pf  0.0
+DS41_ZC_QUOTA=3                               37.3 ms (26.8 tok/s) gpu  25.5 cpu   2.6 engram 11.9 zc  66.8 ram_cpu  6.2 file  0.0 hits 0.70 pf  0.0
+DS41_ZC_QUOTA=4                               35.9 ms (27.9 tok/s) gpu  25.7 cpu   0.8 engram 10.2 zc  71.7 ram_cpu  2.0 file  0.0 hits 0.69 pf  0.0
+DS41_ZC_QUOTA=6                               37.0 ms (27.1 tok/s) gpu  25.8 cpu   0.2 engram 11.1 zc  73.1 ram_cpu  0.3 file  0.0 hits 0.69 pf  0.0
+== prefetch
+DS41_ZC_QUOTA=4 DS41_PREFETCH=6               40.0 ms (25.0 tok/s) gpu  28.1 cpu   0.3 engram 11.9 zc  67.8 ram_cpu  0.3 file  0.0 hits 0.72 pf 42.1
+DS41_ZC_QUOTA=4 DS41_PREFETCH=9               48.4 ms (20.7 tok/s) gpu  34.5 cpu   0.4 engram 13.9 zc  73.1 ram_cpu  0.4 file  0.0 hits 0.69 pf 54.2
+DS41_ZC_QUOTA=6 DS41_PREFETCH=9               45.3 ms (22.1 tok/s) gpu  34.5 cpu   0.2 engram 10.8 zc  72.4 ram_cpu  0.2 file  0.0 hits 0.70 pf 53.2
+== threads
+DS41_ZC_QUOTA=4 T=24                          36.5 ms (27.4 tok/s) gpu  26.3 cpu   1.5 engram 10.2 zc  71.7 ram_cpu  2.0 file  0.0 hits 0.69 pf  0.0
+DS41_ZC_QUOTA=4 T=32                          36.1 ms (27.7 tok/s) gpu  26.1 cpu   1.1 engram 10.0 zc  72.5 ram_cpu  2.0 file  0.0 hits 0.69 pf  0.0
+== ALL DONE
+balloon stopped

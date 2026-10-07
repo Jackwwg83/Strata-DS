@@ -1,0 +1,5 @@
+Vast 54646590: RTX 5090 (32 GB, PCIe 5.0 x16, measured link class 54 GB/s), AMD Ryzen Threadripper PRO 7965WX
+(24 cores, AVX-512 VNNI), container limit 170.5 GiB held at 119.9 GiB by a numpy balloon (a 128 GB PC), disk: an
+overlay block device that caps at 6-8K random 4 KiB reads per s at any depth (159 us at depth 1, 11.9 ms at 96).
+SAGE 1.59bpw pack at eca94a38. Branch feature/ds41-finish at 4e2f0b8 (engram_rows parallel fallback).
+Each line of run5090.out / run_engram.out: one ds41_generate run, the mean of steps 9..end of --step-log.
