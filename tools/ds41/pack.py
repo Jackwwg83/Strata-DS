@@ -27,6 +27,7 @@ once, the engine never re-derives it):
 from __future__ import annotations
 
 import argparse
+import hashlib
 import json
 import os
 import shutil
@@ -279,8 +280,30 @@ class EngramArgs:
         self.engram_compressed_vocab_size = tc["engram_compressed_vocab_size"]
 
 
-def build_pack(src, out, n_layers=40, n_experts=384, wo_a_fp8=True, dense_only=False):
+# SAGE 1.59bpw at eca94a388a70841858feed8f057a9862e897aba4.
+ENGRAM_SHA256 = {
+    "engram_hash.txt": "a55179fea918e66a331ac4cc1bdf9a0b947117dd6478f74d470de2a7e42a5c49",
+    "engram_tokenmap.bin": "c60a86322ec17b4142bfef3c57a8d81fb428550cdf487f88a4320cb59fe46481",
+}
+
+
+def copy_engram_hash(src, out):
+    """Check both shipped SAGE files before writing either copy."""
+    files = {}
+    for name, sha in ENGRAM_SHA256.items():
+        with open(os.path.join(src, name), "rb") as f:
+            files[name] = f.read()
+        if hashlib.sha256(files[name]).hexdigest() != sha:
+            raise SystemExit(f"{name}: SHA-256 does not match the pinned SAGE Engram file")
+    for name, data in files.items():
+        with open(os.path.join(out, name), "wb") as f:
+            f.write(data)
+
+
+def build_pack(src, out, n_layers=40, n_experts=384, wo_a_fp8=True, dense_only=False, engram_from=None):
     """dense_only: rewrite dense.bin and index.txt of a finished pack; experts.bin and the rest stay."""
+    if engram_from is not None and not wo_a_fp8:
+        raise SystemExit("--engram-from cannot use --wo-a-bf16 (that conversion needs torch)")
     os.makedirs(out, exist_ok=True)
     info = os.path.join(out, "pack_info.txt")
     old = {}
@@ -301,7 +324,9 @@ def build_pack(src, out, n_layers=40, n_experts=384, wo_a_fp8=True, dense_only=F
     expert_bytes = write_experts(srcs, out, n_layers, n_experts)
     n_engram = write_engram(src, out)
     cfg = json.load(open(os.path.join(src, "config.json")))
-    if "engram_layer_ids" in cfg.get("text_config", cfg):
+    if engram_from is not None:
+        copy_engram_hash(engram_from, out)
+    elif "engram_layer_ids" in cfg.get("text_config", cfg):
         from transformers import AutoTokenizer
         write_engram_hash(EngramArgs(cfg), AutoTokenizer.from_pretrained(src), out)
     for f in ("config.json", "tokenizer.json", "tokenizer_config.json"):
@@ -320,8 +345,10 @@ def main():
     ap.add_argument("--experts", type=int, default=384)
     ap.add_argument("--wo-a-bf16", action="store_true", help="dequantize attn.wo_a to BF16 (packs before 2026-10-06)")
     ap.add_argument("--dense-only", action="store_true", help="rewrite only dense.bin and index.txt of a finished pack")
+    ap.add_argument("--engram-from", help="copy verified SAGE Engram files from DIR without torch", metavar="DIR")
     a = ap.parse_args()
-    build_pack(a.src, a.out, a.layers, a.experts, wo_a_fp8=not a.wo_a_bf16, dense_only=a.dense_only)
+    build_pack(a.src, a.out, a.layers, a.experts, wo_a_fp8=not a.wo_a_bf16, dense_only=a.dense_only,
+               engram_from=a.engram_from)
 
 
 if __name__ == "__main__":
