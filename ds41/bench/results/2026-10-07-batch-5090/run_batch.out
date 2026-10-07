@@ -1,0 +1,7 @@
+quota 4 slots 1: 39.3 ms per step, 25.4 tokens/s in all, 25.4 per row; gpu 29.1 engram 10.2 cpu 1.5, VRAM hits 0.62
+balloon 50.61953125055879 GiB
+quota 4 slots 2: 70.5 ms per step, 28.3 tokens/s in all, 14.2 per row; gpu 48.4 engram 22.2 cpu 3.9, VRAM hits 0.60
+quota 4 slots 3: 106.4 ms per step, 28.2 tokens/s in all, 9.4 per row; gpu 72.1 engram 34.3 cpu 6.5, VRAM hits 0.58
+quota 4 slots 4: 140.8 ms per step, 28.4 tokens/s in all, 7.1 per row; gpu 94.7 engram 46.1 cpu 9.5, VRAM hits 0.55
+== ALL DONE
+balloon stopped
