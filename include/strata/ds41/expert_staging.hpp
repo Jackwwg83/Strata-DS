@@ -29,6 +29,9 @@ public:
     // Join before reading the staging bytes or reusing any call buffer. All calls are capturable.
     void fork_copy(cudaStream_t main);
     void join(cudaStream_t main);
+    /// The copy kernel's shape for later forks (capture again after a change): `blocks` of 256 threads (default 68,
+    /// leaving SMs to the main stream), each with `unroll` loads in flight (1, 2, 4 or 8; default 1).
+    void set_launch(int blocks, int unroll);
 
 private:
     int capacity_;
@@ -38,6 +41,7 @@ private:
     int* count_ = nullptr;
     cudaStream_t copy_ = nullptr;
     cudaEvent_t ready_ = nullptr, done_ = nullptr;
+    int blocks_ = 68, unroll_ = 1;
 };
 
 } // namespace strata::ds41

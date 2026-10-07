@@ -23,7 +23,10 @@ void Engine::Impl::alloc_slots() {
             }
         }
     }
-    if (zc_stage) batch_stage = std::make_unique<ExpertStaging>(kVerifyMaxTokens * kTopK, zc_stage->stride());
+    if (zc_stage) {
+        batch_stage = std::make_unique<ExpertStaging>(kVerifyMaxTokens * kTopK, zc_stage->stride());
+        tune_stage(*batch_stage);
+    }
     if (n_eng) {
         std::vector<EngramRows::Table> tabs;
         for (const auto& t : pack.engram_tables()) tabs.push_back({t.path, t.weight_offset, t.scale_offset});
