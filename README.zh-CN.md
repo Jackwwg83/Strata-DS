@@ -123,6 +123,10 @@ NVIDIA 和 AMD 的步骤完全一样。安装程序会识别你的显卡，并�
   下载 94 GB。内存少于约 80 GB 时，Strata 回答时要从 SSD 读取其中一部分，所以会更慢（NVMe SSD 有帮助）。
 - **[Unsloth UD-Q4_K_XL](docs/MODELS.md#unsloth-ud-q4_k_xl-experimental)**（实验性）：最接近完整模型。但 Strata
   回答时要从 SSD 读取其中大部分内容，所以在 64 GB 的电脑上每秒只能写 7-8.5 个 token。
+- **[DeepSeek V4.1 Flash](docs/MODELS.md#deepseek-v41-flash-sage-159bpw)**（仅限 Linux + NVIDIA）：规模大得多的模型（连同
+  Engram 记忆共 7630 亿参数），使用 SAGE 1.59bpw 量化。需要 128 GB 内存、24 GB 及以上显存的 NVIDIA 显卡和约 462 GB
+  磁盘；`./setup.sh --setup --family deepseek`。按显卡不同，每秒生成 17-32 个 token（在 RTX 3090 和 RTX 5090 上实测，
+  [详情](docs/MODELS.md#deepseek-v41-flash-sage-159bpw)）。
 - **[OrcaRouter 的 Uncensored IQ3_XXS](docs/MODELS.md#orcarouter-uncensored-iq3_xxs)：** 需要手动设置，不在安装程序的菜单里。
 
 规格、下载以及各配置能装下什么：[docs/MODELS.md](docs/MODELS.md)。以后想再添加模型，运行

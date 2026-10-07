@@ -86,10 +86,10 @@ DeepSeek is an explicit choice. Setup never selects it by default:
 | --- | --- | --- |
 | 128 GB recommended | `--family deepseek --model SAGE-1.59BPW` | Linux + NVIDIA only; 341.8 GB download plus about 120 GB pack; about 462 GB disk in total |
 
-Measured on Linux with an RTX 4090 (24 GB) and 119.9 GiB usable RAM (a 128 GB PC): decode 24-29 tokens/s on code
-text, 15-20 tokens/s in the chat requests of the server test (ds41/bench/results/2026-10-07-serve). Long prompts ran
-at 1,100-1,260 tokens/s at 32K-128K and 967 tokens/s at 256K; a short prompt takes about 3-5 s. The engine also builds and passes its tests
-on sm_86 (RTX 3060), which had too little RAM for the model. Model inference below 120 GiB usable RAM or with GPUs
+Measured on Linux with about 120 GiB of usable RAM (a 128 GB PC), 2026-10-07: an RTX 5090 (PCIe 5.0) writes 26-32
+tokens/s, an RTX 3090 (PCIe 4.0) 16-17 tokens/s; a 2000-token prompt took 13.4 s on the RTX 3090 PC, a short chat
+turn under a second. Details and conditions: docs/MODELS.md, DeepSeek section. The model ran on sm_86 (RTX 3090) and sm_120
+(RTX 5090). Model inference below 120 GiB usable RAM or with GPUs
 under 24 GB VRAM is not tested beyond the measured 119.9 GiB setup. Windows and AMD are not tested.
 
 `--family swift` (Swift 1.5, a fine-tune that thinks shorter; sizes Q2_0, IQ2_XS, IQ3_XXS) is the alternative to
