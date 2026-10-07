@@ -92,9 +92,10 @@ faster $best-huge $best && { best=$best-huge; best_env="$best_env DS41_RAM_HUGEP
 echo "best lossless setting: $best ($best_env)" | tee -a $OUT/speed.txt
 # the same setting again: with the adaptive VRAM tier two plain runs can differ near a tie (the noise floor below)
 speed $best-again $best_env
-SKIPS="0.03 0.06 0.10"
+# the router's 6 weights are sqrt(softplus) scores normalized to their sum: fairly flat, 1/6 = 0.167 on average
+SKIPS="0.05 0.10 0.15"
 for tau in $SKIPS; do speed $best-skip$tau $best_env DS41_SKIP_MISS=$tau; done
-speed $best-skip0.06-norenorm $best_env DS41_SKIP_MISS=0.06 DS41_SKIP_RENORM=0
+speed $best-skip0.10-norenorm $best_env DS41_SKIP_MISS=0.10 DS41_SKIP_RENORM=0
 
 # ---------------------------------------------------------------- 3. quality of DS41_SKIP_MISS
 : > $OUT/quality.txt
@@ -111,10 +112,10 @@ nll() {   # tag VAR=value...
 }
 nll plain $best_env
 for tau in $SKIPS; do nll skip$tau $best_env DS41_SKIP_MISS=$tau; done
-nll skip0.06-norenorm $best_env DS41_SKIP_MISS=0.06 DS41_SKIP_RENORM=0
+nll skip0.10-norenorm $best_env DS41_SKIP_MISS=0.10 DS41_SKIP_RENORM=0
 # greedy agreement with the plain output: tokens equal before the first difference, per chat ($best-again: the
 # agreement of two plain runs, the noise floor)
-for tag in $best-again $(for tau in $SKIPS; do echo $best-skip$tau; done) $best-skip0.06-norenorm; do
+for tag in $best-again $(for tau in $SKIPS; do echo $best-skip$tau; done) $best-skip0.10-norenorm; do
   for name in code zh_chat; do
     $PY - $OUT/runs/$best-$name.log $OUT/runs/$tag-$name.log "$tag" "$name" <<'PY' | tee -a $OUT/quality.txt
 import sys
@@ -129,4 +130,13 @@ print(f"{sys.argv[3]:40s} {sys.argv[4]:8s} greedy tokens equal to the plain run:
 PY
   done
 done
+
+# ---------------------------------------------------------------- 4. where the GPU time goes (when nsys is installed)
+if command -v nsys > /dev/null; then
+  env $best_env nsys profile -o $OUT/runs/decode-profile --force-overwrite true -t cuda,nvtx \
+    $B/ds41_generate --pack $P --expert-profile $PROF --threads $T --prefill --gen 48 \
+    --ids "$(cat $OUT/ids/code.ids)" > $OUT/runs/decode-profile.log 2>&1
+  nsys stats -r cuda_gpu_kern_sum -f csv -o $OUT/runs/decode-kernels $OUT/runs/decode-profile.nsys-rep \
+    > /dev/null 2>&1 && echo "kernel summary: $OUT/runs/decode-kernels_cuda_gpu_kern_sum.csv"
+fi
 echo "done: $OUT"
