@@ -27,6 +27,7 @@
 #include "strata/ds41/kernels/k8_router.hpp"
 #include "strata/ds41/ops.hpp"
 #include "strata/ds41/prefill_ops.hpp"
+#include "strata/ds41/skip_misses.hpp"
 #include "strata/ds41/vram_experts.hpp"
 #include "strata/ds41/wo_a_fp8.hpp"
 
@@ -79,6 +80,12 @@ double now_ms() {
 __global__ void wait_flag_k(const volatile uint32_t* flag) {
     while (*flag == 0) __nanosleep(200);
     __threadfence_system();
+}
+
+/// DS41_SKIP_MISS: one decode token's routed experts through skip_misses_row; how many it left out goes to *skipped
+__global__ void skip_misses_k(const int32_t* ids, float* w, int topk, const int32_t* res, float tau, bool renorm,
+                              int32_t* out, int32_t* skipped) {
+    *skipped = skip_misses_row(ids, w, topk, res, tau, renorm, out);
 }
 
 /// precompute_freqs_cis in fp32, as model.py computes it: [seqlen][32] (cos, sin) pairs
@@ -183,6 +190,15 @@ struct Engine::Impl {
     std::unique_ptr<ExpertPrefetch> prefetch;   // DS41_PREFETCH=N: the next layer's N guessed experts, copied ahead
     std::atomic<int> worker_prefetched{0};
     int32_t* routes_dev = nullptr;     // [40][6]
+    // DS41_SKIP_MISS=tau (opt-in, changes the output): a decode step leaves out the routed experts outside VRAM whose
+    // weight is below tau times the token's weight sum (include/strata/ds41/skip_misses.hpp); DS41_SKIP_RENORM=0 keeps
+    // the other weights as they are (default: scaled back to the old sum). routes_dev keeps the router's choice, so
+    // the VRAM tier still counts the left-out experts as used.
+    float skip_tau = 0.0f;
+    bool skip_renorm = true;
+    int32_t* skip_ids_dev = nullptr;   // [40][6] the ids the step computes (-1: left out)
+    int32_t* skip_n_dev = nullptr;     // [40] experts left out per layer
+    int32_t* skip_n_pinned = nullptr;
     float* weights_dev = nullptr;      // [40][6]
     uint8_t* cand_dev = nullptr;       // [max_seq] candidate mask of the candidate layer
 
@@ -261,6 +277,7 @@ struct Engine::Impl {
         if (hp_next) cudaFreeHost(hp_next);
         if (lg_pinned) cudaFreeHost(lg_pinned);
         if (routes_pinned) cudaFreeHost(routes_pinned);
+        if (skip_n_pinned) cudaFreeHost(skip_n_pinned);
         if (st) cudaStreamDestroy(st);
         if (pfh.base) cudaFreeHost(pfh.base);
     }
@@ -507,6 +524,24 @@ struct Engine::Impl {
         ck(cudaHostAlloc((void**) &hp_next, sizeof(int), cudaHostAllocDefault), "next token");
         ck(cudaHostAlloc((void**) &lg_pinned, (size_t) kVocab * 4, cudaHostAllocDefault), "logits");
         ck(cudaHostAlloc((void**) &routes_pinned, kLayers * kTopK * 4, cudaHostAllocDefault), "routes");
+        if (const char* v = std::getenv("DS41_SKIP_MISS")) {
+            char* end = nullptr;
+            skip_tau = std::strtof(v, &end);
+            if (end == v || *end != '\0' || !(skip_tau >= 0.0f && skip_tau < 1.0f))
+                throw std::invalid_argument("DS41_SKIP_MISS must be a number in [0, 1)");
+        }
+        if (const char* v = std::getenv("DS41_SKIP_RENORM")) {
+            if (std::strcmp(v, "0") != 0 && std::strcmp(v, "1") != 0)
+                throw std::invalid_argument("DS41_SKIP_RENORM must be 0 or 1");
+            skip_renorm = v[0] == '1';
+        }
+        if (skip_tau > 0.0f) {
+            skip_ids_dev = dalloc_own<int32_t>(kLayers * kTopK);
+            skip_n_dev = dalloc_own<int32_t>(kLayers);
+            ck(cudaHostAlloc((void**) &skip_n_pinned, kLayers * 4, cudaHostAllocDefault), "skipped");
+            std::fprintf(stderr, "ds41: DS41_SKIP_MISS %.3f (renorm %d): light experts outside VRAM are left out\n",
+                         skip_tau, (int) skip_renorm);
+        }
         dp = dalloc_own<int>(4);
         d_next = dalloc_own<int>(1);
         one_hot_dev = dalloc_own<float>(kHc);
@@ -881,13 +916,20 @@ struct Engine::Impl {
         int32_t* ids = routes_dev + l * kTopK;
         float* w = weights_dev + l * kTopK;
         kernels::router_topk(xf, 1, y.gate_w, y.gate_bias, ids, w, st);
+        const bool tier = vram && vram->slots() > 0;
+        const int32_t* use_ids = ids;   // what the step computes: the router's choice, less DS41_SKIP_MISS
+        if (skip_tau > 0.0f) {
+            skip_misses_k<<<1, 1, 0, st>>>(ids, w, kTopK, tier ? vram->res_dev() + (size_t) l * kExperts : nullptr,
+                                           skip_tau, skip_renorm, skip_ids_dev + l * kTopK, skip_n_dev + l);
+            ck(cudaGetLastError(), "skip misses");
+            use_ids = skip_ids_dev + l * kTopK;
+        }
         // K10 computes VRAM hits and a quota of RAM misses (staged or direct) while the CPU computes the rest.
         ops::to_half_fp8q(xf, x_half_dev, kDim, st);
-        const bool tier = vram && vram->slots() > 0;
         const auto* ram = host && host->experts_dev() ? host->experts_dev() + (size_t) l * kExperts : nullptr;
         // prefetch: layer l's guesses were planned and copied during layer l - 1 (none for layer 0)
         const bool pf = prefetch && ram && zc_blobs;
-        db->publish(x_half_dev, ids, w, 1, tier ? vram->res_dev() + (size_t) l * kExperts : nullptr, gpu_sel,
+        db->publish(x_half_dev, use_ids, w, 1, tier ? vram->res_dev() + (size_t) l * kExperts : nullptr, gpu_sel,
                     (uint32_t) (l + 1), st, tier ? vram->experts_dev() : nullptr, ram,
                     zc_quota ? zc_quota.get() + l : nullptr,
                     ram ? zc_stage.get() : nullptr, ram && zc_blobs ? zc_blobs.get() + (size_t) l * kExperts : nullptr,
@@ -1788,6 +1830,8 @@ struct Engine::Impl {
         ck(cudaMemcpyAsync(hp_next, d_next, sizeof(int), cudaMemcpyDeviceToHost, st), "next token");
         ck(cudaMemcpyAsync(lg_pinned, logits, (size_t) kVocab * 4, cudaMemcpyDeviceToHost, st), "logits");
         ck(cudaMemcpyAsync(routes_pinned, routes_dev, kLayers * kTopK * 4, cudaMemcpyDeviceToHost, st), "routes");
+        if (skip_tau > 0.0f)
+            ck(cudaMemcpyAsync(skip_n_pinned, skip_n_dev, kLayers * 4, cudaMemcpyDeviceToHost, st), "skipped");
     }
 
     /// Indexer capacity of a graph: the next power of two of t (at least 1), at most the allocated rows
@@ -1972,7 +2016,9 @@ struct Engine::Impl {
         tm.total_ms = now_ms() - t_start;
         tm.cpu_experts_ms = worker_us.load() / 1000.0;
         tm.expert_total = kLayers * kTopK;
-        tm.expert_hits = tm.expert_total - worker_misses.load();
+        if (skip_tau > 0.0f)
+            for (int l = 0; l < kLayers; ++l) tm.skipped += skip_n_pinned[l];
+        tm.expert_hits = tm.expert_total - worker_misses.load() - tm.skipped;
         tm.ram_experts = worker_ram.load();
         tm.file_experts = worker_file.load();
         tm.ssd_experts = worker_ssd.load();
