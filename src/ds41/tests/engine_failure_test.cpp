@@ -6,12 +6,17 @@
 //   --case prefill      a failure before the first prefill pass leaves the engine usable; one inside a pass does not
 //   --case lifecycle    two engines one after the other: the second does not run out of VRAM, and the free VRAM
 //                       comes back after each destruction
+//   --case overlap      DS41_ENGRAM_OVERLAP=1 (engram rows read during the step's GPU work) gives the tokens and the
+//                       logits (within 1e-2) of the serial reads, step by step
+//   --case engram_late  with the overlap, a read that fails after the launch: the step does not hang, the error
+//                       surfaces, the engine refuses the next step
 // Needs the model pack: --pack DIR (without it the test is skipped with code 77). DS41_TEST_FAULT arms the faults.
 #include "strata/ds41/config.hpp"
 #include "strata/ds41/engine.hpp"
 
 #include <cuda_runtime.h>
 
+#include <cmath>
 #include <cstdio>
 #include <cstdlib>
 #include <functional>
@@ -120,6 +125,41 @@ int main(int argc, char** argv) {
                 std::printf("round %d: free VRAM %.0f MiB less than before the first engine\n", round, lost);
                 check(lost < 256.0, "VRAM comes back after the engine is destroyed (round " + std::to_string(round) + ")");
             }
+        } else if (which == "overlap") {
+            // forced tokens (a fixed prompt, one step each) and then greedy tokens, serial reads vs overlapped
+            auto run = [&](const char* overlap, std::vector<int>& toks, std::vector<std::vector<float>>& lgs) {
+                setenv("DS41_ENGRAM_OVERLAP", overlap, 1);
+                Engine e(pack, opt);
+                int next = 0;
+                for (int pos = 0; pos < 40; ++pos) {
+                    const int in = pos < (int) prompt.size() ? prompt[pos] : next;
+                    next = e.step(in, pos);
+                    toks.push_back(next);
+                    lgs.push_back(e.last_logits());
+                }
+                unsetenv("DS41_ENGRAM_OVERLAP");
+            };
+            std::vector<int> ta, tb;
+            std::vector<std::vector<float>> la, lb;
+            run("0", ta, la);
+            run("1", tb, lb);
+            check(ta == tb, "the same 40 tokens with and without the overlap");
+            double worst = 0;
+            for (size_t i = 0; i < la.size() && i < lb.size(); ++i)
+                for (size_t j = 0; j < la[i].size() && j < lb[i].size(); ++j)
+                    worst = std::max(worst, (double) std::fabs(la[i][j] - lb[i][j]));
+            std::printf("  largest logit difference: %g\n", worst);
+            check(la.size() == lb.size() && worst < 1e-2, "the same logits (within 1e-2, as engine_reset_test)");
+        } else if (which == "engram_late") {
+            setenv("DS41_ENGRAM_OVERLAP", "1", 1);
+            setenv("DS41_TEST_FAULT", "engram_late", 1);
+            Engine e(pack, opt);
+            std::string msg;
+            check(throws([&] { e.step(prompt[0], 0); }, &msg) && msg.find("engram") != std::string::npos,
+                  "a read failure after the launch surfaces (the step did not hang)");
+            check(throws([&] { e.step(prompt[1], 1); }, &msg) && msg.find("unusable") != std::string::npos,
+                  "the engine refuses the next step");
+            unsetenv("DS41_ENGRAM_OVERLAP");
         } else {
             std::printf("unknown --case %s\n", which.c_str());
             return 2;

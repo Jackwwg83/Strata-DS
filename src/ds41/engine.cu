@@ -75,6 +75,12 @@ double now_ms() {
     return std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now().time_since_epoch()).count();
 }
 
+/// DS41_ENGRAM_OVERLAP: the decode stream waits here until the host raised `flag` (mapped memory) for this step
+__global__ void wait_flag_k(const volatile uint32_t* flag) {
+    while (*flag == 0) __nanosleep(200);
+    __threadfence_system();
+}
+
 /// precompute_freqs_cis in fp32, as model.py computes it: [seqlen][32] (cos, sin) pairs
 std::vector<float> rope_table(int seqlen, bool yarn) {
     const int dim = kRopeDim;
@@ -145,6 +151,14 @@ struct Engine::Impl {
     static constexpr int kEngRows = 24;
     uint8_t* eng_host = nullptr;       // pinned: per engram layer, kEngRows*256 weight bytes then kEngRows*8 scales
     uint8_t* eng_dev = nullptr;        // the same on the device
+    // DS41_ENGRAM_OVERLAP=1: the step's GPU work starts before the rows are read. The graph waits for table li's flag
+    // (mapped, raised by the host when its rows are in eng_host) just before engram layer li, then copies the rows.
+    // The host reads table 0 first and table 1 only after it: layer 1 needs table 0, layer 14 table 1.
+    bool eng_overlap = false;
+    bool eng_async = false;            // this step overlaps (not with a dump or DS41_DEBUG: they sync inside the step)
+    uint32_t* eng_flag_host = nullptr; // [n_eng], one per 64 bytes; zeroed before each step
+    uint32_t* eng_flag_dev = nullptr;
+    static constexpr int kFlagStride = 16;
 
     // routed experts: the CPU thread and its doorbell (round l+1 = layer l)
     std::unique_ptr<ExpertDoorbell> db;
@@ -242,6 +256,7 @@ struct Engine::Impl {
         for (cudaEvent_t e : pfp.ev) cudaEventDestroy(e);
         if (dbg) std::fclose(dbg);
         if (eng_host) cudaFreeHost(eng_host);
+        if (eng_flag_host) cudaFreeHost(eng_flag_host);
         if (hp) cudaFreeHost(hp);
         if (hp_next) cudaFreeHost(hp_next);
         if (lg_pinned) cudaFreeHost(lg_pinned);
@@ -426,6 +441,17 @@ struct Engine::Impl {
         const size_t eng_bytes = (size_t) n_eng * kEngRows * (256 + 8);
         ck(cudaHostAlloc((void**) &eng_host, std::max<size_t>(eng_bytes, 1), cudaHostAllocDefault), "engram pinned");
         eng_dev = dalloc_own<uint8_t>(std::max<size_t>(eng_bytes, 1));
+        if (const char* v = std::getenv("DS41_ENGRAM_OVERLAP")) {
+            if (std::strcmp(v, "0") != 0 && std::strcmp(v, "1") != 0)
+                throw std::invalid_argument("DS41_ENGRAM_OVERLAP must be 0 or 1");
+            eng_overlap = v[0] == '1' && n_eng > 0;
+        }
+        if (eng_overlap) {
+            const size_t flag_bytes = (size_t) n_eng * kFlagStride * sizeof(uint32_t);
+            ck(cudaHostAlloc((void**) &eng_flag_host, flag_bytes, cudaHostAllocMapped), "engram flags");
+            std::memset(eng_flag_host, 0, flag_bytes);
+            ck(cudaHostGetDevicePointer((void**) &eng_flag_dev, eng_flag_host, 0), "engram flags");
+        }
         // scratch
         h = dalloc_own<bf16>(kHc * kDim);
         h2 = dalloc_own<bf16>(kHc * kDim);
@@ -1712,7 +1738,7 @@ struct Engine::Impl {
     /// dump: eager only (it reads the device between layers).
     void enqueue_step(StepDump* dump) {
         ck(cudaMemcpyAsync(dp, hp, sizeof(StepParams), cudaMemcpyHostToDevice, st), "step params");
-        if (n_eng)
+        if (n_eng && !eng_async)
             ck(cudaMemcpyAsync(eng_dev, eng_host, (size_t) n_eng * kEngRows * (256 + 8), cudaMemcpyHostToDevice, st),
                "engram rows");
         ops::window_index_device(dp + 1, idx_dev, st);
@@ -1721,7 +1747,15 @@ struct Engine::Impl {
         int eng_i = 0;
         for (int l = 0; l < kLayers; ++l) {
             auto& y = L[l];
-            if (is_engram_layer(l)) engram(l, eng_i++);
+            if (is_engram_layer(l)) {
+                if (eng_async) {     // this table's rows: wait for the host, then copy them
+                    const size_t bytes = (size_t) kEngRows * (256 + 8), at = (size_t) eng_i * bytes;
+                    wait_flag_k<<<1, 1, 0, st>>>(eng_flag_dev + (size_t) eng_i * kFlagStride);
+                    ck(cudaGetLastError(), "engram wait");
+                    ck(cudaMemcpyAsync(eng_dev + at, eng_host + at, bytes, cudaMemcpyHostToDevice, st), "engram rows");
+                }
+                engram(l, eng_i++);
+            }
             const bool dbg_layer = dbg && (l == 1 || l == 2);
             if (dbg_layer) dbg_write(h, kHc * kDim);                    // block input (after engram)
             // attention sub-block: h -> h2
@@ -1837,6 +1871,7 @@ struct Engine::Impl {
         try {
             return step_body(token, pos, dump, tm, released);
         } catch (...) {
+            if (eng_rows) eng_rows->abandon();   // DS41_ENGRAM_OVERLAP: reads still in flight
             // nothing reached the device or the worker: undo the history, the step may be retried
             if (released) broken = true;
             else if ((int) history.size() == pos + 1) history.pop_back();
@@ -1854,7 +1889,15 @@ struct Engine::Impl {
             for (int l = 0; l < kLayers; ++l)
                 if (is_engram_layer(l)) engram_ids(l, li++, pos);
             if (fault("engram")) throw std::runtime_error("ds41 test fault: engram read");
-            engram_read_all();
+            eng_async = eng_overlap && !dump && !dbg;
+            if (eng_async) {     // table 0's reads go out now; the rest is waited for after the launch
+                engram_prepare();
+                eng_rows->submit(0);
+                for (int li = 0; li < n_eng; ++li)
+                    __atomic_store_n(eng_flag_host + (size_t) li * kFlagStride, 0u, __ATOMIC_RELEASE);
+            } else {
+                engram_read_all();
+            }
             tm.engram_ms = now_ms() - t0;
         }
         if (vram) tm.vram_swaps = vram->between_steps();   // the device is idle: the last step ended in a sync
@@ -1897,6 +1940,8 @@ struct Engine::Impl {
         } else {
             enqueue_step(dump);
         }
+        const double t_launched = now_ms();
+        if (eng_async) engram_finish_overlapped(tm);
         ck(cudaStreamSynchronize(st), "step");
         {
             std::lock_guard<std::mutex> lk(mu);
@@ -1937,8 +1982,50 @@ struct Engine::Impl {
             tm.warmed = (int) st_.warmed;
             tm.warmed_useful = (int) st_.useful;
         }
-        tm.gpu_ms = tm.total_ms - tm.engram_ms;
+        // DS41_ENGRAM_OVERLAP: from the launch to the end of the step (the reads ran inside it)
+        tm.gpu_ms = eng_async ? t_start + tm.total_ms - t_launched : tm.total_ms - tm.engram_ms;
         return best;
+    }
+
+    /// DS41_ENGRAM_OVERLAP: the requests of this step's rows (into eng_host), none in flight yet
+    void engram_prepare() {
+        const auto& hs = pack.engram_hash();
+        const int cols = (hs.max_ngram - 1) * hs.n_heads;
+        std::vector<const int64_t*> ids;
+        std::vector<uint8_t*> w, s;
+        for (int li = 0; li < n_eng; ++li) {
+            uint8_t* base = eng_host + (size_t) li * kEngRows * (256 + 8);
+            ids.push_back(eng_ids[li].data());
+            w.push_back(base);
+            s.push_back(base + kEngRows * 256);
+        }
+        eng_rows->prepare(ids, cols, w, s);
+    }
+
+    /// DS41_ENGRAM_OVERLAP, after the launch: table by table, wait for the rows, raise the table's flag (the GPU
+    /// copies them), then send the next table's reads. A failed read still raises every flag, so the GPU never
+    /// waits forever, then the error goes up once the stream is idle (the step is lost: the engine is broken).
+    void engram_finish_overlapped(Timing& tm) {
+        const double t0 = now_ms();
+        std::exception_ptr err;
+        for (int li = 0; li < n_eng; ++li) {
+            if (!err) {
+                try {
+                    eng_rows->finish(li);
+                    if (li == 0 && fault("engram_late"))
+                        throw std::runtime_error("ds41 test fault: engram read after the launch");
+                    if (li + 1 < n_eng) eng_rows->submit(li + 1);
+                } catch (...) {
+                    err = std::current_exception();
+                }
+            }
+            __atomic_store_n(eng_flag_host + (size_t) li * kFlagStride, 1u, __ATOMIC_RELEASE);
+        }
+        tm.engram_ms += now_ms() - t0;
+        if (err) {
+            cudaStreamSynchronize(st);
+            std::rethrow_exception(err);
+        }
     }
 };
 

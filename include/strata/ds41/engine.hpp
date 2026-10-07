@@ -144,6 +144,8 @@ public:
     /// time the CPU thread spent computing experts, inside gpu_ms.
     /// expert_hits: routed experts of the step computed from VRAM slots, of expert_total.
     struct Timing {
+        /// DS41_ENGRAM_OVERLAP=1: engram_ms is the read time, most of it during the GPU's work, and gpu_ms runs from
+        /// the launch to the end of the step (otherwise the reads come first and gpu_ms = total_ms - engram_ms)
         double gpu_ms = 0, cpu_experts_ms = 0, engram_ms = 0, total_ms = 0;
         int expert_hits = 0, expert_total = 0;   ///< VRAM hits and all routed uses
         int cpu_experts() const { return ram_experts + file_experts; }
