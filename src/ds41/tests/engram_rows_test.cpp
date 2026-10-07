@@ -106,6 +106,30 @@ bool run(const std::string& dir, const char* name) {
         check(std::memcmp(w.data() + R * 256, data[1].data() + w_off + 3 * 256, 256) == 0,
               std::string(name) + ": the reader works after the misuse");
     }
+    {   // a failed read poisons the reader, and abandon() (finishing the other table) does not clear that
+        const std::string short_path = dir + "/ds41_engram_rows_test_short.bin";
+        std::FILE* f = std::fopen(short_path.c_str(), "wb");
+        if (!f) return false;
+        std::fwrite(data[1].data(), 1, size - 200, f);   // the last row's scale is missing, the first rows are there
+        std::fclose(f);
+        EngramRows er({{paths[0], w_off, s_off}, {short_path, w_off, s_off}}, R);
+        std::vector<int64_t> ids(R, rows - 1);
+        std::vector<uint8_t> w(2 * R * 256), s(2 * R * 8);
+        er.prepare({ids.data(), ids.data()}, R, {w.data(), w.data() + R * 256}, {s.data(), s.data() + R * 8});
+        er.submit(0);
+        er.submit(1);
+        bool threw = false;
+        try { er.finish(1); } catch (const std::exception&) { threw = true; }
+        check(threw, std::string(name) + ": a read past the end of a table fails");
+        er.abandon();   // finishes table 0, which succeeds
+        std::vector<int64_t> first(R, 0);   // rows both files hold: a reader that was not poisoned reads them
+        threw = false;
+        try {
+            er.read({first.data(), first.data()}, R, {w.data(), w.data() + R * 256}, {s.data(), s.data() + R * 8});
+        } catch (const std::exception&) { threw = true; }
+        check(threw, std::string(name) + ": after a failed read and abandon() the reader stays refused");
+        std::remove(short_path.c_str());
+    }
     for (const auto& p : paths) std::remove(p.c_str());
     return true;
 }

@@ -51,6 +51,7 @@
 #include <mutex>
 #include <numeric>
 #include <stdexcept>
+#include <system_error>
 #include <thread>
 
 namespace strata::ds41 {
@@ -156,6 +157,8 @@ struct Engine::Impl {
     // The host reads table 0 first and table 1 only after it: layer 1 needs table 0, layer 14 table 1.
     bool eng_overlap = false;
     bool eng_async = false;            // this step overlaps (not with a dump or DS41_DEBUG: they sync inside the step)
+    std::exception_ptr eng_error;      // the overlapped read's failure, rethrown by the step after its sync
+    double eng_read_ms = 0;            // the overlapped read's time after table 0 was sent
     uint32_t* eng_flag_host = nullptr; // [n_eng], one per 64 bytes; zeroed before each step
     uint32_t* eng_flag_dev = nullptr;
     static constexpr int kFlagStride = 16;
@@ -1755,6 +1758,8 @@ struct Engine::Impl {
                     ck(cudaMemcpyAsync(eng_dev + at, eng_host + at, bytes, cudaMemcpyHostToDevice, st), "engram rows");
                 }
                 engram(l, eng_i++);
+                if (eng_async && fault("enqueue"))   // a wait node is queued: the reader still raises every flag
+                    throw std::runtime_error("ds41 test fault: enqueue after an engram wait");
             }
             const bool dbg_layer = dbg && (l == 1 || l == 2);
             if (dbg_layer) dbg_write(h, kHc * kDim);                    // block input (after engram)
@@ -1883,6 +1888,10 @@ struct Engine::Impl {
         tm = Timing{};
         const double t_start = now_ms();
         history.push_back(pack.engram_hash().token_map[token]);
+        // DS41_ENGRAM_OVERLAP: a thread of its own finishes the reads and raises the flags, so they are raised even when
+        // a launch blocks until its kernels end (DS41_GRAPH=0, CUDA_LAUNCH_BLOCKING=1) or the enqueue throws. Declared
+        // before the launch: on any exception its destructor waits for the reader, so the GPU is never left waiting.
+        std::future<void> reader;
         {
             const double t0 = now_ms();
             int li = 0;
@@ -1890,11 +1899,18 @@ struct Engine::Impl {
                 if (is_engram_layer(l)) engram_ids(l, li++, pos);
             if (fault("engram")) throw std::runtime_error("ds41 test fault: engram read");
             eng_async = eng_overlap && !dump && !dbg;
-            if (eng_async) {     // table 0's reads go out now; the rest is waited for after the launch
+            if (eng_async) {     // table 0's reads go out now; the reader thread does the rest during the GPU work
                 engram_prepare();
                 eng_rows->submit(0);
                 for (int li = 0; li < n_eng; ++li)
                     __atomic_store_n(eng_flag_host + (size_t) li * kFlagStride, 0u, __ATOMIC_RELEASE);
+                eng_error = nullptr;
+                eng_read_ms = 0;
+                try {
+                    reader = std::async(std::launch::async, [this] { engram_finish_overlapped(); });
+                } catch (const std::system_error&) {   // no thread: read here, before the launch (no overlap)
+                    engram_finish_overlapped();
+                }
             } else {
                 engram_read_all();
             }
@@ -1941,8 +1957,10 @@ struct Engine::Impl {
             enqueue_step(dump);
         }
         const double t_launched = now_ms();
-        if (eng_async) engram_finish_overlapped(tm);
+        if (reader.valid()) reader.wait();
+        if (eng_async) tm.engram_ms += eng_read_ms;
         ck(cudaStreamSynchronize(st), "step");
+        if (eng_error) std::rethrow_exception(eng_error);   // the step is lost: released, so the engine is broken
         {
             std::lock_guard<std::mutex> lk(mu);
             if (worker_error) {
@@ -2002,30 +2020,25 @@ struct Engine::Impl {
         eng_rows->prepare(ids, cols, w, s);
     }
 
-    /// DS41_ENGRAM_OVERLAP, after the launch: table by table, wait for the rows, raise the table's flag (the GPU
-    /// copies them), then send the next table's reads. A failed read still raises every flag, so the GPU never
-    /// waits forever, then the error goes up once the stream is idle (the step is lost: the engine is broken).
-    void engram_finish_overlapped(Timing& tm) {
+    /// DS41_ENGRAM_OVERLAP, on the reader thread: table by table, wait for the rows, raise the table's flag (the GPU
+    /// copies them), then send the next table's reads. Throws nothing: a failed read still raises every flag, so the
+    /// GPU never waits forever, and the error goes to eng_error for the step to rethrow after its sync.
+    void engram_finish_overlapped() noexcept {
         const double t0 = now_ms();
-        std::exception_ptr err;
         for (int li = 0; li < n_eng; ++li) {
-            if (!err) {
+            if (!eng_error) {
                 try {
                     eng_rows->finish(li);
                     if (li == 0 && fault("engram_late"))
                         throw std::runtime_error("ds41 test fault: engram read after the launch");
                     if (li + 1 < n_eng) eng_rows->submit(li + 1);
                 } catch (...) {
-                    err = std::current_exception();
+                    eng_error = std::current_exception();
                 }
             }
             __atomic_store_n(eng_flag_host + (size_t) li * kFlagStride, 1u, __ATOMIC_RELEASE);
         }
-        tm.engram_ms += now_ms() - t0;
-        if (err) {
-            cudaStreamSynchronize(st);
-            std::rethrow_exception(err);
-        }
+        eng_read_ms = now_ms() - t0;
     }
 };
 
