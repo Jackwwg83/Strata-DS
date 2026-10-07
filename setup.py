@@ -3746,9 +3746,9 @@ def setup_deepseek(a, data, elsewhere, adopted=None):
     if not 64 <= ctx <= 262144:                         # ds41_serve refuses a context under 64
         fail("DeepSeek context must be between 64 and 262144 tokens; no RoPE extension")
     if a.vision not in (None, "no", "none") or a.kv or a.low_ram != "auto" or \
-            a.experimental_speed_projection not in (None, "off") or a.draft_vocab or a.parallel or \
+            a.experimental_speed_projection not in (None, "off") or a.draft_vocab or \
             a.kv_streaming != "auto" or a.vram_reserve_mib is not None:
-        warn("DeepSeek skips images, KV settings, low-RAM mode, speed projection, draft layers, and parallel tuning")
+        warn("DeepSeek skips images, KV settings, low-RAM mode, speed projection and draft layers")
     src = Path(a.models_dir).expanduser().resolve() / DEEPSEEK_TAG
     pack = find_in([data, *elsewhere], f"packs/{DEEPSEEK_TAG}") or data / "packs" / DEEPSEEK_TAG
     if adopted is not None:
@@ -3799,6 +3799,16 @@ def setup_deepseek(a, data, elsewhere, adopted=None):
             str(ROOT / "ds41/data/expert-profile.bin"), "--threads", str(deepseek_threads())]
     if a.resident_budget_gib is not None:
         args += ["--ram-budget-gib", f"{a.resident_budget_gib:g}"]
+    # --parallel N: N requests decode together (ds41_serve --batch, at most 4 slots); a run without it keeps the last
+    old_args = network.get("args") or []
+    batch = a.parallel if a.parallel is not None else \
+        int(old_args[old_args.index("--batch") + 1]) if "--batch" in old_args[:-1] else 1
+    if batch > 4:
+        warn(f"DeepSeek decodes at most 4 requests together; --parallel {batch} becomes 4")
+        batch = 4
+    if batch >= 2:
+        args += ["--batch", str(batch)]
+        ok(f"parallel requests: up to {batch} decode together (each slot takes about 0.1 GB of VRAM at 32K context)")
     port = a.port or network.get("port") or 8080       # a run again keeps the saved port, host and key
     cfg = {"exe": str(eng / "ds41_serve"), "args": args, "cwd": str(ROOT), "tokenizer": str(pack),
            "format": "deepseek_v41", "model_name": "deepseek-v4.1-flash",

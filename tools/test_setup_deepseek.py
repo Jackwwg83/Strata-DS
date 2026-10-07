@@ -264,6 +264,18 @@ class Installer(unittest.TestCase):
         info = (new / 'packs/deepseek-sage-1.59bpw/pack_info.txt').read_text()
         self.assertIn(f'source {new_src}\n', info)
 
+    def test_parallel_becomes_batch_slots(self):
+        # --parallel N: N requests decode together (ds41_serve --batch N, at most 4); a re-run without it keeps it
+        cfg = self.install('--parallel', '3')
+        self.assertEqual(cfg['args'][-2:], ['--batch', '3'])
+        cfg = self.install()
+        self.assertEqual(cfg['args'][-2:], ['--batch', '3'])
+        cfg = self.install('--parallel', '8')
+        self.assertEqual(cfg['args'][-2:], ['--batch', '4'])
+        self.assertIn('at most 4', self.output)
+        cfg = self.install('--parallel', '1')
+        self.assertNotIn('--batch', cfg['args'])
+
     def test_nominal_24gb_card_is_not_warned(self):
         # an RTX 4090 reports 23.99 GB (24564 MiB): the measured card must not get the "not tested" warning
         self.install(cards=[{**CARD, 'vram_gb': 23.99}])
