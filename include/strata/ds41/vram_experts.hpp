@@ -110,6 +110,7 @@ public:
     static kernels::Exl3Expert describe_at(const Pack& pack, int layer, int expert, const uint8_t* dev);
 
 private:
+    void cleanup() noexcept;
     kernels::Exl3Expert describe(int layer, int expert, int slot) const;
     void upload_res();
     int commit_pending(bool wait);   ///< commits finished adaptive copies (waits for them when `wait`); returns count

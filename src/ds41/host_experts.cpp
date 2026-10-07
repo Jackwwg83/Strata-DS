@@ -2,6 +2,7 @@
 #include "strata/ds41/host_experts.hpp"
 
 #include "strata/ds41/config.hpp"
+#include "strata/ds41/residency.hpp"
 #include "strata/ds41/vram_experts.hpp"
 
 #include "moe_mul1.h"   // third_party/exllamav3_moe
@@ -159,7 +160,7 @@ HostExperts::HostExperts(const Pack& pack, const std::vector<std::pair<int, int>
         }
     }
     for (int s = 0; s < slots_; ++s) {
-        slot_[(size_t) holder_[s].first * n_experts_ + holder_[s].second] = s;
+        publish_residency(slot_[(size_t) holder_[s].first * n_experts_ + holder_[s].second], s);
         point(holder_[s].first, holder_[s].second, slot_ptr(s));
     }
 }
@@ -202,7 +203,8 @@ void HostExperts::publish_descriptor(int layer, int expert, int slot) {
 void HostExperts::point_to_file(int layer, int expert) {
     publish_descriptor(layer, expert, -1);
     point(layer, expert, pack_.expert_base() + pack_.expert(layer, expert).offset);
-    slot_[(size_t) layer * n_experts_ + expert] = -1;   // read from the file now; its slot stays reserved until assign
+    // Read from the file now. Keep its slot reserved until assign().
+    publish_residency(slot_[(size_t) layer * n_experts_ + expert], -1);
 }
 
 void HostExperts::assign(int slot, int layer, int expert) {
@@ -211,9 +213,9 @@ void HostExperts::assign(int slot, int layer, int expert) {
         throw std::invalid_argument("HostExperts::assign: the expert is larger than the slot");
     const auto [ol, oe] = holder_[slot];
     publish_descriptor(ol, oe, -1);
-    slot_[(size_t) ol * n_experts_ + oe] = -1;
+    publish_residency(slot_[(size_t) ol * n_experts_ + oe], -1);
     holder_[slot] = {layer, expert};
-    slot_[(size_t) layer * n_experts_ + expert] = slot;
+    publish_residency(slot_[(size_t) layer * n_experts_ + expert], slot);
     point(layer, expert, slot_ptr(slot));
     publish_descriptor(layer, expert, slot);
 }
