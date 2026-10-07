@@ -213,6 +213,11 @@ class Installer(unittest.TestCase):
         self.install(cards=[{**CARD, 'vram_gb': 15.99}])
         self.assertIn('under 24 GB', self.output)
 
+    def test_nominal_24gb_card_is_not_warned(self):
+        # an RTX 4090 reports 23.99 GB (24564 MiB): the measured card must not get the "not tested" warning
+        self.install(cards=[{**CARD, 'vram_gb': 23.99}])
+        self.assertNotIn('under 24 GB', self.output)
+
     def test_update_refreshes_library_paths(self):
         self.install()
         stamp = self.root / 'engine/DS41_BUILD.json'

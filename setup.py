@@ -3702,7 +3702,7 @@ def setup_deepseek(a, data, elsewhere, adopted=None):
         else:
             confirm_risk(note, a.family == "deepseek", a.yes, "DeepSeek RAM risk was not accepted",
                          "choose --family deepseek --yes to continue on purpose")
-    if gpu["vram_gb"] < 24:
+    if gpu["vram_gb"] < 23.5:                          # an RTX 4090 reports 23.99 GB
         warn("DeepSeek GPUs under 24 GB VRAM are not tested")
     say("  Disk: about 462 GB total (341.8 GB download + 120.2 GB pack). Keep the source shards: Engram reads them in place.")
     if a.check:
