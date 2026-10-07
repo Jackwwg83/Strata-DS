@@ -239,6 +239,10 @@ struct Engine::Impl {
     Impl(const std::string& dir, const EngineOptions& o)
         : pack(dir), opt(o), max_seq(o.max_seq), cpu_threads(o.cpu_threads) {}
     ~Impl() {
+        // Drain the decode stream first, while the CPU worker still runs: a step that failed part way can leave a
+        // layer's wait for the worker (doorbell) on the stream, published before it, so the worker will answer it.
+        // A stream left in capture returns an error at once instead of waiting.
+        if (st) cudaStreamSynchronize(st);
         {
             std::lock_guard<std::mutex> lk(mu);
             stop = true;
@@ -343,11 +347,18 @@ struct Engine::Impl {
         if (t < 0 || t >= kVocab) throw std::invalid_argument("ds41 engine: token id " + std::to_string(t) + " is outside [0, " + std::to_string(kVocab) + ")");
     }
     /// DS41_TEST_FAULT=<name>: throw at that point once, then the variable is cleared (tests of the failure paths)
-    static bool fault(const char* name) {
+    /// Read once when the engine is built (and cleared then): the step's threads (CPU worker, engram reader) never
+    /// touch the environment, which getenv/unsetenv on two threads at once would make a data race.
+    const std::string fault_armed = [] {
         const char* v = std::getenv("DS41_TEST_FAULT");
-        if (!v || std::strcmp(v, name) != 0) return false;
-        unsetenv("DS41_TEST_FAULT");
-        return true;
+        std::string s = v ? v : "";
+        if (v) unsetenv("DS41_TEST_FAULT");
+        return s;
+    }();
+    std::atomic<bool> fault_spent{false};
+    bool fault(const char* name) {
+        if (fault_armed.empty() || fault_armed != name) return false;
+        return !fault_spent.exchange(true);
     }
 
     Fp8 fp8(const std::string& name) {
@@ -1943,7 +1954,15 @@ struct Engine::Impl {
             if (it == graphs.end()) {
                 // relaxed: other threads (the tier's copier) keep using CUDA during the capture
                 ck(cudaStreamBeginCapture(st, cudaStreamCaptureModeRelaxed), "begin capture");
-                enqueue_step(nullptr);
+                try {
+                    enqueue_step(nullptr);
+                } catch (...) {   // end and drop the capture: the stream stays usable for the destructor's drain
+                    cudaGraph_t partial = nullptr;
+                    cudaStreamEndCapture(st, &partial);
+                    if (partial) cudaGraphDestroy(partial);
+                    cudaGetLastError();
+                    throw;
+                }
                 cudaGraph_t gr;
                 ck(cudaStreamEndCapture(st, &gr), "end capture");
                 cudaGraphExec_t ex;
