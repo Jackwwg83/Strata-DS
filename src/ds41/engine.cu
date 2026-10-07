@@ -568,6 +568,7 @@ struct Engine::Impl {
                 }
             }
             zc_stage = std::make_unique<ExpertStaging>(kTopK, largest);
+            tune_stage(*zc_stage);
             zc_blobs = std::shared_ptr<ExpertBlob>(dalloc<ExpertBlob>(blobs.size()),
                                                   [](ExpertBlob* p) { cudaFree(p); });
             ck(cudaMemcpy(zc_blobs.get(), blobs.data(), blobs.size() * sizeof(ExpertBlob), cudaMemcpyHostToDevice),
@@ -653,6 +654,22 @@ struct Engine::Impl {
         }
         worker = std::thread([this] { worker_loop(); });
         if (const char* p = std::getenv("DS41_DEBUG")) dbg = std::fopen(p, "wb");
+    }
+
+    /// DS41_STAGE_BLOCKS (1..1024, default 68) and DS41_STAGE_UNROLL (1, 2, 4, 8; default 1): the staging copy's shape
+    static void tune_stage(ExpertStaging& s) {
+        auto get = [](const char* name, int fallback) {
+            const char* v = std::getenv(name);
+            if (!v) return fallback;
+            char* end = nullptr;
+            const long x = std::strtol(v, &end, 10);
+            if (end == v || *end != '\0') throw std::invalid_argument(std::string(name) + " must be a whole number");
+            return (int) x;
+        };
+        const int blocks = get("DS41_STAGE_BLOCKS", 68), unroll = get("DS41_STAGE_UNROLL", 1);
+        s.set_launch(blocks, unroll);
+        if (blocks != 68 || unroll != 1)
+            std::fprintf(stderr, "ds41: staging copy %d blocks, %d loads in flight per thread\n", blocks, unroll);
     }
 
     void register_cpu_experts(int l) {

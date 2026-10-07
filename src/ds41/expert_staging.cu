@@ -12,16 +12,28 @@ void ck(cudaError_t e, const char* what) {
 
 // All blocks stream each contiguous blob. A fixed grid also handles a device count of zero.
 // Pack slots and staging slots are aligned. Copy only complete uint4s, then the exact byte tail.
-__global__ void stage_experts_k(const ExpertCopy* jobs, const int* count) {
+// U loads per thread are issued before their stores: the source is mapped host memory, so each load waits a PCIe
+// round trip, and more loads in flight keep the link busier (DS41_STAGE_UNROLL).
+template <int U>
+__global__ void stage_experts_k(const ExpertCopy* __restrict__ jobs, const int* __restrict__ count) {
     const size_t lane = size_t(blockIdx.x) * blockDim.x + threadIdx.x;
     const size_t step = size_t(gridDim.x) * blockDim.x;
     const int n = *count;
     for (int j = 0; j < n; ++j) {
         const ExpertCopy job = jobs[j];
-        const auto* src = reinterpret_cast<const uint4*>(job.src);
-        auto* dst = reinterpret_cast<uint4*>(job.dst);
-        for (size_t i = lane; i < job.bytes / 16; i += step) dst[i] = src[i];
-        const size_t tail = job.bytes / 16 * 16 + lane;
+        const auto* __restrict__ src = reinterpret_cast<const uint4*>(job.src);
+        auto* __restrict__ dst = reinterpret_cast<uint4*>(job.dst);
+        const size_t n16 = job.bytes / 16;
+        size_t i = lane;
+        for (; i + (U - 1) * step < n16; i += U * step) {
+            uint4 v[U];
+#pragma unroll
+            for (int u = 0; u < U; ++u) v[u] = src[i + u * step];
+#pragma unroll
+            for (int u = 0; u < U; ++u) dst[i + u * step] = v[u];
+        }
+        for (; i < n16; i += step) dst[i] = src[i];
+        const size_t tail = n16 * 16 + lane;
         if (tail < job.bytes) job.dst[tail] = job.src[tail];
     }
 }
@@ -65,9 +77,21 @@ ExpertStaging::~ExpertStaging() {
 void ExpertStaging::fork_copy(cudaStream_t main) {
     ck(cudaEventRecord(ready_, main), "record publish");
     ck(cudaStreamWaitEvent(copy_, ready_, 0), "wait publish");
-    stage_experts_k<<<68, 256, 0, copy_>>>(jobs_, count_);
+    switch (unroll_) {
+        case 1: stage_experts_k<1><<<blocks_, 256, 0, copy_>>>(jobs_, count_); break;
+        case 2: stage_experts_k<2><<<blocks_, 256, 0, copy_>>>(jobs_, count_); break;
+        case 4: stage_experts_k<4><<<blocks_, 256, 0, copy_>>>(jobs_, count_); break;
+        default: stage_experts_k<8><<<blocks_, 256, 0, copy_>>>(jobs_, count_); break;
+    }
     ck(cudaGetLastError(), "copy launch");
     ck(cudaEventRecord(done_, copy_), "record copy");
+}
+
+void ExpertStaging::set_launch(int blocks, int unroll) {
+    if (blocks < 1 || blocks > 1024 || (unroll != 1 && unroll != 2 && unroll != 4 && unroll != 8))
+        throw std::invalid_argument("ExpertStaging::set_launch: blocks 1..1024, unroll 1, 2, 4 or 8");
+    blocks_ = blocks;
+    unroll_ = unroll;
 }
 
 void ExpertStaging::join(cudaStream_t main) {
