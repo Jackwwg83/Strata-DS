@@ -222,7 +222,7 @@ int main(int argc, char** argv) {
         int next = -1;
         std::vector<int> out;
         double decode_ms = 0, nll_sum = 0, cpu_ms = 0;
-        long long hits = 0, routed = 0, ram = 0, file = 0, ssd = 0, warmed = 0, useful = 0;
+        long long hits = 0, routed = 0, ram = 0, file = 0, ssd = 0, warmed = 0, useful = 0, skipped = 0;
         int decode_steps = 0, nll_n = 0;
         for (int pos = 0; pos < total; ++pos) {
             const int tok = !forced.empty() ? forced[pos] : pos < (int) prompt.size() ? prompt[pos] : next;
@@ -244,6 +244,7 @@ int main(int argc, char** argv) {
             warmed += t.warmed;
             useful += t.warmed_useful;
             routed += t.expert_total;
+            skipped += t.skipped;
             if (pos >= (int) prompt.size() - 1 && forced.empty() && gen > 0) out.push_back(next);
             std::fprintf(stderr,
                          "pos %d tok %d -> %d  total %.1f ms (engram reads %.1f, layers %.1f, of which cpu experts %.1f)"
@@ -275,6 +276,7 @@ int main(int argc, char** argv) {
                     routed ? (double) ram / routed : 0.0, routed ? (double) file / routed : 0.0,
                     routed ? (double) ssd / routed : 0.0);
         std::printf("lookahead warmed %lld useful %lld (%.3f)\n", warmed, useful, warmed ? (double) useful / warmed : 0.0);
+        std::printf("skipped_experts %.4f of the routed uses (DS41_SKIP_MISS)\n", routed ? (double) skipped / routed : 0.0);
     } catch (const std::exception& ex) {
         std::fprintf(stderr, "error: %s\n", ex.what());
         return 1;

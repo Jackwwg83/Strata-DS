@@ -147,13 +147,14 @@ public:
         double gpu_ms = 0, cpu_experts_ms = 0, engram_ms = 0, total_ms = 0;
         int expert_hits = 0, expert_total = 0;   ///< VRAM hits and all routed uses
         int cpu_experts() const { return ram_experts + file_experts; }
-        int zero_copy_experts() const { return expert_total - expert_hits - cpu_experts(); }
+        int zero_copy_experts() const { return expert_total - expert_hits - cpu_experts() - skipped; }
         int vram_swaps = 0;   ///< adaptive swaps committed before this step
         /// the CPU's experts by tier: from the RAM copy, from the mapped file, and of those, the ones with pages
         /// missing from RAM when computed (read from the SSD)
         int ram_experts = 0, file_experts = 0, ssd_experts = 0;
         int warmed = 0, warmed_useful = 0;   ///< lookahead: file-tier experts warmed, and of those, used next layer
         int prefetched = 0;   ///< misses the GPU computed from the prefetch buffer (DS41_PREFETCH), in zero_copy_experts()
+        int skipped = 0;      ///< routed uses left out (DS41_SKIP_MISS): neither hits nor computed
     };
     /// VRAM expert slots in use (0: no tier)
     int vram_expert_slots() const;
