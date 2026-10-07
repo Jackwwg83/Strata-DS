@@ -60,6 +60,8 @@ from serve.structured import StructuredOutputError, prepare_format, validated_js
 from serve import responses as responses_api  # noqa: E402
 from serve.responses import ResponsesError, error_body as responses_error_body  # noqa: E402
 
+from serve.deepseek import DeepSeekTokenizer, DeepSeekTemplate, DeepSeekOutputParser
+
 IM_END = "<|im_end|>"
 IMAGE_PAD = "<|image_pad|>"
 # #458: the trailing effort turn ("effort_position": "end"); low is the template's own sentence, medium (which the
@@ -106,7 +108,7 @@ class MockEngine:
 
     def __init__(self, tokenizer, script: str | list[str], max_context: int = 32768, delay_s: float = 0.0):
         self.tok, self.max_context, self.delay = tokenizer, max_context, delay_s
-        end = tokenizer.encode(IM_END, parse_special=True)
+        end = [tokenizer.eos_id] if hasattr(tokenizer, "eos_id") else tokenizer.encode(IM_END, parse_special=True)
         self.scripts = [tokenizer.encode(x, parse_special=True) + end for x in ([script] if isinstance(script, str)
                                                                                  else script)]
         self.script, self.turns = self.scripts[0], 0
@@ -1394,6 +1396,8 @@ def effort_end_args(cfg: dict, exe: str, tok) -> list[str] | None:
     the engine checkpoints in front of the trailing effort turn - or None when the config leaves it at the top (the
     default) or the engine is too old for it (said once; the prompt stays the default one).  ValueError for a value
     other than "start" / "end"."""
+    if cfg.get("format") == "deepseek_v41":
+        return None
     pos = cfg.get("effort_position", "start")
     if pos not in ("start", "end"):
         raise ValueError(f'"effort_position" must be "start" (the default) or "end", not {pos!r}')
@@ -1463,6 +1467,8 @@ def engine_args(cfg: dict) -> list[str]:
     config: "auto" by default, or the first layer of each later GPU's share, e.g. "18" or "16,32"; see
     layer_split_value)."""
     args = list(cfg["args"])
+    if cfg.get("format") == "deepseek_v41":   # ds41_serve: the config's args only; it refuses flags it does not have
+        return [str(x) for x in args]
     if len(gpu_list(cfg)) > 1 and "--layer-split" not in args:
         args += ["--layer-split", layer_split_value(cfg)]
     # opt-in: an auto split runs on the first card alone when it holds every profiled expert and the KV
@@ -1591,6 +1597,13 @@ def vision_env(cfg: dict, env: dict) -> dict:
     return env
 
 
+class DeepSeekEngine(StrataEngine):
+    """ds41_serve: upstream's line protocol without batch slots, images or the VRAM command."""
+
+    def vram(self, reserve_mib, timeout=120.0):
+        raise ValueError("DeepSeek does not support VRAM resizing")
+
+
 class ByteTokenizer:
     """Tiny stand-in tokenizer for tests without the pack: one id per UTF-8 byte, specials as ids >= 256."""
     SPECIALS = ["<|im_start|>", "<|im_end|>", "<|endoftext|>", "<|vision_start|>", "<|image_pad|>", "<|vision_end|>"]
@@ -1650,8 +1663,13 @@ class Detokenizer:
 class Service:
     def __init__(self, engine: Engine, tokenizer, template: ChatTemplate, model_name: str = "qwen3.8-flash-next",
                  vision: Vision | None = None, sampling_defaults: dict | None = None,
-                 fit_max_tokens: bool = False):
+                 fit_max_tokens: bool = False, format: str = "qwen"):
         self.engine, self.tok, self.template, self.model, self.vision = engine, tokenizer, template, model_name, vision
+        if format not in ("qwen", "deepseek_v41"):
+            raise ValueError(f"unknown model format {format!r}")
+        self.deepseek = format == "deepseek_v41"
+        self.output_parser = DeepSeekOutputParser if self.deepseek else OutputParser
+        self.reasoning_wrap_up = "</think>" if self.deepseek else REASONING_WRAP_UP
         self.fit_max_tokens = fit_max_tokens          # --fit-max-tokens: clamp the output cap instead of 400
         self.aliases: list[str] = []                  # #297: other names of the model (the config's `aliases`)
         self.sampling_defaults = dict(sampling_defaults or {})   # the run config's `sampling` block
@@ -1706,8 +1724,8 @@ class Service:
         self.reasoning_budget_tokens = 0                 # #123: the config's default thinking budget (0: none)
         self.repeat_stop_tokens = REPEAT_STOP_TOKENS     # #606: one token this many times in a row ends a reply (0: off)
         self.anthropic_think_unasked = True               # #278: "anthropic_thinking": "on_request" -> False
-        self.stop_ids = set(tokenizer.encode(IM_END, parse_special=True) +
-                            tokenizer.encode("<|endoftext|>", parse_special=True))
+        self.stop_ids = {tokenizer.eos_id} if self.deepseek else set(
+            tokenizer.encode(IM_END, parse_special=True) + tokenizer.encode("<|endoftext|>", parse_special=True))
 
     def loaded(self) -> bool:
         return not hasattr(self.engine, "alive") or self.engine.alive()
@@ -1817,6 +1835,8 @@ class Service:
         started with), applied between requests - a request that is running finishes first (up to wait_s).  Only an
         engine started with --vram-elastic (the config's "vram_elastic": true) can do it; it never resizes on its own.
         An unloaded engine applies it when it loads.  -> {"status": ..., and the engine's figures}."""
+        if self.deepseek:
+            raise ValueError("DeepSeek does not support VRAM resizing")
         if not hasattr(self.engine, "vram"):
             raise ValueError("this engine cannot resize its VRAM use")
         if not self.fifo.acquire(timeout=self.vram_wait_s):
@@ -2119,6 +2139,8 @@ class Service:
         thinking) is rendered as a default one up to the answer - the same prompt start, so the conversation cache
         keeps it - and its effort follows in a short system turn right before the answer (thinking off: the template's
         empty thinking block).  The engine (--tail-role-token) checkpoints in front of that turn."""
+        if self.deepseek:
+            return self.template.render(messages, tools=tools, **kwargs)
         effort = kwargs.get("reasoning_effort")
         off = kwargs.get("enable_thinking") is False
         if not self.effort_end or (not off and effort in (None, "", "xhigh", "high")):
@@ -2135,6 +2157,8 @@ class Service:
     def encode_prompt(self, messages, tools, kwargs) -> list[int]:
         """The request's prompt: the template rendered and tokenized.  #537: a <think> / </think> written inside a
         message's text is encoded as the text it is, not as the model's reasoning markers (the template's own are)."""
+        if self.deepseek:
+            return self.tok.encode(self.render_prompt(messages, tools, kwargs), parse_special=True)
         marked, marked_tools, changed = mark_think_literals(messages, tools)
         prompt = self.render_prompt(marked, marked_tools, kwargs)
         if not changed:
@@ -2248,7 +2272,7 @@ class Service:
         if defaults:                   # the request's own fields win (explicit 0 stays greedy)
             req_values = {k: v for k, v in (sampling or {}).items() if v is not None}
             sampling = {**defaults, **req_values}
-        parser = OutputParser(thinking=thinking, tools=tools, stream_tools=True)
+        parser = self.output_parser(thinking=thinking, tools=tools, stream_tools=True)
         detok, n, finish = Detokenizer(self.tok), 0, "length"
         run_tok, run_len, repeated = None, 0, False     # #606: the current run of one repeated token
         thinking_n = 0                                  # tokens written while thinking (Responses' reasoning_tokens)
@@ -2307,6 +2331,9 @@ class Service:
                                     with self.status_lock:
                                         trace["first_token_s"] = round(time.perf_counter() - trace["_clock"], 3)
                                 if t in self.stop_ids:
+                                    if self.deepseek:
+                                        for ev in parser.feed(detok.push(t)):
+                                            yield "event", ev
                                     finish = "stop"
                                     raw_ids.append(t)
                                     break
@@ -2356,7 +2383,7 @@ class Service:
                         # short wrap-up and </think>) and let it answer: the next pass's prompt is this one plus what
                         # was generated plus the wrap-up, so the engine continues from the prefix it already holds.
                         budget = None
-                        extra = self.tok.encode(REASONING_WRAP_UP, parse_special=True)
+                        extra = self.tok.encode(self.reasoning_wrap_up, parse_special=True)
                         if max_new - n - len(extra) < 1:
                             break                       # no room left to answer: "length", as without a budget
                         print(f"[strata] thinking budget reached ({thought} tokens): wrapping up the thinking",
@@ -3360,7 +3387,7 @@ def make_handler(svc: Service):
 
         def _openai(self, req):
             req = svc.with_shared(req, "openai")
-            messages, tools, kw = openai_to_messages(req)
+            messages, tools, kw = openai_to_messages(req, deepseek=svc.deepseek)
             messages, validator = prepare_format(req.get("response_format"), messages)
             if validator is not None and (tools or req.get("strata_mcp")):
                 raise ValueError("structured response_format with tools/MCP is not supported")
@@ -3499,7 +3526,7 @@ def make_handler(svc: Service):
 
         def _responses_prepare(self, req):
             responses_api.check_request(req)
-            messages = responses_api.input_messages(req)
+            messages = responses_api.input_messages(req, deepseek=svc.deepseek)
             tools, names, skipped = responses_api.request_tools(req)
             kw = responses_api.template_kwargs(req, svc.shared)
             try:
@@ -3539,13 +3566,13 @@ def make_handler(svc: Service):
             """Anthropic's token count, which Claude Code asks for its context figures: the prompt this server would
             read for the same request, rendered and tokenized - the model does not run."""
             req = svc.with_shared(req, "anthropic")
-            messages, tools, kw = anthropic_to_messages(req, svc.anthropic_think_unasked)
+            messages, tools, kw = anthropic_to_messages(req, svc.anthropic_think_unasked, deepseek=svc.deepseek)
             self._json(200, {"input_tokens": len(svc.encode_prompt(messages, tools, kw))})
 
         def _anthropic(self, req):
             svc.load()
             req = svc.with_shared(req, "anthropic")
-            messages, tools, kw = anthropic_to_messages(req, svc.anthropic_think_unasked)
+            messages, tools, kw = anthropic_to_messages(req, svc.anthropic_think_unasked, deepseek=svc.deepseek)
             max_new = int(req.get("max_tokens") or 0)                  # 0/-1: the rest of the context
             svc.reasoning_budget(req)                         # a bad value is a 400 before anything is sent
             ids, thinking, max_new = svc.prepare(messages, tools, kw, max_new)
@@ -3945,11 +3972,19 @@ def main() -> int:
                  f"Close it, or start this one with a different --port")
     if cfg.get("tokenizer"):
         a.tokenizer = cfg["tokenizer"]
+    model_format = cfg.get("format", "qwen")
+    if model_format not in ("qwen", "deepseek_v41"):
+        ap.error(f"unknown model format {model_format!r}")
+    deepseek = model_format == "deepseek_v41"
+    if deepseek and cfg.get("vision"):
+        ap.error("DeepSeek does not support images in this server")
     tok = ByteTokenizer()
     tpath = Path(a.tokenizer)
-    if a.engine == "strata" and not (tpath / "vocab.json").exists():
+    if deepseek:
+        tok = DeepSeekTokenizer(tpath)
+    if not deepseek and a.engine == "strata" and not (tpath / "vocab.json").exists():
         ap.error(f"the model's tokenizer is missing ({tpath / 'vocab.json'}); run setup again")
-    if (tpath / "vocab.json").exists():
+    if not deepseek and (tpath / "vocab.json").exists():
         import strata_tokenizer as ST
         vocab = json.loads((tpath / "vocab.json").read_text(encoding="utf-8"))
         tokens = [None] * len(vocab)
@@ -3981,7 +4016,7 @@ def main() -> int:
                             env=vision_env(cfg, env))
         print("model unloaded; the first request loads it ..." if lazy else
               "loading the model (the first start takes a minute or two) ...", flush=True)
-        if len(gpu_list(cfg)) > 1:
+        if not deepseek and len(gpu_list(cfg)) > 1:
             try:
                 split = layer_split_value(cfg)          # #644: before the (minutes-long) start
             except ValueError as e:
@@ -3998,7 +4033,8 @@ def main() -> int:
             effort_end = effort_end_args(cfg, exe, tok)  # #458
         except ValueError as e:
             raise SystemExit(f"[strata] config {e}")
-        engine = StrataEngine(exe, engine_args(cfg) + (effort_end or []), cwd=cfg.get("cwd"), log=cfg.get("log"),
+        engine_class = DeepSeekEngine if deepseek else StrataEngine
+        engine = engine_class(exe, engine_args(cfg) + (effort_end or []), cwd=cfg.get("cwd"), log=cfg.get("log"),
                               env=env, lazy=lazy)
         engine.silence_s = silence                      # an attribute of its own: restart() keeps it
         warn_tight_ram(engine.info.get("arena_mib"))
@@ -4012,8 +4048,9 @@ def main() -> int:
             "Thinking about it.</think>\n\nHello from the mock engine."]), None, {}
     # the model's own chat template (exported with its tokenizer), else the original model's
     tpl = tpath / "chat_template.jinja"
-    svc = Service(engine, tok, ChatTemplate(tpl if tpl.exists() else ROOT / "serve/chat_template.jinja"),
-                  model_name=cfg.get("model_name", "qwen3.8-flash-next"), vision=vision,
+    template = DeepSeekTemplate() if deepseek else ChatTemplate(tpl if tpl.exists() else ROOT / "serve/chat_template.jinja")
+    svc = Service(engine, tok, template, format=model_format,
+                  model_name=cfg.get("model_name", "deepseek-v4.1-flash" if deepseek else "qwen3.8-flash-next"), vision=vision,
                   sampling_defaults=sampling_defaults,
                   fit_max_tokens=a.fit_max_tokens or cfg.get("fit_max_tokens") is True)
     try:
