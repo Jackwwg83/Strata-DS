@@ -36,6 +36,20 @@ public:
     void read(const std::vector<const int64_t*>& ids, int n_rows, const std::vector<uint8_t*>& w_out,
               const std::vector<uint8_t*>& s_out);
 
+    /// The reads of read(), one table at a time, so a caller can use table t's rows while later tables are still on
+    /// their way (the decode step: layer 1 needs table 0, layer 14 table 1). prepare() lays out the requests of every
+    /// table; the ids are copied, the outputs must stay valid until finish. submit(t) puts table t's reads in flight;
+    /// finish(t) waits for them (submitting first if needed) and writes the rows. prepare() throws while a table of
+    /// the previous prepare is not finished. A failed read disables this reader, as in read().
+    void prepare(const std::vector<const int64_t*>& ids, int n_rows, const std::vector<uint8_t*>& w_out,
+                 const std::vector<uint8_t*>& s_out);
+    void submit(size_t t);
+    void finish(size_t t);
+    /// Drop the tables of the last prepare that are not finished: waits for the reads in flight, throws nothing.
+    /// For a caller whose step failed between submit and finish.
+    void abandon() noexcept;
+    size_t tables() const { return tables_.size(); }
+
     /// True when every table is read with O_DIRECT
     bool direct() const { return direct_; }
 
@@ -55,6 +69,9 @@ private:
     bool failed_ = false;
     uint8_t* buf_ = nullptr;   ///< aligned: one 8 KiB block per request
     std::vector<Req> reqs_;
+    std::vector<size_t> first_;   ///< table t's requests: reqs_[first_[t] .. first_[t + 1])
+    enum class State : uint8_t { kIdle, kPrepared, kSubmitted, kFinished };
+    std::vector<State> state_;    ///< per table, since the last prepare
 };
 
 }  // namespace strata::ds41
