@@ -5,8 +5,12 @@
 #include <unistd.h>
 
 #include <cstdio>
+#include <algorithm>
+#include <atomic>
 #include <cstring>
 #include <stdexcept>
+#include <thread>
+#include <vector>
 
 namespace strata::ds41 {
 
@@ -102,11 +106,21 @@ void EngramRows::read(const std::vector<const int64_t*>& ids, int n_rows, const 
             }
             if (!ok) throw std::runtime_error("EngramRows: a direct read failed: " + tables_[t].path);
         } else {
-            for (size_t r = first[t]; r < first[t + 1]; ++r) {
-                const Req& q = reqs_[r];
-                if (pread(fds_[t], q.dst, q.bytes, (off_t) (q.aligned + q.skip)) != (ssize_t) q.bytes)
-                    throw std::runtime_error("EngramRows: a read failed: " + tables_[t].path);
-            }
+            // plain reads (through the file cache), in parallel: a row the cache does not hold is a random SSD read
+            const size_t n = first[t + 1] - first[t];
+            const size_t workers = std::min<size_t>(std::max<size_t>(n / 4, 1), 64);
+            std::atomic<bool> bad{false};
+            auto slice = [&](size_t w) {
+                for (size_t r = first[t] + w; r < first[t + 1]; r += workers) {
+                    const Req& q = reqs_[r];
+                    if (pread(fds_[t], q.dst, q.bytes, (off_t) (q.aligned + q.skip)) != (ssize_t) q.bytes) bad = true;
+                }
+            };
+            std::vector<std::thread> pool;
+            for (size_t w = 1; w < workers; ++w) pool.emplace_back(slice, w);
+            slice(0);
+            for (auto& th : pool) th.join();
+            if (bad) throw std::runtime_error("EngramRows: a read failed: " + tables_[t].path);
         }
     }
     failed_ = false;
