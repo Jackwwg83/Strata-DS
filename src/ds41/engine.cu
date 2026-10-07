@@ -397,7 +397,9 @@ struct Engine::Impl {
             std::vector<EngramRows::Table> tabs;
             for (const auto& t : pack.engram_tables()) tabs.push_back({t.path, t.weight_offset, t.scale_offset});
             n_eng = (int) tabs.size();
-            if (n_eng) eng_rows = std::make_unique<EngramRows>(tabs, kEngRows);
+            // every request of a step in flight at once: 24 rows x (weight, scale) per table, one thread each (on a disk
+            // with 0.6 ms random-read latency, 16 threads made it 5.9 ms per token)
+            if (n_eng) eng_rows = std::make_unique<EngramRows>(tabs, kEngRows, 256, 8, 2 * kEngRows);   // per table
             eng_ids.assign(n_eng, std::vector<int64_t>(kEngRows, 0));
         }
         const size_t eng_bytes = (size_t) n_eng * kEngRows * (256 + 8);
@@ -884,7 +886,7 @@ struct Engine::Impl {
     static constexpr int kEngBatch = 256;     ///< tokens per engram read (its O_DIRECT buffers: 16 KiB per row)
     /// engram reads in flight per table: the rows are small random reads, an NVMe needs a deep queue. Measured on
     /// the 7950X + 4090 box, 32K prompt: 16 (the decode default) 14.9 s of GPU wait, 64 2.6 s (1,148 tok/s).
-    static constexpr int kEngIoThreads = 64;
+    static constexpr int kEngIoThreads = 128;   ///< per table; both tables read at once
 
     /// DS41_PF_PROFILE=1: the GPU time of prefill by phase, printed at its end. Events in stream order; the time
     /// between two marks goes to the phase of the first one, so host waits (the routes' sort, expert copies not yet
@@ -1418,44 +1420,61 @@ struct Engine::Impl {
     /// table t is in the buffer (or carries the read error).
     void engram_pass(int S, int p0, std::vector<std::promise<void>>& done, double& ms) {
         const double t0 = now_ms();
-        size_t t = 0;
+        const size_t eng_table = (size_t) pf.cap * kEngRows * (256 + 8);
+        // the rows of each table first (cheap), then both tables' reads at once, each on its reader's threads: the
+        // reads are random 4 KiB ones, so the depth of the queue sets the speed
+        std::vector<std::vector<int64_t>> uniq(done.size());
+        std::vector<std::thread> readers;
+        std::vector<char> started(done.size(), 0);
         try {
             const auto& hs = pack.engram_hash();
             const int cols = (hs.max_ngram - 1) * hs.n_heads;
             if (cols != kEngRows) throw std::runtime_error("engram: the prefill buffers assume 24 rows per token");
-            const size_t eng_table = (size_t) pf.cap * kEngRows * (256 + 8);
+            size_t t = 0;
             for (int l = 0; l < kLayers; ++l) {
                 if (!is_engram_layer(l)) continue;
-                const int li = (int) t;
+                const int li = (int) t++;
                 std::vector<int64_t>& all = eng_ids_pf[li];
                 for (int i = 0; i < S; ++i) {
                     engram_ids(l, li, p0 + i);
                     std::copy(eng_ids[li].begin(), eng_ids[li].begin() + cols, all.begin() + (size_t) i * cols);
                 }
-                const size_t n = (size_t) S * cols;
-                std::vector<int64_t> uniq(all.begin(), all.begin() + n);
-                std::sort(uniq.begin(), uniq.end());
-                uniq.erase(std::unique(uniq.begin(), uniq.end()), uniq.end());
-                std::vector<uint8_t> uw(uniq.size() * 256), us(uniq.size() * 8);
-                const size_t batch = (size_t) kEngBatch * kEngRows;
-                for (size_t r = 0; r < uniq.size(); r += batch)
-                    eng_rows_pf[li]->read({uniq.data() + r}, (int) std::min(batch, uniq.size() - r), {uw.data() + r * 256},
-                                          {us.data() + r * 8});
-                uint8_t* w = pfh.eng + (size_t) li * eng_table;
-                uint8_t* sc = w + (size_t) pf.cap * kEngRows * 256;
-                for (size_t i = 0; i < n; ++i) {
-                    const size_t u = (size_t) (std::lower_bound(uniq.begin(), uniq.end(), all[i]) - uniq.begin());
-                    std::memcpy(w + i * 256, uw.data() + u * 256, 256);
-                    std::memcpy(sc + i * 8, us.data() + u * 8, 8);
-                }
-                ptm->engram_rows += (int64_t) n;
-                ptm->engram_unique += (int64_t) uniq.size();
-                done[li].set_value();
-                ++t;
+                std::vector<int64_t>& u = uniq[li];
+                u.assign(all.begin(), all.begin() + (size_t) S * cols);
+                std::sort(u.begin(), u.end());
+                u.erase(std::unique(u.begin(), u.end()), u.end());
+                ptm->engram_rows += (int64_t) S * cols;
+                ptm->engram_unique += (int64_t) u.size();
+            }
+            for (size_t li = 0; li < done.size(); ++li) {
+                readers.emplace_back([&, li, cols] {
+                    try {
+                        const std::vector<int64_t>& u = uniq[li];
+                        const std::vector<int64_t>& all = eng_ids_pf[li];
+                        std::vector<uint8_t> uw(u.size() * 256), us(u.size() * 8);
+                        const size_t batch = (size_t) kEngBatch * kEngRows;
+                        for (size_t r = 0; r < u.size(); r += batch)
+                            eng_rows_pf[li]->read({u.data() + r}, (int) std::min(batch, u.size() - r),
+                                                  {uw.data() + r * 256}, {us.data() + r * 8});
+                        uint8_t* w = pfh.eng + li * eng_table;
+                        uint8_t* sc = w + (size_t) pf.cap * kEngRows * 256;
+                        for (size_t i = 0; i < (size_t) S * cols; ++i) {
+                            const size_t k = (size_t) (std::lower_bound(u.begin(), u.end(), all[i]) - u.begin());
+                            std::memcpy(w + i * 256, uw.data() + k * 256, 256);
+                            std::memcpy(sc + i * 8, us.data() + k * 8, 8);
+                        }
+                        done[li].set_value();
+                    } catch (...) {
+                        done[li].set_exception(std::current_exception());
+                    }
+                });
+                started[li] = 1;
             }
         } catch (...) {
-            for (; t < done.size(); ++t) done[t].set_exception(std::current_exception());
+            for (size_t li = 0; li < done.size(); ++li)
+                if (!started[li]) done[li].set_exception(std::current_exception());
         }
+        for (auto& r : readers) r.join();
         ms = now_ms() - t0;
     }
 

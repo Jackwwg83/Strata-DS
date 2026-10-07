@@ -62,7 +62,7 @@ struct Pending {
 int io_threads(int dflt) {
     const char* v = std::getenv("STRATA_IO_THREADS");
     const int n = v ? std::atoi(v) : dflt;
-    return std::clamp(n, 1, 64);
+    return std::clamp(n, 1, 256);   // ds41's engram rows ask for more than 64 (random 4 KiB reads want depth)
 }
 }  // namespace
 
