@@ -134,6 +134,15 @@ def main() -> int:
     lines, out, done, err = e.request(P, 2)
     check(done is not None and lines[0] == "RESUME 0" and done[5] == "length", "the engine works after the cancel")
 
+    # STOP while a short prompt part is read in verify windows: the windows read so far stay in the session
+    lines, out, done, err = e.request(P, 2)
+    P3 = P + out + prompt(101, 4)[1:]   # 100 new tokens: the window path
+    lines, out, done, err = e.request(P3, 4, stop_after_pp=3)
+    check(done is not None and done[5] == "cancel" and 0 < int(done[14]) < 100,
+          f"STOP during the windows: DONE ... cancel after {done[14] if done else '?'} tokens")
+    lines, out, done, err = e.request(P3, 2)
+    check(done is not None and int(lines[0].split()[1]) > len(P), f"the next request reuses what was read ({lines[0]})")
+
     # STOP while tokens are written
     lines, out, done, err = e.request(P + [5, 6, 7], 200, stop_after_t=3)
     check(done is not None and done[5] == "cancel" and len(out) < 10, f"STOP during decode ends it ({len(out)} tokens)")

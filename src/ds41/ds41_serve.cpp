@@ -155,7 +155,11 @@ struct Input {
 struct Options {
     std::string pack;
     int max_context = 8192;
-    int step_prompt_max = 8;   ///< a prompt part this short is read token by token (a pass costs ~300 ms however short)
+    /// a prompt part this short is read in verify windows of 4 tokens (upstream: a short part goes through the
+    /// verify windows); a pass streams every expert outside VRAM over PCIe, which costs seconds however short it is.
+    /// RTX 4090, SAGE 1.59bpw (ds41/bench/scripts/prompt_window_ab.py): windows ~32 ms per token, a pass 2.6 s plus
+    /// ~4.6 ms per token; equal at about 125 tokens (128 new: 3.9 s both).
+    int window_prompt_max = 120;
     std::vector<int> eos = {1};   ///< <｜end▁of▁sentence｜>
     EngineOptions eng;
 };
@@ -165,7 +169,7 @@ struct Options {
                  "ds41_serve: %s\n"
                  "usage: ds41_serve --serve --pack DIR [--max-context N] [--threads T] [--expert-profile F]\n"
                  "       [--vram-slots N] [--ram-budget-gib G] [--adapt-every N] [--adapt-swaps N] [--prefill-chunk N]\n"
-                 "       [--prefill-batch N] [--prefill-ring N] [--prefill-threads N] [--step-prompt-max N]\n"
+                 "       [--prefill-batch N] [--prefill-ring N] [--prefill-threads N] [--window-prompt-max N]\n"
                  "       [--eos-id ID ...]\n",
                  why.c_str());
     std::exit(2);
@@ -203,7 +207,7 @@ Options parse_args(int argc, char** argv) {
         else if (a == "--prefill-batch") o.eng.prefill_batch = (int) num(next());
         else if (a == "--prefill-ring") o.eng.prefill_ring = (int) num(next());
         else if (a == "--prefill-threads") o.eng.prefill_threads = (int) num(next());
-        else if (a == "--step-prompt-max") o.step_prompt_max = (int) num(next());
+        else if (a == "--window-prompt-max") o.window_prompt_max = (int) num(next());
         else if (a == "--eos-id") {
             if (!eos_given) o.eos.clear();
             eos_given = true;
@@ -302,11 +306,16 @@ int main(int argc, char** argv) {
             int greedy_next = -1;
             bool cancelled = false;
             int read = 0;
-            if ((int) rest.size() <= o.step_prompt_max) {
-                for (int t : rest) {
-                    greedy_next = e.step(t, e.position());
-                    s.live.push_back(t);
-                    pp(++read);
+            if ((int) rest.size() <= o.window_prompt_max) {
+                for (size_t i = 0; i < rest.size(); i += kVerifyMaxTokens) {
+                    const std::vector<int> win(rest.begin() + i,
+                                               rest.begin() + std::min(rest.size(), i + kVerifyMaxTokens));
+                    const VerifyResult v = e.verify(win, e.position());
+                    e.commit((int) win.size());   // all of them: the window is prompt, not drafts
+                    greedy_next = v.next.back();
+                    s.live.insert(s.live.end(), win.begin(), win.end());
+                    read += (int) win.size();
+                    pp(read);
                     if (in.stop.load() && read < (int) rest.size()) {
                         cancelled = true;
                         break;
