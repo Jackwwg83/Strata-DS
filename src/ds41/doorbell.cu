@@ -106,7 +106,12 @@ ExpertDoorbell::ExpertDoorbell(int max_m, int topk, int dim) : max_m_(max_m), to
     ck(cudaHostAlloc(&host_, total, cudaHostAllocMapped), "cudaHostAlloc");
     std::memset(host_, 0, total);
     void* dev = nullptr;
-    ck(cudaHostGetDevicePointer(&dev, host_, 0), "cudaHostGetDevicePointer");
+    if (cudaHostGetDevicePointer(&dev, host_, 0) != cudaSuccess) {   // the constructor throws: no destructor runs
+        cudaFreeHost(host_);
+        host_ = nullptr;
+        ck(cudaGetLastError(), "cudaHostGetDevicePointer");
+        throw std::runtime_error("ExpertDoorbell: cudaHostGetDevicePointer failed");
+    }
     auto hp = [&](size_t o) { return (char*) host_ + o; };
     auto dp = [&](size_t o) { return (char*) dev + o; };
     h_seq_ = (uint32_t*) hp(o_seq);    d_seq_ = (uint32_t*) dp(o_seq);

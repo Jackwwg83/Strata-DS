@@ -155,6 +155,10 @@ int main(int argc, char** argv) {
         forced = parse_ids(all);
     }
     try {
+        // the teacher-forced path reads logits at the next forced id before the engine sees it
+        for (const auto* ids : {&prompt, &forced})
+            for (int t : *ids)
+                if (t < 0 || t >= kVocab) throw std::invalid_argument("token id " + std::to_string(t) + " is outside the vocabulary");
         if (gen < 0 || spec_max < 1 || spec_max > 8 || (spec != "none" && spec != "suffix"))
             throw std::invalid_argument("use --gen >= 0, --spec none|suffix, --spec-max 1..8");
         if (spec == "suffix" && (!force_path.empty() || !dump_path.empty()))
@@ -194,6 +198,10 @@ int main(int argc, char** argv) {
             return 0;
         }
         std::FILE* dump = dump_path.empty() ? nullptr : std::fopen(dump_path.c_str(), "wb");
+        if (!dump_path.empty() && !dump) throw std::runtime_error("cannot open --dump " + dump_path);
+        auto put = [&](const void* p, size_t size, size_t n) {
+            if (std::fwrite(p, size, n, dump) != n) throw std::runtime_error("cannot write --dump " + dump_path);
+        };
         StepDump sd;
         const int total = forced.empty() ? (int) prompt.size() + std::max(0, gen-1) : (int) forced.size();
         int next = -1;
@@ -230,15 +238,15 @@ int main(int argc, char** argv) {
                          t.ssd_experts, t.warmed, t.warmed_useful);
             if (dump) {
                 const int32_t hdr[2] = {tok, next};
-                std::fwrite(hdr, 4, 2, dump);
-                std::fwrite(sd.hidden.data(), 2, sd.hidden.size(), dump);
-                for (int l = 0; l < kLayers; ++l) std::fwrite(sd.routes[l].data(), 4, kTopK, dump);
-                for (int l = 0; l < kLayers; ++l) std::fwrite(sd.weights[l].data(), 4, kTopK, dump);
-                for (auto& p : sd.top_logits) { std::fwrite(&p.first, 4, 1, dump); }
-                for (auto& p : sd.top_logits) { std::fwrite(&p.second, 4, 1, dump); }
+                put(hdr, 4, 2);
+                put(sd.hidden.data(), 2, sd.hidden.size());
+                for (int l = 0; l < kLayers; ++l) put(sd.routes[l].data(), 4, kTopK);
+                for (int l = 0; l < kLayers; ++l) put(sd.weights[l].data(), 4, kTopK);
+                for (auto& p : sd.top_logits) put(&p.first, 4, 1);
+                for (auto& p : sd.top_logits) put(&p.second, 4, 1);
             }
         }
-        if (dump) std::fclose(dump);
+        if (dump && std::fclose(dump) != 0) throw std::runtime_error("cannot write --dump " + dump_path);
         std::printf("generated:");
         for (int v : out) std::printf(" %d", v);
         if (nll_n) std::printf("\nteacher_forced_mean_nll %.6f ppl %.4f over %d tokens", nll_sum / nll_n,
