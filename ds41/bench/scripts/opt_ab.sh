@@ -39,6 +39,9 @@ corr expert_staging_test $B/expert_staging_test
 corr engram_rows_test $B/engram_rows_test
 corr overlap_same_tokens $B/engine_failure_test --pack $P --expert-profile $PROF --case overlap
 corr overlap_late_failure $B/engine_failure_test --pack $P --expert-profile $PROF --case engram_late
+corr overlap_enqueue_failure $B/engine_failure_test --pack $P --expert-profile $PROF --case enqueue_late
+corr overlap_blocking_launch env CUDA_LAUNCH_BLOCKING=1 $B/engine_failure_test --pack $P --expert-profile $PROF \
+  --case overlap
 corr overlap_early_failure env DS41_ENGRAM_OVERLAP=1 $B/engine_failure_test --pack $P --expert-profile $PROF --case engram
 corr overlap_reset env DS41_ENGRAM_OVERLAP=1 $B/engine_reset_test --pack $P --expert-profile $PROF --case reset
 corr overlap_snapshot env DS41_ENGRAM_OVERLAP=1 $B/engine_reset_test --pack $P --expert-profile $PROF --case snapshot
