@@ -119,14 +119,28 @@
         <td>跳过的比例取决于权重分布：路由权重偏平均，均值 1/6≈0.167。粗估 τ=0.10 少拷 10–30% → −1~3 ms。质量代价未知。</td>
         <td><span class="tag ok">代码实现</span> <span class="tag warn">规则单测通过</span> <span class="tag no">真实数据 ✗</span></td></tr>
   </table></div>
-  <p><b>Codex 审查：</b>overlap 有 3 个真问题，已全部修好，并各加了测试：</p>
+  <p><b>Codex 审查（两轮）：</b>一共 5 个真问题，全部修好。</p>
   <ul>
-    <li>非 graph 模式或阻塞式 launch 下会互等死锁；</li>
-    <li>入队中途出错时标志位不放行，GPU 会一直等；</li>
+    <li>非 graph 模式或阻塞式 launch 下会互等死锁。</li>
+    <li>入队中途出错时，标志位不放行，GPU 会一直等。</li>
     <li>读失败后 <code>abandon()</code> 会把失败状态清掉。</li>
+    <li>析构时先停 CPU worker、再等 GPU，可能永远等下去。这是原有缺口，新故障点会触发它。</li>
+    <li>测试用的故障注入在两个线程上同时改环境变量。</li>
   </ul>
-  <p>改法：标志位改由独立的读盘线程放行；读失败的状态永久保留。</p>
-  <p>第三个问题的回归测试修复前失败、修复后通过（air-rig）。前两个的测试要 GPU 和模型，明天跑。skip-miss 和 staging 部分没有发现问题。</p>
+  <p>改法：</p>
+  <ul>
+    <li>标志位改由独立的读盘线程放行；</li>
+    <li>失败状态永久保留；</li>
+    <li>析构先排空 stream，再停 worker；</li>
+    <li>故障配置在建引擎时只读一次。</li>
+  </ul>
+  <p>测试状态：</p>
+  <ul>
+    <li>读盘失败的回归测试：修复前失败，修复后通过（air-rig）；</li>
+    <li>其余几个修复的测试要 GPU 和模型，明天跑；</li>
+    <li>第二轮复审确认前三个问题在所有路径上都已修好；</li>
+    <li>skip-miss 和 staging 部分两轮都没有发现问题。</li>
+  </ul>
   <p class="muted">另外：上游 v0.1.40.2 已合并进来（PR #14），并修好合并后 DeepSeek 每次回复都会 TypeError 的问题。CI 已迁到 air-rig（PR #16）。MCP 回退表补上了 DeepSeek（PR #15）。</p>
 
   <h2>3. 还有哪些空间（按收益排序）</h2>
