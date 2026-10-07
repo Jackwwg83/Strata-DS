@@ -52,7 +52,9 @@ def quiet(fn, *args, **kw):
 class HuggingFacePins(unittest.TestCase):
     def test_every_model_url_is_pinned(self):
         for name, fam in setup.FAMILIES.items():
-            for key in ("hf", "mmproj_hf"):
+            if "mmproj_hf" not in fam:
+                self.assertIs(fam.get("vision"), False)
+            for key in ("hf", "mmproj_hf") if "mmproj_hf" in fam else ("hf",):
                 with self.subTest(family=name, key=key):
                     self.assertRegex(fam[key], SHA)
                     self.assertNotIn("/resolve/main/", fam[key])
