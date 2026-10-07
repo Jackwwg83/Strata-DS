@@ -1,0 +1,4 @@
+{"exe": "/workspace/Strata-DS-serve/build/ds41_serve",
+ "args": ["--pack", "/workspace/pack-sage", "--max-context", "32768", "--expert-profile", "/workspace/Strata-DS-revfix/ds41/data/expert-profile.bin", "--threads", "8"],
+ "cwd": "/workspace/Strata-DS-serve", "tokenizer": "/workspace/pack-sage", "format": "deepseek_v41", "model_name": "deepseek-v4.1-flash",
+ "log": "/workspace/results/serve_slice2/engine.log", "port": 18000}
