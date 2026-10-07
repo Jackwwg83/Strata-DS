@@ -1,5 +1,6 @@
 // src/ds41/host_experts.cpp - see include/strata/ds41/host_experts.hpp.
 #include "strata/ds41/host_experts.hpp"
+#include "strata/ds41/parallel.hpp"
 
 #include "strata/ds41/config.hpp"
 #include "strata/ds41/residency.hpp"
@@ -119,29 +120,27 @@ HostExperts::HostExperts(const Pack& pack, const std::vector<std::pair<int, int>
     const uint8_t* base = pack.expert_base();
     std::atomic<int> next{0};
     std::atomic<bool> failed{false};
-    std::vector<std::thread> pool;
-    for (int t = 0; t < (filled_direct_ ? std::max(threads, 16) : std::max(threads, 1)); ++t)
-        pool.emplace_back([&] {
-            for (int s; (s = next++) < slots_ && !failed;) {
-                const ExpertSlot& x = pack.expert(holder_[s].first, holder_[s].second);
-                if (filled_direct_ && x.offset % 4096 == 0) {   // an unaligned expert (not in a real pack): copied
-                    const size_t len = (size_t) (off_[s + 1] - off_[s]);   // the slot: the expert rounded to 4 KiB
-                    size_t got = 0;
-                    while (got < x.bytes) {
-                        const ssize_t r = pread(dfd, arena_ + off_[s] + got, len - got, (off_t) (x.offset + got));
-                        if (r <= 0) break;
-                        got += (size_t) r;
-                    }
-                    if (got < x.bytes) failed = true;
-                    continue;
+    const int readers = filled_direct_ ? std::max(threads, 16) : std::max(threads, 1);
+    run_parallel((size_t) readers, [&](size_t) {
+        for (int s; (s = next++) < slots_ && !failed;) {
+            const ExpertSlot& x = pack.expert(holder_[s].first, holder_[s].second);
+            if (filled_direct_ && x.offset % 4096 == 0) {   // an unaligned expert (not in a real pack): copied
+                const size_t len = (size_t) (off_[s + 1] - off_[s]);   // the slot: the expert rounded to 4 KiB
+                size_t got = 0;
+                while (got < x.bytes) {
+                    const ssize_t r = pread(dfd, arena_ + off_[s] + got, len - got, (off_t) (x.offset + got));
+                    if (r <= 0) break;
+                    got += (size_t) r;
                 }
-                std::memcpy(arena_ + off_[s], base + x.offset, x.bytes);
-                // the file pages are not needed any more: unmap them, so the OS reclaims them first
-                const uintptr_t a = ((uintptr_t) (base + x.offset)) & ~(uintptr_t) 4095;
-                madvise((void*) a, (uintptr_t) (base + x.offset + x.bytes) - a, MADV_DONTNEED);
+                if (got < x.bytes) failed = true;
+                continue;
             }
-        });
-    for (auto& t : pool) t.join();
+            std::memcpy(arena_ + off_[s], base + x.offset, x.bytes);
+            // the file pages are not needed any more: unmap them, so the OS reclaims them first
+            const uintptr_t a = ((uintptr_t) (base + x.offset)) & ~(uintptr_t) 4095;
+            madvise((void*) a, (uintptr_t) (base + x.offset + x.bytes) - a, MADV_DONTNEED);
+        }
+    });
     if (dfd >= 0) close(dfd);
     if (failed) {
         munmap(arena_, arena_bytes_);

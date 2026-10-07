@@ -1,5 +1,6 @@
 // src/ds41/engram_rows.cpp - see include/strata/ds41/engram_rows.hpp.
 #include "strata/ds41/engram_rows.hpp"
+#include "strata/ds41/parallel.hpp"
 
 #include <fcntl.h>
 #include <unistd.h>
@@ -9,7 +10,6 @@
 #include <atomic>
 #include <cstring>
 #include <stdexcept>
-#include <thread>
 #include <vector>
 
 namespace strata::ds41 {
@@ -110,16 +110,12 @@ void EngramRows::read(const std::vector<const int64_t*>& ids, int n_rows, const 
             const size_t n = first[t + 1] - first[t];
             const size_t workers = std::min<size_t>(std::max<size_t>(n / 4, 1), 64);
             std::atomic<bool> bad{false};
-            auto slice = [&](size_t w) {
+            run_parallel(workers, [&](size_t w) {
                 for (size_t r = first[t] + w; r < first[t + 1]; r += workers) {
                     const Req& q = reqs_[r];
                     if (pread(fds_[t], q.dst, q.bytes, (off_t) (q.aligned + q.skip)) != (ssize_t) q.bytes) bad = true;
                 }
-            };
-            std::vector<std::thread> pool;
-            for (size_t w = 1; w < workers; ++w) pool.emplace_back(slice, w);
-            slice(0);
-            for (auto& th : pool) th.join();
+            });
             if (bad) throw std::runtime_error("EngramRows: a read failed: " + tables_[t].path);
         }
     }

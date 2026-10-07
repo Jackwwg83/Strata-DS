@@ -59,6 +59,12 @@ if(STRATA_BUILD_TESTS)
   target_link_libraries(doorbell_test PRIVATE strata_ds41_engine)
   add_test(NAME doorbell_test COMMAND doorbell_test)
   set_tests_properties(doorbell_test PROPERTIES SKIP_RETURN_CODE 77 TIMEOUT 300)
+  # run_parallel: every part once, also when a thread cannot start
+  add_executable(parallel_test src/ds41/tests/parallel_test.cpp)
+  target_include_directories(parallel_test PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/include)
+  target_compile_features(parallel_test PRIVATE cxx_std_17)
+  target_link_libraries(parallel_test PRIVATE Threads::Threads)
+  add_test(NAME parallel_test COMMAND parallel_test)
   # ds41_serve's line protocol on the host
   add_executable(serve_request_test src/ds41/tests/serve_request_test.cpp)
   target_include_directories(serve_request_test PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/include)
