@@ -3,6 +3,8 @@
 // GEMM logits must pick K8's experts for almost every row (a near tie can flip with the summation order).
 #include "bench_util.hpp"
 
+#include <cstring>
+
 #include "strata/ds41/config.hpp"
 #include "strata/ds41/kernels/k8_router.hpp"
 #include "strata/ds41/ops.hpp"
@@ -91,6 +93,34 @@ int main() {
                           inv);
             v.check(same_bits(x.down(), ref.down()), pass ? "rope_rows (step 2, inverse) differs" : "rope_rows differs");
         }
+    }
+    {   // more rows than one launch dimension (grid.y <= 65535): a 65,536-token prefill pass (regression)
+        constexpr int RL = 65536 + 7, V = 100;
+        Dev<bf16> table(rand_bf16((size_t) V * H, 1.0f, 30)), h((size_t) RL * C * H);
+        std::vector<int32_t> tok(RL);
+        for (int r = 0; r < RL; ++r) tok[r] = (r * 37 + 11) % V;
+        Dev<int32_t> tk(tok);
+        pf::embed_rows(table.p, tk.p, RL, h.p);
+        ck(cudaDeviceSynchronize(), "embed_rows, many rows");
+        const auto hv = h.down(), tv = table.down();
+        bool ok = true;
+        for (int r : {0, 65534, 65535, 65536, RL - 1})
+            for (int c = 0; c < C; ++c) ok &= std::memcmp(&hv[((size_t) r * C + c) * H], &tv[(size_t) tok[r] * H], H * 2) == 0;
+        v.check(ok, "embed_rows with more than 65535 rows");
+        constexpr int PL = RL + 8;
+        Dev<float> rt(rand_f32((size_t) PL * sd::kRopeDim, 1.0f, 31));
+        const auto x0 = rand_bf16((size_t) RL * 512, 1.0f, 32);
+        Dev<bf16> x(x0), one((size_t) 512);
+        pf::rope_rows(x.p, RL, 1, 512, rt.p, 3, 1, false);
+        ck(cudaDeviceSynchronize(), "rope_rows, many rows");
+        const auto xv = x.down();
+        for (int r : {65535, 65536, RL - 1}) {
+            ck(cudaMemcpy(one.p, x0.data() + (size_t) r * 512, 512 * 2, cudaMemcpyHostToDevice), "row");
+            ops::rope(one.p, 1, 512, rt.p + (size_t) (3 + r) * sd::kRopeDim, false);
+            const auto ov = one.down();
+            ok &= std::memcmp(ov.data(), &xv[(size_t) r * 512], 512 * 2) == 0;
+        }
+        v.check(ok, "rope_rows with more than 65535 rows");
     }
     {   // bf16_gemm against bf16_linear, both outputs; wo_a_grouped_rows against wo_a_grouped
         constexpr int K = 5120, N = 512;

@@ -1,6 +1,8 @@
 // src/ds41/prefill_ops.cu - GPU operations that only batched prefill needs. See prefill_ops.hpp.
 #include "strata/ds41/prefill_ops.hpp"
 
+#include <algorithm>
+
 #include "strata/ds41/config.hpp"
 
 #include <cublas_v2.h>
@@ -167,15 +169,23 @@ void round_bf16(const float* x, bf16* y, int64_t n) {
 
 }  // namespace
 
+/// rows per launch: grid.y is at most 65535
+constexpr int kMaxGridY = 65535;
+
 void embed_rows(const bf16* table, const int32_t* tokens, int rows, bf16* h) {
-    if (rows > 0) embed_rows_k<<<dim3(grid(kDim, 256), rows), 256>>>(table, tokens, h);
+    for (int r0 = 0; r0 < rows; r0 += kMaxGridY) {
+        const int n = std::min(kMaxGridY, rows - r0);
+        embed_rows_k<<<dim3(grid(kDim, 256), n), 256>>>(table, tokens + r0, h + (int64_t) r0 * kHc * kDim);
+    }
     LAUNCH_CHECK("embed_rows");
 }
 
 void rope_rows(bf16* v, int rows, int n_vec, int stride, const float* table, int pos0, int pos_step, bool inverse) {
-    if (rows > 0)
-        rope_rows_k<<<dim3(grid((int64_t) n_vec * (kRopeDim / 2), 256), rows), 256>>>(v, n_vec, stride, table, pos0,
-                                                                                    pos_step, inverse);
+    for (int r0 = 0; r0 < rows; r0 += kMaxGridY) {
+        const int n = std::min(kMaxGridY, rows - r0);
+        rope_rows_k<<<dim3(grid((int64_t) n_vec * (kRopeDim / 2), 256), n), 256>>>(
+            v + (int64_t) r0 * n_vec * stride, n_vec, stride, table, pos0 + r0 * pos_step, pos_step, inverse);
+    }
     LAUNCH_CHECK("rope_rows");
 }
 
