@@ -29,3 +29,15 @@ band dispatch read `mat.bits` and `mat.hb`. Layers can already mix integer
 K1..K6 across experts and projections. No CPU math change is needed.
 The extended K11 acceptance test checks a mixed layer against the same
 LinearEXL3 FP16 reference, then relocates each expert through `set_expert_raw`.
+
+Review fixes for CPU registration and staging:
+- Staging offsets use the selected projections' actual packed sizes.
+- Registration checks every gate/up/down shape. Raw dimensions must be positive.
+- A `unique_ptr` owns a new layer until registry insertion succeeds.
+
+`tests/revfix_test.cpp` checks mixed-K copies, guards, shape rejection, and
+allocation failures. Run `python3 third_party/exllamav3_moe/tests/check_revfix_host.py`
+for the extracted registry and staging code on a non-x86 host. Add `--native`
+on Linux to build the complete CPU source. Add `--sanitize address,undefined`
+for ASan and UBSan. The CMake target `moe_revfix_test` also uses the complete source.
+This directory tracks changes in Git and has no `strata.patch` file.

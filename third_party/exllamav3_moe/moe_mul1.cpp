@@ -22,6 +22,7 @@
 #include <cstdio>
 #include <cstdlib>
 #include <map>
+#include <memory>
 #include <mutex>
 #include <string>
 #include <thread>
@@ -2556,8 +2557,8 @@ namespace {
 struct StageCtx
 {
     const MoeCpuLayer* layer;
-    const uint32_t* ids;
-    int count;
+    std::vector<const MoeCpuMatrix*> matrices;
+    std::vector<size_t> offsets;
     uint8_t* dst;
 };
 
@@ -2578,24 +2579,8 @@ inline void stage_copy_trellis(uint8_t* dst, const MoeCpuMatrix& m)
 void stage_phase(void* vctx, int worker, int num_workers)
 {
     StageCtx& c = *static_cast<StageCtx*>(vctx);
-    const bool gated = !c.layer->gates.empty();
-    const int nmat = gated ? 3 : 2;
-    // Each (expert, matrix) is one unit; offsets accumulate expert-major in g, u, d order
-    const size_t gb = gated ? trellis_bytes(c.layer->gates[0]) : 0;
-    const size_t ub = trellis_bytes(c.layer->ups[0]);
-    const size_t db = trellis_bytes(c.layer->downs[0]);
-    const size_t per_expert = gb + ub + db;
-    for (int u = worker; u < c.count * nmat; u += num_workers)
-    {
-        const int e = c.ids[u / nmat];
-        const int mi = u % nmat;
-        size_t off = static_cast<size_t>(u / nmat) * per_expert;
-        const MoeCpuMatrix* m;
-        if (gated && mi == 0)      { m = &c.layer->gates[e]; }
-        else if (mi == (gated ? 1 : 0)) { m = &c.layer->ups[e]; off += gb; }
-        else                       { m = &c.layer->downs[e]; off += gb + ub; }
-        stage_copy_trellis(c.dst + off, *m);
-    }
+    for (size_t u = worker; u < c.matrices.size(); u += num_workers)
+        stage_copy_trellis(c.dst + c.offsets[u], *c.matrices[u]);
 }
 
 } // namespace
@@ -2611,10 +2596,26 @@ void exl3_moe_cpu_stage_experts
 {
     // Runs on the worker's stager thread, concurrently with compute jobs on the pool: use
     // scratch threads, never the shared pool. A few threads saturate memcpy DRAM bandwidth.
-    StageCtx ctx { get_layer(handle), expert_ids, count, dst };
+    TORCH_CHECK(count >= 0 && (count == 0 || (expert_ids && dst)), "invalid staging buffer");
+    StageCtx ctx { get_layer(handle), {}, {}, dst };
     const bool gated = !ctx.layer->gates.empty();
-    int units = count * (gated ? 3 : 2);
-    int nt = std::min(threads > 0 ? threads : 1, units);
+    size_t offset = 0;
+    auto append = [&](const MoeCpuMatrix& m) {
+        const size_t bytes = trellis_bytes(m);
+        TORCH_CHECK(bytes <= std::numeric_limits<size_t>::max() - offset, "staging size overflow");
+        ctx.matrices.push_back(&m);
+        ctx.offsets.push_back(offset);
+        offset += bytes;
+    };
+    for (int i = 0; i < count; ++i) {
+        const uint32_t e = expert_ids[i];
+        TORCH_CHECK(e < static_cast<uint32_t>(ctx.layer->num_experts), "bad staging expert");
+        if (gated) append(ctx.layer->gates[e]);
+        append(ctx.layer->ups[e]);
+        append(ctx.layer->downs[e]);
+    }
+    const size_t units = ctx.matrices.size();
+    int nt = static_cast<int>(std::min<size_t>(threads > 0 ? threads : 1, units));
     if (nt <= 1)
     {
         stage_phase(&ctx, 0, 1);
@@ -2685,9 +2686,10 @@ int64_t exl3_moe_cpu_make_layer
     int64_t swizzled
 )
 {
-    auto* layer = new MoeCpuLayer;
+    auto layer = std::make_unique<MoeCpuLayer>();
     const bool swz = swizzled != 0;
     const size_t E = up_trellis.size();
+    TORCH_CHECK(E > 0, "empty layer");
     const bool gated = !gate_trellis.empty();
     TORCH_CHECK(down_trellis.size() == E && (!gated || gate_trellis.size() == E), "expert count mismatch");
     TORCH_CHECK(gated ? (activation == 0 || activation == 1 || activation == 3) : activation == 2, "gated experts take silu/gelu/swiglu_oai, gateless take relu2");
@@ -2716,11 +2718,19 @@ int64_t exl3_moe_cpu_make_layer
     }
     layer->hidden_size = layer->ups[0].k;
     layer->interm_size = layer->ups[0].n;
-    TORCH_CHECK(layer->downs[0].k == layer->interm_size && layer->downs[0].n == layer->hidden_size,
-                "expert shape mismatch");
+    TORCH_CHECK(layer->hidden_size > 0 && layer->interm_size > 0, "non-positive layer dimensions");
+    for (int e = 0; e < layer->num_experts; ++e) {
+        const int h = layer->hidden_size, i = layer->interm_size;
+        TORCH_CHECK(layer->ups[e].k == h && layer->ups[e].n == i &&
+                    layer->downs[e].k == i && layer->downs[e].n == h,
+                    "expert shape mismatch");
+        if (gated)
+            TORCH_CHECK(layer->gates[e].k == h && layer->gates[e].n == i, "gate shape mismatch");
+    }
 
     std::lock_guard<std::mutex> lock(g_layers_mutex);
-    g_layers.push_back(layer);
+    g_layers.push_back(layer.get());
+    layer.release();
     return static_cast<int64_t>(g_layers.size() - 1);
 }
 
@@ -2730,6 +2740,9 @@ int64_t exl3_moe_cpu_make_layer
 static MoeCpuMatrix make_matrix_raw(const MoeCpuMatrixDesc& d, bool swizzled)
 {
     TORCH_CHECK(d.trellis && d.suh && d.svh, "null weight pointer");
+    TORCH_CHECK(d.k_tiles > 0 && d.k_tiles <= 8192 / 16 &&
+                d.n_tiles > 0 && d.n_tiles <= std::numeric_limits<int>::max() / 16,
+                "invalid matrix dimensions");
     MoeCpuMatrix m;
     m.trellis = d.trellis;
     m.suh = d.suh;
@@ -2762,7 +2775,7 @@ int64_t exl3_moe_cpu_make_layer_raw
     const bool gated = gates != nullptr;
     TORCH_CHECK(num_experts > 0 && ups && downs, "empty layer");
     TORCH_CHECK(gated ? (activation == 0 || activation == 1 || activation == 3) : activation == 2, "gated experts take silu/gelu/swiglu_oai, gateless take relu2");
-    auto* layer = new MoeCpuLayer;
+    auto layer = std::make_unique<MoeCpuLayer>();
     layer->num_experts = num_experts;
     layer->activation = activation;
     layer->act_limit = act_limit;
@@ -2774,10 +2787,18 @@ int64_t exl3_moe_cpu_make_layer_raw
     }
     layer->hidden_size = layer->ups[0].k;
     layer->interm_size = layer->ups[0].n;
-    TORCH_CHECK(layer->downs[0].k == layer->interm_size && layer->downs[0].n == layer->hidden_size,
-                "expert shape mismatch");
+    TORCH_CHECK(layer->hidden_size > 0 && layer->interm_size > 0, "non-positive layer dimensions");
+    for (int e = 0; e < layer->num_experts; ++e) {
+        const int h = layer->hidden_size, i = layer->interm_size;
+        TORCH_CHECK(layer->ups[e].k == h && layer->ups[e].n == i &&
+                    layer->downs[e].k == i && layer->downs[e].n == h,
+                    "expert shape mismatch");
+        if (gated)
+            TORCH_CHECK(layer->gates[e].k == h && layer->gates[e].n == i, "gate shape mismatch");
+    }
     std::lock_guard<std::mutex> lock(g_layers_mutex);
-    g_layers.push_back(layer);
+    g_layers.push_back(layer.get());
+    layer.release();
     return static_cast<int64_t>(g_layers.size() - 1);
 }
 

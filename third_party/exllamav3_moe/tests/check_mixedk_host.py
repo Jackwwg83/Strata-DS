@@ -14,12 +14,14 @@ VENDOR = Path(__file__).resolve().parents[1]
 
 def registry():
     full = (VENDOR / "moe_mul1.cpp").read_text()
-    begin = full.index("static MoeCpuMatrix make_matrix_raw(")
+    begin = full.index("static MoeCpuMatrix make_matrix_raw")
     end = full.index("static const MoeCpuLayer* get_layer(int64_t handle)\n{", begin)
     source = '''#include "moe_mul1.h"
 #include <cassert>
 #include <cstdio>
 #include <mutex>
+#include <limits>
+#include <memory>
 std::vector<MoeCpuLayer*> g_layers;
 std::mutex g_layers_mutex;
 ''' + full[begin:end] + r'''
