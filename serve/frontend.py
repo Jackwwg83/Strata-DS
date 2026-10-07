@@ -257,10 +257,12 @@ def _tool_list(value, wrapper: str | None) -> list[dict]:
     return tools
 
 
-def openai_to_messages(req: dict) -> tuple[list[dict], list[dict] | None, dict]:
+def openai_to_messages(req: dict, deepseek: bool = False) -> tuple[list[dict], list[dict] | None, dict]:
     """OpenAI Chat Completions -> (template messages, template tools, template kwargs)."""
     messages = []
     for m in _object_list(req.get("messages"), "messages"):
+        if deepseek and _has_image(m.get("content")):
+            raise ValueError("DeepSeek V4.1 does not support images in this server")
         role = m.get("role")
         if role == "developer":
             role = "system"
@@ -277,7 +279,11 @@ def openai_to_messages(req: dict) -> tuple[list[dict], list[dict] | None, dict]:
                 if isinstance(args, str):               # the template requires a mapping, not a JSON string
                     args = json.loads(args) if args.strip() else {}
                 calls.append({"function": {"name": fn.get("name"), "arguments": args or {}}})
+                if deepseek and c.get("id"):
+                    calls[-1]["id"] = c["id"]
             out["tool_calls"] = calls
+        if deepseek and m.get("tool_call_id"):
+            out["tool_call_id"] = m["tool_call_id"]
         messages.append(out)
     tools = [t.get("function", t) if t.get("type") == "function" else t
              for t in _tool_list(req.get("tools"), "function")] or None
@@ -291,19 +297,26 @@ def openai_to_messages(req: dict) -> tuple[list[dict], list[dict] | None, dict]:
             kwargs = {"enable_thinking": False}
         elif k == "reasoning_effort" and "enable_thinking" not in kwargs:
             kwargs.update(effort_kwargs(v))
-    return _late_system_to_user(messages), tools, kwargs
+    return (messages if deepseek else _late_system_to_user(messages)), tools, kwargs
 
 
-def anthropic_to_messages(req: dict, think_unasked: bool = True) -> tuple[list[dict], list[dict] | None, dict]:
+def anthropic_to_messages(req: dict, think_unasked: bool = True,
+                          deepseek: bool = False) -> tuple[list[dict], list[dict] | None, dict]:
     """Anthropic Messages -> (template messages, template tools, template kwargs).  `think_unasked`: a request
     without "thinking", an effort or a budget gets the template's default (it thinks), as through 0.1.31; False
     renders it without thinking (#278, the config's "anthropic_thinking": "on_request")."""
     messages = []
     system = req.get("system")
+    if deepseek and _has_image(system):
+        raise ValueError("DeepSeek V4.1 does not support images in this server")
     if system:
         messages.append({"role": "system", "content": _text_of(system)})
     for m in _object_list(req.get("messages"), "messages"):
         content = m.get("content")
+        if deepseek and (_has_image(content) or isinstance(content, list) and any(
+                isinstance(b, dict) and b.get("type") == "tool_result" and _has_image(b.get("content"))
+                for b in content)):
+            raise ValueError("DeepSeek V4.1 does not support images in this server")
         if isinstance(content, str):
             messages.append({"role": m["role"], "content": content})
             continue
@@ -320,8 +333,12 @@ def anthropic_to_messages(req: dict, think_unasked: bool = True) -> tuple[list[d
                 reasoning.append(block.get("thinking", ""))
             elif kind == "tool_use":
                 calls.append({"function": {"name": block.get("name"), "arguments": block.get("input") or {}}})
+                if deepseek and block.get("id"):
+                    calls[-1]["id"] = block["id"]
             elif kind == "tool_result":
                 messages.append({"role": "tool", "content": _text_of(block.get("content"))})
+                if deepseek and block.get("tool_use_id"):
+                    messages[-1]["tool_call_id"] = block["tool_use_id"]
         if text or calls or reasoning:
             out = {"role": m["role"], "content": "".join(text)}
             if reasoning:
@@ -350,7 +367,7 @@ def anthropic_to_messages(req: dict, think_unasked: bool = True) -> tuple[list[d
         # A config's reasoning_effort still applies: Service.with_shared sets output_config before this runs.  A
         # request that gives its own reasoning_budget_tokens (#123) asks for thinking, so it thinks as before.
         kwargs["enable_thinking"] = False
-    return _late_system_to_user(messages), tools, kwargs
+    return (messages if deepseek else _late_system_to_user(messages)), tools, kwargs
 
 
 # ------------------------------------------------------------------------------------------------ output parser
