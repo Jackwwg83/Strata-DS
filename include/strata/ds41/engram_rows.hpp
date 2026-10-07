@@ -46,7 +46,7 @@ public:
     void submit(size_t t);
     void finish(size_t t);
     /// Drop the tables of the last prepare that are not finished: waits for the reads in flight, throws nothing.
-    /// For a caller whose step failed between submit and finish.
+    /// For a caller whose step failed between submit and finish. A reader that saw a failed read stays refused.
     void abandon() noexcept;
     size_t tables() const { return tables_.size(); }
 
@@ -66,7 +66,8 @@ private:
     std::vector<int> fds_;   ///< the fallback (plain pread) per table, -1 when the table is read with O_DIRECT
     int max_rows_, row_bytes_, scale_bytes_;
     bool direct_ = true;
-    bool failed_ = false;
+    bool failed_ = false;      ///< a read failed: refused from then on (never cleared)
+    void finish_table(size_t t);   ///< finish() without the state checks
     uint8_t* buf_ = nullptr;   ///< aligned: one 8 KiB block per request
     std::vector<Req> reqs_;
     std::vector<size_t> first_;   ///< table t's requests: reqs_[first_[t] .. first_[t + 1])

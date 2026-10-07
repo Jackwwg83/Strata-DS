@@ -95,16 +95,19 @@ void EngramRows::submit(size_t t) {
     if (t >= tables_.size()) throw std::invalid_argument("EngramRows::submit: no such table");
     if (state_.size() != tables_.size() || state_[t] != State::kPrepared)
         throw std::logic_error("EngramRows::submit: table not prepared");
-    // Any exception after submission poisons the reader. Destruction joins the I/O workers
-    // before it frees their buffers. No later read can consume old completions.
-    failed_ = true;
+    // Any failure after a submission poisons the reader for good (failed_ is never cleared). Destruction joins the
+    // I/O workers before it frees their buffers. No later read can consume old completions.
     std::string err;
-    if (files_[t])
-        for (size_t r = first_[t]; r < first_[t + 1]; ++r)
-            if (!files_[t]->submit(reqs_[r].aligned, buf_ + r * kBlock, reqs_[r].length, r, err))
-                throw std::runtime_error("EngramRows: " + err);
+    try {
+        if (files_[t])
+            for (size_t r = first_[t]; r < first_[t + 1]; ++r)
+                if (!files_[t]->submit(reqs_[r].aligned, buf_ + r * kBlock, reqs_[r].length, r, err))
+                    throw std::runtime_error("EngramRows: " + err);
+    } catch (...) {
+        failed_ = true;
+        throw;
+    }
     state_[t] = State::kSubmitted;
-    failed_ = false;
 }
 
 void EngramRows::finish(size_t t) {
@@ -112,7 +115,15 @@ void EngramRows::finish(size_t t) {
     if (state_.size() != tables_.size() || state_[t] == State::kIdle || state_[t] == State::kFinished)
         throw std::logic_error("EngramRows::finish: table not prepared");
     if (state_[t] == State::kPrepared) submit(t);
-    failed_ = true;
+    try {
+        finish_table(t);
+    } catch (...) {
+        failed_ = true;   // for good: see submit
+        throw;
+    }
+}
+
+void EngramRows::finish_table(size_t t) {
     if (files_[t]) {
         platform::Completion c[64];
         size_t got = 0;
@@ -143,10 +154,11 @@ void EngramRows::finish(size_t t) {
         state_[t] = State::kFinished;
         if (bad) throw std::runtime_error("EngramRows: a read failed: " + tables_[t].path);
     }
-    failed_ = false;
 }
 
 void EngramRows::abandon() noexcept {
+    // A failed read stays failed (finish never clears failed_): a table whose submit failed part way may still have
+    // reads in flight that would land in a later read's buffers.
     for (size_t t = 0; t < state_.size(); ++t) {
         if (state_[t] == State::kSubmitted) {
             try {
