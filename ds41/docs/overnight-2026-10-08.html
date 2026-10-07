@@ -1,0 +1,194 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>DeepSeek 优化空间</title>
+<link rel="icon" href="data:,">
+<style>
+  :root {
+    --bg: #fbfaf7; --fg: #1d1d1b; --muted: #6b6a66; --line: #e2dfd8; --card: #ffffff;
+    --ok: #1f7a4d; --ok-bg: #e7f4ec; --warn: #9a5b00; --warn-bg: #fdf1dc; --no: #a3302a; --no-bg: #fbe7e5;
+    --accent: #2d4f9e; --bar: #2d4f9e; --bar2: #c9862b; --bar3: #7a8a3a;
+  }
+  @media (prefers-color-scheme: dark) {
+    :root:not([data-theme="light"]) {
+      --bg: #161614; --fg: #ecebe6; --muted: #a09e97; --line: #34332f; --card: #1f1f1c;
+      --ok: #6fd19c; --ok-bg: #18301f; --warn: #f0b45a; --warn-bg: #33270f; --no: #f08a82; --no-bg: #3a1a17;
+      --accent: #8fb0ff; --bar: #8fb0ff; --bar2: #f0b45a; --bar3: #b9c97a;
+    }
+  }
+  :root[data-theme="dark"] {
+    --bg: #161614; --fg: #ecebe6; --muted: #a09e97; --line: #34332f; --card: #1f1f1c;
+    --ok: #6fd19c; --ok-bg: #18301f; --warn: #f0b45a; --warn-bg: #33270f; --no: #f08a82; --no-bg: #3a1a17;
+    --accent: #8fb0ff; --bar: #8fb0ff; --bar2: #f0b45a; --bar3: #b9c97a;
+  }
+  * { box-sizing: border-box; }
+  body { margin: 0; background: var(--bg); color: var(--fg);
+         font: 15px/1.65 -apple-system, BlinkMacSystemFont, "PingFang SC", "Hiragino Sans GB", "Microsoft YaHei",
+               "Noto Sans CJK SC", "Segoe UI", Roboto, sans-serif; }
+  main { max-width: 980px; margin: 0 auto; padding: 32px 16px 64px; }
+  h1 { font-size: 26px; margin: 0 0 4px; }
+  h2 { font-size: 19px; margin: 36px 0 12px; padding-bottom: 6px; border-bottom: 1px solid var(--line); }
+  h3 { font-size: 16px; margin: 22px 0 8px; }
+  .sub { color: var(--muted); margin: 0 0 20px; }
+  .lead { background: var(--card); border: 1px solid var(--line); border-left: 4px solid var(--accent);
+          border-radius: 8px; padding: 14px 18px; }
+  .lead p { margin: 6px 0; }
+  table { width: 100%; border-collapse: collapse; background: var(--card); border: 1px solid var(--line);
+          border-radius: 8px; overflow: hidden; font-size: 14px; }
+  th, td { text-align: left; padding: 8px 10px; border-bottom: 1px solid var(--line); vertical-align: top; }
+  th { color: var(--muted); font-weight: 600; background: color-mix(in srgb, var(--card) 85%, var(--line)); }
+  tr:last-child td { border-bottom: none; }
+  td.num { text-align: right; font-variant-numeric: tabular-nums; white-space: nowrap; }
+  .wrap { overflow-x: auto; }
+  .tag { display: inline-block; font-size: 12px; padding: 1px 8px; border-radius: 999px; white-space: nowrap; }
+  .ok { color: var(--ok); background: var(--ok-bg); }
+  .warn { color: var(--warn); background: var(--warn-bg); }
+  .no { color: var(--no); background: var(--no-bg); }
+  code { font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace; font-size: 13px;
+         background: color-mix(in srgb, var(--card) 80%, var(--line)); padding: 1px 5px; border-radius: 4px;
+         overflow-wrap: anywhere; }
+  td:first-child code { overflow-wrap: normal; white-space: nowrap; }
+  .stack { display: flex; height: 30px; border-radius: 6px; overflow: hidden; border: 1px solid var(--line);
+           margin: 8px 0 4px; }
+  .stack div { display: flex; align-items: center; justify-content: center; color: #fff; font-size: 12px;
+               white-space: nowrap; overflow: hidden; }
+  .legend { font-size: 13px; color: var(--muted); }
+  ol.decide li { margin: 10px 0; }
+  ol.decide b { color: var(--accent); }
+  .muted { color: var(--muted); }
+  footer { margin-top: 40px; color: var(--muted); font-size: 13px; }
+</style>
+</head>
+<body>
+<main>
+  <h1>DeepSeek V4.1 Flash：还有多少优化空间</h1>
+  <p class="sub">2026-10-08 夜间 · 按你的要求今晚只改代码、不租机器；GPU 验证放到明天 · 开发机 air-rig（笔记本 RTX 5090 Laptop）</p>
+
+  <div class="lead">
+    <p><b>结论：</b>单卡、不损失质量的前提下，单条 decode 的上限大约是 <b>35–40 tok/s</b>（5090，PCIe 5.0）。原因是物理带宽：每个 token 约有 510 MB 的专家要过 PCIe。</p>
+    <p>今晚写了 4 个开关，都默认关闭，等 GPU 实测：</p>
+    <ul>
+      <li>2 个无损开关：engram 读盘与 GPU 并行、staging 拷贝调优；</li>
+      <li>1 个看系统设置的开关：内存层大页；</li>
+      <li>1 个有损开关：跳过低权重的未命中专家，要用 NLL 量质量。</li>
+    </ul>
+    <p>要明显超过 40 tok/s，只剩三条路：</p>
+    <ol>
+      <li>有损：跳专家，或冷门专家降比特；</li>
+      <li>加硬件：双卡按专家切分；</li>
+      <li>换指标：看多并发的总吞吐。</li>
+    </ol>
+  </div>
+
+  <h2>1. 时间花在哪：5090 实测（2026-10-07，35.9 ms/token = 27.9 tok/s）</h2>
+  <div class="stack" role="img" aria-label="35.9 ms 分解：dense 约 14 ms，staging 约 11 ms，engram 10.2 ms，CPU 0.8 ms">
+    <div style="width:39%;background:var(--bar)">dense 计算 ≈14</div>
+    <div style="width:31%;background:var(--bar2)">专家过 PCIe ≈11</div>
+    <div style="width:28%;background:var(--bar3)">engram 读盘 10.2</div>
+    <div style="width:2%;background:var(--muted)"></div>
+  </div>
+  <p class="legend">单位 ms。engram 和 CPU 是实测值（step log）。dense 和 staging 的拆分是估算：GPU 一共 25.7 ms，staging 按 72 个专家 × 约 7.1 MB ÷ 46 GB/s 计算。明天用 nsys 实测拆分。</p>
+  <div class="wrap"><table>
+    <tr><th>部分</th><th>大小</th><th>物理下限</th><th>说明</th></tr>
+    <tr><td>engram 读盘</td><td class="num">10.2 ms</td><td class="num">≈0.2 ms</td><td>每 token 96 次 4 KiB 随机读，而且在 GPU 开始前<b>串行</b>执行。那台机器的盘被限到 6–8K IOPS；本地 NVMe 只要零点几毫秒。</td></tr>
+    <tr><td>专家过 PCIe（staging）</td><td class="num">≈11 ms</td><td class="num">≈9.4 ms</td><td>每 token 约 72 个未命中的专家，约 510 MB。实测链路 54 GB/s，引擎里只跑到约 46 GB/s。</td></tr>
+    <tr><td>dense 计算</td><td class="num">≈14 ms</td><td class="num">≈5.3 ms</td><td>每 token 读约 9.5 GB 权重（attention、shared expert、head 等）。5090 显存带宽 1.8 TB/s。差距大，可能有空间，需要 nsys 看是哪些 kernel。</td></tr>
+    <tr><td>CPU 专家</td><td class="num">0.8 ms</td><td class="num">—</td><td>quota=4 时 CPU 基本只算剩下的零头。</td></tr>
+  </table></div>
+
+  <h2>2. 今晚做了什么</h2>
+  <p>四个开关都是<b>默认关闭</b>的环境变量，不改变现有行为。状态用四档标注。</p>
+  <div class="wrap"><table>
+    <tr><th>开关</th><th>做什么</th><th>预计收益（估算）</th><th>状态</th></tr>
+    <tr><td><code>DS41_ENGRAM_OVERLAP=1</code></td>
+        <td>先发 GPU，读盘与计算并行。GPU 只在用到 engram 的层（第 1、14 层）前等一个标志位。表 0 先读完，再读表 1（表 1 有 13 层的余量）。读失败也会放行所有标志位，GPU 不会卡死。</td>
+        <td>慢盘（6–8K IOPS）：每 token 约 −4 ms，27.9 → 约 31 tok/s（+12%）<br>快 NVMe：约 −0.2 ms（几乎无感）</td>
+        <td><span class="tag ok">代码实现</span> <span class="tag no">部署路径 ✗</span> <span class="tag no">真实数据 ✗</span><br><span class="muted">编译通过；读盘 API 的单测在 air-rig 通过；引擎级测试（token 一致、失败不挂死）要 GPU + 模型</span></td></tr>
+    <tr><td><code>DS41_STAGE_UNROLL</code><br><code>DS41_STAGE_BLOCKS</code></td>
+        <td>staging 拷贝 kernel 每线程同时发 2/4/8 个 load（原来 1 个），block 数可调（原来 68；5090 有 170 个 SM）。</td>
+        <td>如果能从 46 GB/s 提到约 52 GB/s：每 token 约 −1.3 ms。也可能 0：瓶颈可能不在这里。</td>
+        <td><span class="tag ok">代码实现</span> <span class="tag no">部署路径 ✗</span> <span class="tag no">真实数据 ✗</span><br><span class="muted">逐字节正确性测试已写好，5 种形状；需要约 400 MB 显存，笔记本 GPU 被 llama-server 占满，没跑</span></td></tr>
+    <tr><td><code>DS41_RAM_HUGEPAGES=1</code></td>
+        <td>内存层按 2 MiB 对齐，并申请大页，减少 GPU 零拷贝读时的页表开销。</td>
+        <td>只在系统 THP=madvise 时可能有用：0–5%。THP=always 的机器（比如 air-rig）本来就是大页。</td>
+        <td><span class="tag ok">代码实现</span> <span class="tag warn">单测通过（air-rig）</span> <span class="tag no">真实数据 ✗</span></td></tr>
+    <tr><td><code>DS41_SKIP_MISS=τ</code><br><code>DS41_SKIP_RENORM=0/1</code></td>
+        <td><b>有损。</b>一个专家既不在显存，权重又低于 τ × 该 token 的权重和时，这一步跳过它。最重的专家永远保留。默认把剩下的权重放大回原来的和。显存层的统计仍按路由器的原始选择计数。</td>
+        <td>跳过的比例取决于权重分布：路由权重偏平均，均值 1/6≈0.167。粗估 τ=0.10 少拷 10–30% → −1~3 ms。质量代价未知。</td>
+        <td><span class="tag ok">代码实现</span> <span class="tag warn">规则单测通过</span> <span class="tag no">真实数据 ✗</span></td></tr>
+  </table></div>
+  <p class="muted">另外：上游 v0.1.40.2 已合并进来（PR #14），并修好合并后 DeepSeek 每次回复都会 TypeError 的问题。CI 已迁到 air-rig（PR #16）。MCP 回退表补上了 DeepSeek（PR #15）。</p>
+
+  <h2>3. 还有哪些空间（按收益排序）</h2>
+  <div class="wrap"><table>
+    <tr><th>方向</th><th>预计收益</th><th>代价</th><th>质量</th><th>建议</th></tr>
+    <tr><td><b>双卡，按专家切分</b>：两张卡各放每层一半的专家，两条 PCIe 同时拷</td>
+        <td class="num">约 45–55 tok/s（估算）</td><td>大：新的多卡执行路径；要两张卡的机器验证</td><td>无损</td>
+        <td>这是唯一能在无损前提下明显越过 40 的路。注意：按<b>层</b>切分（上游 Qwen 的做法）对 decode 帮助小，因为两条链路按层轮流用，不是同时用。</td></tr>
+    <tr><td><b>dense kernel 优化</b>：hyper-connection mix 小 kernel 融合，FP8 GEMV 调优</td>
+        <td class="num">−2~6 ms（未知）</td><td>中：先看 nsys</td><td>无损</td>
+        <td>dense 实测约 14 ms，带宽下限约 5.3 ms，差距最大。旧 nsys 数据（2026-10-05，不是 5090）里光 hc mix 就占 3.1 ms，看起来是 launch 限制。明天的脚本会出 kernel 拆分。</td></tr>
+    <tr><td>跳过低权重未命中专家（今晚已做）</td><td class="num">−1~3 ms</td><td>已实现</td><td>有损，要量</td><td>明天出 NLL 与速度曲线，再决定要不要做成“快速模式”选项。</td></tr>
+    <tr><td>冷门专家降比特：只给内存层的专家再量化一份更低比特</td><td class="num">按比例减少 PCIe 字节</td><td>大：重新量化 + 新 pack</td><td>有损</td><td>排在跳专家之后。跳专家效果好，说明这条值得做。</td></tr>
+    <tr><td>embedding 表放内存（腾出约 1 GB 显存）</td><td class="num">+约 150 个专家槽，约 1–2%</td><td>小</td><td>无损</td><td>收益小，排后面。</td></tr>
+    <tr><td>多并发（batch slots，已上线）</td><td class="num">4 路总吞吐 28–31（慢盘）</td><td>已实现</td><td>无损</td><td>每行带来自己的未命中，所以叠加收益有限。engram 并行化之后要重测。</td></tr>
+    <tr><td>投机解码（后缀匹配，已有）</td><td class="num">重复多的文本 +5%，否则 −10%</td><td>已实现</td><td>无损</td><td>受 PCIe 限制，验证窗口里的专家要多拷。默认保持关闭。</td></tr>
+    <tr><td>预取下一层专家（已试过）</td><td class="num">更慢</td><td>—</td><td>无损</td><td>实测每 token 预取 42 个，只省下 4 个未命中，白占 PCIe。放弃。</td></tr>
+  </table></div>
+  <p class="muted">你之前问过双 5070 Ti。按层切分时，它的显存层与一张 5090 差不多（2×16 GB，减去 dense），显存带宽却只有一半，所以预计不会比一张 5090 快。按专家切分才有意义。</p>
+
+  <h2>4. 明天的 GPU 验证（要你确认再租）</h2>
+  <h3>机器候选（Vast，2026-10-08 凌晨查询，只查询没租）</h3>
+  <div class="wrap"><table>
+    <tr><th>编号</th><th>配置</th><th class="num">$/h</th><th class="num">下载 $/TB</th><th>说明</th></tr>
+    <tr><td>54640835</td><td>5090 · Ryzen 9 9950X3D · PCIe 5.0（55 GB/s）· 125 GB 内存 · 盘 12 GB/s · 下载 2.3 Gbps · 德州</td><td class="num">1.00</td><td class="num">5.3</td><td><b>推荐。</b>最接近高端家用机（和你笔记本同代 X3D），下载快，模型约 30 分钟到。</td></tr>
+    <tr><td>54679993</td><td>5090 · Threadripper PRO · PCIe 5.0（54 GB/s）· 126 GB · 盘 10 GB/s · 775 Mbps · 挪威</td><td class="num">0.69</td><td class="num">13.7</td><td>便宜，但下载约 1 小时。</td></tr>
+    <tr><td>52451718</td><td>5090 · EPYC 9754 · PCIe 5.0（54 GB/s）· 126 GB · 盘 1.7 GB/s · 英国</td><td class="num">0.80</td><td class="num">2.7</td><td>盘慢，engram 读盘会偏慢。可以用来专门验证慢盘场景。</td></tr>
+  </table></div>
+  <p>预算（推荐那台）：</p>
+  <ul>
+    <li>下载模型 342 GB × $5.3/TB ≈ $1.8；</li>
+    <li>机器约 3 小时（下载、打包、在机器上编译、A/B 约 1 小时）≈ $3；</li>
+    <li>合计约 <b>$5</b>。</li>
+  </ul>
+  <p class="muted">要在租的机器上编译：air-rig 是 Arch（glibc、gcc-15 都比 Vast 的 Ubuntu 镜像新），编出来的程序拿过去大概率跑不起来。开发迭代仍在 air-rig 上编译。</p>
+  <h3>一条命令跑完：<code>ds41/bench/scripts/opt_ab.sh</code></h3>
+  <ol>
+    <li><b>正确性先行</b>：新测试全部要过，否则不计时，直接退出。包括：开 overlap 时 token 和 logits 跟关闭时一致；读失败不挂死；staging 逐字节一致；reset、snapshot、batch 开着开关也对。</li>
+    <li><b>速度</b>：两段真实对话，依次测 base → overlap → 5 种 staging 形状 → 大页。自动保留最快的无损组合，再在上面叠加 <code>SKIP_MISS</code> 的 0.05/0.10/0.15，以及不 renorm 的一档。</li>
+    <li><b>质量</b>：三段固定文本（中文文档、英文文档、Python 代码，各 768 token）测 teacher-forced NLL。再看贪心输出和原版在第几个 token 开始分叉，并用两次原版运行的分叉点作为噪声底。</li>
+    <li><b>拆分</b>：机器上有 nsys 时，出 kernel 时间表，用来决定 dense 优化先做哪块。</li>
+  </ol>
+  <p class="muted">脚本逻辑已在 Mac 上用假程序跑通（解析、选优、分叉比较），真实数字明天出。</p>
+
+  <h2>5. 需要你决定的事</h2>
+  <ol class="decide">
+    <li><b>明天租哪台：</b>推荐 54640835（约 $5）。确认后我再租。</li>
+    <li><b>“跳专家”的质量门槛：</b>建议的规则如下：
+      <ul>
+        <li>三段文本的 NLL 平均上升 ≤ 0.02，并且提速 ≥ 5%：做成可选的“快速模式”，默认仍关闭；</li>
+        <li>超过这个门槛：只留作实验开关。</li>
+      </ul>
+      你同意这个门槛吗？</li>
+    <li><b>下一个大项：</b>二选一：
+      <ul>
+        <li>dense kernel 优化：无损，单卡，等 nsys 结果决定；</li>
+        <li>双卡按专家切分：要双卡机器，工程量大，但无损上限最高。</li>
+      </ul>
+      我的建议是先 dense（明天有数据就能动手），双卡放到 GLM-5.3 之后再评估。</li>
+    <li><b>PR 合并：</b>
+      <ul>
+        <li>#14（上游同步）、#15（MCP）、#16（CI）：主机侧都已验证，可以先合；</li>
+        <li>三个优化分支：等明天 GPU 结果出来再开 PR。</li>
+      </ul></li>
+  </ol>
+
+  <footer>
+    分支：<code>feature/ds41-engram-overlap</code>、<code>feature/ds41-skip-miss</code>、<code>feature/ds41-staging-tune</code>，合在 <code>opt/2026-10-08</code> 里用于明天的 A/B。<br>
+    数字来源：ds41/bench/results/2026-10-07-decode-5090（租用 5090，盘限 6–8K IOPS）、2026-10-05-m2（旧 nsys）。标了“估算”的都还没有实测。
+  </footer>
+</main>
+</body>
+</html>
