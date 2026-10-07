@@ -2,6 +2,7 @@
 // the exact top-k and candidate-block rules (as K5's test), then speed on a 4096-query chunk.
 // Fixed by ds41/tasks/K14.md; implementations may not change it.
 #include "bench_util.hpp"
+#include "test_validation.hpp"
 
 #include "strata/ds41/config.hpp"
 #include "strata/ds41/kernels/k14_indexer_prefill.hpp"
@@ -95,7 +96,7 @@ int main() {
             const int ki = (int) std::min<int64_t>(K, t);
             const int32_t* row = got.data() + (size_t) i * K;
             for (int j = ki; j < K; ++j) shape_ok &= row[j] == -1;
-            shape_ok &= std::is_sorted(row, row + ki);
+            shape_ok &= valid_topk(row, ki, OFF, t);
             if (t == 0) continue;
             sd::ops::indexer_scores(q.p + (size_t) i * QN, keys.p, t, w.p + (size_t) i * sd::kIndexHeads, rs.p);
             ck(cudaDeviceSynchronize(), "reference scores");
@@ -105,9 +106,7 @@ int main() {
                 for (int64_t j = 0; j < t; ++j)
                     if (!ch[(size_t) i * stride + j]) s[j] = -INFINITY;
             const auto want = ref_topk(s, ki, OFF);
-            std::set<int32_t> ws_(want.begin(), want.end());
-            int64_t ov = 0;
-            for (int j = 0; j < ki; ++j) ov += ws_.count(row[j]);
+            const int64_t ov = topk_overlap(row, ki, want);
             overlap += ov;
             wanted += ki;
             worst_q = std::min(worst_q, (double) ov / ki);   // one bad query must not hide in the average
@@ -122,7 +121,7 @@ int main() {
                     "mismatches %lld/%lld\n", c.m, c.pos0, c.ratio, c.cand_in, c.cand_out, (long long) overlap,
                     (long long) wanted, worst_q, (long long) cand_bad, (long long) cand_n);
         v.check(worst_q >= 0.98, "a query's top-k overlap below 98%");
-        v.check(shape_ok, "rows not ascending, not -1 padded, or the candidate mask written past t_i");
+        v.check(shape_ok, "rows lack strictly increasing valid IDs or -1 padding, or the mask extends past t_i");
         v.check(overlap * 1000 >= wanted * 995, "top-k overlap below 99.5%");
         v.check(cand_bad * 1000 <= cand_n, "more than 0.1% of candidate mask entries differ");
         if (ci == 1)

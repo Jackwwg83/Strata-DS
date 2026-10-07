@@ -1,6 +1,7 @@
 // src/ds41/tests/k5_indexer_test.cu - task K5 acceptance: parity with ops::indexer_scores + exact top-k, then speed.
 // Fixed by the task spec (ds41/tasks/K5.md); implementations may not change it.
 #include "bench_util.hpp"
+#include "test_validation.hpp"
 
 #include "strata/ds41/config.hpp"
 #include "strata/ds41/kernels/k5_indexer.hpp"
@@ -61,15 +62,13 @@ int main() {
             for (int64_t j = 0; j < t; ++j)
                 if (!(sh[j] == rsh[j] || (std::isinf(sh[j]) && std::isinf(rsh[j]) && sh[j] < 0 && rsh[j] < 0)))
                     ++score_mismatch;
-            std::set<int32_t> wset(want.begin(), want.end());
-            int64_t overlap = 0;
-            for (int32_t x : got) overlap += wset.count(x);
-            const bool sorted = std::is_sorted(got.begin(), got.end());
+            const int64_t overlap = topk_overlap(got.data(), (int) got.size(), want);
+            const bool sorted = valid_topk(got.data(), (int) got.size(), sd::kWindow, t);
             std::printf("t=%lld cand=%d score_mismatch=%lld overlap=%lld/%zu sorted=%d\n", (long long) t, with_cand,
                         (long long) score_mismatch, (long long) overlap, want.size(), sorted);
             v.check(score_mismatch <= t / 1000, "more than 0.1% of scores differ from the bf16 reference values");
             v.check(overlap * 1000 >= (int64_t) want.size() * 995, "top-k overlap below 99.5%");
-            v.check(sorted, "out_idx not ascending");
+            v.check(sorted, "out_idx must contain strictly increasing valid IDs");
             // candidate blocks: exact against the baseline rules, on the reference scores
             if (t >= 300 && !with_cand) {
                 Dev<float> s2(rsh);

@@ -2,6 +2,7 @@
 // Element-wise and per-row ops must match bit for bit; the cuBLAS GEMMs up to the summation order; routing from
 // GEMM logits must pick K8's experts for almost every row (a near tie can flip with the summation order).
 #include "bench_util.hpp"
+#include "test_validation.hpp"
 
 #include "strata/ds41/config.hpp"
 #include "strata/ds41/kernels/k8_router.hpp"
@@ -134,8 +135,10 @@ int main() {
         for (int t = 0; t < T; ++t) {
             const bool eq = std::equal(a.begin() + t * 6, a.begin() + t * 6 + 6, b.begin() + t * 6);
             same += eq;
-            if (eq)
-                for (int j = 0; j < 6; ++j) werr = std::max(werr, (double) std::fabs(aw[t * 6 + j] - bw[t * 6 + j]));
+            for (int j = 0; j < 6; ++j) {
+                const double error = std::fabs(aw[t * 6 + j] - bw[t * 6 + j]);
+                if (eq || !std::isfinite(error)) werr = max_error(werr, error);
+            }
         }
         std::printf("route_rows: %d of %d rows pick K8's experts, max weight difference %.3g\n", same, T, werr);
         v.check(same >= T - 2, "route_rows picks other experts than K8 in more than 2 rows");
@@ -202,7 +205,7 @@ int main() {
             for (int i = 0; i < V; ++i) mx = std::max(mx, (double) lg[(size_t) r * V + i]);
             for (int i = 0; i < V; ++i) sum += std::exp(lg[(size_t) r * V + i] - mx);
             const double want = tg[r] < 0 ? 0.0 : std::log(sum) + mx - lg[(size_t) r * V + tg[r]];
-            worst = std::max(worst, std::fabs(got[r] - want));
+            worst = max_error(worst, std::fabs(got[r] - want));
         }
         std::printf("nll_rows: max abs error %.3g\n", worst);
         v.check(worst <= 1e-4, "nll_rows differs from the host log-softmax");
