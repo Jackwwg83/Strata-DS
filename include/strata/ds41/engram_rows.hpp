@@ -32,7 +32,7 @@ public:
     EngramRows& operator=(const EngramRows&) = delete;
 
     /// For every table t, rows ids[t][0..n_rows): writes the weights to w_out[t] + i * row_bytes and the scales to
-    /// s_out[t] + i * scale_bytes. All reads of all tables are in flight together. Throws on a failed read.
+    /// s_out[t] + i * scale_bytes. All reads of all tables are in flight together. A failed read disables this reader.
     void read(const std::vector<const int64_t*>& ids, int n_rows, const std::vector<uint8_t*>& w_out,
               const std::vector<uint8_t*>& s_out);
 
@@ -52,6 +52,7 @@ private:
     std::vector<int> fds_;   ///< the fallback (plain pread) per table, -1 when the table is read with O_DIRECT
     int max_rows_, row_bytes_, scale_bytes_;
     bool direct_ = true;
+    bool failed_ = false;
     uint8_t* buf_ = nullptr;   ///< aligned: one 8 KiB block per request
     std::vector<Req> reqs_;
 };
