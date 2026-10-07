@@ -233,6 +233,7 @@ struct Engine::Impl {
         vram.reset();
         host.reset();
         for (auto& [k, e] : graphs) cudaGraphExecDestroy(e);
+        for (auto& [k, e] : batch_graphs) cudaGraphExecDestroy(e);
         if (st) cudaStreamSynchronize(st);
         prefill_end_quiet();
         for (const auto& y : L)
@@ -294,6 +295,26 @@ struct Engine::Impl {
     PrefillProgress progress;          // prefill progress (set_prefill_progress); a false return cancels
     // snapshot slots: the window rings of all layers, then the compressor states of the kv sources with ratio > 1
     struct Snapshot { int pos = -1; bf16* win = nullptr; float* comp = nullptr; };
+    // batch slots (EngineOptions.batch_slots, src/ds41/batch.cu): per slot, every layer's attention state and its tokens
+    struct SlotLayer {
+        bf16 *window = nullptr, *comp = nullptr, *idx_keys = nullptr;
+        float *kv_state = nullptr, *score_state = nullptr;
+    };
+    struct SlotState {
+        std::vector<SlotLayer> L;
+        std::vector<int32_t> history;
+    };
+    std::vector<SlotState> slot_states;
+    std::shared_ptr<VerifyWorkspace> batch_ws;   // the rows' buffers: a verify workspace has the same shapes
+    std::unique_ptr<ExpertStaging> batch_stage;          // the staging copies of all rows (4 x 6 experts)
+    std::unique_ptr<EngramRows> eng_rows_batch;          // every row's engram rows in one read
+    std::map<std::array<int64_t, 5>, cudaGraphExec_t> batch_graphs;
+    bool batch_warmed = false;
+    int batch_row_slot[kVerifyMaxTokens] = {}, batch_row_parity[kVerifyMaxTokens] = {};
+    void alloc_slots();
+    void slot_copy(int slot, bool to_slot);
+    void enqueue_slots(int m);
+    std::vector<int> step_slots(const std::vector<int>& slots, const std::vector<int>& tokens, Timing& tm);
     std::vector<Snapshot> snaps;
     size_t snap_comp_floats = 0;
     std::exception_ptr worker_error;   // set by the CPU worker; rethrown by the step that ran into it
@@ -504,6 +525,7 @@ struct Engine::Impl {
                 std::fprintf(stderr, "ds41: prefetch %d guesses per layer, 2 x %zu MiB\n", prefetch->guesses(), mb);
             }
         }
+        alloc_slots();   // the batch slots' state and staging, before the VRAM tier sizes itself
         // the VRAM expert tier last: an automatic slot count takes what the rest left free
         if (!opt.expert_profile.empty() && opt.vram_expert_slots != 0) {
             VramExperts::Adapt ad;
@@ -695,11 +717,13 @@ struct Engine::Impl {
 
     // ------------------------------------------------------------------------------------- engram
     /// Hash the n-grams ending at pos for engram layer li: its table rows go to eng_ids[li] (host only).
-    void engram_ids(int l, int li, int pos) {
+    void engram_ids(int l, int li, int pos) { engram_ids(l, li, pos, history); }
+    /// the rows of engram layer l (table li) for position pos of the token sequence `hist` (a slot's, or the main one)
+    void engram_ids(int l, int li, int pos, const std::vector<int32_t>& hist) {
         const auto& hs = pack.engram_hash();
         const int n = hs.max_ngram, nh = hs.n_heads, cols = (n - 1) * nh;
         std::vector<int64_t> toks(n);
-        for (int s = 0; s < n; ++s) toks[s] = pos - s >= 0 ? history[pos - s] : hs.pad;
+        for (int s = 0; s < n; ++s) toks[s] = pos - s >= 0 ? hist[pos - s] : hs.pad;
         if (cols > kEngRows) throw std::runtime_error("engram: more n-gram heads than the row buffer holds");
         int64_t* ids = eng_ids[li].data();
         const auto& m = hs.multipliers[li];
@@ -1919,6 +1943,7 @@ struct Engine::Impl {
 };
 
 #include "verify.cu"
+#include "batch.cu"
 
 Engine::Engine(const std::string& pack_dir, const EngineOptions& opt) : impl_(new Impl(pack_dir, opt)) {
     impl_->init();

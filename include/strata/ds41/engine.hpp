@@ -51,6 +51,10 @@ struct EngineOptions {
     /// each. ds41_serve keeps one before each prompt's last token, so a chat whose next prompt changes the last
     /// answer's start (DeepSeek drops earlier reasoning) goes back there instead of reading everything again.
     int snapshots = 4;
+    /// concurrent requests (ds41_serve --batch, upstream's batch slots): slots with their own attention state that
+    /// decode together, at most kVerifyMaxTokens (the CPU expert kernel's rows). 0: none. Each slot holds about
+    /// 90 MB of VRAM at 32K context, and the slots share a staging area of 4 x 6 experts.
+    int batch_slots = 0;
     int prefill_threads = 16;       ///< expert stream readers (pread from the pack)
     int prefill_host_buffers = 64;  ///< pinned staging buffers of the expert stream (how far reads run ahead)
 };
@@ -117,6 +121,21 @@ public:
     /// verify window is dropped. The slot stays valid.
     int restore_snapshot(int slot);
     int snapshot_slots() const;
+
+    /// Concurrent requests. A request is read in the main session (prefill, step, verify), then copied into a slot.
+    int batch_slots() const;
+    /// The main session's state and tokens -> slot (what the slot held is gone)
+    void copy_to_slot(int slot);
+    /// slot -> the main session (a later turn of the slot's conversation continues from there)
+    void copy_from_slot(int slot);
+    /// Tokens fed to a slot so far: its next position
+    int slot_position(int slot) const;
+    /// One decode step of several slots (distinct, 1..kVerifyMaxTokens of them): row i feeds tokens[i] at slot
+    /// slots[i]'s position. The dense weights and the experts are read once for all rows; each row attends over its
+    /// own slot. Returns the greedy next token of each row; slot_logits(i) holds row i's FP32 logits until the next
+    /// call. With static residency (adapt_every 0) a row's tokens equal those of the same sequence decoded alone.
+    std::vector<int> step_slots(const std::vector<int>& slots, const std::vector<int>& tokens);
+    const float* slot_logits(int row) const;
 
     /// FP32 logits of the last step (all 129280)
     const std::vector<float>& last_logits() const;
