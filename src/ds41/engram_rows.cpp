@@ -52,6 +52,7 @@ EngramRows::~EngramRows() {
 
 void EngramRows::read(const std::vector<const int64_t*>& ids, int n_rows, const std::vector<uint8_t*>& w_out,
                       const std::vector<uint8_t*>& s_out) {
+    if (failed_) throw std::runtime_error("EngramRows::read: failed state; create a new reader");
     if (ids.size() != tables_.size() || w_out.size() != tables_.size() || s_out.size() != tables_.size() ||
         n_rows < 0 || n_rows > max_rows_)
         throw std::invalid_argument("EngramRows::read: bad arguments");
@@ -75,6 +76,9 @@ void EngramRows::read(const std::vector<const int64_t*>& ids, int n_rows, const 
         }
     }
     first[tables_.size()] = reqs_.size();
+    // Any exception after submission poisons the reader. Destruction joins the I/O workers
+    // before it frees their buffers. No later read can consume old completions.
+    failed_ = true;
     for (size_t t = 0; t < tables_.size(); ++t) {
         if (!files_[t]) continue;
         for (size_t r = first[t]; r < first[t + 1]; ++r)
@@ -105,6 +109,7 @@ void EngramRows::read(const std::vector<const int64_t*>& ids, int n_rows, const 
             }
         }
     }
+    failed_ = false;
 }
 
 }  // namespace strata::ds41

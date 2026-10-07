@@ -67,6 +67,7 @@ public:
     int slots() const { return slots_; }
 
 private:
+    void cleanup() noexcept;
     void reader();
     void issuer();
     void fail(const std::string& what);

@@ -2,6 +2,7 @@
 #include "strata/ds41/vram_experts.hpp"
 
 #include "strata/ds41/config.hpp"
+#include "strata/ds41/residency.hpp"
 #include "strata/ds41/host_experts.hpp"
 
 #include <algorithm>
@@ -89,58 +90,66 @@ std::vector<ExpertSwap> plan_expert_swaps(const std::vector<float>& usage, const
 VramExperts::VramExperts(const Pack& pack, const std::string& profile_path, int64_t n_slots, size_t reserve_bytes,
                          Adapt adapt)
     : pack_(pack), adapt_(adapt) {
-    const int L = pack.n_layers(), E = pack.n_experts();
-    ck(cudaGetDevice(&device_), "cudaGetDevice");
-    res_host_.assign((size_t) L * E, -1);
-    usage_.assign((size_t) L * E, 0.0f);
-    ck(cudaMalloc(&res_dev_, res_host_.size() * sizeof(int32_t)), "residency table");
-    ck(cudaMalloc(&ws_, kWorkspaceBytes), "K10 workspace");
-    ck(cudaStreamCreateWithFlags(&copy_stream_, cudaStreamNonBlocking), "copy stream");
-    auto slot_size = [&](int l, int e) { return (size_t) (pack.expert(l, e).bytes + 255) / 256 * 256; };
-    if (n_slots != 0 && !profile_path.empty()) {
-        const auto ranked = read_expert_profile(profile_path, L, E);
-        if (n_slots < 0) {   // by bytes, in rank order, up to the first that does not fit (upstream)
-            size_t free_b = 0, total_b = 0;
-            ck(cudaMemGetInfo(&free_b, &total_b), "cudaMemGetInfo");
-            const size_t descs = (size_t) L * E * sizeof(kernels::Exl3Expert);
-            const size_t room = free_b > reserve_bytes + descs ? free_b - reserve_bytes - descs : 0;
-            size_t used = 0;
-            n_slots = 0;
-            for (const auto& [l, e] : ranked) {
-                if (slot_size(l, e) > room - used) break;
-                used += slot_size(l, e);
-                ++n_slots;
+    try {
+        const int L = pack.n_layers(), E = pack.n_experts();
+        ck(cudaGetDevice(&device_), "cudaGetDevice");
+        res_host_.assign((size_t) L * E, -1);
+        usage_.assign((size_t) L * E, 0.0f);
+        ck(cudaMalloc(&res_dev_, res_host_.size() * sizeof(int32_t)), "residency table");
+        ck(cudaMalloc(&ws_, kWorkspaceBytes), "K10 workspace");
+        ck(cudaStreamCreateWithFlags(&copy_stream_, cudaStreamNonBlocking), "copy stream");
+        auto slot_size = [&](int l, int e) { return (size_t) (pack.expert(l, e).bytes + 255) / 256 * 256; };
+        if (n_slots != 0 && !profile_path.empty()) {
+            const auto ranked = read_expert_profile(profile_path, L, E);
+            if (n_slots < 0) {   // by bytes, in rank order, up to the first that does not fit (upstream)
+                size_t free_b = 0, total_b = 0;
+                ck(cudaMemGetInfo(&free_b, &total_b), "cudaMemGetInfo");
+                const size_t descs = (size_t) L * E * sizeof(kernels::Exl3Expert);
+                const size_t room = free_b > reserve_bytes + descs ? free_b - reserve_bytes - descs : 0;
+                size_t used = 0;
+                n_slots = 0;
+                for (const auto& [l, e] : ranked) {
+                    if (slot_size(l, e) > room - used) break;
+                    used += slot_size(l, e);
+                    ++n_slots;
+                }
             }
-        }
-        slots_ = (int) std::min<int64_t>(n_slots, (int64_t) ranked.size());
-        for (int s = 0; s < slots_; ++s) {
-            off_.push_back(off_.back() + slot_size(ranked[s].first, ranked[s].second));
-            max_slot_bytes_ = std::max(max_slot_bytes_, off_.back() - off_[s]);
-        }
-        if (slots_ > 0) {
-            ck(cudaMalloc(&arena_, off_.back()), "expert slots");
-            desc_host_.resize(slots_);
-            const uint8_t* base = pack.expert_base();
+            slots_ = (int) std::min<int64_t>(n_slots, (int64_t) ranked.size());
             for (int s = 0; s < slots_; ++s) {
-                const auto [l, e] = ranked[s];
-                const ExpertSlot& x = pack.expert(l, e);
-                ck(cudaMemcpy(arena_ + off_[s], base + x.offset, x.bytes, cudaMemcpyHostToDevice), "expert copy");
-                desc_host_[s] = describe(l, e, s);
-                res_host_[(size_t) l * E + e] = s;
+                off_.push_back(off_.back() + slot_size(ranked[s].first, ranked[s].second));
+                max_slot_bytes_ = std::max(max_slot_bytes_, off_.back() - off_[s]);
             }
-            ck(cudaMalloc(&experts_dev_, desc_host_.size() * sizeof(desc_host_[0])), "expert descriptors");
-            ck(cudaMemcpy(experts_dev_, desc_host_.data(), desc_host_.size() * sizeof(desc_host_[0]),
-                          cudaMemcpyHostToDevice),
-               "expert descriptors");
+            if (slots_ > 0) {
+                ck(cudaMalloc(&arena_, off_.back()), "expert slots");
+                desc_host_.resize(slots_);
+                const uint8_t* base = pack.expert_base();
+                for (int s = 0; s < slots_; ++s) {
+                    const auto [l, e] = ranked[s];
+                    const ExpertSlot& x = pack.expert(l, e);
+                    ck(cudaMemcpy(arena_ + off_[s], base + x.offset, x.bytes, cudaMemcpyHostToDevice), "expert copy");
+                    desc_host_[s] = describe(l, e, s);
+                    publish_residency(res_host_[(size_t) l * E + e], s);
+                }
+                ck(cudaMalloc(&experts_dev_, desc_host_.size() * sizeof(desc_host_[0])), "expert descriptors");
+                ck(cudaMemcpy(experts_dev_, desc_host_.data(), desc_host_.size() * sizeof(desc_host_[0]),
+                              cudaMemcpyHostToDevice),
+                   "expert descriptors");
+            }
         }
+        upload_res();
+    } catch (...) {
+        cleanup();
+        throw;
     }
-    upload_res();
 }
 
-VramExperts::~VramExperts() {
+VramExperts::~VramExperts() { cleanup(); }
+
+void VramExperts::cleanup() noexcept {
     if (copier_.joinable()) copier_.join();
+    if (copy_stream_) cudaStreamSynchronize(copy_stream_);
     if (staging_) cudaFreeHost(staging_);
-    cudaStreamDestroy(copy_stream_);
+    if (copy_stream_) cudaStreamDestroy(copy_stream_);
     cudaFree(arena_);
     cudaFree(res_dev_);
     cudaFree(experts_dev_);
@@ -230,7 +239,7 @@ int VramExperts::commit_pending(bool wait) {
     copier_.join();
     if (copy_error_) throw std::runtime_error("ds41 vram experts: an adaptive expert copy failed");
     for (const Pending& w : pending_) {
-        res_host_[(size_t) w.layer * E + w.in] = w.vram_slot;
+        publish_residency(res_host_[(size_t) w.layer * E + w.in], w.vram_slot);
         if (w.ram_slot >= 0) host_->assign(w.ram_slot, w.layer, w.out);   // the CPU now reads `out` from RAM
     }
     const int committed = (int) pending_.size();
@@ -261,7 +270,8 @@ int VramExperts::between_steps() {
     for (const ExpertSwap& s : swaps) {
         const size_t out = (size_t) s.layer * E + s.out;
         const int32_t slot = res_host_[out];
-        res_host_[out] = -1;   // evicted now: the CPU computes it (from the file) from the next step on
+        // The CPU reads the evicted expert from the file on the next step.
+        publish_residency(res_host_[out], -1);
         desc_host_[slot] = describe(s.layer, s.in, slot);
         const int32_t ram = host_ ? host_->slot_of(s.layer, s.in) : -1;
         if (ram >= 0) host_->point_to_file(s.layer, s.in);   // its RAM slot is about to be overwritten
@@ -283,7 +293,7 @@ uint8_t* VramExperts::lend(int n) {
         const int32_t s = res_host_[i];
         if (s >= slots_ - n) {
             lent_owner_[s - (slots_ - n)] = {(int) (i / E), (int) (i % E)};
-            res_host_[i] = -1;
+            publish_residency(res_host_[i], -1);
         }
     }
     lent_ = n;
@@ -308,7 +318,8 @@ void VramExperts::restore() {
         const int s = slots_ - lent_ + i;
         const ExpertSlot& x = pack_.expert(l, e);
         ck(cudaMemcpy(arena_ + off_[s], base + x.offset, x.bytes, cudaMemcpyHostToDevice), "restore lent slot");
-        res_host_[(size_t) l * E + e] = s;   // desc_host_ and experts_dev_ still describe (l, e) at slot s
+        // The descriptors still describe (l, e) at slot s.
+        publish_residency(res_host_[(size_t) l * E + e], s);
     }
     lent_ = 0;
     lent_owner_.clear();

@@ -180,6 +180,8 @@ def write_engram(src, out):
     paths += [os.path.join(src, f) for f in sorted({f for k, f in idx.items() if k.endswith(".engram.embed.weight")})]
     tables = {}
     for path in map(os.path.abspath, paths):
+        if "\n" in path or "\r" in path:
+            raise ValueError("Engram paths must not contain newlines")
         with open(path, "rb") as fh:
             n = struct.unpack("<Q", fh.read(8))[0]
             hdr = json.loads(fh.read(n))

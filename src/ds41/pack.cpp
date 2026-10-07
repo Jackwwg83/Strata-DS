@@ -12,6 +12,7 @@
 #include <cstdio>
 #include <cstring>
 #include <fstream>
+#include <limits>
 #include <sstream>
 #include <stdexcept>
 
@@ -41,6 +42,18 @@ std::ifstream open_text(const std::string& path) {
     std::ifstream f(path);
     if (!f) fail("cannot open " + path);
     return f;
+}
+
+bool contains(uint64_t limit, uint64_t offset, uint64_t bytes) {
+    return offset <= limit && bytes <= limit - offset;
+}
+
+uint64_t component_number(const std::string& text) {
+    if (text.empty() || text[0] == '-') fail("bad component size");
+    size_t used = 0;
+    const auto n = std::stoull(text, &used);
+    if (used != text.size()) fail("bad component size");
+    return n;
 }
 
 bool skip(const std::string& line) { return line.empty() || line[0] == '#'; }
@@ -86,14 +99,19 @@ Pack::Pack(const std::string& dir) : dir_(dir) {
             std::string dt;
             int ndim = 0;
             s >> t.name >> dt >> ndim;
+            if (!s || ndim < 0 || ndim > 16) fail("bad tensor rank: " + line);
             t.dtype = parse_dtype(dt);
             t.shape.resize(ndim);
             for (auto& d : t.shape) s >> d;
             s >> t.file_offset >> t.bytes;
             if (!s) fail("bad index.txt line: " + line);
-            int64_t n = 1;
-            for (auto d : t.shape) n *= d;
-            if ((uint64_t) n * dtype_size(t.dtype) != t.bytes) fail("size mismatch for " + t.name);
+            uint64_t bytes = dtype_size(t.dtype);
+            for (auto d : t.shape) {
+                if (d <= 0 || (uint64_t) d > std::numeric_limits<uint64_t>::max() / bytes)
+                    fail("invalid or overflowing shape for " + t.name);
+                bytes *= (uint64_t) d;
+            }
+            if (bytes != t.bytes) fail("size mismatch for " + t.name);
             dense_[t.name] = t;
         }
     }
@@ -112,12 +130,16 @@ Pack::Pack(const std::string& dir) : dir_(dir) {
                 std::string item;
                 s >> item;
                 const auto a = item.find(':'), b = item.rfind(':');
-                if (a == std::string::npos || item.substr(0, a) != kComp[c]) fail("bad component in experts.txt: " + item);
-                x.comp_off[c] = std::stoull(item.substr(a + 1, b - a - 1));
-                x.comp_bytes[c] = std::stoull(item.substr(b + 1));
-                if (x.comp_off[c] + x.comp_bytes[c] > x.bytes) fail("component outside its slot: " + line);
+                if (a == std::string::npos || b <= a || item.substr(0, a) != kComp[c])
+                    fail("bad component in experts.txt: " + item);
+                x.comp_off[c] = component_number(item.substr(a + 1, b - a - 1));
+                x.comp_bytes[c] = component_number(item.substr(b + 1));
+                if (!contains(x.bytes, x.comp_off[c], x.comp_bytes[c])) fail("component outside its slot: " + line);
             }
             if (!s || l < 0 || l >= n_layers_ || e < 0 || e >= n_experts_) fail("bad experts.txt line: " + line);
+            // The tiers round slot sizes up to 4 KiB.
+            if (x.bytes > std::numeric_limits<size_t>::max() - 4095)
+                fail("slot size cannot be aligned");
             experts_[(size_t) l * n_experts_ + e] = x;
             seen[(size_t) l * n_experts_ + e] = true;
         }
@@ -131,13 +153,18 @@ Pack::Pack(const std::string& dir) : dir_(dir) {
             if (skip(line)) continue;
             std::istringstream s(line);
             EngramTable t;
-            s >> t.layer >> t.rows >> t.dim >> t.weight_offset >> t.scale_offset >> t.path;
-            if (!s) fail("bad engram.txt line: " + line);
+            s >> t.layer >> t.rows >> t.dim >> t.weight_offset >> t.scale_offset;
+            std::getline(s >> std::ws, t.path);
+            if (!s || t.path.empty() || t.rows <= 0 || t.dim <= 0) fail("bad engram.txt line: " + line);
             engram_.push_back(t);
         }
     }
     {
         auto f = open_text(dir + "/engram_hash.txt");
+        const size_t tables = engram_.size();
+        hash_.multipliers.resize(tables);
+        hash_.primes.resize(tables);
+        hash_.offsets.resize(tables);
         std::string line;
         while (std::getline(f, line)) {
             if (skip(line)) continue;
@@ -148,17 +175,43 @@ Pack::Pack(const std::string& dir) : dir_(dir) {
             else if (key == "n_heads") s >> hash_.n_heads;
             else if (key == "pad") s >> hash_.pad;
             else if (key == "vocab") { long long v; s >> v; }
-            else if (key == "layers") { int l; while (s >> l) hash_.layers.push_back(l); }
-            else {
+            else if (key == "layers") {
+                int l;
+                while (s >> l) hash_.layers.push_back(l);
+                if (!s.eof()) fail("bad engram hash layers");
+                continue;
+            } else {
                 int li = 0;
-                s >> li;
+                if (!(s >> li) || li < 0 || (size_t) li >= tables) fail("bad engram hash table index");
                 std::vector<int64_t> v;
                 long long x;
                 while (s >> x) v.push_back(x);
                 auto& dst = key == "multipliers" ? hash_.multipliers : key == "primes" ? hash_.primes : hash_.offsets;
                 if (key != "multipliers" && key != "primes" && key != "offsets") fail("bad engram_hash.txt key " + key);
-                if ((int) dst.size() <= li) dst.resize(li + 1);
+                if (!s.eof() || !dst[li].empty()) fail("bad or repeated engram hash array");
                 dst[li] = v;
+                continue;
+            }
+            if (!s) fail("bad engram hash scalar: " + line);
+        }
+        if (hash_.layers.size() != tables) fail("engram hash layer count mismatch");
+        if (tables) {
+            // The engine has room for 24 row IDs per table and token.
+            if (hash_.max_ngram < 2 || hash_.max_ngram > 25 || hash_.n_heads < 1 ||
+                hash_.n_heads > 24 / (hash_.max_ngram - 1)) fail("bad engram hash dimensions");
+            const size_t cols = (size_t) (hash_.max_ngram - 1) * hash_.n_heads;
+            for (size_t i = 0; i < tables; ++i) {
+                const int layer = hash_.layers[i];
+                if (layer < 0 || layer >= n_layers_ || layer != engram_[i].layer ||
+                    (i && layer <= hash_.layers[i - 1])) fail("engram hash layer mismatch");
+                if (hash_.multipliers[i].size() != (size_t) hash_.max_ngram ||
+                    hash_.primes[i].size() != cols || hash_.offsets[i].size() != cols)
+                    fail("missing or incomplete engram hash array");
+                for (size_t c = 0; c < cols; ++c) {
+                    const int64_t prime = hash_.primes[i][c], off = hash_.offsets[i][c];
+                    if (prime <= 0 || off < 0 || !contains((uint64_t) engram_[i].rows, off, prime))
+                        fail("bad engram hash prime or offset");
+                }
             }
         }
         std::ifstream tm(dir + "/engram_tokenmap.bin", std::ios::binary | std::ios::ate);
@@ -196,8 +249,17 @@ uint64_t Pack::upload_dense() {
     const int fd = open(path.c_str(), O_RDONLY);
     if (fd < 0) fail("cannot open " + path);
     struct stat st {};
-    fstat(fd, &st);
+    if (fstat(fd, &st) != 0 || st.st_size <= 0) {
+        close(fd);
+        fail("cannot size dense.bin");
+    }
     const uint64_t total = (uint64_t) st.st_size;
+    for (const auto& kv : dense_) {
+        if (!contains(total, kv.second.file_offset, kv.second.bytes)) {
+            close(fd);
+            fail("tensor past end of dense.bin: " + kv.first);
+        }
+    }
     check_cuda(cudaMalloc(&arena_, total), "cudaMalloc dense arena");
     constexpr uint64_t kChunk = 64ull << 20;
     void* host = nullptr;
@@ -216,7 +278,6 @@ uint64_t Pack::upload_dense() {
     posix_fadvise(fd, 0, 0, POSIX_FADV_DONTNEED);   // its 11 GB stay out of the file cache the experts need
     close(fd);
     for (auto& kv : dense_) {
-        if (kv.second.file_offset + kv.second.bytes > total) fail("tensor past end of dense.bin: " + kv.first);
         kv.second.device = (char*) arena_ + kv.second.file_offset;
     }
     return total;
@@ -227,14 +288,23 @@ void Pack::map_experts() {
     const int fd = open(path.c_str(), O_RDONLY);
     if (fd < 0) fail("cannot open " + path);
     struct stat st {};
-    fstat(fd, &st);
-    experts_map_bytes_ = (uint64_t) st.st_size;
-    void* p = mmap(nullptr, experts_map_bytes_, PROT_READ, MAP_SHARED, fd, 0);
+    if (fstat(fd, &st) != 0 || st.st_size <= 0) {
+        close(fd);
+        fail("cannot size experts.bin");
+    }
+    const uint64_t total = (uint64_t) st.st_size;
+    for (const auto& expert : experts_) {
+        if (!contains(total, expert.offset, expert.bytes)) {
+            close(fd);
+            fail("expert past end of experts.bin");
+        }
+    }
+    void* p = mmap(nullptr, total, PROT_READ, MAP_SHARED, fd, 0);
     close(fd);
     if (p == MAP_FAILED) fail("mmap experts.bin failed");
+    if (experts_map_) munmap(const_cast<uint8_t*>(experts_map_), experts_map_bytes_);
     experts_map_ = (const uint8_t*) p;
-    const auto& last = experts_.back();
-    if (last.offset + last.bytes > experts_map_bytes_) fail("experts.bin is shorter than experts.txt says");
+    experts_map_bytes_ = total;
 }
 
 }  // namespace strata::ds41

@@ -1,5 +1,6 @@
 // src/ds41/lookahead.cpp - see include/strata/ds41/lookahead.hpp.
 #include "strata/ds41/lookahead.hpp"
+#include "strata/ds41/residency.hpp"
 
 #include <algorithm>
 #include <cmath>
@@ -99,8 +100,10 @@ void RouterLookahead::run() {
         const int next = layer + 1;
         cpu_router_topk(x.data(), w_[next].data(), bias_[next].data(), n_experts_, dim_, k_, ids.data());
         std::vector<int32_t> warmed;
-        for (int i = 0; i < k_; ++i)
+        for (int i = 0; i < k_; ++i) {
+            std::lock_guard<std::mutex> lock(residency_mutex());
             if (warm_(next, ids[i])) warmed.push_back(ids[i]);
+        }
         predicted_ += k_;
         warmed_n_ += (int64_t) warmed.size();
         std::lock_guard<std::mutex> lk(mu_);
