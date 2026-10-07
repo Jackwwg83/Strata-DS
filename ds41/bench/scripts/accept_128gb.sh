@@ -14,8 +14,11 @@ python3 -c "import numpy as np, time; a = np.ones(int($GB * 2**30 / 8)); print('
 BAL=$!
 SERVER=
 cleanup() {
+  # the run script's shell is not the server: stop the server itself (it ends its engine)
+  pkill -f "[s]erve/server.py --engine strata --config $REL/" 2>/dev/null
   [ -n "$SERVER" ] && kill $SERVER 2>/dev/null
-  pkill -f "[d]s41_serve --serve" 2>/dev/null
+  sleep 15
+  pkill -f "$REL/engine/[d]s41_serve" 2>/dev/null
   kill $BAL 2>/dev/null; wait $BAL 2>/dev/null; echo "balloon stopped"
 }
 trap cleanup EXIT
