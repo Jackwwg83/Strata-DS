@@ -66,6 +66,8 @@ FALLBACK_MODELS = {
                            "less than ~80 GB of RAM part of its experts are read from the SSD",
                   "download_gb": 93.7, "ram_gb": 48, "arena_gb": 59.5, "families": ("unsloth",), "budget": True,
                   "vision": True},
+    "SAGE-1.59BPW": {"about": "DeepSeek V4.1 Flash, SAGE EXL3 1.59bpw", "download_gb": 341.8, "ram_gb": 128,
+                     "arena_gb": 108.9, "families": ("deepseek",), "nvidia_only": True},
 }
 FALLBACK_FAMILIES = {
     "qwen": {"title": "Qwen3.8-Flash-Next", "about": "the original model", "tag": ""},
@@ -77,6 +79,8 @@ FALLBACK_FAMILIES = {
                                                                   "of RAM part of its experts are read from the SSD "
                                                                   "(UD-Q4_K_XL, 111 GB: experimental)",
                 "tag": "unsloth-", "vision": False},
+    "deepseek": {"title": "DeepSeek V4.1 Flash", "about": "Linux + NVIDIA only; 128 GB RAM recommended; 462 GB disk",
+                 "tag": "deepseek-", "vision": False, "nvidia_only": True},
 }
 FALLBACK_CONTEXTS = [8192, 32768, 65536, 131072, 262144, 393216, 524288]
 BENCH_PROMPT = ("Write a short story (about 300 words) about a lighthouse keeper who finds a message in a bottle. "
