@@ -58,6 +58,8 @@ public:
     /// the largest slot
     size_t max_slot_bytes() const { return max_slot_bytes_; }
     bool locked() const { return locked_; }
+    /// the slots were read with O_DIRECT (else copied from the mapped pack, through the file cache)
+    bool filled_direct() const { return filled_direct_; }
     /// [n_layers][n_experts] on the device. Null when mapping is unavailable.
     /// An entry with w1.trellis == nullptr is CPU-only. The address stays fixed.
     const kernels::Exl3Expert* experts_dev() const { return experts_dev_; }
@@ -90,6 +92,7 @@ private:
     uint8_t* arena_ = nullptr;
     size_t arena_bytes_ = 0;
     bool locked_ = false;
+    bool filled_direct_ = false;
     bool registered_ = false;
     uint8_t* device_alias_ = nullptr;
     kernels::Exl3Expert* experts_dev_ = nullptr;
