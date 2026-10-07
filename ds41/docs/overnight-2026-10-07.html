@@ -1,0 +1,118 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>DeepSeek 夜间报告</title>
+<link rel="icon" href="data:,">
+<style>
+  :root {
+    --bg: #fbfaf7; --fg: #1d1d1b; --muted: #6b6a66; --line: #e2dfd8; --card: #ffffff;
+    --ok: #1f7a4d; --ok-bg: #e7f4ec; --warn: #9a5b00; --warn-bg: #fdf1dc; --no: #a3302a; --no-bg: #fbe7e5;
+    --accent: #2d4f9e;
+  }
+  @media (prefers-color-scheme: dark) {
+    :root:not([data-theme="light"]) {
+      --bg: #161614; --fg: #ecebe6; --muted: #a09e97; --line: #34332f; --card: #1f1f1c;
+      --ok: #6fd19c; --ok-bg: #18301f; --warn: #f0b45a; --warn-bg: #33270f; --no: #f08a82; --no-bg: #3a1a17;
+      --accent: #8fb0ff;
+    }
+  }
+  :root[data-theme="dark"] {
+    --bg: #161614; --fg: #ecebe6; --muted: #a09e97; --line: #34332f; --card: #1f1f1c;
+    --ok: #6fd19c; --ok-bg: #18301f; --warn: #f0b45a; --warn-bg: #33270f; --no: #f08a82; --no-bg: #3a1a17;
+    --accent: #8fb0ff;
+  }
+  * { box-sizing: border-box; }
+  body { margin: 0; background: var(--bg); color: var(--fg);
+         font: 15px/1.65 -apple-system, BlinkMacSystemFont, "PingFang SC", "Hiragino Sans GB", "Microsoft YaHei",
+               "Noto Sans CJK SC", "Segoe UI", Roboto, sans-serif; }
+  main { max-width: 980px; margin: 0 auto; padding: 32px 16px 64px; }
+  h1 { font-size: 26px; margin: 0 0 4px; }
+  h2 { font-size: 19px; margin: 36px 0 12px; padding-bottom: 6px; border-bottom: 1px solid var(--line); }
+  .sub { color: var(--muted); margin: 0 0 20px; }
+  .lead { background: var(--card); border: 1px solid var(--line); border-left: 4px solid var(--accent);
+          border-radius: 8px; padding: 14px 18px; }
+  .lead p { margin: 6px 0; }
+  table { width: 100%; border-collapse: collapse; background: var(--card); border: 1px solid var(--line);
+          border-radius: 8px; overflow: hidden; font-size: 14px; }
+  th, td { text-align: left; padding: 8px 10px; border-bottom: 1px solid var(--line); vertical-align: top; }
+  th { color: var(--muted); font-weight: 600; background: color-mix(in srgb, var(--card) 85%, var(--line)); }
+  tr:last-child td { border-bottom: none; }
+  td.num { text-align: right; font-variant-numeric: tabular-nums; white-space: nowrap; }
+  .wrap { overflow-x: auto; }
+  .tag { display: inline-block; font-size: 12px; padding: 1px 8px; border-radius: 999px; white-space: nowrap; }
+  .ok { color: var(--ok); background: var(--ok-bg); }
+  .warn { color: var(--warn); background: var(--warn-bg); }
+  .no { color: var(--no); background: var(--no-bg); }
+  code { font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace; font-size: 13px;
+         background: color-mix(in srgb, var(--card) 80%, var(--line)); padding: 1px 5px; border-radius: 4px; }
+  ol.decide li { margin: 10px 0; }
+  ol.decide b { color: var(--accent); }
+  .muted { color: var(--muted); }
+  footer { margin-top: 40px; color: var(--muted); font-size: 13px; }
+</style>
+</head>
+<body>
+<main>
+  <h1>DeepSeek V4.1 Flash：夜间报告</h1>
+  <p class="sub">2026-10-07 · 机器：租用 RTX 5090（PCIe 5.0）、RTX 3090（PCIe 4.0）；开发机 air-rig</p>
+
+  <div class="lead">
+    <p><b>一句话：</b>今晚完成了「聊天不重读」「解码提速约 30%」「加载提速 5-6 倍」「多请求并发」四件事，都有 GPU 实测和测试证据，开了 PR #12、#13 等你确认合并。</p>
+    <p><b>80 tok/s 的结论：</b>这个模型在单张消费级显卡上做不到。单条在 5090 上实测 26-32 tok/s（推算本地 NVMe 约 34-40）；4 路并发总吞吐推算约 47。瓶颈是每个 token 约 600 MB 不在显存里的专家要过 PCIe，并发分摊不了。</p>
+  </div>
+
+  <h2>完成的工作</h2>
+  <div class="wrap">
+  <table>
+    <tr><th>工作</th><th>效果（实测）</th><th>状态</th></tr>
+    <tr><td>聊天快照续接</td><td>开思考的多轮聊天，第 2、3 轮只读新内容：1.3-1.4 秒（原来要重读全部）</td>
+        <td><span class="tag ok">代码</span> <span class="tag ok">部署</span> <span class="tag ok">真实数据</span> PR #12</td></tr>
+    <tr><td>自适应换位不再掉到 SSD</td><td>3090：每 token 76-98 ms → 64 ms；输出抖动消失</td>
+        <td><span class="tag ok">真实数据</span> PR #12</td></tr>
+    <tr><td>RAM 层并行 O_DIRECT 填充</td><td>90 GiB 加载 167-205 秒 → 30-39 秒</td>
+        <td><span class="tag ok">真实数据</span> PR #12</td></tr>
+    <tr><td>Engram 并行读</td><td>2000 token prompt：21.3 秒 → 13.4 秒</td>
+        <td><span class="tag ok">真实数据</span> PR #12</td></tr>
+    <tr><td>文档与 128 GB 全链路验收</td><td>新 checkout 一键安装 329 秒，服务 110 秒就绪，工具调用、中英文问答全部正确</td>
+        <td><span class="tag ok">真实数据</span> PR #12</td></tr>
+    <tr><td>多请求并发（--parallel N）</td><td>3 个请求同时发，6.1 秒全部答对；与单独解码逐 token 一致</td>
+        <td><span class="tag ok">代码</span> <span class="tag ok">部署</span> <span class="tag ok">真实数据</span> PR #13</td></tr>
+    <tr><td>预取下一层专家</td><td>结果正确，但 PCIe 4.0 和 5.0 上都更慢</td>
+        <td><span class="tag warn">默认关闭</span></td></tr>
+  </table>
+  </div>
+
+  <h2>性能数字（约 120 GiB 内存，模拟 128 GB 的 PC）</h2>
+  <div class="wrap">
+  <table>
+    <tr><th>机器</th><th class="num">单条（实测）</th><th class="num">4 路并发总吞吐（实测）</th><th class="num">推算：本地 NVMe</th><th>说明</th></tr>
+    <tr><td>RTX 5090 + Threadripper 7965WX</td><td class="num">26-32 tok/s</td><td class="num">28-31 tok/s</td>
+        <td class="num">单条 34-40，4 路约 47</td><td>租用机器的磁盘随机读被限速（每秒 6-8 千次），Engram 每 token 多花 6-13 ms</td></tr>
+    <tr><td>RTX 3090 + EPYC 7D12</td><td class="num">13 → 16.8 tok/s</td><td class="num">—</td><td class="num">约 20</td>
+        <td>PCIe 4.0 搬运是瓶颈</td></tr>
+  </table>
+  </div>
+  <p class="muted">原始数据：<code>ds41/bench/results/2026-10-07-decode-5090</code>、<code>2026-10-07-batch-5090</code>、<code>2026-10-07-accept-5090</code>。</p>
+
+  <h2>为什么到不了 80</h2>
+  <p>每生成一个 token：稠密部分要读约 9 GB 显存（约 10 ms）；约 100 个专家不在显存里（约 600-700 MB），只能经 PCIe 搬运（5.0 约 46-50 GB/s）或交给 CPU 算。两边并行的理想分工下，单条上限约 40 tok/s。并发时每个对话用的专家几乎不重叠，搬运量随路数线性增长，只省下稠密部分，所以 4 路总吞吐只多约 40%。</p>
+
+  <h2>需要你决定</h2>
+  <ol class="decide">
+    <li><b>合并 PR #12</b>（收尾发版）：Codex 审查只有 1 个问题，已修复并加测试。<a href="https://github.com/Jackwwg83/Strata-DS/pull/12">#12</a></li>
+    <li><b>合并 PR #13</b>（并发，默认关闭）：基于 #12，Codex 审查没有发现问题。<a href="https://github.com/Jackwwg83/Strata-DS/pull/13">#13</a></li>
+    <li><b>开发机迁到 air-rig</b>：已在笔记本建好 <code>~/strata-ds-dev</code>，能编译、主机端测试全过；但 GPU 被你的 <code>llama-server</code>（23.5 GB）占着，GPU 测试和 dots 的 CI 都跑不了。要不要在开发时停掉 llama-server？确认后我迁 CI，再删 3060（$0.088/h）。</li>
+    <li><b>租用机器</b>：5090 测完已停机（只收磁盘费约 $0.24/h），3090 也已停机（约 $0.12/h），两台上都有模型和 pack，再测时不用重新下载。几天内不测的话建议删掉，我删之前会再确认。</li>
+    <li><b>同步上游 0.1.40.2</b>：其中「短 prompt 让 CPU 分担 prefill」对 DeepSeek 有价值；同步会和我们改过的 setup/serve 冲突，建议单独做一轮。</li>
+    <li><b>下一个模型</b>：DeepSeek 做完后转 GLM-5.3-Flash（按你之前的安排）。</li>
+  </ol>
+
+  <h2>花费</h2>
+  <p>今天约 <b>$8.8</b>（含下载）：4090 约 $1.6，3090 约 $2.5，5090 约 $3.3，3060 开发机约 $1.4。Vast 余额 $16.66。</p>
+
+  <footer>本报告由 Claude Code 生成；所有数字都来自上面列出的实测文件。</footer>
+</main>
+</body>
+</html>
