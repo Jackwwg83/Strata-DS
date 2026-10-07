@@ -5,17 +5,23 @@
 //
 // stdin:  GEN <max_new> [key=value ...] id,id,...   one request; the sampling keys are upstream's
 //         STOP                                       ends the running request (read on its own thread)
+//         BGEN <slot> <max_new> [keys] ids           with --batch N: a request for a batch slot (upstream's)
+//         BSTOP <slot>                               ends a slot's request
 //         QUIT                                       ends the engine
-// stdout: INFO k=v ...  then  READY <context> stop   once, when the model is loaded
+// stdout: INFO k=v ...  then  READY <context> stop   once, when the model is loaded (batch_slots=N with --batch)
 //         RESUME <reused>                            per request: the session tokens the prompt reuses
 //         PP <done> <total> <ms> <tok/s>             prompt progress (every layer of a pass): also the heartbeat
 //         T <id>                                     each output token
 //         DONE ... | ERR <message>                   the end of a request (DONE: serve_request.hpp)
-// Not supported, answered with ERR: GENI (images), batch slots (BGEN, BSTOP, BYIELD), VRAM.
+//         BADM <slot> 1|0                            after a BGEN's DONE (or ERR): it continues in the slot, or not
+//         BT <slot> <id>, BDONE <slot> <n> <finish> <ms>   the slots' tokens, decoded together between lines
+// Not supported, answered with ERR: GENI and BGENI (images), VRAM. BYIELD is ignored (upstream allows that).
 //
 // The session is the tokens fed so far. A prompt that starts with all of them reads only the rest. Before each
 // prompt's last token the engine keeps a snapshot (--snapshots slots, least recently used first); a prompt that starts
-// with a snapshot's tokens goes back there. Any other prompt starts over at position 0.
+// with a snapshot's tokens goes back there, and one that continues an idle batch slot's conversation takes that slot's
+// state (upstream's slot_cache). Any other prompt starts over at position 0. A BGEN is read in the main session (the
+// slots wait), then its state is copied into the slot.
 #include "strata/ds41/config.hpp"
 #include "strata/ds41/engine.hpp"
 #include "strata/ds41/serve_request.hpp"
@@ -85,6 +91,9 @@ public:
     /// The token after `session` (every token fed, most recent last), from its logits
     int pick(const std::vector<float>& lg, const Request& r, const std::vector<int>& session, uint64_t seed,
              uint64_t counter) {
+        return pick(lg.data(), r, session, seed, counter);
+    }
+    int pick(const float* lg, const Request& r, const std::vector<int>& session, uint64_t seed, uint64_t counter) {
         strata::kernels::SamplerParams p;
         p.greedy = r.temperature <= 0.0f;
         p.temperature = r.temperature;
@@ -98,7 +107,7 @@ public:
         p.penalty_repeat = r.penalty_repeat;
         p.penalty_freq = r.penalty_freq;
         p.penalty_present = r.penalty_present;
-        ck(cudaMemcpyAsync(logits_, lg.data(), (size_t) kVocab * 4, cudaMemcpyHostToDevice, st_), "logits up");
+        ck(cudaMemcpyAsync(logits_, lg, (size_t) kVocab * 4, cudaMemcpyHostToDevice, st_), "logits up");
         if (h > 0)
             ck(cudaMemcpyAsync(hist_, session.data() + session.size() - h, (size_t) h * 4, cudaMemcpyHostToDevice, st_),
                "history up");
@@ -151,6 +160,18 @@ struct Input {
         lines.pop_front();
         return true;
     }
+    /// a waiting line, without blocking (batch slots decode while nothing arrives)
+    bool poll(std::string& out) {
+        std::lock_guard<std::mutex> lk(mu);
+        if (lines.empty()) return false;
+        out = std::move(lines.front());
+        lines.pop_front();
+        return true;
+    }
+    bool ended() {
+        std::lock_guard<std::mutex> lk(mu);
+        return eof && lines.empty();
+    }
 };
 
 struct Options {
@@ -171,7 +192,7 @@ struct Options {
                  "usage: ds41_serve --serve --pack DIR [--max-context N] [--threads T] [--expert-profile F]\n"
                  "       [--vram-slots N] [--ram-budget-gib G] [--adapt-every N] [--adapt-swaps N] [--prefill-chunk N]\n"
                  "       [--prefill-batch N] [--prefill-ring N] [--prefill-threads N] [--window-prompt-max N]\n"
-                 "       [--snapshots N]\n"
+                 "       [--snapshots N] [--batch N]\n"
                  "       [--eos-id ID ...]\n",
                  why.c_str());
     std::exit(2);
@@ -211,6 +232,7 @@ Options parse_args(int argc, char** argv) {
         else if (a == "--prefill-threads") o.eng.prefill_threads = (int) num(next());
         else if (a == "--window-prompt-max") o.window_prompt_max = (int) num(next());
         else if (a == "--snapshots") o.eng.snapshots = (int) num(next());
+        else if (a == "--batch") o.eng.batch_slots = (int) num(next());
         else if (a == "--eos-id") {
             if (!eos_given) o.eos.clear();
             eos_given = true;
@@ -255,6 +277,28 @@ struct Session {
     }
 };
 
+/// a batch slot's request (upstream's BSlot)
+struct Slot {
+    bool active = false, stop = false;
+    bool cached = false;         ///< idle, and its engine state holds `ids` (a later turn can continue there)
+    int x = -1;                  ///< the token to feed next (already written as T or BT)
+    long long produced = 0, max_new = 0;
+    Request r;                   ///< the sampling keys
+    uint64_t seed = 0, counter = 0;
+    std::vector<int> ids;        ///< the tokens fed to the slot
+    double t0 = 0;               ///< when the request was admitted
+};
+
+/// how a request in the main session ended
+struct Outcome {
+    enum { kErr, kDone, kFatal } status = kErr;   ///< kErr: ERR written; kFatal: the engine is unusable
+    std::string finish;
+    long long generated = 0;
+    int last = -1;               ///< the last token written
+    uint64_t seed = 0, counter = 0;
+    double t0 = 0;
+};
+
 }  // namespace
 
 int main(int argc, char** argv) {
@@ -273,55 +317,58 @@ int main(int argc, char** argv) {
               std::vector<uint64_t>((size_t) e.snapshot_slots(), 0)};
     Input in;
     in.start();
-    say("INFO context=%d expert_slots=%d spec=0 model=deepseek-v4.1-flash engine=" STRATA_VERSION, o.max_context,
-        e.vram_expert_slots());
+    const int nslots = e.batch_slots();
+    std::vector<Slot> slots((size_t) nslots);
+    const std::string batch_info =
+        nslots >= 2 ? " batch_slots=" + std::to_string(nslots) + " slot_cache=1" : std::string();
+    say("INFO context=%d expert_slots=%d spec=0 model=deepseek-v4.1-flash engine=" STRATA_VERSION "%s", o.max_context,
+        e.vram_expert_slots(), batch_info.c_str());
     say("READY %d stop", o.max_context);   // "stop": this engine honours STOP
 
-    std::string line;
-    while (in.next(line)) {
-        if (line == "QUIT") break;
-        if (line.empty()) continue;
-        in.stop.store(false);   // a STOP that arrived between requests is stale
-        if (line == "VRAM" || line.rfind("VRAM ", 0) == 0) {
-            say("ERR VRAM is not supported by ds41_serve");
-            continue;
-        }
-        if (line.rfind("GENI ", 0) == 0) {
-            say("ERR this engine has no image input");
-            continue;
-        }
-        if (line.rfind("GEN ", 0) != 0) {
-            say("ERR expected: GEN <max_new> <id,id,...> (ds41_serve has no batch slots)");
-            continue;
-        }
-        Request r;
-        const std::string bad = serve::parse_gen(line, r);
-        if (!bad.empty()) {
-            say("ERR bad request: %s", bad.c_str());
-            continue;
-        }
+    // One request in the main session: its prompt (reusing the session, a snapshot or an idle slot's conversation),
+    // then up to r.max_new tokens (T lines) and the DONE line. ERR on a bad request or an engine failure.
+    auto serve_gen = [&](const Request& r) -> Outcome {
+        Outcome oc;
         const long long n = (long long) r.ids.size();
         if (n + r.max_new + 8 > o.max_context) {
             say("ERR prompt (%lld tokens) + max_new (%lld) exceeds the context (%d)", n, r.max_new, o.max_context);
-            continue;
+            return oc;
         }
         if (std::any_of(r.ids.begin(), r.ids.end(), [](int t) { return t < 0 || t >= kVocab; })) {
             say("ERR a token id is outside the vocabulary");
-            continue;
+            return oc;
         }
-
         DoneStats d;
         d.prompt = n;
         const double r0 = now_ms();
-        const uint64_t seed = r.seed ? r.seed : (uint64_t) std::chrono::steady_clock::now().time_since_epoch().count();
+        oc.seed = r.seed ? r.seed : (uint64_t) std::chrono::steady_clock::now().time_since_epoch().count();
         try {
             // ---- the prompt: reuse the session when the prompt continues it, or go back to a snapshot that the
             // prompt starts with (DeepSeek drops the last answer's reasoning, so the next prompt differs from the
-            // session at that answer's start: the snapshot before the last prompt token is there), else start over
+            // session at that answer's start: the snapshot before the last prompt token is there), or take the
+            // conversation an idle batch slot holds (upstream's slot_cache), whichever reuses most; else start over
             int64_t resume = serve::reusable(s.live, r.ids);
             const int snap = serve::pick_snapshot(s.snaps, s.live, r.ids, resume);
-            if (snap >= 0) resume = s.restore(snap);
-            else if (resume == 0 && !s.live.empty()) s.restart();
+            int64_t best = std::max<int64_t>(resume, snap >= 0 ? (int64_t) s.snaps[(size_t) snap].size() : 0);
+            int from_slot = -1;
+            for (int b = 0; b < nslots; ++b) {
+                const Slot& sl = slots[(size_t) b];
+                if (sl.active || !sl.cached) continue;
+                const int64_t len = serve::reusable(sl.ids, r.ids);
+                if (len > best) {
+                    best = len;
+                    from_slot = b;
+                }
+            }
+            if (from_slot >= 0) {
+                e.copy_from_slot(from_slot);
+                s.live = slots[(size_t) from_slot].ids;
+                resume = best;
+            } else if (snap >= 0) {
+                resume = s.restore(snap);
+            } else if (resume == 0 && !s.live.empty()) {
+                s.restart();
+            }
             d.reused = resume;
             say("RESUME %lld", (long long) resume);
             const std::vector<int> rest(r.ids.begin() + resume, r.ids.end());
@@ -388,10 +435,10 @@ int main(int argc, char** argv) {
             if (cancelled) {
                 d.finish = "cancel";
             } else {
-                uint64_t counter = 0;
-                int tok = r.greedy() ? greedy_next : sampler->pick(e.last_logits(), r, s.live, seed, counter++);
+                int tok = r.greedy() ? greedy_next : sampler->pick(e.last_logits(), r, s.live, oc.seed, oc.counter++);
                 for (;;) {
                     say("T %d", tok);
+                    oc.last = tok;
                     ++d.generated;
                     if (std::find(o.eos.begin(), o.eos.end(), tok) != o.eos.end()) {
                         d.finish = "stop";
@@ -413,7 +460,7 @@ int main(int argc, char** argv) {
                     d.ram += tm.ram_experts;
                     d.file += tm.file_experts;
                     d.offloaded += tm.zero_copy_experts();
-                    tok = r.greedy() ? greedy_next : sampler->pick(e.last_logits(), r, s.live, seed, counter++);
+                    tok = r.greedy() ? greedy_next : sampler->pick(e.last_logits(), r, s.live, oc.seed, oc.counter++);
                 }
             }
             d.decode_ms = now_ms() - t0;
@@ -425,6 +472,10 @@ int main(int argc, char** argv) {
                          d.generated > 1 ? d.decode_ms / (double) (d.generated - 1) : 0.0, d.hits, d.lookups,
                          d.finish.c_str());
             std::fflush(stderr);
+            oc.status = Outcome::kDone;
+            oc.finish = d.finish;
+            oc.generated = d.generated;
+            oc.t0 = r0;
         } catch (const std::exception& ex) {
             e.set_prefill_progress(nullptr);
             say("ERR %s", ex.what());
@@ -434,9 +485,140 @@ int main(int argc, char** argv) {
                 // the engine refuses every call after a failure that left its state half written: end, so the
                 // server starts a new one
                 std::fprintf(stderr, "ds41_serve: the engine is unusable (%s); exiting\n", again.what());
-                return 1;
+                oc.status = Outcome::kFatal;
             }
         }
+        return oc;
+    };
+
+    // One decode step of every active slot (upstream's batch window): BT per slot, BDONE for a slot that ends.
+    auto batch_step = [&]() -> bool {
+        std::vector<int> rows, toks;
+        for (int b = 0; b < nslots; ++b)
+            if (slots[(size_t) b].active) {
+                rows.push_back(b);
+                toks.push_back(slots[(size_t) b].x);
+            }
+        try {
+            const std::vector<int> next = e.step_slots(rows, toks);
+            for (size_t i = 0; i < rows.size(); ++i) {
+                Slot& sl = slots[(size_t) rows[i]];
+                sl.ids.push_back(sl.x);
+                const int tok = sl.r.greedy() ? next[i]
+                                              : sampler->pick(e.slot_logits((int) i), sl.r, sl.ids, sl.seed, sl.counter++);
+                say("BT %d %d", rows[i], tok);
+                ++sl.produced;
+                const char* fin = nullptr;
+                if (std::find(o.eos.begin(), o.eos.end(), tok) != o.eos.end()) fin = "stop";
+                else if (sl.stop) fin = "cancel";
+                else if (sl.produced >= sl.max_new || (int) sl.ids.size() + 2 > o.max_context) fin = "length";
+                if (fin) {
+                    say("BDONE %d %lld %s %.1f", rows[i], sl.produced, fin, now_ms() - sl.t0);
+                    sl.active = sl.stop = false;
+                    sl.cached = true;   // its state holds sl.ids: a later turn of this conversation continues there
+                } else {
+                    sl.x = tok;
+                }
+            }
+        } catch (const std::exception& ex) {
+            std::fprintf(stderr, "ds41_serve: a batch step failed (%s); exiting\n", ex.what());
+            return false;
+        }
+        return true;
+    };
+    auto any_active = [&] {
+        return std::any_of(slots.begin(), slots.end(), [](const Slot& sl) { return sl.active; });
+    };
+
+    std::string line;
+    for (;;) {
+        if (any_active()) {
+            if (!in.poll(line)) {
+                if (!batch_step()) return 1;
+                continue;
+            }
+        } else if (!in.next(line)) {
+            break;
+        }
+        if (line == "QUIT") break;
+        if (line.empty()) continue;
+        if (line.rfind("BSTOP ", 0) == 0) {   // the slot's next window writes one more BT, then BDONE ... cancel
+            const int b = std::atoi(line.c_str() + 6);
+            if (b >= 0 && b < nslots && slots[(size_t) b].active) slots[(size_t) b].stop = true;
+            continue;
+        }
+        if (line.rfind("BYIELD ", 0) == 0) {   // optional in upstream's protocol: a prompt here is read in one go
+            std::fprintf(stderr, "ds41_serve: BYIELD ignored (a prompt is read without yielding)\n");
+            continue;
+        }
+        in.stop.store(false);   // a STOP that arrived between requests is stale
+        if (line == "VRAM" || line.rfind("VRAM ", 0) == 0) {
+            say("ERR VRAM is not supported by ds41_serve");
+            continue;
+        }
+        if (line.rfind("BGEN ", 0) == 0 || line.rfind("BGENI ", 0) == 0) {
+            // BGEN <slot> <max_new> [keys] ids: the prompt and its first token in the main session (GEN 1), then the
+            // state goes into the slot, which decodes the rest in the batch windows. BADM 1 | 0 always follows
+            // (the server waits for it), also after an ERR.
+            const bool image = line.rfind("BGENI ", 0) == 0;
+            const char* p = line.c_str() + (image ? 6 : 5);
+            char* end = nullptr;
+            const long b = std::strtol(p, &end, 10);
+            const long long mn = end && *end == ' ' ? std::strtoll(end + 1, &end, 10) : 0;
+            const bool ok_slot = b >= 0 && b < nslots && !slots[(size_t) b].active;
+            if (image || !ok_slot || mn < 1 || !end) {
+                say("ERR %s", image ? "this engine has no image input" : "BGEN: no such free slot, or a bad max_new");
+                say("BADM %ld 0", b);
+                continue;
+            }
+            Request r;
+            const std::string bad = serve::parse_gen("GEN 1" + std::string(end), r);
+            if (!bad.empty()) {
+                say("ERR bad request: %s", bad.c_str());
+                say("BADM %ld 0", b);
+                continue;
+            }
+            const Outcome oc = serve_gen(r);
+            if (oc.status == Outcome::kFatal) return 1;
+            const bool cont = oc.status == Outcome::kDone && oc.finish == "length" && oc.generated == 1 && mn > 1;
+            if (cont) {
+                try {
+                    e.copy_to_slot((int) b);
+                } catch (const std::exception& ex) {
+                    std::fprintf(stderr, "ds41_serve: copy into slot %ld failed (%s); exiting\n", b, ex.what());
+                    return 1;
+                }
+                Slot& sl = slots[(size_t) b];
+                sl = Slot{};
+                sl.active = true;
+                sl.x = oc.last;
+                sl.produced = 1;
+                sl.max_new = mn;
+                sl.r = r;
+                sl.r.max_new = mn;
+                sl.seed = oc.seed;
+                sl.counter = oc.counter;
+                sl.ids = s.live;
+                sl.t0 = oc.t0;
+            }
+            say("BADM %ld %d", b, cont ? 1 : 0);
+            continue;
+        }
+        if (line.rfind("GENI ", 0) == 0) {
+            say("ERR this engine has no image input");
+            continue;
+        }
+        if (line.rfind("GEN ", 0) != 0) {
+            say("ERR expected: GEN <max_new> <id,id,...> or BGEN <slot> <max_new> <id,id,...>");
+            continue;
+        }
+        Request r;
+        const std::string bad = serve::parse_gen(line, r);
+        if (!bad.empty()) {
+            say("ERR bad request: %s", bad.c_str());
+            continue;
+        }
+        if (serve_gen(r).status == Outcome::kFatal) return 1;
     }
     return 0;
 }
