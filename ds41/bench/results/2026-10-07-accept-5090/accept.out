@@ -1,0 +1,27 @@
+               total        used        free      shared  buff/cache   available
+Mem:             251          90          91           0          69         158
+== install 14:43:40
+balloon 50.61953125055879 GiB
+setup exit 0 after 329 s
+== start 14:49:09
+server up after 110 s
+== a three-turn chat with thinking
+turn 1: 7.1 s, prompt 54 (5689.8 ms), 19.1 tok/s, answer: '6 apples.'
+turn 2: 3.7 s, prompt 17 (1372.6 ms), 24.1 tok/s, answer: '19'
+turn 3: 3.5 s, prompt 16 (1262.6 ms), 26.0 tok/s, answer: 'Yes, 19 is a prime number.'
+== OpenAI streamed, a tool
+"name": "get_weather" "arguments": "" "arguments": "{" "arguments": "\" "arguments": "}" "finish_reason": "tool_calls" 
+== Anthropic, a tool call and its result
+anthropic_1.json tool_use [('thinking', ''), ('tool_use', {'city': '东京'})]
+anthropic_2.json end_turn [('text', '东京现在的天气情况如下：\n\n- **天气状况**：多云（Cloudy）\n- **气温**：18°C\n- **傍晚预报**：预计傍晚会有小雨（light rain')]
+== the engine's request lines
+ds41: 2606 VRAM expert slots (19.18 GiB)
+ds41: RAM tier 12754 experts (82.3 GiB, locked), filled in 79.6 s
+ds41_serve: prompt 54 (reused 0, read 54) 5690 ms, 26 out 54.5 ms/token, VRAM hits 2654 of 6000, stop
+ds41_serve: prompt 70 (reused 53, read 17) 1373 ms, 57 out 42.3 ms/token, VRAM hits 8593 of 13440, stop
+ds41_serve: prompt 85 (reused 69, read 16) 1263 ms, 58 out 39.1 ms/token, VRAM hits 9314 of 13680, stop
+ds41_serve: prompt 295 (reused 0, read 295) 6656 ms, 55 out 37.8 ms/token, VRAM hits 8005 of 12960, stop
+ds41_serve: prompt 293 (reused 0, read 293) 2957 ms, 58 out 28.9 ms/token, VRAM hits 10013 of 13680, stop
+ds41_serve: prompt 375 (reused 350, read 25) 1376 ms, 62 out 39.2 ms/token, VRAM hits 9609 of 14640, stop
+== ALL DONE 14:51:31
+balloon stopped
