@@ -53,6 +53,10 @@ for rel in all_sources():
     edit(rel, sub(r"__nanosleep\(\d+\);", "/* spin (no __nanosleep on SYCL) */;"))
     # 7. `__fadd_rn(a, b ? c : d)` lost its parentheses.
     edit(rel, sub(r"= (\w+) \+ (\w+) \? (\w+\[\w+\]) : 0\.0f;", r"= \1 + (\2 ? \3 : 0.0f);"))
+    # 8. cudaStreamQuery(s): dpct writes `DPCT_CHECK_ERROR(s->ext_oneapi_empty())`, which is 0 whenever the call does not
+    #    throw, so the ring waits' `q != 1` guard (1 = still running) was always true and any wait over 2 ms "never rang".
+    edit(rel, sub(r"(const dpct::err0 q =)\s*DPCT_CHECK_ERROR\(\(+(\w+)\)*->ext_oneapi_empty\(\)\)+;",
+                  r"\1 \2->ext_oneapi_empty() ? 0 : 1;"))
 
 # 2b. every `(dpct::queue_ptr) stream` cast goes through strata::q_of(), which maps CUDA's null stream to the
 #     default in-order queue instead of dereferencing a null sycl::queue* (include/strata/sycl_queue.hpp).
@@ -303,3 +307,9 @@ for p in sorted((root / "src" / "kernels").glob("*_parity.cpp")):
 edit("src/program/generate.cpp", sub(
     r"(    const strata::core::OnDevice on\(dev\);\n        size_t fb = 0, tb = 0;\n)(?!        dpct::get_current_device)",
     r"\1        dpct::get_current_device().get_memory_info(fb, tb);   // #423 (tmking01): dpct dropped cudaMemGetInfo here\n"))
+
+# A770: only subgroup row zero reaches the native router's synchronization.
+# CUDA's early-exit block pattern must not become a divergent SYCL work-group barrier.
+edit("src/kernels/cuda/native_router.dp.cpp", lambda s: s.replace(
+    "    item_ct1.barrier(sycl::access::fence_space::local_space);",
+    "    sycl::group_barrier(item_ct1.get_sub_group());  // only subgroup row zero participates"))
