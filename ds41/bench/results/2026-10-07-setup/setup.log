@@ -1,0 +1,215 @@
+Strata - DeepSeek V4.1 Flash (Linux + NVIDIA)
+  [ok] DeepSeek V4.1 Flash SAGE 1.59bpw: GPU 0 (NVIDIA GeForce RTX 4090, 24 GB); RAM 1007.6 GiB; 128 GB PC recommended
+  Disk: about 462 GB total (341.8 GB download + 120.2 GB pack). Keep the source shards: Engram reads them in place.
+  Installing Strata Python packages (pack: numpy) ...
+  > /workspace/strata-release/.venv/bin/python -m pip install --quiet --disable-pip-version-check numpy==2.5.3; python_version >= "3.12" numpy==2.4.6; python_version == "3.11" numpy==2.2.6; python_version < "3.11" jinja2==3.1.6 regex==2026.9.10 pyyaml==6.0.3 tqdm==4.70.1 requests==2.34.2 cmake==4.4.3 ninja==1.13.2 pillow==12.3.0 psutil==7.2.2 markupsafe==3.0.3 certifi==2026.7.22 charset-normalizer==3.5.1 idna==3.20 urllib3==2.8.0 colorama==0.4.6; sys_platform == "win32"
+  [ok] Strata Python packages (pack: numpy) installed
+  [ok] build tools present (CUDA 12.8)
+  llama.cpp source:   0.01 / 0.04 GB (21%)   
+  [ok] llama.cpp source downloaded
+  > /opt/conda/bin/cmake -G Ninja -DCMAKE_MAKE_PROGRAM=/opt/conda/bin/ninja -S /workspace/strata-release -B /workspace/strata-release/build-ds41 -DCMAKE_BUILD_TYPE=Release -DSTRATA_ENABLE_CUDA=ON -DSTRATA_ENABLE_HIP=OFF -DSTRATA_BUILD_TESTS=OFF -DCMAKE_CUDA_ARCHITECTURES=89 -DCMAKE_CUDA_COMPILER=/usr/local/cuda/bin/nvcc -DSTRATA_GGML_DIR=/workspace/strata-release/third_party/llama.cpp
+-- The CXX compiler identification is GNU 11.4.0
+-- Detecting CXX compiler ABI info
+-- Detecting CXX compiler ABI info - done
+-- Check for working CXX compiler: /usr/bin/c++ - skipped
+-- Detecting CXX compile features
+-- Detecting CXX compile features - done
+-- The CUDA compiler identification is NVIDIA 12.8.93 with host compiler GNU 11.4.0
+-- Detecting CUDA compiler ABI info
+-- Detecting CUDA compiler ABI info - done
+-- Check for working CUDA compiler: /usr/local/cuda/bin/nvcc - skipped
+-- Detecting CUDA compile features
+-- Detecting CUDA compile features - done
+-- Found CUDAToolkit: /usr/local/cuda/targets/x86_64-linux/include (found version "12.8.93")
+-- Performing Test CMAKE_HAVE_LIBC_PTHREAD
+-- Performing Test CMAKE_HAVE_LIBC_PTHREAD - Success
+-- Found Threads: TRUE
+-- Strata: CUDA enabled, arch 89
+-- strata: pack/full/experts.bin absent - the expert arena load test is NOT registered
+-- The C compiler identification is GNU 11.4.0
+-- Detecting C compiler ABI info
+-- Detecting C compiler ABI info - done
+-- Check for working C compiler: /usr/bin/cc - skipped
+-- Detecting C compile features
+-- Detecting C compile features - done
+-- The ASM compiler identification is GNU
+-- Found assembler: /usr/bin/cc
+-- ccache found, compilation results will be cached. Disable with GGML_CCACHE=OFF.
+-- CMAKE_SYSTEM_PROCESSOR: x86_64
+-- GGML_SYSTEM_ARCH: x86
+-- Including CPU backend
+-- x86 detected
+-- Adding CPU backend variant ggml-cpu: -march=native 
+-- ggml version: 0.24.0
+-- ggml commit:  unknown
+-- Configuring done (4.3s)
+-- Generating done (0.2s)
+-- Build files have been written to: /workspace/strata-release/build-ds41
+  > /opt/conda/bin/cmake --build /workspace/strata-release/build-ds41 --target ds41_serve -j 127
+/workspace/strata-release/src/core/weights.cpp: In member function ‘bool strata::core::WeightTable::load(const string&, void*, uint64_t, std::string&, const std::set<std::__cxx11::basic_string<char> >*)’:
+/workspace/strata-release/src/core/weights.cpp:167:51: warning: format ‘%llu’ expects argument of type ‘long long unsigned int*’, but argument 6 has type ‘uint64_t*’ {aka ‘long unsigned int*’} [-Wformat=]
+  167 |                                   "%255s %d %d %llu %llu %llu %llu %lld %lld %d %d %d %d %d %llu %llu %llu %d %d",
+      |                                                ~~~^
+      |                                                   |
+      |                                                   long long unsigned int*
+      |                                                %lu
+  168 |                                   name, &r.file, &kind, &r.src_off, &r.src_bytes, &r.dst_off, &r.dst_bytes,
+      |                                                         ~~~~~~~~~~
+      |                                                         |
+      |                                                         uint64_t* {aka long unsigned int*}
+/workspace/strata-release/src/core/weights.cpp:167:56: warning: format ‘%llu’ expects argument of type ‘long long unsigned int*’, but argument 7 has type ‘uint64_t*’ {aka ‘long unsigned int*’} [-Wformat=]
+  167 |                                   "%255s %d %d %llu %llu %llu %llu %lld %lld %d %d %d %d %d %llu %llu %llu %d %d",
+      |                                                     ~~~^
+      |                                                        |
+      |                                                        long long unsigned int*
+      |                                                     %lu
+  168 |                                   name, &r.file, &kind, &r.src_off, &r.src_bytes, &r.dst_off, &r.dst_bytes,
+      |                                                                     ~~~~~~~~~~~~
+      |                                                                     |
+      |                                                                     uint64_t* {aka long unsigned int*}
+/workspace/strata-release/src/core/weights.cpp:167:61: warning: format ‘%llu’ expects argument of type ‘long long unsigned int*’, but argument 8 has type ‘uint64_t*’ {aka ‘long unsigned int*’} [-Wformat=]
+  167 |                                   "%255s %d %d %llu %llu %llu %llu %lld %lld %d %d %d %d %d %llu %llu %llu %d %d",
+      |                                                          ~~~^
+      |                                                             |
+      |                                                             long long unsigned int*
+      |                                                          %lu
+  168 |                                   name, &r.file, &kind, &r.src_off, &r.src_bytes, &r.dst_off, &r.dst_bytes,
+      |                                                                                   ~~~~~~~~~~
+      |                                                                                   |
+      |                                                                                   uint64_t* {aka long unsigned int*}
+/workspace/strata-release/src/core/weights.cpp:167:66: warning: format ‘%llu’ expects argument of type ‘long long unsigned int*’, but argument 9 has type ‘uint64_t*’ {aka ‘long unsigned int*’} [-Wformat=]
+  167 |                                   "%255s %d %d %llu %llu %llu %llu %lld %lld %d %d %d %d %d %llu %llu %llu %d %d",
+      |                                                               ~~~^
+      |                                                                  |
+      |                                                                  long long unsigned int*
+      |                                                               %lu
+  168 |                                   name, &r.file, &kind, &r.src_off, &r.src_bytes, &r.dst_off, &r.dst_bytes,
+      |                                                                                               ~~~~~~~~~~~~
+      |                                                                                               |
+      |                                                                                               uint64_t* {aka long unsigned int*}
+/workspace/strata-release/src/core/weights.cpp:167:71: warning: format ‘%lld’ expects argument of type ‘long long int*’, but argument 10 has type ‘int64_t*’ {aka ‘long int*’} [-Wformat=]
+  167 |                                   "%255s %d %d %llu %llu %llu %llu %lld %lld %d %d %d %d %d %llu %llu %llu %d %d",
+      |                                                                    ~~~^
+      |                                                                       |
+      |                                                                       long long int*
+      |                                                                    %ld
+  168 |                                   name, &r.file, &kind, &r.src_off, &r.src_bytes, &r.dst_off, &r.dst_bytes,
+  169 |                                   &r.ne0, &r.ne1, &r.code_bits, &r.code_bias, &r.group_elems, &r.codebook,
+      |                                   ~~~~~~                               
+      |                                   |
+      |                                   int64_t* {aka long int*}
+/workspace/strata-release/src/core/weights.cpp:167:76: warning: format ‘%lld’ expects argument of type ‘long long int*’, but argument 11 has type ‘int64_t*’ {aka ‘long int*’} [-Wformat=]
+  167 |                                   "%255s %d %d %llu %llu %llu %llu %lld %lld %d %d %d %d %d %llu %llu %llu %d %d",
+      |                                                                         ~~~^
+      |                                                                            |
+      |                                                                            long long int*
+      |                                                                         %ld
+  168 |                                   name, &r.file, &kind, &r.src_off, &r.src_bytes, &r.dst_off, &r.dst_bytes,
+  169 |                                   &r.ne0, &r.ne1, &r.code_bits, &r.code_bias, &r.group_elems, &r.codebook,
+      |                                           ~~~~~~                            
+      |                                           |
+      |                                           int64_t* {aka long int*}
+/workspace/strata-release/src/core/weights.cpp:167:96: warning: format ‘%llu’ expects argument of type ‘long long unsigned int*’, but argument 17 has type ‘uint64_t*’ {aka ‘long unsigned int*’} [-Wformat=]
+  167 |                                   "%255s %d %d %llu %llu %llu %llu %lld %lld %d %d %d %d %d %llu %llu %llu %d %d",
+      |                                                                                             ~~~^
+      |                                                                                                |
+      |                                                                                                long long unsigned int*
+      |                                                                                             %lu
+......
+  170 |                                   &r.has_offset, &r.codes_bytes, &r.scales_bytes, &r.offset_bytes,
+      |                                                  ~~~~~~~~~~~~~~                                 
+      |                                                  |
+      |                                                  uint64_t* {aka long unsigned int*}
+/workspace/strata-release/src/core/weights.cpp:167:101: warning: format ‘%llu’ expects argument of type ‘long long unsigned int*’, but argument 18 has type ‘uint64_t*’ {aka ‘long unsigned int*’} [-Wformat=]
+  167 |                                   "%255s %d %d %llu %llu %llu %llu %lld %lld %d %d %d %d %d %llu %llu %llu %d %d",
+      |                                                                                                  ~~~^
+      |                                                                                                     |
+      |                                                                                                     long long unsigned int*
+      |                                                                                                  %lu
+......
+  170 |                                   &r.has_offset, &r.codes_bytes, &r.scales_bytes, &r.offset_bytes,
+      |                                                                  ~~~~~~~~~~~~~~~                     
+      |                                                                  |
+      |                                                                  uint64_t* {aka long unsigned int*}
+/workspace/strata-release/src/core/weights.cpp:167:106: warning: format ‘%llu’ expects argument of type ‘long long unsigned int*’, but argument 19 has type ‘uint64_t*’ {aka ‘long unsigned int*’} [-Wformat=]
+  167 |                                   "%255s %d %d %llu %llu %llu %llu %lld %lld %d %d %d %d %d %llu %llu %llu %d %d",
+      |                                                                                                       ~~~^
+      |                                                                                                          |
+      |                                                                                                          long long unsigned int*
+      |                                                                                                       %lu
+......
+  170 |                                   &r.has_offset, &r.codes_bytes, &r.scales_bytes, &r.offset_bytes,
+      |                                                                                   ~~~~~~~~~~~~~~~         
+      |                                                                                   |
+      |                                                                                   uint64_t* {aka long unsigned int*}
+                            float softplus_f(float x) { return x > 20.0f ? x : log1pf(expf(x)); }
+/workspace/strata-release/src/kernels/ngram.cpp: In member function ‘bool strata::kernels::PleTable::open(const string&, std::string&, const strata::kernels::PleIoOptions&)’:
+/workspace/strata-release/src/kernels/ngram.cpp:212:43: warning: ‘int strcmp(const char*, const char*)’ of a string of length 6 and an array of size 4 evaluates to nonzero [-Wstring-compare]
+  212 |     } else if (!impl_->q5_0 && std::strcmp(t->type_name(), "IQ4_NL") != 0) {
+      |                                ~~~~~~~~~~~^~~~~~~~~~~~~~~~~~~~~~~~~~
+      const int n_embd = NG_N_EMBD, hc = NG_HC, hc_dim = NG_HC_DIM;
+  [ok] config.json already downloaded
+  [ok] model-00001-of-00017.safetensors already downloaded
+  [ok] model-00002-of-00017.safetensors already downloaded
+  [ok] model-00003-of-00017.safetensors already downloaded
+  [ok] model-00004-of-00017.safetensors already downloaded
+  [ok] model-00005-of-00017.safetensors already downloaded
+  [ok] model-00006-of-00017.safetensors already downloaded
+  [ok] model-00007-of-00017.safetensors already downloaded
+  [ok] model-00008-of-00017.safetensors already downloaded
+  [ok] model-00009-of-00017.safetensors already downloaded
+  [ok] model-00010-of-00017.safetensors already downloaded
+  [ok] model-00011-of-00017.safetensors already downloaded
+  [ok] model-00012-of-00017.safetensors already downloaded
+  [ok] model-00013-of-00017.safetensors already downloaded
+  [ok] model-00014-of-00017.safetensors already downloaded
+  [ok] model-00015-of-00017.safetensors already downloaded
+  [ok] model-00016-of-00017.safetensors already downloaded
+  [ok] model-00017-of-00017.safetensors already downloaded
+  [ok] model.safetensors.index.json already downloaded
+  [ok] tokenizer.json already downloaded
+  [ok] tokenizer_config.json already downloaded
+  > /workspace/strata-release/.venv/bin/python /workspace/strata-release/tools/ds41/pack.py --src /workspace/models/deepseek-sage-1.59bpw --out /workspace/sdata/packs/deepseek-sage-1.59bpw --engram-from /workspace/strata-release/ds41/data/engram
+layer 0 done, 2.51 GiB, 2 s
+layer 1 done, 4.90 GiB, 5 s
+layer 2 done, 7.25 GiB, 7 s
+layer 3 done, 9.61 GiB, 9 s
+layer 4 done, 12.01 GiB, 11 s
+layer 5 done, 14.45 GiB, 13 s
+layer 6 done, 16.88 GiB, 15 s
+layer 7 done, 19.44 GiB, 17 s
+layer 8 done, 22.14 GiB, 19 s
+layer 9 done, 24.77 GiB, 22 s
+layer 10 done, 27.38 GiB, 24 s
+layer 11 done, 30.17 GiB, 26 s
+layer 12 done, 32.95 GiB, 29 s
+layer 13 done, 35.84 GiB, 32 s
+layer 14 done, 38.54 GiB, 35 s
+layer 15 done, 41.57 GiB, 38 s
+layer 16 done, 44.35 GiB, 40 s
+layer 17 done, 47.15 GiB, 42 s
+layer 18 done, 49.90 GiB, 45 s
+layer 19 done, 53.00 GiB, 47 s
+layer 20 done, 55.86 GiB, 50 s
+layer 21 done, 58.71 GiB, 52 s
+layer 22 done, 61.48 GiB, 55 s
+layer 23 done, 64.36 GiB, 58 s
+layer 24 done, 67.05 GiB, 61 s
+layer 25 done, 69.58 GiB, 64 s
+layer 26 done, 72.14 GiB, 67 s
+layer 27 done, 74.69 GiB, 71 s
+layer 28 done, 77.10 GiB, 73 s
+layer 29 done, 79.51 GiB, 76 s
+layer 30 done, 81.85 GiB, 78 s
+layer 31 done, 84.20 GiB, 81 s
+layer 32 done, 86.47 GiB, 84 s
+layer 33 done, 88.74 GiB, 86 s
+layer 34 done, 90.88 GiB, 88 s
+layer 35 done, 93.03 GiB, 91 s
+layer 36 done, 95.15 GiB, 92 s
+layer 37 done, 97.27 GiB, 95 s
+layer 38 done, 99.36 GiB, 97 s
+layer 39 done, 101.45 GiB, 99 s
+  [ok] start script: run-deepseek-sage-1.59bpw.sh
+  [ok] --max-context 32768 --threads 16; server 127.0.0.1:8080, no browser, gpu 0
+SETUP_EXIT 0 261 s
