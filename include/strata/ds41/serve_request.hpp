@@ -1,5 +1,5 @@
 // include/strata/ds41/serve_request.hpp - ds41_serve's line protocol, the host-only parts: the GEN line, which part
-// of the session a prompt reuses, and the DONE line. The formats are upstream's `strata --serve`
+// of the session (or which snapshot) a prompt reuses, and the DONE line. The formats are upstream's `strata --serve`
 // (src/program/generate.cpp), so serve/server.py drives both engines the same way.
 #pragma once
 
@@ -90,6 +90,28 @@ inline int64_t reusable(const std::vector<int>& live, const std::vector<int>& pr
     for (size_t i = 0; i < L; ++i)
         if (live[i] != prompt[i]) return 0;
     return (int64_t) L;
+}
+
+/// Which snapshot a prompt goes back to, or -1. snaps[i]: the tokens fed before slot i's position (empty: no
+/// snapshot). A snapshot counts when the session still holds its tokens (they were fed before its position and not
+/// replaced since) and the prompt starts with them; it must beat the session's own reuse (`live_reuse`) and leave the
+/// prompt's last token to read. The longest one wins.
+inline int pick_snapshot(const std::vector<std::vector<int>>& snaps, const std::vector<int>& live,
+                         const std::vector<int>& prompt, int64_t live_reuse) {
+    int best = -1;
+    size_t best_n = 0;
+    for (size_t i = 0; i < snaps.size(); ++i) {
+        const std::vector<int>& t = snaps[i];
+        const size_t n = t.size();
+        if (n == 0 || (int64_t) n <= live_reuse || n <= best_n || n + 1 > prompt.size() || n > live.size()) continue;
+        bool same = true;
+        for (size_t j = 0; j < n && same; ++j) same = t[j] == live[j] && t[j] == prompt[j];
+        if (same) {
+            best = (int) i;
+            best_n = n;
+        }
+    }
+    return best;
 }
 
 /// The fields of the DONE line

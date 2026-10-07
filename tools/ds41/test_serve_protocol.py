@@ -126,6 +126,21 @@ def main() -> int:
     print(f"  continued {out2} fresh {out3}", flush=True)
     check(out2[0] == out3[0], "the reused session gives the first token a fresh start gives")
 
+    # a snapshot before the last prompt token: the next turn changes the last answer's start (DeepSeek drops its
+    # reasoning), so it differs from the session at the old prompt's last token - for a pass (400) and windows (60)
+    for size, seed in ((400, 21), (60, 22)):
+        e.request(prompt(30, 900 + seed), 1)               # another conversation: the session starts over
+        Pa = prompt(size, seed)
+        lines, outa, done, err = e.request(Pa, 4)
+        Q = Pa[:-1] + prompt(31, 100 + seed)[1:]           # the old prompt but its last token, then 30 new tokens
+        lines, outq, done, err = e.request(Q, 3)
+        check(lines[0] == f"RESUME {len(Pa) - 1}", f"{size}: the next turn goes back to the snapshot ({lines[0]})")
+        check(done is not None and done[14] == "30", f"{size}: it reads only the 30 new tokens ({done and done[14]})")
+        e.request(prompt(30, 950 + seed), 1)
+        _, fresh, _, _ = e.request(Q, 3)
+        print(f"  {size}: from the snapshot {outq}, fresh {fresh}", flush=True)
+        check(outq[0] == fresh[0], f"{size}: the snapshot gives the first token a fresh start gives")
+
     # STOP while the prompt is read: cancel, nothing generated, the next request works
     long_p = prompt(6000, 3)
     lines, out, done, err = e.request(long_p, 4, stop_after_pp=2)

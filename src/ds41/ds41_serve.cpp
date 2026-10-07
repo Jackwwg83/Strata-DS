@@ -13,8 +13,9 @@
 //         DONE ... | ERR <message>                   the end of a request (DONE: serve_request.hpp)
 // Not supported, answered with ERR: GENI (images), batch slots (BGEN, BSTOP, BYIELD), VRAM.
 //
-// The session is the tokens fed so far. A prompt that starts with all of them reads only the rest; any other
-// prompt starts over at position 0 (the engine cannot go back to an earlier position yet).
+// The session is the tokens fed so far. A prompt that starts with all of them reads only the rest. Before each
+// prompt's last token the engine keeps a snapshot (--snapshots slots, least recently used first); a prompt that starts
+// with a snapshot's tokens goes back there. Any other prompt starts over at position 0.
 #include "strata/ds41/config.hpp"
 #include "strata/ds41/engine.hpp"
 #include "strata/ds41/serve_request.hpp"
@@ -170,6 +171,7 @@ struct Options {
                  "usage: ds41_serve --serve --pack DIR [--max-context N] [--threads T] [--expert-profile F]\n"
                  "       [--vram-slots N] [--ram-budget-gib G] [--adapt-every N] [--adapt-swaps N] [--prefill-chunk N]\n"
                  "       [--prefill-batch N] [--prefill-ring N] [--prefill-threads N] [--window-prompt-max N]\n"
+                 "       [--snapshots N]\n"
                  "       [--eos-id ID ...]\n",
                  why.c_str());
     std::exit(2);
@@ -208,6 +210,7 @@ Options parse_args(int argc, char** argv) {
         else if (a == "--prefill-ring") o.eng.prefill_ring = (int) num(next());
         else if (a == "--prefill-threads") o.eng.prefill_threads = (int) num(next());
         else if (a == "--window-prompt-max") o.window_prompt_max = (int) num(next());
+        else if (a == "--snapshots") o.eng.snapshots = (int) num(next());
         else if (a == "--eos-id") {
             if (!eos_given) o.eos.clear();
             eos_given = true;
@@ -225,10 +228,30 @@ Options parse_args(int argc, char** argv) {
 struct Session {
     Engine& e;
     std::vector<int> live;
+    /// per engine snapshot slot: the tokens fed before its position (empty: unused), and when it was last used
+    std::vector<std::vector<int>> snaps;
+    std::vector<uint64_t> used;
+    uint64_t clock = 0;
 
     void restart() {
         e.reset();
         live.clear();
+    }
+    /// a snapshot of the current position in the least recently used slot (none without slots)
+    void save() {
+        if (snaps.empty()) return;
+        const size_t slot = (size_t) (std::min_element(used.begin(), used.end()) - used.begin());
+        snaps[slot].clear();   // a failed save leaves the slot empty
+        e.save_snapshot((int) slot);
+        snaps[slot] = live;
+        used[slot] = ++clock;
+    }
+    /// back to slot's position: the session ends there
+    int64_t restore(int slot) {
+        const int pos = e.restore_snapshot(slot);
+        live.resize((size_t) pos);
+        used[(size_t) slot] = ++clock;
+        return pos;
     }
 };
 
@@ -246,7 +269,8 @@ int main(int argc, char** argv) {
         return 1;
     }
     Engine& e = *engine;
-    Session s{e, {}};
+    Session s{e, {}, std::vector<std::vector<int>>((size_t) e.snapshot_slots()),
+              std::vector<uint64_t>((size_t) e.snapshot_slots(), 0)};
     Input in;
     in.start();
     say("INFO context=%d expert_slots=%d spec=0 model=deepseek-v4.1-flash engine=" STRATA_VERSION, o.max_context,
@@ -291,13 +315,18 @@ int main(int argc, char** argv) {
         const double r0 = now_ms();
         const uint64_t seed = r.seed ? r.seed : (uint64_t) std::chrono::steady_clock::now().time_since_epoch().count();
         try {
-            // ---- the prompt: reuse the session when the prompt continues it, else start over
-            const int64_t resume = serve::reusable(s.live, r.ids);
-            if (resume == 0 && !s.live.empty()) s.restart();
+            // ---- the prompt: reuse the session when the prompt continues it, or go back to a snapshot that the
+            // prompt starts with (DeepSeek drops the last answer's reasoning, so the next prompt differs from the
+            // session at that answer's start: the snapshot before the last prompt token is there), else start over
+            int64_t resume = serve::reusable(s.live, r.ids);
+            const int snap = serve::pick_snapshot(s.snaps, s.live, r.ids, resume);
+            if (snap >= 0) resume = s.restore(snap);
+            else if (resume == 0 && !s.live.empty()) s.restart();
             d.reused = resume;
             say("RESUME %lld", (long long) resume);
             const std::vector<int> rest(r.ids.begin() + resume, r.ids.end());
             const double pp0 = now_ms();
+            int read = 0;
             auto pp = [&](int done) {
                 const double ms = now_ms() - pp0;
                 say("PP %lld %lld %.0f %.1f", (long long) (resume + done), n, ms,
@@ -305,36 +334,51 @@ int main(int argc, char** argv) {
             };
             int greedy_next = -1;
             bool cancelled = false;
-            int read = 0;
-            if ((int) rest.size() <= o.window_prompt_max) {
-                for (size_t i = 0; i < rest.size(); i += kVerifyMaxTokens) {
-                    const std::vector<int> win(rest.begin() + i,
-                                               rest.begin() + std::min(rest.size(), i + kVerifyMaxTokens));
-                    const VerifyResult v = e.verify(win, e.position());
-                    e.commit((int) win.size());   // all of them: the window is prompt, not drafts
-                    greedy_next = v.next.back();
-                    s.live.insert(s.live.end(), win.begin(), win.end());
-                    read += (int) win.size();
-                    pp(read);
-                    if (in.stop.load() && read < (int) rest.size()) {
-                        cancelled = true;
-                        break;
+            // part of the prompt: in verify windows of 4 tokens, or one batched prefill; false when STOP ended it
+            auto feed = [&](std::vector<int>::const_iterator b, std::vector<int>::const_iterator end,
+                            bool windows) -> bool {
+                const std::vector<int> part(b, end);
+                if (windows) {
+                    for (size_t i = 0; i < part.size(); i += kVerifyMaxTokens) {
+                        const std::vector<int> win(part.begin() + i,
+                                                   part.begin() + std::min(part.size(), i + kVerifyMaxTokens));
+                        const VerifyResult v = e.verify(win, e.position());
+                        e.commit((int) win.size());   // all of them: the window is prompt, not drafts
+                        greedy_next = v.next.back();
+                        s.live.insert(s.live.end(), win.begin(), win.end());
+                        read += (int) win.size();
+                        pp(read);
+                        if (in.stop.load() && read < (int) rest.size()) return false;
                     }
+                    return true;
                 }
-            } else {
+                const int before = read;
                 e.set_prefill_progress([&](int done, int) {
-                    pp(done);
+                    pp(before + done);
                     return !in.stop.load();
                 });
                 try {
-                    greedy_next = e.prefill(rest, e.position());
-                    read = (int) rest.size();
-                    s.live.insert(s.live.end(), rest.begin(), rest.end());
+                    greedy_next = e.prefill(part, e.position());
+                    read += (int) part.size();
+                    s.live.insert(s.live.end(), part.begin(), part.end());
                 } catch (const PrefillCancelled&) {
                     s.live.clear();   // the engine reset itself
-                    cancelled = true;
+                    e.set_prefill_progress(nullptr);
+                    return false;
                 }
                 e.set_prefill_progress(nullptr);
+                return true;
+            };
+            const bool windows = (int) rest.size() <= o.window_prompt_max;
+            if (rest.size() >= 2 && !s.snaps.empty()) {
+                // all but the last token, a snapshot, then the last token (one window)
+                cancelled = !feed(rest.begin(), rest.end() - 1, windows);
+                if (!cancelled) {
+                    s.save();
+                    cancelled = !feed(rest.end() - 1, rest.end(), true);
+                }
+            } else {
+                cancelled = !feed(rest.begin(), rest.end(), windows);
             }
             d.read = read;
             d.prompt_ms = now_ms() - r0;
