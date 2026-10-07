@@ -1,0 +1,10 @@
+ACC code_py_0 fp16_ref 1.076752 | notier nll 1.056031 | tier nll 1.038057 hit_rate 0.6684 
+ACC zh_0 fp16_ref 3.644291 | notier nll 3.647609 | tier nll 3.591600 hit_rate 0.5100 
+ACC en_0 fp16_ref 1.943494 | notier nll 1.959310 | tier nll 1.931497 hit_rate 0.5299 
+ACC code_cpp_1 fp16_ref 2.146486 | notier nll 2.146510 | tier nll 2.192479 hit_rate 0.5198 
+ACC zh_2 fp16_ref 2.326274 | notier nll 2.381141 | tier nll 2.416474 hit_rate 0.5984 
+TIME rep 1 notier: decode_ms_per_token 268.1 over 200 steps (cpu experts 249.1)
+TIME rep 1 tier:   decode_ms_per_token 124.8 over 200 steps (cpu experts 93.7) vram_expert_slots 896 hit_rate 0.6684 
+TIME rep 2 notier: decode_ms_per_token 276.2 over 200 steps (cpu experts 257.3)
+TIME rep 2 tier:   decode_ms_per_token 126.6 over 200 steps (cpu experts 95.6) vram_expert_slots 896 hit_rate 0.6684 
+EVAL_DONE

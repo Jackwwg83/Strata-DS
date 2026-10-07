@@ -1,0 +1,366 @@
+{
+  "schema_version": 1,
+  "evidence": "SOURCE_DERIVED_LAYOUT_AND_IMPLEMENTATION_DESIGN",
+  "inputs": {
+    "ram_gib": 128,
+    "vram_gib": 24,
+    "context": 32768,
+    "slots": 1,
+    "chunk": 64,
+    "ring_mib": 512,
+    "wave_experts": 8,
+    "expert_row_tile": 64,
+    "attention_query_tile": 64,
+    "attention_key_tile": 64,
+    "index_query_tile": 16,
+    "index_key_tile": 4096,
+    "index_head_tile": 4,
+    "engram_query_tile": 256,
+    "kv_format": "reference_bf16",
+    "reconstruction": "disabled",
+    "mandatory_device_bytes": null,
+    "external_device_bytes": 1073741824,
+    "device_safety_bytes": 1073741824,
+    "kernel_extra_bytes": 67108864,
+    "sort_extra_bytes": 33554432,
+    "host_system_reserve_bytes": 19327352832,
+    "host_runtime_reserve_bytes": 8589934592,
+    "host_page_cache_reserve_bytes": 4294967296,
+    "engram_row_cache_bytes": 2147483648,
+    "host_hot_backup_bytes": 0,
+    "graph_capture": false
+  },
+  "model_revision": "650cae2c13aaaec303871a35301503570889c0be",
+  "expert_layout": {
+    "geometry": {
+      "hidden": 5120,
+      "intermediate": 2304,
+      "layers": 40,
+      "experts": 384,
+      "top_k": 6,
+      "bits": 3
+    },
+    "topology": "TP1",
+    "source_payload_bytes": 13315596,
+    "slot_stride_bytes": 13316352,
+    "component_alignment": 256,
+    "slot_padding_bytes": 756,
+    "full_layer_payload_bytes": 5113188864,
+    "full_routed_bank_payload_bytes": 204527554560,
+    "one_fp16_reconstructed_matrix_bytes": 23592960,
+    "components": [
+      {
+        "projection": "w1",
+        "suffix": "trellis",
+        "dtype": "I16",
+        "shape": [
+          320,
+          144,
+          48
+        ],
+        "payload_bytes": 4423680,
+        "slot_offset": 0
+      },
+      {
+        "projection": "w1",
+        "suffix": "suh",
+        "dtype": "F16",
+        "shape": [
+          5120
+        ],
+        "payload_bytes": 10240,
+        "slot_offset": 4423680
+      },
+      {
+        "projection": "w1",
+        "suffix": "svh",
+        "dtype": "F16",
+        "shape": [
+          2304
+        ],
+        "payload_bytes": 4608,
+        "slot_offset": 4433920
+      },
+      {
+        "projection": "w1",
+        "suffix": "mul1",
+        "dtype": "I32",
+        "shape": [
+          1
+        ],
+        "payload_bytes": 4,
+        "slot_offset": 4438528
+      },
+      {
+        "projection": "w3",
+        "suffix": "trellis",
+        "dtype": "I16",
+        "shape": [
+          320,
+          144,
+          48
+        ],
+        "payload_bytes": 4423680,
+        "slot_offset": 4438784
+      },
+      {
+        "projection": "w3",
+        "suffix": "suh",
+        "dtype": "F16",
+        "shape": [
+          5120
+        ],
+        "payload_bytes": 10240,
+        "slot_offset": 8862464
+      },
+      {
+        "projection": "w3",
+        "suffix": "svh",
+        "dtype": "F16",
+        "shape": [
+          2304
+        ],
+        "payload_bytes": 4608,
+        "slot_offset": 8872704
+      },
+      {
+        "projection": "w3",
+        "suffix": "mul1",
+        "dtype": "I32",
+        "shape": [
+          1
+        ],
+        "payload_bytes": 4,
+        "slot_offset": 8877312
+      },
+      {
+        "projection": "w2",
+        "suffix": "trellis",
+        "dtype": "I16",
+        "shape": [
+          144,
+          320,
+          48
+        ],
+        "payload_bytes": 4423680,
+        "slot_offset": 8877568
+      },
+      {
+        "projection": "w2",
+        "suffix": "suh",
+        "dtype": "F16",
+        "shape": [
+          2304
+        ],
+        "payload_bytes": 4608,
+        "slot_offset": 13301248
+      },
+      {
+        "projection": "w2",
+        "suffix": "svh",
+        "dtype": "F16",
+        "shape": [
+          5120
+        ],
+        "payload_bytes": 10240,
+        "slot_offset": 13305856
+      },
+      {
+        "projection": "w2",
+        "suffix": "mul1",
+        "dtype": "I32",
+        "shape": [
+          1
+        ],
+        "payload_bytes": 4,
+        "slot_offset": 13316096
+      }
+    ],
+    "evidence": "PINNED_SOURCE_SCHEMA_DERIVATION"
+  },
+  "ring": {
+    "budget_bytes": 536870912,
+    "slot_stride_bytes": 13316352,
+    "slots": 40,
+    "allocated_bytes": 532654080,
+    "unused_bytes": 4216832,
+    "wave_experts": 8,
+    "min_slots": 16,
+    "feasible": true,
+    "algorithm": "two_wave_whole_expert_lease",
+    "bytes_are_device_only": true
+  },
+  "workspace": {
+    "persistent": {
+      "hc_residual_pingpong_bf16": 5242880,
+      "normalized_layer_input_fp16": 655360,
+      "layer_output_fp32": 1310720,
+      "candidate_block_ids_i32": 524288,
+      "selected_key_ids_i32": 131072,
+      "token_positions_and_flags": 1024
+    },
+    "phase_terms": {
+      "moe": {
+        "contributions_by_token_topk_fp32": 7864320,
+        "route_ids_weights_and_stable_sort_arrays": 12288,
+        "counts_offsets": 9240,
+        "gate_up_hadamard_inputs_fp16": 10485760,
+        "gate_up_results_fp32": 9437184,
+        "down_input_and_hadamard_fp16": 4718592,
+        "down_result_fp16": 5242880,
+        "wave_row_metadata": 6144,
+        "external_sort_workspace_allowance": 33554432,
+        "native_kernel_extra_allowance": 67108864
+      },
+      "attention": {
+        "query_bf16": 4194304,
+        "kv_gather_shared_across_heads_bf16": 4194304,
+        "score_slab_fp32": 1048576,
+        "online_output_accumulator_fp32": 8388608,
+        "attention_output_bf16": 4194304,
+        "online_max_and_lse_fp32": 32768,
+        "native_kernel_extra_allowance": 67108864
+      },
+      "indexer": {
+        "queries_bf16": 131072,
+        "key_slab_bf16": 1048576,
+        "head_score_tile_fp32": 1048576,
+        "accumulated_scores_fp32": 262144,
+        "topk_merge_pairs_i32_fp32": 589824,
+        "candidate_merge_pairs_i32_fp32": 786432,
+        "native_kernel_extra_allowance": 67108864
+      },
+      "engram": {
+        "raw_fp8_e8m0_rows": 405504,
+        "decoded_rows_fp32": 1572864,
+        "gated_rows_and_projection_fp32": 2883584,
+        "native_kernel_extra_allowance": 67108864
+      },
+      "dense": {
+        "gemm_activation_slab_bf16": 4194304,
+        "native_kernel_extra_allowance": 67108864
+      },
+      "head_last_row": {
+        "one_requested_row_logits_fp32": 517120,
+        "head_activation_allowance": 81920,
+        "native_kernel_extra_allowance": 67108864
+      }
+    },
+    "phase_total_bytes": {
+      "moe": 146305048,
+      "attention": 97027072,
+      "indexer": 78840832,
+      "engram": 79836160,
+      "dense": 79168512,
+      "head_last_row": 75573248
+    },
+    "peak_phase": "moe",
+    "peak_bytes": 146305048,
+    "row_capacity": 384,
+    "bounded_live_wave_rows": 512,
+    "attention_query_tile_effective": 64,
+    "index_key_tile_effective": 4096,
+    "head_policy": "last request row only; teacher-forced all-row logits require streamed head or a distinct contract",
+    "buffer_reuse_requires": "all last-consumer CUDA events complete; eager only",
+    "unknown_runtime_native_requirements": true
+  },
+  "state": {
+    "format": "reference_bf16",
+    "source_banks": [
+      {
+        "source_layer": 2,
+        "compression": 2,
+        "logical_rows": 16384,
+        "allocated_rows": 16384,
+        "bytes": 20971520
+      },
+      {
+        "source_layer": 8,
+        "compression": 2,
+        "logical_rows": 16384,
+        "allocated_rows": 16384,
+        "bytes": 20971520
+      },
+      {
+        "source_layer": 14,
+        "compression": 2,
+        "logical_rows": 16384,
+        "allocated_rows": 16384,
+        "bytes": 20971520
+      },
+      {
+        "source_layer": 20,
+        "compression": 1,
+        "logical_rows": 32768,
+        "allocated_rows": 32768,
+        "bytes": 41943040
+      }
+    ],
+    "global_bytes_per_session": 104857600,
+    "swa_bytes_per_session": 5242880,
+    "compressor_bytes_per_session": 30720,
+    "page_table_bytes_per_session": 2560,
+    "metadata_allowance_per_session": 65536,
+    "bytes_per_session": 110199296,
+    "allocated_slots": 1,
+    "total_bytes": 110199296,
+    "asymptotic_global_bytes_per_token": 3200.0,
+    "evidence": "EXPLICIT_PLANNED_LAYOUT; not the legacy v0.1 allocator or stock vLLM allocation"
+  },
+  "device": {
+    "bytes": 25769803776,
+    "terms_before_hot_cache": {
+      "mandatory_device_weight_budget": 10817285568,
+      "persistent_session_state": 110199296,
+      "expert_ring": 532654080,
+      "phase_workspace_peak": 146305048,
+      "external_runtime_allowance": 1073741824,
+      "safety_margin": 1073741824
+    },
+    "before_hot_cache_bytes": 13753927640,
+    "hot_slots": 902,
+    "hot_cache_bytes": 12011349504,
+    "planned_peak_bytes": 25765277144,
+    "remaining_after_safety_bytes": 4526632
+  },
+  "host": {
+    "bytes": 137438953472,
+    "noncache_terms": {
+      "system_other_and_safety": 19327352832,
+      "runtime_metadata_and_cpu_scratch": 8589934592,
+      "page_cache_allowance": 4294967296,
+      "engram_row_cache": 2147483648,
+      "pinned_expert_staging": 1065308160,
+      "engram_chunk_double_buffer": 1622016,
+      "gpu_hot_expert_explicit_host_backup": 0
+    },
+    "warm_slots": 7660,
+    "warm_cache_bytes": 102003256320,
+    "planned_peak_bytes": 137429924864,
+    "remaining_after_reserves_bytes": 9028608
+  },
+  "cold_expert_count_design": 6798,
+  "cold_payload_bytes_design": 90519421608,
+  "fit_under_declared_design_contract": true,
+  "errors": [],
+  "can_launch": false,
+  "performance_prediction": null,
+  "launch_blockers": [
+    "exact checkpoint audit and checksums",
+    "TP1 GPU kernel + model numerical qualification",
+    "measured mandatory/native/allocator peak bounds",
+    "actual hardware/cgroup preflight"
+  ],
+  "assumptions": [
+    "This TP1 executor is a design contract, not the existing two-Spark runtime.",
+    "Full forty-layer prefill; no unqualified CED decoder truncation or speculative acceleration.",
+    "Expert admission is route-exact; no top-k pruning; source bundle markers/headers must be audited.",
+    "Nonexpert budget defaults to source-ledger active-minus-routed including vision; not a measured allocation.",
+    "Native workspace allowances are explicit trial reservations; measured upper bounds must replace them.",
+    "KV profile is explicit; packed_890 is an unqualified planned layout, not a claimed vLLM feature.",
+    "No whole-model/whole-layer FP16 reconstruction; RAM stores packed expert bytes.",
+    "Combined resident capacities assume exclusive placement; they are not a cache hit-rate estimate.",
+    "Host page cache is accounted separately; actual cgroup/physical I/O and peak memory still need measurement."
+  ],
+  "plan_digest": "a884493e25f91eba7eb1caf473832ea51d42c02dc8e7b5a0ebddee75e03af1db"
+}

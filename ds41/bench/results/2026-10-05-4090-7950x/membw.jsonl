@@ -1,0 +1,6 @@
+{"threads": 1, "gib": 8, "read_gbps": 42.81, "copy_gbps_rw": 29.97, "sink": 0}
+{"threads": 2, "gib": 8, "read_gbps": 48.50, "copy_gbps_rw": 31.28, "sink": 0}
+{"threads": 4, "gib": 8, "read_gbps": 48.68, "copy_gbps_rw": 30.74, "sink": 0}
+{"threads": 8, "gib": 8, "read_gbps": 47.51, "copy_gbps_rw": 29.95, "sink": 0}
+{"threads": 16, "gib": 8, "read_gbps": 46.13, "copy_gbps_rw": 29.05, "sink": 0}
+{"threads": 32, "gib": 8, "read_gbps": 45.32, "copy_gbps_rw": 28.82, "sink": 0}

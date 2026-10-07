@@ -1,0 +1,6 @@
+{"id": "zh_moe", "thinking_mode": "chat", "messages": [{"role": "user", "content": "用三段话解释什么是混合专家模型（MoE），以及它为什么适合在显存小的电脑上运行。"}]}
+{"id": "zh_mail", "thinking_mode": "chat", "messages": [{"role": "user", "content": "帮我写一封简短的邮件，通知团队下周三的产品评审改到周四下午三点。"}]}
+{"id": "zh_pcie", "thinking_mode": "chat", "messages": [{"role": "user", "content": "比较 PCIe 4.0 和 PCIe 5.0 的带宽，并说明它们对本地大模型推理有什么影响。"}]}
+{"id": "code_st", "thinking_mode": "chat", "messages": [{"role": "user", "content": "Write a Python function that reads a safetensors file header and returns a dict mapping tensor name to (dtype, shape). Include error handling."}]}
+{"id": "code_lru", "thinking_mode": "chat", "messages": [{"role": "user", "content": "Implement a thread-safe LRU cache template in C++ with get and put, then explain the locking strategy in two sentences."}]}
+{"id": "code_zsh", "thinking_mode": "chat", "messages": [{"role": "user", "content": "下面的脚本在 zsh 里运行时 for 循环只执行一次，为什么？怎么修？\n```bash\nPKGS=\"a b c\"\nfor p in $PKGS; do echo $p; done\n```"}]}

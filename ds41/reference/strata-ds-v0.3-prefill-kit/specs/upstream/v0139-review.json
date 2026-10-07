@@ -1,0 +1,138 @@
+{
+  "schema_version": 1,
+  "design_version": "0.2.1",
+  "reference": {
+    "repo": "Niko1221/Strata",
+    "tag": "v0.1.39",
+    "commit": "6f32ec070f23ced9f50e704d854d775da52591ab",
+    "prior_baseline_commit": "99f3dbd0b21d1401b3769e0c0d963913607f380b",
+    "release_id": 403010090,
+    "release_published_at_utc": "2026-10-04T12:32:47Z",
+    "review_date": "2026-10-04",
+    "purpose": "Reference mechanisms; NOT DeepSeek or EXL3 runtime",
+    "review_scope": "Targeted source snapshots and release/doc review; not a complete repository diff audit",
+    "reviewed_files": [
+      {
+        "path": "docs/BATCHING.md",
+        "git_blob_sha1": "7672dcc586152372712e8ef18b1c8a953c32738d",
+        "scope": "documentation; exactness, scheduling, penalties, performance scope"
+      },
+      {
+        "path": "src/prefill/prefill.cpp",
+        "git_blob_sha1": "e76fb6ddc12c43cc151724e62bc778918acc67c3",
+        "scope": "lines 1-190, ring and architecture constants"
+      },
+      {
+        "path": "include/strata/platform/memory.hpp",
+        "git_blob_sha1": "202a3bf25b258c70c55190726aacc46abe515ee7",
+        "scope": "file_cache_keeps contract"
+      },
+      {
+        "path": "src/core/expert_source.cpp",
+        "git_blob_sha1": "98e1952d67c4683268593ae3bb9b4c39485b3704",
+        "scope": "lines 1-180 plus #577 search fragments"
+      },
+      {
+        "path": "serve/responses.py",
+        "git_blob_sha1": "4a017c38d83e7814de6d26146b6ec5591e86bb1e",
+        "scope": "lines 1-190 and 200-355; not entire security audit"
+      }
+    ],
+    "baseline_prefill_blob_sha1": "5d46e4bfb9fde25a58ebd70df86a863d67acebe0",
+    "upstream_source_compiled": false,
+    "upstream_gpu_tested": false,
+    "all_existing_model_asset_pins_preserved": true,
+    "model_assets_revalidated_this_update": false
+  },
+  "decisions": [
+    {
+      "area": "memory_and_io",
+      "decision": "P0_ADAPT",
+      "issues": [
+        "577",
+        "620",
+        "633"
+      ],
+      "source_paths": [
+        "include/strata/platform/memory.hpp",
+        "src/core/expert_source.cpp"
+      ]
+    },
+    {
+      "area": "prefill_ring",
+      "decision": "P0_CONTRACT_P1_IMPLEMENT",
+      "issues": [
+        "583"
+      ],
+      "source_paths": [
+        "src/prefill/prefill.cpp"
+      ]
+    },
+    {
+      "area": "responses",
+      "decision": "P0_PROTOCOL_P1_REAL_E2E",
+      "issues": [
+        "451"
+      ],
+      "source_paths": [
+        "serve/responses.py"
+      ]
+    },
+    {
+      "area": "batching",
+      "decision": "P1_REBUILD_DS_STATE",
+      "issues": [
+        "465",
+        "559",
+        "656"
+      ],
+      "source_paths": [
+        "docs/BATCHING.md"
+      ]
+    },
+    {
+      "area": "verify_fastpath",
+      "decision": "P2_PROFILE_FIRST",
+      "issues": [
+        "646"
+      ],
+      "source_paths": [
+        "src/core/verify.cpp",
+        "src/kernels/cuda/verify_kernels.cu"
+      ]
+    },
+    {
+      "area": "platform",
+      "decision": "OBSERVE_FIRST_OPTIMIZE_LATER",
+      "issues": [
+        "650",
+        "626",
+        "622"
+      ],
+      "source_paths": []
+    },
+    {
+      "area": "old_gpu_sycl_multi_gpu",
+      "decision": "DEFER",
+      "issues": [
+        "395",
+        "423",
+        "578",
+        "598",
+        "663"
+      ],
+      "source_paths": []
+    }
+  ],
+  "not_claimed": [
+    "DeepSeek support added by Strata v0.1.39",
+    "EXL3 kernels portable without qualification",
+    "default batching bitwise exact",
+    "all cited PR branches merged verbatim"
+  ],
+  "upstream_pr_583": {
+    "state": "closed",
+    "merged": false,
+    "use_tag_source_not_branch": true
+  }
+}

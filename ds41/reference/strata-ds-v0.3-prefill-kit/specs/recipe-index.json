@@ -1,0 +1,17 @@
+{
+  "recipes": [
+    "exl3-3-r256-v24",
+    "exl3-3-r192-v24",
+    "exl3-3-r128-v24",
+    "exl3-3-r128-v16",
+    "exl3-3-r256-v16",
+    "q2-r128-v24",
+    "q2-r128-v16",
+    "q2-r192-v24",
+    "exl3-3-r384-v24",
+    "native-r384-v24",
+    "sage-1.59-r128-v24"
+  ],
+  "core_count": 8,
+  "optional_count": 3
+}

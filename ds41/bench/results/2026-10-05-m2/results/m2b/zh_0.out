@@ -1,0 +1,4 @@
+generated:
+teacher_forced_mean_nll 3.618278 ppl 37.2733 over 199 tokens
+decode_ms_per_token 203.6 over 200 steps (cpu experts 155.7)
+vram_expert_slots 896 hit_rate 0.5106

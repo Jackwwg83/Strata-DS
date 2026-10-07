@@ -1,0 +1,405 @@
+{
+ "sequences": {
+  "chat_0": {
+   "kind": "prefill",
+   "tokens": 2702
+  },
+  "chat_1": {
+   "kind": "prefill",
+   "tokens": 2675
+  },
+  "chat_2": {
+   "kind": "prefill",
+   "tokens": 2852
+  },
+  "chat_3": {
+   "kind": "prefill",
+   "tokens": 2997
+  },
+  "code_cpp_0": {
+   "kind": "prefill",
+   "tokens": 4012
+  },
+  "code_cpp_1": {
+   "kind": "prefill",
+   "tokens": 4069
+  },
+  "code_cpp_2": {
+   "kind": "prefill",
+   "tokens": 4023
+  },
+  "code_cpp_3": {
+   "kind": "prefill",
+   "tokens": 4096
+  },
+  "code_cpp_4": {
+   "kind": "prefill",
+   "tokens": 3946
+  },
+  "code_cpp_5": {
+   "kind": "prefill",
+   "tokens": 4000
+  },
+  "code_py_0": {
+   "kind": "prefill",
+   "tokens": 3844
+  },
+  "code_py_1": {
+   "kind": "prefill",
+   "tokens": 3810
+  },
+  "code_py_2": {
+   "kind": "prefill",
+   "tokens": 4031
+  },
+  "code_py_3": {
+   "kind": "prefill",
+   "tokens": 3607
+  },
+  "code_py_4": {
+   "kind": "prefill",
+   "tokens": 3973
+  },
+  "code_py_5": {
+   "kind": "prefill",
+   "tokens": 3274
+  },
+  "en_0": {
+   "kind": "prefill",
+   "tokens": 4096
+  },
+  "en_1": {
+   "kind": "prefill",
+   "tokens": 4096
+  },
+  "en_2": {
+   "kind": "prefill",
+   "tokens": 4096
+  },
+  "en_3": {
+   "kind": "prefill",
+   "tokens": 3934
+  },
+  "en_4": {
+   "kind": "prefill",
+   "tokens": 4096
+  },
+  "en_5": {
+   "kind": "prefill",
+   "tokens": 4096
+  },
+  "zh_0": {
+   "kind": "prefill",
+   "tokens": 2964
+  },
+  "zh_1": {
+   "kind": "prefill",
+   "tokens": 2872
+  },
+  "zh_2": {
+   "kind": "prefill",
+   "tokens": 3047
+  },
+  "zh_3": {
+   "kind": "prefill",
+   "tokens": 3207
+  },
+  "zh_4": {
+   "kind": "prefill",
+   "tokens": 3109
+  },
+  "zh_5": {
+   "kind": "prefill",
+   "tokens": 3231
+  },
+  "gen_code_lru": {
+   "kind": "decode",
+   "tokens": 128
+  },
+  "gen_code_st": {
+   "kind": "decode",
+   "tokens": 128
+  },
+  "gen_code_zsh": {
+   "kind": "decode",
+   "tokens": 128
+  },
+  "gen_zh_mail": {
+   "kind": "decode",
+   "tokens": 59
+  },
+  "gen_zh_moe": {
+   "kind": "decode",
+   "tokens": 128
+  },
+  "gen_zh_pcie": {
+   "kind": "decode",
+   "tokens": 128
+  }
+ },
+ "tokens_total": 101454,
+ "skew_all": {
+  "top_1pct_pairs_share": 0.1521331917256425,
+  "top_5pct_pairs_share": 0.355709484101169,
+  "top_10pct_pairs_share": 0.4938990002037048,
+  "top_20pct_pairs_share": 0.6650240913780301,
+  "top_50pct_pairs_share": 0.910539793075351
+ },
+ "skew_per_layer_top10pct_median": 0.4930962143763019,
+ "pairs_never_used": 39,
+ "static_hit_curve": {
+  "0": 0.0,
+  "100": 0.10642595866974175,
+  "250": 0.177998326627657,
+  "500": 0.25585458645607634,
+  "850": 0.3370888473437187,
+  "1000": 0.3660145948959787,
+  "2000": 0.509003167259128,
+  "4000": 0.6923173599412118,
+  "6000": 0.8083508060210416,
+  "8000": 0.8889163691365675,
+  "10000": 0.9426009021067979,
+  "12000": 0.9764447742177751,
+  "15360": 1.0
+ },
+ "tiers_128gb": {
+  "3.0bpw_16GB": {
+   "vram_experts": 266,
+   "ram_experts": 7677,
+   "vram_share": 0.18338432111499062,
+   "ram_share": 0.7036567536084837,
+   "ssd_share": 0.11295892527652562
+  },
+  "3.0bpw_24GB": {
+   "vram_experts": 870,
+   "ram_experts": 7677,
+   "vram_share": 0.34063569044202735,
+   "ram_share": 0.564890142202003,
+   "ssd_share": 0.0944741673559697
+  },
+  "2.5bpw_16GB": {
+   "vram_experts": 319,
+   "ram_experts": 9206,
+   "vram_share": 0.20129378568403103,
+   "ram_share": 0.7301617229403276,
+   "ssd_share": 0.06854449137564139
+  },
+  "2.5bpw_24GB": {
+   "vram_experts": 1044,
+   "ram_experts": 9206,
+   "vram_share": 0.37401949108699034,
+   "ram_share": 0.5734958491623205,
+   "ssd_share": 0.052484659750689173
+  },
+  "2.0bpw_16GB": {
+   "vram_experts": 398,
+   "ram_experts": 11496,
+   "vram_share": 0.22655715714760305,
+   "ram_share": 0.748277607845993,
+   "ssd_share": 0.02516523500640419
+  },
+  "2.0bpw_24GB": {
+   "vram_experts": 1304,
+   "ram_experts": 11496,
+   "vram_share": 0.4172221122291919,
+   "ram_share": 0.5680316231879159,
+   "ssd_share": 0.014746264582892148
+  },
+  "1.59bpw_16GB": {
+   "vram_experts": 499,
+   "ram_experts": 14422,
+   "vram_share": 0.2555214756427175,
+   "ram_share": 0.7431476951857047,
+   "ssd_share": 0.0013308291715777637
+  },
+  "1.59bpw_24GB": {
+   "vram_experts": 1635,
+   "ram_experts": 13725,
+   "vram_share": 0.4646072452585373,
+   "ram_share": 0.5353927547414628,
+   "ssd_share": 0.0
+  }
+ },
+ "adaptive_vs_static": {
+  "260": {
+   "static": 0.18110329110890616,
+   "adaptive": 0.3397192054390045
+  },
+  "850": {
+   "static": 0.3370888473437187,
+   "adaptive": 0.5305414080310771
+  }
+ },
+ "window_distinct_ratio": {
+  "1": 1.0,
+  "2": 0.843659841748651,
+  "3": 0.7601328288057322,
+  "4": 0.7040634613867635,
+  "6": 0.629273760425711,
+  "8": 0.577689307232878
+ },
+ "measured_constants": {
+  "cpu_expert_gbps": 46.1,
+  "nvme_13m_gbps": 6.759,
+  "gpu_dense_ms": 8.907985747222805,
+  "gpu_expert_us": 40.03
+ },
+ "decode_estimate_no_spec": {
+  "3.0bpw_16GB": {
+   "cpu_ms": 48.8,
+   "gpu_ms": 10.7,
+   "ssd_ms": 53.4,
+   "tok_s": 9.8
+  },
+  "3.0bpw_24GB": {
+   "cpu_ms": 39.2,
+   "gpu_ms": 12.2,
+   "ssd_ms": 44.7,
+   "tok_s": 11.9
+  },
+  "2.5bpw_16GB": {
+   "cpu_ms": 42.2,
+   "gpu_ms": 10.8,
+   "ssd_ms": 27.0,
+   "tok_s": 14.4
+  },
+  "2.5bpw_24GB": {
+   "cpu_ms": 33.2,
+   "gpu_ms": 12.5,
+   "ssd_ms": 20.7,
+   "tok_s": 18.6
+  },
+  "2.0bpw_16GB": {
+   "cpu_ms": 34.6,
+   "gpu_ms": 11.1,
+   "ssd_ms": 7.9,
+   "tok_s": 23.5
+  },
+  "2.0bpw_24GB": {
+   "cpu_ms": 26.3,
+   "gpu_ms": 12.9,
+   "ssd_ms": 4.7,
+   "tok_s": 32.3
+  },
+  "1.59bpw_16GB": {
+   "cpu_ms": 27.4,
+   "gpu_ms": 11.4,
+   "ssd_ms": 0.3,
+   "tok_s": 36.0
+  },
+  "1.59bpw_24GB": {
+   "cpu_ms": 19.8,
+   "gpu_ms": 13.4,
+   "ssd_ms": 0.0,
+   "tok_s": 50.6
+  }
+ },
+ "tiers_128gb_adaptive": {
+  "3.0bpw_16GB": {
+   "vram_experts": 266,
+   "ram_experts": 7677,
+   "vram_share": 0.34344996707791803,
+   "ram_share": 0.5435911076455563,
+   "ssd_share": 0.11295892527652562
+  },
+  "3.0bpw_24GB": {
+   "vram_experts": 870,
+   "ram_experts": 7677,
+   "vram_share": 0.5342994713311902,
+   "ram_share": 0.37122636131284015,
+   "ssd_share": 0.0944741673559697
+  },
+  "2.5bpw_16GB": {
+   "vram_experts": 319,
+   "ram_experts": 9206,
+   "vram_share": 0.37296819832301126,
+   "ram_share": 0.5584873103013472,
+   "ssd_share": 0.06854449137564139
+  },
+  "2.5bpw_24GB": {
+   "vram_experts": 1044,
+   "ram_experts": 9206,
+   "vram_share": 0.5641719795424242,
+   "ram_share": 0.3833433607068867,
+   "ssd_share": 0.052484659750689173
+  },
+  "2.0bpw_16GB": {
+   "vram_experts": 398,
+   "ram_experts": 11496,
+   "vram_share": 0.4073538041893632,
+   "ram_share": 0.5674809608042326,
+   "ssd_share": 0.02516523500640419
+  },
+  "2.0bpw_24GB": {
+   "vram_experts": 1304,
+   "ram_experts": 11496,
+   "vram_share": 0.6011034770184542,
+   "ram_share": 0.38415025839865363,
+   "ssd_share": 0.014746264582892148
+  },
+  "1.59bpw_16GB": {
+   "vram_experts": 499,
+   "ram_experts": 14422,
+   "vram_share": 0.44340827343737077,
+   "ram_share": 0.5552608973910514,
+   "ssd_share": 0.0013308291715777637
+  },
+  "1.59bpw_24GB": {
+   "vram_experts": 1635,
+   "ram_experts": 13725,
+   "vram_share": 0.6394047959189642,
+   "ram_share": 0.36059520408103585,
+   "ssd_share": 0.0
+  }
+ },
+ "decode_estimate_no_spec_adaptive": {
+  "3.0bpw_16GB": {
+   "cpu_ms": 37.7,
+   "gpu_ms": 12.2,
+   "ssd_ms": 53.4,
+   "tok_s": 11.0
+  },
+  "3.0bpw_24GB": {
+   "cpu_ms": 25.7,
+   "gpu_ms": 14.0,
+   "ssd_ms": 44.7,
+   "tok_s": 14.2
+  },
+  "2.5bpw_16GB": {
+   "cpu_ms": 32.3,
+   "gpu_ms": 12.5,
+   "ssd_ms": 27.0,
+   "tok_s": 16.9
+  },
+  "2.5bpw_24GB": {
+   "cpu_ms": 22.2,
+   "gpu_ms": 14.3,
+   "ssd_ms": 20.7,
+   "tok_s": 23.3
+  },
+  "2.0bpw_16GB": {
+   "cpu_ms": 26.3,
+   "gpu_ms": 12.8,
+   "ssd_ms": 7.9,
+   "tok_s": 29.2
+  },
+  "2.0bpw_24GB": {
+   "cpu_ms": 17.8,
+   "gpu_ms": 14.7,
+   "ssd_ms": 4.7,
+   "tok_s": 44.6
+  },
+  "1.59bpw_16GB": {
+   "cpu_ms": 20.5,
+   "gpu_ms": 13.2,
+   "ssd_ms": 0.3,
+   "tok_s": 48.0
+  },
+  "1.59bpw_24GB": {
+   "cpu_ms": 13.3,
+   "gpu_ms": 15.1,
+   "ssd_ms": 0.0,
+   "tok_s": 66.4
+  }
+ }
+}

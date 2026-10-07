@@ -1,0 +1,23 @@
+layer 10: 384 experts, 13315596 bytes each
+{'path': 'gemv', 'proj': 'w1', 'rows': 1, 'us': 11.44, 'weight_gbps': 388.1}
+{'path': 'gemv', 'proj': 'w2', 'rows': 1, 'us': 9.86, 'weight_gbps': 450.3}
+{'path': 'gemv', 'proj': 'w1', 'rows': 2, 'us': 14.88, 'weight_gbps': 298.3}
+{'path': 'gemv', 'proj': 'w2', 'rows': 2, 'us': 12.47, 'weight_gbps': 356.0}
+{'path': 'gemv', 'proj': 'w1', 'rows': 4, 'us': 11.3, 'weight_gbps': 392.8}
+{'path': 'gemv', 'proj': 'w2', 'rows': 4, 'us': 11.21, 'weight_gbps': 396.1}
+{'path': 'gemv', 'proj': 'w1', 'rows': 6, 'us': 11.42, 'weight_gbps': 388.8}
+{'path': 'gemv', 'proj': 'w2', 'rows': 6, 'us': 11.98, 'weight_gbps': 370.6}
+{'path': 'gemv', 'proj': 'w1', 'rows': 8, 'us': 11.54, 'weight_gbps': 384.6}
+{'path': 'gemv', 'proj': 'w2', 'rows': 8, 'us': 12.86, 'weight_gbps': 345.3}
+{'path': 'gemv', 'proj': 'w1', 'rows': 16, 'us': 16.68, 'weight_gbps': 266.1}
+{'path': 'gemv', 'proj': 'w2', 'rows': 16, 'us': 13.08, 'weight_gbps': 339.4}
+{'path': 'reconstruct_gemm', 'proj': 'w1', 'rows': 64, 'us': 30.8, 'tflops': 49.04}
+{'path': 'reconstruct_gemm', 'proj': 'w2', 'rows': 64, 'us': 30.9, 'tflops': 48.83}
+{'path': 'reconstruct_gemm', 'proj': 'w1', 'rows': 256, 'us': 68.1, 'tflops': 88.7}
+{'path': 'reconstruct_gemm', 'proj': 'w2', 'rows': 256, 'us': 69.7, 'tflops': 86.68}
+{'path': 'reconstruct_gemm', 'proj': 'w1', 'rows': 1024, 'us': 205.2, 'tflops': 117.73}
+{'path': 'reconstruct_gemm', 'proj': 'w2', 'rows': 1024, 'us': 167.1, 'tflops': 144.61}
+{'path': 'reconstruct_gemm', 'proj': 'w1', 'rows': 2048, 'us': 322.9, 'tflops': 149.62}
+{'path': 'reconstruct_gemm', 'proj': 'w2', 'rows': 2048, 'us': 283.4, 'tflops': 170.51}
+{'path': 'reconstruct_gemm', 'proj': 'w1', 'rows': 4096, 'us': 561.6, 'tflops': 172.09}
+{'path': 'reconstruct_gemm', 'proj': 'w2', 'rows': 4096, 'us': 532.7, 'tflops': 181.41}

@@ -1,0 +1,8 @@
+[07:49:33] /project/src/transform/thread_storage_sync.cc:841: Warning: [ThreadSync] Hoisting sync from inside if to before if. Condition depends on runtime value: thread_binding % 32 // 4 * 4 + thread_binding % 128 // 32 == 0
+[07:49:33] /project/src/transform/thread_storage_sync.cc:841: Warning: [ThreadSync] Hoisting sync from inside if to before if. Condition depends on runtime value: thread_binding % 32 // 4 * 4 + thread_binding % 128 // 32 == 0
+[07:49:34] /project/src/transform/thread_storage_sync.cc:841: Warning: [ThreadSync] Hoisting sync from inside if to before if. Condition depends on runtime value: thread_binding % 32 // 4 * 4 + thread_binding % 128 // 32 == 0
+[transformers] You are using a model of type `deepseek_v41` to instantiate a model of type ``. This may be expected if you are loading a checkpoint that shares a subset of the architecture (e.g., loading a `sam2_video` checkpoint into `Sam2Model`), but is otherwise not supported and can yield errors. Please verify that the checkpoint is compatible with the model you are instantiating.
+TileLang sparse_attn unusable here (Failed to set the allowed dynamic shared memory size to 141312); using the torch version
+model ready {'kernels': 'tilelang+torch_sparse_attn', 'load_s': 3.8, 'gpu_alloc_gib_after_load': 10.56}
+{"id": "smoke_zh", "prompt_tokens": 9, "new_tokens": 24, "prefill_s": 47.56, "decode_s_per_token_median": 0.675, "output": "我是 DeepSeek，由深度求索公司创造的 AI 助手，随时准备为你解答问题、提供帮助！"}
+done

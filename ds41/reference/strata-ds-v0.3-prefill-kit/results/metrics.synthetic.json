@@ -1,0 +1,35 @@
+{
+  "trial_id": "synthetic-trial",
+  "condition_sha256": "synthetic-condition",
+  "provenance": "synthetic_test",
+  "requests": 2,
+  "completed_requests": 2,
+  "failure_or_cancel_rate": 0.0,
+  "wall_seconds": 5.0,
+  "goodput_output_tokens": 5,
+  "all_output_tokens": 5,
+  "aggregate_goodput_tok_s": 1.0,
+  "per_completed_request": [
+    {
+      "request_id": "a",
+      "ttft_ms": 1000.0,
+      "decode_tokens_per_second": 1.0
+    },
+    {
+      "request_id": "b",
+      "ttft_ms": 2000.0,
+      "decode_tokens_per_second": 0.5
+    }
+  ],
+  "ttft_ms": {
+    "p50": 1500.0,
+    "p95": 1950.0,
+    "p99": 1990.0
+  },
+  "tpot_ms": {
+    "p50": 1000.0,
+    "p95": 1900.0,
+    "p99": 1980.0
+  },
+  "note": "Goodput includes trial wall time of failed/cancelled requests; per-request rates are never summed."
+}

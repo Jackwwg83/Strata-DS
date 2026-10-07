@@ -78,6 +78,7 @@ struct Req {
 }  // namespace
 
 struct DirectFile::Impl {
+    int requested = 0;   // set_threads(): issuing threads, 0 = the default
     HANDLE file = INVALID_HANDLE_VALUE;
     HANDLE port = nullptr;
     uint64_t size = 0;
@@ -149,6 +150,7 @@ struct DirectFile::Impl {
 };
 
 DirectFile::DirectFile() : impl_(new Impl) {}
+void DirectFile::set_threads(int n) { impl_->requested = n; }
 DirectFile::~DirectFile() {
     close();
     for (Req* r : impl_->all_reqs) delete r;
@@ -183,7 +185,7 @@ bool DirectFile::open(const std::string& path, std::string& err) {
     }
     // Completions of reads that finish synchronously are still queued to the port, so every issued read
     // produces exactly one packet; `wait` is the only completion path.
-    const int n = io_threads(4);
+    const int n = io_threads(impl_->requested > 0 ? impl_->requested : 4);
     for (int i = 0; i < n; ++i) impl_->pool.emplace_back([this] { impl_->worker(); });
     return true;
 }
@@ -264,6 +266,7 @@ void DirectFile::wake() {
 // count is the queue depth).  It replaced one synchronous pread inside `submit`, which read the n-gram table's
 // rows one at a time.
 struct DirectFile::Impl {
+    int requested = 0;   // set_threads(): issuing threads, 0 = the default
     int fd = -1;
     uint64_t size = 0;
     std::mutex mu;
@@ -301,6 +304,7 @@ struct DirectFile::Impl {
 };
 
 DirectFile::DirectFile() : impl_(new Impl) {}
+void DirectFile::set_threads(int n) { impl_->requested = n; }
 DirectFile::~DirectFile() { close(); delete impl_; }
 
 bool DirectFile::open(const std::string& path, std::string& err) {
@@ -310,7 +314,7 @@ bool DirectFile::open(const std::string& path, std::string& err) {
     struct stat st;
     if (fstat(impl_->fd, &st) != 0) { err = "DirectFile: cannot size " + path; close(); return false; }
     impl_->size = (uint64_t) st.st_size;
-    const int n = io_threads(16);
+    const int n = io_threads(impl_->requested > 0 ? impl_->requested : 16);
     for (int i = 0; i < n; ++i) impl_->pool.emplace_back([this] { impl_->worker(); });
     return true;
 }

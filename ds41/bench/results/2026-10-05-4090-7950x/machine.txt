@@ -1,0 +1,141 @@
+## date_utc
+2026-10-05T05:58:51Z
+## uname
+Linux a8421e784745 5.15.0-153-generic #163-Ubuntu SMP Thu Aug 7 16:37:18 UTC 2025 x86_64 x86_64 x86_64 GNU/Linux
+## nvidia-smi
+Mon Oct  5 05:58:51 2026       
++-----------------------------------------------------------------------------------------+
+| NVIDIA-SMI 580.65.06              Driver Version: 580.65.06      CUDA Version: 13.0     |
++-----------------------------------------+------------------------+----------------------+
+| GPU  Name                 Persistence-M | Bus-Id          Disp.A | Volatile Uncorr. ECC |
+| Fan  Temp   Perf          Pwr:Usage/Cap |           Memory-Usage | GPU-Util  Compute M. |
+|                                         |                        |               MIG M. |
+|=========================================+========================+======================|
+|   0  NVIDIA GeForce RTX 4090        On  |   00000000:01:00.0 Off |                  Off |
+|  0%   29C    P8             29W /  450W |       1MiB /  24564MiB |      0%      Default |
+|                                         |                        |                  N/A |
++-----------------------------------------+------------------------+----------------------+
+
++-----------------------------------------------------------------------------------------+
+| Processes:                                                                              |
+|  GPU   GI   CI              PID   Type   Process name                        GPU Memory |
+|        ID   ID                                                               Usage      |
+|=========================================================================================|
+|  No running processes found                                                             |
++-----------------------------------------------------------------------------------------+
+## gpu_query
+name, memory.total [MiB], driver_version, pcie.link.gen.max, pcie.link.gen.current, pcie.link.width.max, pcie.link.width.current, clocks.max.memory [MHz], power.limit [W]
+NVIDIA GeForce RTX 4090, 24564 MiB, 580.65.06, 4, 1, 16, 16, 10501 MHz, 450.00 W
+## lscpu
+Architecture:                            x86_64
+CPU op-mode(s):                          32-bit, 64-bit
+Address sizes:                           48 bits physical, 48 bits virtual
+Byte Order:                              Little Endian
+CPU(s):                                  32
+On-line CPU(s) list:                     0-31
+Vendor ID:                               AuthenticAMD
+Model name:                              AMD Ryzen 9 7950X 16-Core Processor
+CPU family:                              25
+Model:                                   97
+Thread(s) per core:                      2
+Core(s) per socket:                      16
+Socket(s):                               1
+Stepping:                                2
+Frequency boost:                         enabled
+CPU max MHz:                             4500.0000
+CPU min MHz:                             3000.0000
+BogoMIPS:                                9000.06
+Flags:                                   fpu vme de pse tsc msr pae mce cx8 apic sep mtrr pge mca cmov pat pse36 clflush mmx fxsr sse sse2 ht syscall nx mmxext fxsr_opt pdpe1gb rdtscp lm constant_tsc rep_good nopl nonstop_tsc cpuid extd_apicid aperfmperf rapl pni pclmulqdq monitor ssse3 fma cx16 sse4_1 sse4_2 movbe popcnt aes xsave avx f16c rdrand lahf_lm cmp_legacy svm extapic cr8_legacy abm sse4a misalignsse 3dnowprefetch osvw ibs skinit wdt tce topoext perfctr_core perfctr_nb bpext perfctr_llc mwaitx cpb cat_l3 cdp_l3 hw_pstate ssbd mba ibrs ibpb stibp ibrs_enhanced vmmcall fsgsbase bmi1 avx2 smep bmi2 erms invpcid cqm rdt_a avx512f avx512dq rdseed adx smap avx512ifma clflushopt clwb avx512cd sha_ni avx512bw avx512vl xsaveopt xsavec xgetbv1 xsaves cqm_llc cqm_occup_llc cqm_mbm_total cqm_mbm_local avx512_bf16 clzero irperf xsaveerptr rdpru wbnoinvd cppc arat npt lbrv svm_lock nrip_save tsc_scale vmcb_clean flushbyasid decodeassists pausefilter pfthreshold avic v_vmsave_vmload vgif v_spec_ctrl avx512vbmi umip pku ospke avx512_vbmi2 gfni vaes vpclmulqdq avx512_vnni avx512_bitalg avx512_vpopcntdq rdpid overflow_recov succor smca fsrm flush_l1d
+Virtualization:                          AMD-V
+L1d cache:                               512 KiB (16 instances)
+L1i cache:                               512 KiB (16 instances)
+L2 cache:                                16 MiB (16 instances)
+L3 cache:                                64 MiB (2 instances)
+NUMA node(s):                            1
+NUMA node0 CPU(s):                       0-31
+Vulnerability Gather data sampling:      Not affected
+Vulnerability Indirect target selection: Not affected
+Vulnerability Itlb multihit:             Not affected
+Vulnerability L1tf:                      Not affected
+Vulnerability Mds:                       Not affected
+Vulnerability Meltdown:                  Not affected
+Vulnerability Mmio stale data:           Not affected
+Vulnerability Reg file data sampling:    Not affected
+Vulnerability Retbleed:                  Not affected
+Vulnerability Spec rstack overflow:      Mitigation; safe RET
+Vulnerability Spec store bypass:         Mitigation; Speculative Store Bypass disabled via prctl and seccomp
+Vulnerability Spectre v1:                Mitigation; usercopy/swapgs barriers and __user pointer sanitization
+Vulnerability Spectre v2:                Mitigation; Enhanced / Automatic IBRS; IBPB disabled; STIBP disabled; PBRSB-eIBRS Not affected; BHI Not affected
+Vulnerability Srbds:                     Not affected
+Vulnerability Tsx async abort:           Not affected
+## cpu_flags_simd
+avx avx2 avx512_bf16 avx512_bitalg avx512_vbmi2 avx512_vnni avx512_vpopcntdq avx512bw avx512cd avx512dq avx512f avx512ifma avx512vbmi avx512vl f16c fma sse4_1 sse4_2 sse4a 
+## nproc
+32
+## meminfo
+MemTotal:       130949112 kB
+MemFree:        27950552 kB
+MemAvailable:   127670640 kB
+Buffers:          302904 kB
+Cached:         99183408 kB
+SwapCached:         2520 kB
+Active:         55956700 kB
+Inactive:       43832976 kB
+## cgroup_memory_max
+128726335488
+## cgroup_cpu_max
+## cpuset
+## ulimit
+real-time non-blocking time  (microseconds, -R) unlimited
+core file size              (blocks, -c) unlimited
+data seg size               (kbytes, -d) unlimited
+scheduling priority                 (-e) 0
+file size                   (blocks, -f) unlimited
+pending signals                     (-i) 510720
+max locked memory           (kbytes, -l) 64
+max memory size             (kbytes, -m) unlimited
+open files                          (-n) 1024
+pipe size                (512 bytes, -p) 8
+POSIX message queues         (bytes, -q) 819200
+real-time priority                  (-r) 0
+stack size                  (kbytes, -s) 8192
+cpu time                   (seconds, -t) unlimited
+max user processes                  (-u) unlimited
+virtual memory              (kbytes, -v) unlimited
+file locks                          (-x) unlimited
+## dimms
+## numa
+available: 1 nodes (0)
+node 0 cpus: 0 1 2 3 4 5 6 7 8 9 10 11 12 13 14 15 16 17 18 19 20 21 22 23 24 25 26 27 28 29 30 31
+node 0 size: 127879 MB
+node 0 free: 27294 MB
+node distances:
+node   0 
+  0:  10 
+## thp
+always [madvise] never
+## disks
+NAME          SIZE TYPE MODEL                                    ROTA MOUNTPOINT
+loop0       115.3M loop                                             0 
+loop1          74M loop                                             0 
+loop2          74M loop                                             0 
+loop3        50.3M loop                                             0 
+loop4        44.7M loop                                             0 
+loop5        63.8M loop                                             0 
+loop7        63.8M loop                                             0 
+loop8       115.2M loop                                             0 
+nvme0n1       1.8T disk Samsung SSD 980 PRO with Heatsink 2TB       0 
+|-nvme0n1p1     1G part                                             0 
+|-nvme0n1p2    50G part                                             0 /usr/lib/x86_64-linux-gnu/nvidia/xorg/nvidia_drv.so
+`-nvme0n1p3   1.8T part                                             0 /etc/resolv.conf
+## df
+Filesystem      Size  Used Avail Use% Mounted on
+overlay          60G  8.3G   52G  14% /
+overlay          60G  8.3G   52G  14% /
+## mounts
+overlay / overlay rw,relatime,lowerdir=/var/lib/docker/overlay2/l/XIGZ4IN7PFU2VGD5GOU36KZTWP:/var/lib/docker/overlay2/l/DR74YMHH7LD3E2YLKFHWE33A43:/var/lib/docker/overlay2/l/IDXA7DKFMEMJHALZOVGDRWZ4NH:/var/lib/docker/overlay2/l/IJCO2DT7HW6D47OO633OIVZTI3:/var/lib/docker/overlay2/l/RRZRRB5D7SKCYWTW3YPWW7EUQH:/var/lib/docker/overlay2/l/PPJ3ST4MIE2D6PWTEZ2MLZSBB7:/var/lib/docker/overlay2/l/2XNIFMXESLZBXJ7RTDCFTLUZ26:/var/lib/docker/overlay2/l/PAA3U2XFTDWM74XWA77J6LDLSS:/var/lib/docker/overlay2/l/SBYEZS2EBDITIECUVHAGFIPVPS:/var/lib/docker/overlay2/l/UTZUN2CP4L4WMBOHGTUU3D5MWY:/var/lib/docker/overlay2/l/7XTNJS6YQXD5B3MGQ4JH56PEI4:/var/lib/docker/overlay2/l/IB75I7MG3ETQUQWFIZTGOOQJM5:/var/lib/docker/overlay2/l/WCP7IDBEOFLAJL372QFQO6MAC4:/var/lib/docker/overlay2/l/XWQMEPREBUL6OOKFM6JCEE5BTV:/var/lib/docker/overlay2/l/VJ3GV2QPAC56DHR5E3TBEJX2I4:/var/lib/docker/overlay2/l/PIUWAG5W5Y2DXYURR2AQ44PSZX:/var/lib/docker/overlay2/l/2C7SJUPYLJKLHVQEGUYA3Z2NQY:/var/lib/docker/overlay2/l/ZVGNJZ7KRHU5POGX5VP6PG5TWE:/var/lib/docker/overlay2/l/5PXS2H2WXFNZ2FEVRX4UTXAJS6:/var/lib/docker/overlay2/l/PTT34QRQPYBFZWTKDMI7JHPXNC:/var/lib/docker/overlay2/l/2MXQZH5TJY54B7JNEO67FVW5OH,upperdir=/var/lib/docker/overlay2/6046cf4289e44fca2c23c3dee4a16a27f3d38079b9413602fa3baf7d713518d2/diff,workdir=/var/lib/docker/overlay2/6046cf4289e44fca2c23c3dee4a16a27f3d38079b9413602fa3baf7d713518d2/work 0 0
+## python_torch
+2.8.0+cu128 12.8 NVIDIA GeForce RTX 4090 (8, 9)
+## nvcc
+Cuda compilation tools, release 12.8, V12.8.93
+Build cuda_12.8.r12.8/compiler.35583870_0

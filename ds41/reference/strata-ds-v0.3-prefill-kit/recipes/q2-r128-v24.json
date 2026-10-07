@@ -1,0 +1,43 @@
+{
+  "schema_version": 1,
+  "id": "q2-r128-v24",
+  "model": "q2",
+  "tier": "core",
+  "readiness": "DESIGN_ONLY",
+  "topology": "discrete_single_gpu",
+  "ram_gib": 128,
+  "vram_gib": 24,
+  "host_reserve_gib": {
+    "os_other_and_margin": 18,
+    "engram_rows": 2,
+    "io_staging": 4,
+    "runtime_kv_metadata": 8
+  },
+  "device_nonweight_reserve_gib": 6,
+  "engram_placement": "ssd_native_fp8_lossless",
+  "expert_residency": "exclusive_where_possible",
+  "expert_execution": "gpu_stream_packed",
+  "context_initial": 8192,
+  "context_steps": [
+    1024,
+    8192,
+    32768,
+    131072
+  ],
+  "concurrency_steps": [
+    1,
+    2,
+    5
+  ],
+  "speculation": false,
+  "vision": false,
+  "kv_policy": "fixed_per_backend_then_parity_qualified_common_layout",
+  "storage_free_gib": 1024,
+  "required_backend": "gguf_q2_bridge",
+  "independent_cuda_qualification_required": true,
+  "notes": [
+    "Budgets are design allocations, not measured memory or launch permission.",
+    "RAM/VRAM are separate pools. GPU mandatory tensors must fit independently.",
+    "3bpw CPU packed compute is NOT assumed; initial path streams packed experts to GPU."
+  ]
+}

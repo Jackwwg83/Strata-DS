@@ -1,0 +1,9 @@
+DOC budget 0: teacher_forced_mean_nll 1.053710 ppl 2.8683 over 199 tokens decode_ms_per_token 294.6 over 200 steps (cpu experts 262.2) vram_expert_slots 854 hit_rate 0.6618 tiers_share vram 0.6618 ram 0.0000 file 0.3382 ssd 0.0940 lookahead warmed 0 useful 0 (0.000) 
+GEN budget 0: decode_ms_per_token 419.0 over 129 steps (cpu experts 385.8) vram_expert_slots 854 hit_rate 0.5298 tiers_share vram 0.5298 ram 0.0000 file 0.4702 ssd 0.2059 lookahead warmed 0 useful 0 (0.000) 
+DOC budget 16: teacher_forced_mean_nll 1.031037 ppl 2.8040 over 199 tokens decode_ms_per_token 323.1 over 200 steps (cpu experts 296.0) vram_expert_slots 854 hit_rate 0.6533 tiers_share vram 0.6533 ram 0.0632 file 0.2835 ssd 0.1050 lookahead warmed 16098 useful 6372 (0.396) 
+GEN budget 16: decode_ms_per_token 396.6 over 129 steps (cpu experts 369.4) vram_expert_slots 854 hit_rate 0.5281 tiers_share vram 0.5281 ram 0.0677 file 0.4042 ssd 0.1957 lookahead warmed 18377 useful 8823 (0.480) 
+DOC budget 32: teacher_forced_mean_nll 1.067817 ppl 2.9090 over 199 tokens decode_ms_per_token 319.6 over 200 steps (cpu experts 292.9) vram_expert_slots 854 hit_rate 0.6454 tiers_share vram 0.6454 ram 0.1165 file 0.2381 ssd 0.1106 lookahead warmed 13643 useful 5365 (0.393) 
+GEN budget 32: decode_ms_per_token 471.3 over 129 steps (cpu experts 442.3) vram_expert_slots 854 hit_rate 0.5186 tiers_share vram 0.5186 ram 0.1339 file 0.3475 ssd 0.1971 lookahead warmed 15932 useful 7908 (0.496) 
+DOC budget 48: teacher_forced_mean_nll 1.057878 ppl 2.8803 over 199 tokens decode_ms_per_token 337.9 over 200 steps (cpu experts 310.4) vram_expert_slots 854 hit_rate 0.6394 tiers_share vram 0.6394 ram 0.1685 file 0.1920 ssd 0.1105 lookahead warmed 11266 useful 4273 (0.379) 
+GEN budget 48: decode_ms_per_token 516.4 over 129 steps (cpu experts 486.9) vram_expert_slots 854 hit_rate 0.4933 tiers_share vram 0.4933 ram 0.2126 file 0.2941 ssd 0.1863 lookahead warmed 14001 useful 6781 (0.484) 
+SWEEP_DONE

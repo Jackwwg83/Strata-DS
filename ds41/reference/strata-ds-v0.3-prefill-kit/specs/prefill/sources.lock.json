@@ -1,0 +1,80 @@
+{
+  "schema_version": 1,
+  "checked_date": "2026-10-04",
+  "direct_huggingface_config_and_header_access": "FAILED_ACCESS_THIS_TURN",
+  "all_real_checkpoint_headers_scanned": false,
+  "model_payload_downloaded": false,
+  "sources": [
+    {
+      "id": "PF-S01",
+      "repository": "tpurtell/ds41rt",
+      "commit": "3067d0684a0b572d88a17d38ca3f7d10599619b4",
+      "path": "rust/crates/ds41rt-loader/src/official-v41-config.json",
+      "blob_sha1": "09917a9139b22d5bf8be52132787f435147b1020",
+      "scope": "Checked-in official config mirror; verify actual target config locally"
+    },
+    {
+      "id": "PF-S02",
+      "repository": "coolbho3k/DeepSeek-v4.1-Flash-2x-DGX-Spark",
+      "commit": "1d8ac64af01c6fec87f39eb1dd526ff183615c73",
+      "path": "release/runtime/ds41/vllm_exl3.py",
+      "blob_sha1": "b29d0ea806f9f27407b87b0544e98ed88551c5ad",
+      "scope": "Packed source shapes/dtypes, TP slicing, capacity=120 integration constraint"
+    },
+    {
+      "id": "PF-S03",
+      "repository": "coolbho3k/DeepSeek-v4.1-Flash-2x-DGX-Spark",
+      "commit": "1d8ac64af01c6fec87f39eb1dd526ff183615c73",
+      "path": "release/runtime/ds41/exl3_moe.py",
+      "blob_sha1": "bcef8163078f9fb3e583412e120153a2f21374c4",
+      "scope": "MUL1 marker; FP16 expert output, weighting before w2, temporary reconstruction"
+    },
+    {
+      "id": "PF-S04",
+      "repository": "coolbho3k/DeepSeek-v4.1-Flash-2x-DGX-Spark",
+      "commit": "1d8ac64af01c6fec87f39eb1dd526ff183615c73",
+      "path": "release/runtime/serving/spark_grouped_prefill.py",
+      "blob_sha1": "81523ddb157a225b0e54a69fdc21d551d030e223",
+      "scope": "TP2 1152-wide intermediate, 1056*6 row capacity, fat threshold16, tile64, immutable bank pointers; AGPL source read, not vendored"
+    },
+    {
+      "id": "PF-S05",
+      "repository": "coolbho3k/DeepSeek-v4.1-Flash-2x-DGX-Spark",
+      "commit": "1d8ac64af01c6fec87f39eb1dd526ff183615c73",
+      "path": "release/experimental/prefill/RESULTS.md",
+      "blob_sha1": "2db1a5b556a454a0cfe3f8b597a87d6ea2eb542e",
+      "scope": "2048->3072 no improvement on two-Spark campaign; not discrete-GPU benchmark"
+    },
+    {
+      "id": "PF-S06",
+      "repository": "coolbho3k/DeepSeek-v4.1-Flash-2x-DGX-Spark",
+      "commit": "1d8ac64af01c6fec87f39eb1dd526ff183615c73",
+      "path": "release/runtime/ds41/vllm_prefill_workspace.py",
+      "blob_sha1": "5efee5b471317b7771d03eee5df1b38aa9fafbed",
+      "scope": "Global uncompressed row sizing; no double division by compression/DCP"
+    },
+    {
+      "id": "PF-S07",
+      "repository": "coolbho3k/DeepSeek-v4.1-Flash-2x-DGX-Spark",
+      "commit": "1d8ac64af01c6fec87f39eb1dd526ff183615c73",
+      "path": "release/runtime/probes/check_exl3_prefill_bench.py",
+      "blob_sha1": "ec24cef4cbdcb53adc81c05a9a8c8fd208d7f026",
+      "scope": "Actual shapes, reconstruct comparison; aliased four-weight routing test is not full-layer bandwidth"
+    },
+    {
+      "id": "PF-S08",
+      "repository": "Niko1221/Strata",
+      "commit": "6f32ec070f23ced9f50e704d854d775da52591ab",
+      "path": "src/prefill/prefill.cpp",
+      "scope": "Byte budget mechanism; Qwen constants explicitly not imported"
+    },
+    {
+      "id": "PF-S09",
+      "repository": "tpurtell/ds41rt",
+      "commit": "3067d0684a0b572d88a17d38ca3f7d10599619b4",
+      "path": "docs/ds41-prefill-tail.md",
+      "blob_sha1": "1da867425198a0d59748b17b394a10ae3c429047",
+      "scope": "CED pairing and decoder replay are separate qualification problems; no automatic decoder pruning"
+    }
+  ]
+}

@@ -1,0 +1,67 @@
+{
+ "device": "NVIDIA GeForce RTX 4090",
+ "pcie_by_size": [
+  {
+   "bytes": 1048576,
+   "h2d_pinned_gbps": 25.03,
+   "d2h_pinned_gbps": 25.42
+  },
+  {
+   "bytes": 13316352,
+   "h2d_pinned_gbps": 26.75,
+   "d2h_pinned_gbps": 26.98
+  },
+  {
+   "bytes": 67108864,
+   "h2d_pinned_gbps": 26.88,
+   "d2h_pinned_gbps": 27.1
+  },
+  {
+   "bytes": 268435456,
+   "h2d_pinned_gbps": 26.89,
+   "d2h_pinned_gbps": 26.4
+  },
+  {
+   "bytes": 1073741824,
+   "h2d_pinned_gbps": 26.9,
+   "d2h_pinned_gbps": 26.41
+  }
+ ],
+ "h2d_pageable_256m_gbps": 24.51,
+ "h2d_40_expert_copies_gbps": 26.79,
+ "gpu_copy_gbps_rw": 921.1,
+ "gpu_read_sum_gbps": 954.2,
+ "gpu_free_gib_idle": 23.05,
+ "gpu_total_gib": 23.52,
+ "pinned_alloc": [
+  {
+   "gib": 4,
+   "ok": true,
+   "alloc_s": 1.27
+  },
+  {
+   "gib": 16,
+   "ok": true,
+   "alloc_s": 7.88
+  },
+  {
+   "gib": 32,
+   "ok": true,
+   "alloc_s": 15.1
+  },
+  {
+   "gib": 64,
+   "ok": true,
+   "alloc_s": 30.52
+  },
+  {
+   "gib": 96,
+   "skipped": "above cap 95 GiB"
+  },
+  {
+   "gib": 112,
+   "skipped": "above cap 95 GiB"
+  }
+ ],
+ "ulimit_memlock": "64"
+}

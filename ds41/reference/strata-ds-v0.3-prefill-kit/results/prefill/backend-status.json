@@ -1,0 +1,18 @@
+{
+  "exl3_gpu_stream": {
+    "implemented": false,
+    "reason": "single discrete GPU EXL3 V4.1 bridge required; TP2/GB10 image is not interchangeable"
+  },
+  "gguf_q2_bridge": {
+    "implemented": false,
+    "reason": "pinned DwarfStar subprocess/metrics bridge and discrete hybrid qualification required"
+  },
+  "native_oracle": {
+    "implemented": false,
+    "reason": "independent fixed-native oracle not integrated"
+  },
+  "sage_exl3_adapter": {
+    "implemented": false,
+    "reason": "mixed K/layout support and independent quality gate required"
+  }
+}

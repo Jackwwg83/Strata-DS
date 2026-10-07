@@ -1,0 +1,43 @@
++ pip install -q huggingface_hub hf_transfer 'safetensors>=0.5' transformers tokenizers sympy pillow pytest ninja
+WARNING: Running pip as the 'root' user can result in broken permissions and conflicting behaviour with the system package manager, possibly rendering your system unusable. It is recommended to use a virtual environment instead: https://pip.pypa.io/warnings/venv. Use the --root-user-action option if you know what you are doing and want to suppress this warning.
++ '[' -d /workspace/exllamav3 ']'
++ git clone -q https://github.com/turboderp-org/exllamav3 /workspace/exllamav3
++ cd /workspace/exllamav3
++ git checkout -q 16a49792
+++ python -c 'import torch;m,n=torch.cuda.get_device_capability(0);print(f'\''{m}.{n}'\'')'
++ cap=8.9
++ TORCH_CUDA_ARCH_LIST=8.9
+++ nproc
++ MAX_JOBS=256
++ pip install --no-build-isolation --no-deps .
++ pip install -q -r requirements.txt
+WARNING: Running pip as the 'root' user can result in broken permissions and conflicting behaviour with the system package manager, possibly rendering your system unusable. It is recommended to use a virtual environment instead: https://pip.pypa.io/warnings/venv. Use the --root-user-action option if you know what you are doing and want to suppress this warning.
++ timeout 900 pip install -q tilelang==0.1.8
++ python -c 'import tilelang; print('\''tilelang'\'', tilelang.__version__)'
+[WARNING] Field "span" in type "ir.TupleType" duplicates an ancestor field in "ir.Type". Child types should not re-register inherited fields.
+[WARNING] Field "span" in type "ir.FuncType" duplicates an ancestor field in "ir.Type". Child types should not re-register inherited fields.
+[WARNING] Field "span" in type "ir.TensorMapType" duplicates an ancestor field in "ir.Type". Child types should not re-register inherited fields.
+[WARNING] Field "binding_blocks" in type "script.ir_builder.relax.FunctionFrame" duplicates an ancestor field in "script.ir_builder.relax.SeqExprFrame". Child types should not re-register inherited fields.
+[WARNING] Field "output" in type "script.ir_builder.relax.FunctionFrame" duplicates an ancestor field in "script.ir_builder.relax.SeqExprFrame". Child types should not re-register inherited fields.
+Traceback (most recent call last):
+  File "<string>", line 1, in <module>
+  File "/opt/conda/lib/python3.11/site-packages/tilelang/__init__.py", line 133, in <module>
+    import tvm
+  File "/opt/conda/lib/python3.11/site-packages/tilelang/3rdparty/tvm/python/tvm/__init__.py", line 31, in <module>
+    from .runtime.object import Object
+  File "/opt/conda/lib/python3.11/site-packages/tilelang/3rdparty/tvm/python/tvm/runtime/__init__.py", line 28, in <module>
+    from ._tensor import Tensor, tensor, empty
+  File "/opt/conda/lib/python3.11/site-packages/tilelang/3rdparty/tvm/python/tvm/runtime/_tensor.py", line 62, in <module>
+    @tvm_ffi.register_object("ffi.Tensor")
+     ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "/opt/conda/lib/python3.11/site-packages/tvm_ffi/registry.py", line 98, in _decorator_with_name
+    return _register(cls, type_key)
+           ^^^^^^^^^^^^^^^^^^^^^^^^
+  File "/opt/conda/lib/python3.11/site-packages/tvm_ffi/registry.py", line 88, in _register
+    info = core._register_object_by_index(type_index, cls)
+           ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "python/tvm_ffi/cython/object.pxi", line 668, in tvm_ffi.core._register_object_by_index
+ValueError: Type 'ffi.Tensor' already has a registered class (<class 'tvm_ffi.core.Tensor'>); re-registering it with the larger wrapper class <class 'tvm.runtime._tensor.Tensor'> is not supported. Register the class before any object of this type is materialized (which auto-creates a fallback).
++ true
++ echo SETUP_DONE
+SETUP_DONE

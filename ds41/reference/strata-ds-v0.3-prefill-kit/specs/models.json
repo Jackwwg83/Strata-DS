@@ -1,0 +1,54 @@
+{
+  "schema_version": 1,
+  "recorded_on": "2026-10-04",
+  "models": {
+    "exl3-3": {
+      "repo": "coolbho3k/DeepSeek-V4.1-Flash-EXL3-3bpw",
+      "revision": "650cae2c13aaaec303871a35301503570889c0be",
+      "manifest_sha256": "828b7b5d7a672c5f2e44caca3d72d9c114c39634e46eb51deabd067a0f44a2c9",
+      "non_engram_hint_bytes": 215344840128,
+      "size_evidence": "publisher_active_payload_including_vision_excluding_retained_draft",
+      "engram_hint_bytes": 202758032400,
+      "status": "upstream_specialized_TP2_GB10_recipe; our_discrete_single_GPU_adapter_missing",
+      "backend": "exl3_gpu_stream",
+      "priority": "quality_primary",
+      "expert_execution": "gpu_stream_packed"
+    },
+    "q2": {
+      "repo": "antirez/deepseek-v4.1-flash-gguf",
+      "revision": null,
+      "manifest_sha256": null,
+      "non_engram_hint_bytes": 162961796628,
+      "size_evidence": "publisher_rounded_main_weight_size",
+      "engram_hint_bytes": 202758032400,
+      "status": "upstream_V41_SSD_path; discrete_CPU_GPU_split_not_qualified",
+      "backend": "gguf_q2_bridge",
+      "priority": "cost_comparison",
+      "expert_execution": "gpu_stream_packed"
+    },
+    "native": {
+      "repo": "deepseek-ai/DeepSeek-V4.1-Flash",
+      "revision": "df42c109f1defefcbfcedbe7d905718a12266e40",
+      "manifest_sha256": null,
+      "non_engram_hint_bytes": 288777830400,
+      "size_evidence": "routed_experts_only_LOWER_BOUND_not_total",
+      "engram_hint_bytes": 202758032400,
+      "status": "independent_native_oracle_not_integrated",
+      "backend": "native_oracle",
+      "priority": "optional_quality_anchor",
+      "expert_execution": "gpu_stream_packed"
+    },
+    "sage-1.59": {
+      "repo": "vcruz305/DSV4.1-Flash-SAGE-EXL3-1.59bpw",
+      "revision": null,
+      "manifest_sha256": null,
+      "non_engram_hint_bytes": 127608261960,
+      "size_evidence": "prior_review_tensor_payload_less_native_engram_includes_auxiliary",
+      "engram_hint_bytes": 202758032400,
+      "status": "optional_revalidate_publisher_manifest_and_quality",
+      "backend": "sage_exl3_adapter",
+      "priority": "optional_capacity_experiment",
+      "expert_execution": "gpu_stream_packed"
+    }
+  }
+}

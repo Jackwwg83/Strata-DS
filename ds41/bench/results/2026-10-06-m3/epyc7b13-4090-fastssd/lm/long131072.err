@@ -1,0 +1,8 @@
+ds41: 859 VRAM expert slots (10.66 GiB)
+ds41: RAM tier 7752 experts (96.2 GiB, locked), filled in 39.8 s
+ds41 prefill: pass 32768 tokens, sub-batch 4096; scratch 9.58 GiB in lent slots; ring 64 slots cudaMalloc; 773 tier slots lent
+ds41 prefill: 23.9 GiB available, 94.4 GiB of experts read from the pack: unbuffered (O_DIRECT): the file cache could not keep them
+ds41 prefill profile (GPU timeline, 29527 ms): engram 3094 ms (10%); hc mixes + norms 6519 ms (22%); q/kv projections 1228 ms (4%); compressor 11 ms (0%); indexer 566 ms (2%); attention 1477 ms (5%); o projection 1591 ms (5%); routing + sort 148 ms (1%); routed experts 13829 ms (47%); shared expert + hc post 1061 ms (4%); head 3 ms (0%);
+ds41 prefill profile (GPU timeline, 30586 ms): engram 3438 ms (11%); hc mixes + norms 6530 ms (21%); q/kv projections 1229 ms (4%); compressor 11 ms (0%); indexer 1549 ms (5%); attention 1537 ms (5%); o projection 1468 ms (5%); routing + sort 165 ms (1%); routed experts 13595 ms (44%); shared expert + hc post 1063 ms (3%); head 3 ms (0%);
+ds41 prefill profile (GPU timeline, 31558 ms): engram 3321 ms (11%); hc mixes + norms 6534 ms (21%); q/kv projections 1230 ms (4%); compressor 11 ms (0%); indexer 2544 ms (8%); attention 1571 ms (5%); o projection 1469 ms (5%); routing + sort 168 ms (1%); routed experts 13644 ms (43%); shared expert + hc post 1063 ms (3%); head 3 ms (0%);
+ds41 prefill profile (GPU timeline, 32302 ms): engram 3106 ms (10%); hc mixes + norms 6534 ms (20%); q/kv projections 1231 ms (4%); compressor 11 ms (0%); indexer 3550 ms (11%); attention 1584 ms (5%); o projection 1470 ms (5%); routing + sort 162 ms (1%); routed experts 13585 ms (42%); shared expert + hc post 1064 ms (3%); head 4 ms (0%);

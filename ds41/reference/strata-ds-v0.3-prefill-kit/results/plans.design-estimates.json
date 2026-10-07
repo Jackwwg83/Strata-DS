@@ -1,0 +1,332 @@
+[
+  {
+    "status": "DESIGN_ESTIMATE",
+    "can_launch": false,
+    "recipe_id": "exl3-3-r128-v16",
+    "recipe_sha256": "09d986074842bcce8029300435c532fc1420f03f3647d3d1848c9744a5aa4ff7",
+    "model_revision": "650cae2c13aaaec303871a35301503570889c0be",
+    "host_weight_ceiling_bytes": 103079215104,
+    "gpu_all_weights_ceiling_bytes": 10737418240,
+    "optimistic_unique_weight_ceiling_bytes": 113816633344,
+    "non_engram_hint_bytes": 215344840128,
+    "cold_weight_lower_bound_bytes": 101528206784,
+    "cold_weight_lower_bound_gib": 94.55551093816757,
+    "possible_all_active_weight_residency": false,
+    "size_evidence": "publisher_active_payload_including_vision_excluding_retained_draft",
+    "engram_ssd_hint_bytes": 202758032400,
+    "mandatory_gpu_bytes": null,
+    "expert_gpu_cache_bytes": null,
+    "blockers": [
+      "backend integration and hardware qualification missing",
+      "exact text/vision/draft tensor partition required",
+      "mandatory GPU working set, decode/prefill peaks and cgroup must be measured",
+      "zero spill does not prove fit; capacity share is not request hit rate"
+    ],
+    "caveats": [
+      "CPU/GPU sums are optimistic unique-weight bounds, not a shared allocator.",
+      "No extra full CPU copy of GPU weights is budgeted; staging must bound temporary duplicates.",
+      "Page cache is charged memory; buffered I/O prototypes do not enforce this RAM plan.",
+      "Context/concurrency reserves must be replaced with backend-specific measurements."
+    ]
+  },
+  {
+    "status": "DESIGN_ESTIMATE",
+    "can_launch": false,
+    "recipe_id": "exl3-3-r128-v24",
+    "recipe_sha256": "55b4ccf57f1ecc562597054c80769271479660e94cf1ea7dde324a33ef388cb2",
+    "model_revision": "650cae2c13aaaec303871a35301503570889c0be",
+    "host_weight_ceiling_bytes": 103079215104,
+    "gpu_all_weights_ceiling_bytes": 19327352832,
+    "optimistic_unique_weight_ceiling_bytes": 122406567936,
+    "non_engram_hint_bytes": 215344840128,
+    "cold_weight_lower_bound_bytes": 92938272192,
+    "cold_weight_lower_bound_gib": 86.55551093816757,
+    "possible_all_active_weight_residency": false,
+    "size_evidence": "publisher_active_payload_including_vision_excluding_retained_draft",
+    "engram_ssd_hint_bytes": 202758032400,
+    "mandatory_gpu_bytes": null,
+    "expert_gpu_cache_bytes": null,
+    "blockers": [
+      "backend integration and hardware qualification missing",
+      "exact text/vision/draft tensor partition required",
+      "mandatory GPU working set, decode/prefill peaks and cgroup must be measured",
+      "zero spill does not prove fit; capacity share is not request hit rate"
+    ],
+    "caveats": [
+      "CPU/GPU sums are optimistic unique-weight bounds, not a shared allocator.",
+      "No extra full CPU copy of GPU weights is budgeted; staging must bound temporary duplicates.",
+      "Page cache is charged memory; buffered I/O prototypes do not enforce this RAM plan.",
+      "Context/concurrency reserves must be replaced with backend-specific measurements."
+    ]
+  },
+  {
+    "status": "DESIGN_ESTIMATE",
+    "can_launch": false,
+    "recipe_id": "exl3-3-r192-v24",
+    "recipe_sha256": "9e09f7bc1f86f0370030f57fed0fe2c321f781e192d43945c48574f037068cc8",
+    "model_revision": "650cae2c13aaaec303871a35301503570889c0be",
+    "host_weight_ceiling_bytes": 171798691840,
+    "gpu_all_weights_ceiling_bytes": 19327352832,
+    "optimistic_unique_weight_ceiling_bytes": 191126044672,
+    "non_engram_hint_bytes": 215344840128,
+    "cold_weight_lower_bound_bytes": 24218795456,
+    "cold_weight_lower_bound_gib": 22.555510938167572,
+    "possible_all_active_weight_residency": false,
+    "size_evidence": "publisher_active_payload_including_vision_excluding_retained_draft",
+    "engram_ssd_hint_bytes": 202758032400,
+    "mandatory_gpu_bytes": null,
+    "expert_gpu_cache_bytes": null,
+    "blockers": [
+      "backend integration and hardware qualification missing",
+      "exact text/vision/draft tensor partition required",
+      "mandatory GPU working set, decode/prefill peaks and cgroup must be measured",
+      "zero spill does not prove fit; capacity share is not request hit rate"
+    ],
+    "caveats": [
+      "CPU/GPU sums are optimistic unique-weight bounds, not a shared allocator.",
+      "No extra full CPU copy of GPU weights is budgeted; staging must bound temporary duplicates.",
+      "Page cache is charged memory; buffered I/O prototypes do not enforce this RAM plan.",
+      "Context/concurrency reserves must be replaced with backend-specific measurements."
+    ]
+  },
+  {
+    "status": "DESIGN_ESTIMATE",
+    "can_launch": false,
+    "recipe_id": "exl3-3-r256-v16",
+    "recipe_sha256": "8bfff5691e3c12ad8500e33bd887db32b1dd9bfa67e62e5de7a6d577b070e742",
+    "model_revision": "650cae2c13aaaec303871a35301503570889c0be",
+    "host_weight_ceiling_bytes": 240518168576,
+    "gpu_all_weights_ceiling_bytes": 10737418240,
+    "optimistic_unique_weight_ceiling_bytes": 251255586816,
+    "non_engram_hint_bytes": 215344840128,
+    "cold_weight_lower_bound_bytes": 0,
+    "cold_weight_lower_bound_gib": 0.0,
+    "possible_all_active_weight_residency": true,
+    "size_evidence": "publisher_active_payload_including_vision_excluding_retained_draft",
+    "engram_ssd_hint_bytes": 202758032400,
+    "mandatory_gpu_bytes": null,
+    "expert_gpu_cache_bytes": null,
+    "blockers": [
+      "backend integration and hardware qualification missing",
+      "exact text/vision/draft tensor partition required",
+      "mandatory GPU working set, decode/prefill peaks and cgroup must be measured",
+      "zero spill does not prove fit; capacity share is not request hit rate"
+    ],
+    "caveats": [
+      "CPU/GPU sums are optimistic unique-weight bounds, not a shared allocator.",
+      "No extra full CPU copy of GPU weights is budgeted; staging must bound temporary duplicates.",
+      "Page cache is charged memory; buffered I/O prototypes do not enforce this RAM plan.",
+      "Context/concurrency reserves must be replaced with backend-specific measurements."
+    ]
+  },
+  {
+    "status": "DESIGN_ESTIMATE",
+    "can_launch": false,
+    "recipe_id": "exl3-3-r256-v24",
+    "recipe_sha256": "24d582f4dbfca16f80c743641d8d555db827c2cefb5f775e5d80df90365fe408",
+    "model_revision": "650cae2c13aaaec303871a35301503570889c0be",
+    "host_weight_ceiling_bytes": 240518168576,
+    "gpu_all_weights_ceiling_bytes": 19327352832,
+    "optimistic_unique_weight_ceiling_bytes": 259845521408,
+    "non_engram_hint_bytes": 215344840128,
+    "cold_weight_lower_bound_bytes": 0,
+    "cold_weight_lower_bound_gib": 0.0,
+    "possible_all_active_weight_residency": true,
+    "size_evidence": "publisher_active_payload_including_vision_excluding_retained_draft",
+    "engram_ssd_hint_bytes": 202758032400,
+    "mandatory_gpu_bytes": null,
+    "expert_gpu_cache_bytes": null,
+    "blockers": [
+      "backend integration and hardware qualification missing",
+      "exact text/vision/draft tensor partition required",
+      "mandatory GPU working set, decode/prefill peaks and cgroup must be measured",
+      "zero spill does not prove fit; capacity share is not request hit rate"
+    ],
+    "caveats": [
+      "CPU/GPU sums are optimistic unique-weight bounds, not a shared allocator.",
+      "No extra full CPU copy of GPU weights is budgeted; staging must bound temporary duplicates.",
+      "Page cache is charged memory; buffered I/O prototypes do not enforce this RAM plan.",
+      "Context/concurrency reserves must be replaced with backend-specific measurements."
+    ]
+  },
+  {
+    "status": "DESIGN_ESTIMATE",
+    "can_launch": false,
+    "recipe_id": "exl3-3-r384-v24",
+    "recipe_sha256": "2155b79892e88cf9e1b7f9fdd64a019826fd4b321ebd40e21ba8d736749b442b",
+    "model_revision": "650cae2c13aaaec303871a35301503570889c0be",
+    "host_weight_ceiling_bytes": 377957122048,
+    "gpu_all_weights_ceiling_bytes": 19327352832,
+    "optimistic_unique_weight_ceiling_bytes": 397284474880,
+    "non_engram_hint_bytes": 215344840128,
+    "cold_weight_lower_bound_bytes": 0,
+    "cold_weight_lower_bound_gib": 0.0,
+    "possible_all_active_weight_residency": true,
+    "size_evidence": "publisher_active_payload_including_vision_excluding_retained_draft",
+    "engram_ssd_hint_bytes": 202758032400,
+    "mandatory_gpu_bytes": null,
+    "expert_gpu_cache_bytes": null,
+    "blockers": [
+      "backend integration and hardware qualification missing",
+      "exact text/vision/draft tensor partition required",
+      "mandatory GPU working set, decode/prefill peaks and cgroup must be measured",
+      "zero spill does not prove fit; capacity share is not request hit rate"
+    ],
+    "caveats": [
+      "CPU/GPU sums are optimistic unique-weight bounds, not a shared allocator.",
+      "No extra full CPU copy of GPU weights is budgeted; staging must bound temporary duplicates.",
+      "Page cache is charged memory; buffered I/O prototypes do not enforce this RAM plan.",
+      "Context/concurrency reserves must be replaced with backend-specific measurements."
+    ]
+  },
+  {
+    "status": "DESIGN_ESTIMATE",
+    "can_launch": false,
+    "recipe_id": "native-r384-v24",
+    "recipe_sha256": "a58eca9be09f2c98547b237ae99ba73f1bc0a58fdb26a716030b68178356e0c0",
+    "model_revision": "df42c109f1defefcbfcedbe7d905718a12266e40",
+    "host_weight_ceiling_bytes": 377957122048,
+    "gpu_all_weights_ceiling_bytes": 19327352832,
+    "optimistic_unique_weight_ceiling_bytes": 397284474880,
+    "non_engram_hint_bytes": 288777830400,
+    "cold_weight_lower_bound_bytes": 0,
+    "cold_weight_lower_bound_gib": 0.0,
+    "possible_all_active_weight_residency": null,
+    "size_evidence": "routed_experts_only_LOWER_BOUND_not_total",
+    "engram_ssd_hint_bytes": 202758032400,
+    "mandatory_gpu_bytes": null,
+    "expert_gpu_cache_bytes": null,
+    "blockers": [
+      "backend integration and hardware qualification missing",
+      "exact text/vision/draft tensor partition required",
+      "mandatory GPU working set, decode/prefill peaks and cgroup must be measured",
+      "zero spill does not prove fit; capacity share is not request hit rate"
+    ],
+    "caveats": [
+      "CPU/GPU sums are optimistic unique-weight bounds, not a shared allocator.",
+      "No extra full CPU copy of GPU weights is budgeted; staging must bound temporary duplicates.",
+      "Page cache is charged memory; buffered I/O prototypes do not enforce this RAM plan.",
+      "Context/concurrency reserves must be replaced with backend-specific measurements."
+    ]
+  },
+  {
+    "status": "DESIGN_ESTIMATE",
+    "can_launch": false,
+    "recipe_id": "q2-r128-v16",
+    "recipe_sha256": "968b119be97c8a85d1d6ddd083cf1ca9b77f4c3ec62e04faa1315373550d83db",
+    "model_revision": null,
+    "host_weight_ceiling_bytes": 103079215104,
+    "gpu_all_weights_ceiling_bytes": 10737418240,
+    "optimistic_unique_weight_ceiling_bytes": 113816633344,
+    "non_engram_hint_bytes": 162961796628,
+    "cold_weight_lower_bound_bytes": 49145163284,
+    "cold_weight_lower_bound_gib": 45.769999999552965,
+    "possible_all_active_weight_residency": false,
+    "size_evidence": "publisher_rounded_main_weight_size",
+    "engram_ssd_hint_bytes": 202758032400,
+    "mandatory_gpu_bytes": null,
+    "expert_gpu_cache_bytes": null,
+    "blockers": [
+      "backend integration and hardware qualification missing",
+      "exact text/vision/draft tensor partition required",
+      "mandatory GPU working set, decode/prefill peaks and cgroup must be measured",
+      "zero spill does not prove fit; capacity share is not request hit rate"
+    ],
+    "caveats": [
+      "CPU/GPU sums are optimistic unique-weight bounds, not a shared allocator.",
+      "No extra full CPU copy of GPU weights is budgeted; staging must bound temporary duplicates.",
+      "Page cache is charged memory; buffered I/O prototypes do not enforce this RAM plan.",
+      "Context/concurrency reserves must be replaced with backend-specific measurements."
+    ]
+  },
+  {
+    "status": "DESIGN_ESTIMATE",
+    "can_launch": false,
+    "recipe_id": "q2-r128-v24",
+    "recipe_sha256": "b3b869c47efeba30b0cbcd14cd55e7fcb60ba7ce65179f7ea9e7ff1d2a393d20",
+    "model_revision": null,
+    "host_weight_ceiling_bytes": 103079215104,
+    "gpu_all_weights_ceiling_bytes": 19327352832,
+    "optimistic_unique_weight_ceiling_bytes": 122406567936,
+    "non_engram_hint_bytes": 162961796628,
+    "cold_weight_lower_bound_bytes": 40555228692,
+    "cold_weight_lower_bound_gib": 37.769999999552965,
+    "possible_all_active_weight_residency": false,
+    "size_evidence": "publisher_rounded_main_weight_size",
+    "engram_ssd_hint_bytes": 202758032400,
+    "mandatory_gpu_bytes": null,
+    "expert_gpu_cache_bytes": null,
+    "blockers": [
+      "backend integration and hardware qualification missing",
+      "exact text/vision/draft tensor partition required",
+      "mandatory GPU working set, decode/prefill peaks and cgroup must be measured",
+      "zero spill does not prove fit; capacity share is not request hit rate"
+    ],
+    "caveats": [
+      "CPU/GPU sums are optimistic unique-weight bounds, not a shared allocator.",
+      "No extra full CPU copy of GPU weights is budgeted; staging must bound temporary duplicates.",
+      "Page cache is charged memory; buffered I/O prototypes do not enforce this RAM plan.",
+      "Context/concurrency reserves must be replaced with backend-specific measurements."
+    ]
+  },
+  {
+    "status": "DESIGN_ESTIMATE",
+    "can_launch": false,
+    "recipe_id": "q2-r192-v24",
+    "recipe_sha256": "bd828be3e950df7f113257b672be2cb6368c389ac820bfd417cc4ffeb408525f",
+    "model_revision": null,
+    "host_weight_ceiling_bytes": 171798691840,
+    "gpu_all_weights_ceiling_bytes": 19327352832,
+    "optimistic_unique_weight_ceiling_bytes": 191126044672,
+    "non_engram_hint_bytes": 162961796628,
+    "cold_weight_lower_bound_bytes": 0,
+    "cold_weight_lower_bound_gib": 0.0,
+    "possible_all_active_weight_residency": true,
+    "size_evidence": "publisher_rounded_main_weight_size",
+    "engram_ssd_hint_bytes": 202758032400,
+    "mandatory_gpu_bytes": null,
+    "expert_gpu_cache_bytes": null,
+    "blockers": [
+      "backend integration and hardware qualification missing",
+      "exact text/vision/draft tensor partition required",
+      "mandatory GPU working set, decode/prefill peaks and cgroup must be measured",
+      "zero spill does not prove fit; capacity share is not request hit rate"
+    ],
+    "caveats": [
+      "CPU/GPU sums are optimistic unique-weight bounds, not a shared allocator.",
+      "No extra full CPU copy of GPU weights is budgeted; staging must bound temporary duplicates.",
+      "Page cache is charged memory; buffered I/O prototypes do not enforce this RAM plan.",
+      "Context/concurrency reserves must be replaced with backend-specific measurements."
+    ]
+  },
+  {
+    "status": "DESIGN_ESTIMATE",
+    "can_launch": false,
+    "recipe_id": "sage-1.59-r128-v24",
+    "recipe_sha256": "c2aa4e06e21959a683092c459b11f449735dc8e0c130b6a7a557323dd2fd23e0",
+    "model_revision": null,
+    "host_weight_ceiling_bytes": 103079215104,
+    "gpu_all_weights_ceiling_bytes": 19327352832,
+    "optimistic_unique_weight_ceiling_bytes": 122406567936,
+    "non_engram_hint_bytes": 127608261960,
+    "cold_weight_lower_bound_bytes": 5201694024,
+    "cold_weight_lower_bound_gib": 4.844455070793629,
+    "possible_all_active_weight_residency": false,
+    "size_evidence": "prior_review_tensor_payload_less_native_engram_includes_auxiliary",
+    "engram_ssd_hint_bytes": 202758032400,
+    "mandatory_gpu_bytes": null,
+    "expert_gpu_cache_bytes": null,
+    "blockers": [
+      "backend integration and hardware qualification missing",
+      "exact text/vision/draft tensor partition required",
+      "mandatory GPU working set, decode/prefill peaks and cgroup must be measured",
+      "zero spill does not prove fit; capacity share is not request hit rate"
+    ],
+    "caveats": [
+      "CPU/GPU sums are optimistic unique-weight bounds, not a shared allocator.",
+      "No extra full CPU copy of GPU weights is budgeted; staging must bound temporary duplicates.",
+      "Page cache is charged memory; buffered I/O prototypes do not enforce this RAM plan.",
+      "Context/concurrency reserves must be replaced with backend-specific measurements."
+    ]
+  }
+]

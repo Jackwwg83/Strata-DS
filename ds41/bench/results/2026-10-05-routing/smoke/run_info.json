@@ -1,0 +1,7 @@
+{
+ "kernels": "tilelang+torch_sparse_attn",
+ "load_s": 3.8,
+ "gpu_alloc_gib_after_load": 10.56,
+ "expert_act_fp8": true,
+ "max_tokens": 4096
+}

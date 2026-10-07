@@ -1,0 +1,19 @@
+== code_py_0
+generated:
+teacher_forced_mean_nll 1.059282 ppl 2.8843 over 199 tokens
+decode_ms_per_token 298.1 over 200 steps
+M1:
+generated:
+teacher_forced_mean_nll 1.059282 ppl 2.8843 over 199 tokens
+decode_ms_per_token 665.4 over 200 steps
+DUMP_IDENTICAL code_py_0
+== zh_0
+generated:
+teacher_forced_mean_nll 3.581346 ppl 35.9219 over 199 tokens
+decode_ms_per_token 291.1 over 200 steps
+M1:
+generated:
+teacher_forced_mean_nll 3.581346 ppl 35.9219 over 199 tokens
+decode_ms_per_token 814.9 over 200 steps
+DUMP_IDENTICAL zh_0
+M2A_DONE

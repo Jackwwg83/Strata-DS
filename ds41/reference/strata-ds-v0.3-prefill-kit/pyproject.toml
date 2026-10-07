@@ -1,0 +1,13 @@
+[build-system]
+requires = ["setuptools>=68"]
+build-backend = "setuptools.build_meta"
+[project]
+name = "strata-ds-lab"
+version = "0.3.0.dev0"
+description = "Design contracts and offline experiment tooling; not a DeepSeek inference engine"
+requires-python = ">=3.11"
+dependencies = []
+[project.scripts]
+strata-ds-lab = "strata_ds_lab.cli:main"
+[tool.setuptools.packages.find]
+include = ["strata_ds_lab*"]

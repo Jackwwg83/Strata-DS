@@ -1,0 +1,188 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<title>Strata-DS 引擎方案</title>
+<link rel="icon" href="data:,">
+<style>
+:root{--bg:#fbfbf9;--fg:#1d1d1b;--mut:#6b6b66;--line:#e2e1dc;--card:#fff;--acc:#2f5d8a;--ok:#2e7d4f;--warn:#9a5b00;--chip:#eef2f6}
+@media (prefers-color-scheme:dark){:root:not([data-theme=light]){--bg:#161615;--fg:#e9e8e3;--mut:#9b9a94;--line:#33332f;--card:#1f1f1d;--acc:#8db7e0;--ok:#7cc79a;--warn:#e0b060;--chip:#26303a}}
+:root[data-theme=dark]{--bg:#161615;--fg:#e9e8e3;--mut:#9b9a94;--line:#33332f;--card:#1f1f1d;--acc:#8db7e0;--ok:#7cc79a;--warn:#e0b060;--chip:#26303a}
+body{margin:0;background:var(--bg);color:var(--fg);font:15px/1.7 -apple-system,BlinkMacSystemFont,"Segoe UI","PingFang SC","Hiragino Sans GB","Microsoft YaHei","Noto Sans CJK SC",sans-serif}
+main{max-width:1080px;margin:0 auto;padding:24px 16px 72px}
+h1{font-size:26px;margin:0 0 4px}
+h2{font-size:19px;margin:36px 0 10px;color:var(--acc);border-bottom:1px solid var(--line);padding-bottom:4px}
+h3{font-size:15.5px;margin:20px 0 6px}
+p{margin:8px 0}
+.sub,.note{color:var(--mut);font-size:13px}
+.card{background:var(--card);border:1px solid var(--line);border-radius:10px;padding:14px 18px;margin:12px 0}
+.tw{overflow-x:auto;margin:10px 0;border:1px solid var(--line);border-radius:8px;background:var(--card)}
+table{border-collapse:collapse;width:100%;font-size:13.5px;font-variant-numeric:tabular-nums}
+th,td{padding:7px 10px;border-bottom:1px solid var(--line);text-align:left;vertical-align:top}
+th{font-weight:600;background:color-mix(in srgb,var(--acc) 8%,transparent);white-space:nowrap}
+tr:last-child td{border-bottom:0}
+code{font-family:ui-monospace,SFMono-Regular,Menlo,Consolas,monospace;font-size:12.5px;background:var(--chip);padding:1px 4px;border-radius:4px}
+.tag{display:inline-block;font-size:12px;padding:0 7px;border-radius:10px;background:var(--chip);white-space:nowrap}
+.ok{color:var(--ok)}.warn{color:var(--warn)}
+ol li,ul li{margin:4px 0}
+.toc a{color:var(--acc);text-decoration:none}
+</style>
+</head>
+<body>
+<main>
+<h1>Strata-DS 引擎方案</h1>
+<p class="sub">2026-10-05 · 依据：上游 Strata v0.1.39 源码、DeepSeek V4.1 Flash 官方配置与参考代码、两次 Vast 实测
+（<code>bench/results/2026-10-05-4090-7950x/</code>、<code>bench/results/2026-10-05-routing/</code>）。本文是待确认的方案，尚未开始写引擎代码。</p>
+
+<div class="card">
+<h3 style="margin-top:4px">一页结论</h3>
+<ol>
+<li><b>做什么：</b>fork 上游 Strata，加一条 DeepSeek V4.1 Flash 模型路径。上游的通用机制全部沿用（内存分层、CPU/GPU 每层分工、自适应专家缓存、prefill 流式、SSD 直读、服务层）；模型相关部分（注意力、路由、mHC、Engram、专家格式）重写。</li>
+<li><b>性能目标</b>（7950X + 128 GB + 4090，2bpw）：decode ≥ 35 tok/s（推算 45），16 GB 卡 ≥ 22 tok/s（推算 29）；8K prompt prefill ≥ 1,500 tok/s。</li>
+<li><b>决定性能的三件事</b>（来自实测）：每 token 搬的专家字节数（位宽）、GPU 命中率（自适应缓存）、CPU 侧是否跑满内存带宽（exllamav3 的 AVX-512 kernel 已达 92%）。引擎设计全部围绕这三件事。</li>
+<li><b>第一条纵切（M1）：</b>C++ 引擎用现有 3bpw 权重跑通整模型 decode，逐层数值与原型对齐、贪心输出逐 token 一致。不先铺功能。</li>
+<li><b>正确性基准：</b>我们自己的原型（官方 <code>model.py</code> 原样导入）就是对照答案，不需要租 8 卡机器。</li>
+</ol>
+</div>
+
+<p class="toc sub">目录：
+<a href="#targets">1 性能目标</a> · <a href="#map">2 上游映射</a> · <a href="#decisions">3 关键设计</a> ·
+<a href="#quant">4 2bpw 量化</a> · <a href="#milestones">5 里程碑</a> · <a href="#kernels">6 kernel 拆分与 Codex 分工</a> ·
+<a href="#verify">7 验证方式</a> · <a href="#repo">8 仓库</a> · <a href="#risks">9 风险</a> · <a href="#confirm">10 需要确认</a></p>
+
+<h2 id="targets">1. 性能目标</h2>
+<p>基准机器：Ryzen 9 7950X（双通道 DDR5，实测 48 GB/s）+ 128 GB + RTX 4090（16 GB 档用显存上限模拟）+ NVMe（实测 6.8 GB/s）。</p>
+<div class="tw"><table>
+<thead><tr><th>指标</th><th>配置</th><th>推算值</th><th>验收目标</th><th>推算依据</th></tr></thead>
+<tbody>
+<tr><td>decode</td><td>2bpw，24 GB</td><td>45 tok/s</td><td><b>≥ 35 tok/s</b></td><td>自适应命中 60%，CPU 17.8 ms / GPU 14.7 ms / SSD 4.7 ms</td></tr>
+<tr><td>decode</td><td>2bpw，16 GB</td><td>29 tok/s</td><td><b>≥ 22 tok/s</b></td><td>自适应命中 41%</td></tr>
+<tr><td>decode</td><td>1.59bpw（SAGE），24 GB</td><td>66 tok/s</td><td>≥ 45 tok/s</td><td>全部专家进内存，无 SSD</td></tr>
+<tr><td>decode</td><td>3bpw，24 GB</td><td>14 tok/s</td><td>≥ 10 tok/s</td><td>9% 访问落 SSD，SSD 是瓶颈</td></tr>
+<tr><td>prefill</td><td>2bpw，8K chunk，精确模式</td><td>≈ 1,800 tok/s</td><td><b>≥ 1,500 tok/s</b></td><td>每 chunk 40 层 × 约 3.1 GB 专家经 PCIe 4.0（26.8 GB/s）</td></tr>
+<tr><td>prefill</td><td>同上，CED 快速模式</td><td>≈ 3,400 tok/s</td><td>质量验收后再定</td><td>只有前 20 层处理整个 prompt</td></tr>
+</tbody></table></div>
+<p class="note">推算值来自 <code>proto/analyze_routes.py</code>，不含投机解码、注意力计算和调度开销。验收以真机实测为准，报告里分清"推算 / 实测"。</p>
+
+<h2 id="map">2. 上游子系统映射</h2>
+<div class="tw"><table>
+<thead><tr><th>子系统</th><th>上游做法（v0.1.39）</th><th>Strata-DS 做法</th><th>复用</th></tr></thead>
+<tbody>
+<tr><td>专家存放</td><td>全部专家进 pinned 内存 arena；内存不够时 <code>--resident-budget-gib</code> + mmap 读文件；<code>RouterLookahead</code> 预取</td><td>原样沿用。128 GB 下 2bpw 约 1.5% 访问落 SSD</td><td><span class="tag ok">复用</span> <code>expert_source.*</code>、<code>pinned.cu</code></td></tr>
+<tr><td>decode 专家计算</td><td>GPU 算显存命中，CPU 就地算未命中（AVX-512 Q2_0/IQ kernel），每层 doorbell 同步</td><td>同一机制；CPU kernel 换成 exllamav3 <code>moe_mul1</code>（EXL3，MIT），GPU 换成 exllamav3 EXL3 kernel</td><td><span class="tag ok">机制复用</span> <span class="tag">kernel 替换</span> <code>verify.cpp</code>、<code>kernels/cpu/</code></td></tr>
+<tr><td>PCIe 分流（pcie_frac）</td><td>部分未命中专家 DMA 到 GPU 算</td><td>AVX-512 机器上默认 0（实测与 CPU 抢内存带宽，合计 ≤ 50 GB/s）；只在 AVX2 / 核少的机器上开</td><td><span class="tag ok">复用</span>，默认值改</td></tr>
+<tr><td>显存专家缓存</td><td>profile.bin 静态填充 + 衰减计数自适应换入</td><td>原样沿用；profile 用我们采到的路由生成；按字节而不是按槽位分配</td><td><span class="tag ok">复用</span> <code>expert_cache.*</code>、<code>tools/make_profile.py</code></td></tr>
+<tr><td>prefill</td><td>GPU 按专家分组，pinned ring 借用缓存槽，chunk 自动选（≤ 8192）</td><td>同一机制，几何参数换成 DeepSeek；加 CED 快速模式开关</td><td><span class="tag ok">机制复用</span> <span class="tag">几何重写</span> <code>src/prefill/</code></td></tr>
+<tr><td>注意力</td><td>36 层 DeltaNet + 12 层 QSA（2 KV head）</td><td>40 层 CSA 稀疏注意力（64 head × 512，共享 KV，滑窗 128 + top-512 压缩项）、两级 indexer、compressor</td><td><span class="tag warn">重写</span>；参考上游 <code>qsa_*.cu</code></td></tr>
+<tr><td>KV cache</td><td>分页 int8；64K 以上流式放内存</td><td>DeepSeek 每 token 仅 3.2 KB（bf16），1M 上下文也只 3 GB：整块放显存，先不做 KV 流式</td><td><span class="tag">简化</span></td></tr>
+<tr><td>残差</td><td>gated residual（hc=4）</td><td>mHC（hc=4，Sinkhorn 20 轮）</td><td><span class="tag warn">重写</span>，参考 <code>gr.cu</code></td></tr>
+<tr><td>路由</td><td>top-10 of 512</td><td>sqrt(softplus) 打分 + bias 选 top-6 of 384，×1.5</td><td><span class="tag warn">重写</span>（小）</td></tr>
+<tr><td>n-gram 表</td><td>PLE 28.8 GB，O_DIRECT 16 线程，每 token 16 行</td><td>Engram 2 层 × 98 GB，每 token 48 行（264 B）；I/O 层复用，哈希重写</td><td><span class="tag ok">I/O 复用</span> <code>ple_reader.*</code>、<code>direct_file.*</code></td></tr>
+<tr><td>投机解码</td><td>MTP 验证窗口，整窗一张 CUDA graph</td><td>验证窗口框架沿用，先用窗口 = 1。DSpark 放 M7 评估（实测：CPU 受限时收益不确定）</td><td><span class="tag ok">框架复用</span></td></tr>
+<tr><td>服务层</td><td>Python HTTP，引擎子进程 stdin/stdout 行协议；OpenAI / Anthropic / Responses API</td><td>原样沿用；模板和工具调用解析换成 DeepSeek（DSML）</td><td><span class="tag ok">复用</span> <code>serve/</code>，改 <code>frontend.py</code></td></tr>
+<tr><td>安装与准入</td><td><code>setup.py</code> 按内存/显存推荐配置</td><td>加 DeepSeek 档位表（16/24 GB × 2bpw/1.59bpw/3bpw）</td><td><span class="tag ok">复用</span></td></tr>
+</tbody></table></div>
+<p class="note">上游约一半 C++/CUDA 代码是模型无关的基础设施。模型几何在上游是编译期常量（<code>include/strata/core/layout.hpp</code>），DeepSeek 路径放在独立目录，避免和上游后续更新冲突。</p>
+
+<h2 id="decisions">3. 关键设计决定（都以性能为导向）</h2>
+<div class="tw"><table>
+<thead><tr><th>#</th><th>决定</th><th>理由（实测依据）</th></tr></thead>
+<tbody>
+<tr><td>D1</td><td>专家统一用 EXL3 mul1 格式；kernel 不绑位宽（支持 1–8、2.5 等混合位宽）</td><td>同一套 kernel 跑 3bpw、2bpw、1.59bpw；CPU kernel 实测达内存带宽 92%</td></tr>
+<tr><td>D2</td><td>CPU 侧：8 线程绑物理核，每层一次调用算完所有未命中专家</td><td>实测 8 线程最快（44–46 GB/s），16/32 线程反而略慢</td></tr>
+<tr><td>D3</td><td>整个 decode 步录成一张 CUDA graph；CPU/GPU 用 doorbell + 自旋标志同步</td><td>原型的 GPU 单专家 40 µs 主要是 kernel 启动开销；上游用同样办法消掉</td></tr>
+<tr><td>D4</td><td>GPU 专家用融合 kernel：一次调用算一层所有命中专家</td><td>逐个算要 6 × 40 µs/层；融合后预计降一个数量级（待 M2 实测）</td></tr>
+<tr><td>D5</td><td>稠密层自写 FP8 块缩放 GEMV（寄存器里反量化），不依赖 FP8 硬件</td><td>3090（sm86）没有 FP8；decode 本来就卡带宽不卡算力。每步读 8.5 GB，4090 上约 9 ms</td></tr>
+<tr><td>D6</td><td>注意力 kernel 共享内存 ≤ 99 KB</td><td>官方 kernel 需要 141 KB，4090 上跑不了（实测）</td></tr>
+<tr><td>D7</td><td>内存分层按"最热进显存、次热进内存、最冷进 SSD"，以字节为单位规划</td><td>128 GB 下 2bpw 只有 1.5% 访问落 SSD；3bpw 是 9%（SSD 成瓶颈）</td></tr>
+<tr><td>D8</td><td>prefill 先做精确模式（40 层全跑）；CED 有界重放作为快速模式，过质量门槛再默认开</td><td>CED 是官方生产用法，prefill 可快约 1 倍；但属于近似，必须先测质量</td></tr>
+<tr><td>D9</td><td>投机解码（DSpark）放到最后，按实测决定开不开</td><td>窗口 6 时 CPU 专家量是单 token 的 3.8 倍；若平均接受 &lt; 3.8 个 token，CPU 受限配置会变慢</td></tr>
+<tr><td>D10</td><td>所有数值以原型为准：逐层隐藏状态、逐 token 输出、困惑度</td><td>原型已在 4090 上验证（生成正确，困惑度正常）</td></tr>
+</tbody></table></div>
+
+<h2 id="quant">4. 2bpw 量化路线（可选：引擎实测后再决定）</h2>
+<p class="warn">2026-10-05 更新：先不自己做量化。引擎开发用现成的 SAGE 1.59bpw（最快）和 coolbho3k 3bpw（质量最好）；引擎不绑位宽，有更好的 2bpw 时直接换权重包。下面是需要时的做法。</p>
+<p>没有现成的 DeepSeek V4.1 2bpw TP1 量化；coolbho3k 没有公开量化工具；exllamav3 的转换脚本只支持 V4 架构。我们只量化路由专家（其余权重保持官方 FP8/BF16），步骤：</p>
+<ol>
+<li><b>量化源：</b>官方原版 FP4 专家（基座仓库，475 GiB，含 Engram）。不从 3bpw 再压缩，避免误差叠加。</li>
+<li><b>校准：</b>用原型逐层前向，收集每个专家的输入行，累积 Hessian。逐层进行：第 L 层量化完，用量化后的第 L 层算出第 L+1 层的输入（与 exllamav3 的做法一致）。</li>
+<li><b>量化核心：</b>直接调用 exllamav3 的 <code>quantize_tiles</code>（LDLQ + trellis，mul1 码本），目标约 2.0–2.25bpw，可按层/按矩阵混合位宽。</li>
+<li><b>质量评估：</b>同一批文档上与原版 FP4 比 KL、top-1 一致率、困惑度；再加中文与编程任务抽查。参照：3bpw KL 0.041，SAGE 1.59bpw KL 0.19。</li>
+</ol>
+<p class="warn">成本未知：先做"试点"——只量化 1 层，实测 GPU 时间，再外推整模型成本给你确认。粗估整模型 10–30 GPU 小时（≈ $5–15），未经验证。</p>
+
+<h2 id="milestones">5. 里程碑</h2>
+<div class="tw"><table>
+<thead><tr><th>里程碑</th><th>内容</th><th>验收（必须有真实数据举证）</th><th>Vast 用量</th></tr></thead>
+<tbody>
+<tr><td><b>M0</b> 地基</td><td>fork 上游；在 Vast 4090 机器上原样编译、跑通上游测试；建立 DeepSeek 目录结构和打包工具（3bpw → 引擎 pack 格式）</td><td>上游测试全过；pack 文件校验通过（与原型读出的字节逐一相等）</td><td>约 3 小时</td></tr>
+<tr><td><b>M1</b> 第一条纵切</td><td>C++ 引擎整模型 decode（窗口 = 1）：稠密层先用简单正确的 kernel，专家全部 CPU 算（不缓存），Engram 先用 mmap</td><td>6 个 prompt × 64 token 贪心输出与原型逐 token 一致；40 层隐藏状态相对误差在阈值内；记录 tok/s（此时不追求快）</td><td>约 8–15 小时</td></tr>
+<tr><td><b>M2</b> decode 性能</td><td>自适应显存缓存 + profile、doorbell 并行、CUDA graph、融合 GPU 专家 kernel、FP8 GEMV；用现成的 3bpw 和 SAGE 1.59bpw 实测</td><td>SAGE 1.59bpw / 24 GB 实测 ≥ 45 tok/s；与推算偏差有解释</td><td>约 10–20 小时</td></tr>
+<tr><td><b>M3</b> prefill</td><td>pinned ring 流式、自动 chunk、注意力/indexer 的 prefill kernel</td><td>8K prompt 实测 tok/s；28 篇文档困惑度与原型偏差 &lt; 1%</td><td>约 8 小时</td></tr>
+<tr><td><b>M4</b> 128 GB 真约束</td><td>SSD 专家层（resident budget + RouterLookahead）、Engram O_DIRECT 直读、16 GB 档；用 cgroup / 内存占位把机器限到 128 GB</td><td>128 GB 限制下 3bpw 与 2bpw 实测 tok/s；无 OOM</td><td>约 6 小时</td></tr>
+<tr><td><b>M5</b> 2bpw 量化（可选）</td><td>引擎实测后决定是否做：试点 1 层 → 报成本 → 整模型量化 → 质量评估；或请 SAGE 作者出约 2.2bpw 版本</td><td>KL / top-1 / 困惑度对比表；2bpw / 24 GB 实测 ≥ 35 tok/s</td><td>试点后确定</td></tr>
+<tr><td><b>M6</b> 可用产品</td><td>服务层（OpenAI / Anthropic / Responses API）、DeepSeek 模板与 DSML 工具调用、setup 档位</td><td>Codex CLI 真实工具循环跑通</td><td>约 4 小时</td></tr>
+<tr><td><b>M7</b> 扩展</td><td>AVX2（Intel 消费级）调优、双卡层切分、DSpark 评估、CED 快速 prefill</td><td>各项实测对比</td><td>按需</td></tr>
+</tbody></table></div>
+<p class="note">M1 跑通前不开始横向铺功能。每个里程碑结束：原始数据进 <code>bench/results/</code>，HTML 报告，标注每个组件处于"代码实现 / 部署路径 / 真实数据 / 推算"哪一级。</p>
+
+<h2 id="kernels">6. kernel 拆分与 Codex 分工</h2>
+<p>每个 kernel 任务都附：输入输出形状、数值语义（每一步量化/舍入）、共享内存预算（sm86/sm89 ≤ 99 KB）、对拍测试（以 <code>proto/torch_kernels.py</code> 与官方 <code>model.py</code> 的函数为参考答案，给出容差）。Codex 写代码，测试在 Vast GPU 机器上跑，我审 diff。</p>
+<div class="tw"><table>
+<thead><tr><th>#</th><th>kernel</th><th>难度</th><th>建议执行者</th><th>里程碑</th></tr></thead>
+<tbody>
+<tr><td>K1</td><td>FP8 块缩放 GEMV（decode 稠密层，e8m0 32×32 scale，寄存器内反量化）</td><td>低</td><td><b>Codex 试点任务</b></td><td>M1/M2</td></tr>
+<tr><td>K2</td><td>FP8 块缩放 GEMM（prefill，反量化 tile → tensor core）</td><td>中</td><td>Codex</td><td>M3</td></tr>
+<tr><td>K3</td><td>CSA 稀疏注意力 decode/验证窗口（64 head × 512，gather 640 项，sink，≤ 99 KB）</td><td>高</td><td>我</td><td>M1/M2</td></tr>
+<tr><td>K4</td><td>CSA 稀疏注意力 prefill</td><td>高</td><td>我（或 Codex 在 K3 基础上）</td><td>M3</td></tr>
+<tr><td>K5</td><td>indexer 打分 + 两级 top-k（候选块 2048×8 → top-512）</td><td>高</td><td>我</td><td>M1/M3</td></tr>
+<tr><td>K6</td><td>compressor（ratio 2 softmax 池化，FP4/E4M3 KV 量化）</td><td>中</td><td>Codex</td><td>M1</td></tr>
+<tr><td>K7</td><td>mHC：hc_mixes + Sinkhorn + pre/post 融合</td><td>中</td><td>Codex</td><td>M2</td></tr>
+<tr><td>K8</td><td>路由：sqrt(softplus) + bias top-6 + 归一化</td><td>低</td><td>Codex</td><td>M1</td></tr>
+<tr><td>K9</td><td>Engram：CPU 哈希、行反量化、门控</td><td>中</td><td>Codex</td><td>M1/M4</td></tr>
+<tr><td>K10</td><td>GPU EXL3 专家：接入 exllamav3 融合 MoE kernel</td><td>中（集成）</td><td>我</td><td>M2</td></tr>
+<tr><td>K11</td><td>CPU EXL3 专家：接入 exllamav3 <code>moe_mul1</code>，挂到上游 CPU 线程池</td><td>中（集成）</td><td>我</td><td>M1</td></tr>
+</tbody></table></div>
+<p class="note">Codex 跑在你的 Mac mini 上（没有 NVIDIA 卡），只能写代码不能编译测试 CUDA；需要它把代码推到仓库分支，由我在 Vast 机器上编译跑对拍。先用 K1 试一次，看质量再决定交多少。</p>
+
+<h2 id="verify">7. 验证方式</h2>
+<ul>
+<li><b>kernel 级：</b>每个 kernel 对拍参考实现，记录相对误差；比照上游的 <code>*_parity</code> 测试组织方式。</li>
+<li><b>模型级：</b>固定 prompt，在原型里导出每层隐藏状态与 logits；引擎逐层比对。贪心输出逐 token 比对。</li>
+<li><b>质量级：</b>28 篇文档困惑度（已有基线）；量化版本额外比 KL 与 top-1。</li>
+<li><b>性能级：</b>固定 7950X + 4090 机型，记录 tok/s、每层 CPU/GPU/SSD 时间、显存命中率；16 GB 用显存上限模拟，128 GB 用内存限制模拟。原始 JSON 与日志全部入库。</li>
+<li><b>TDD：</b>改变运行时行为的代码先写测试；每个 bug 修复带回归测试。</li>
+</ul>
+
+<h2 id="repo">8. 仓库与分支</h2>
+<ul>
+<li>在 GitHub 上 fork <code>Niko1221/Strata</code>（MIT），本地 <code>Strata-DS/</code> 改为这个 fork 的工作区。</li>
+<li>DeepSeek 相关代码放独立目录（如 <code>src/ds41/</code>、<code>include/strata/ds41/</code>、<code>tools/ds41/</code>），研究材料放 <code>ds41/</code>（原型、实测数据、文档），尽量不改上游已有文件，方便以后合并上游更新。</li>
+<li>分支：<code>main</code> 保护；功能分支 <code>feature/ds41-*</code>；每次提交不超过 5 个文件。</li>
+<li>许可：上游 MIT；exllamav3 MIT；DeepSeek 参考代码 MIT；coolbho3k 运行时是 AGPL，<b>不拷贝其代码</b>，只用其公开的 MIT 权重。</li>
+</ul>
+
+<h2 id="risks">9. 风险</h2>
+<div class="tw"><table>
+<thead><tr><th>风险</th><th>影响</th><th>应对</th></tr></thead>
+<tbody>
+<tr><td>2bpw 质量不够</td><td>主推配置不成立</td><td>M5 试点先测质量；退路是 2.25–2.5bpw（速度约 23–29 tok/s / 24 GB）或混合位宽</td></tr>
+<tr><td>真实使用的命中率低于测出的 53–60%</td><td>decode 变慢</td><td>语料扩充（更多 agent 对话）；按用户自己的使用重建 profile（上游已支持保存学到的 profile）</td></tr>
+<tr><td>注意力 kernel 在 99 KB 共享内存下效率低</td><td>GPU 侧变慢</td><td>参考上游 QSA kernel 的分块；decode 时注意力只占小头（每层只读几十 KB KV）</td></tr>
+<tr><td>上游迭代极快（11 天 40 个版本）</td><td>合并成本</td><td>DeepSeek 代码独立目录；固定在某个上游版本，按需合并</td></tr>
+<tr><td>Intel 消费级 CPU 没有 AVX-512</td><td>CPU 侧降到 33–36 GB/s（16+ 线程）</td><td>M7 专项：AVX2 路径 + 开启 pcie_frac 分流</td></tr>
+<tr><td>Vast 机型随时变化</td><td>测量不可比</td><td>固定"台式 Zen4 + 4090 + 128 GB"机型；每次记录机器指纹</td></tr>
+</tbody></table></div>
+
+<h2 id="confirm">10. 需要你确认</h2>
+<div class="card">
+<ol>
+<li><b>GitHub fork 放在哪个账号 / 组织下，公开还是私有？</b>（创建 fork 属于对外操作，需要你点头。）</li>
+<li><b>本阶段 Vast 预算：</b>M0–M2 预计 20–40 GPU 小时，按 $0.6–0.7/小时约 <b>$15–30</b>；量化试点另报。这个范围可以吗？</li>
+<li><b>Codex 分工：</b>是否从 K1（FP8 GEMV）开始试点？需要 Codex 能推送到仓库分支。</li>
+</ol>
+</div>
+</main>
+</body>
+</html>

@@ -1,0 +1,4 @@
+NLL code_py_0 notier nll 1.071680  (M2c: code_py_0 1.056031 zh_0 3.647609; K3-10: 1.071680 3.625383)
+NLL zh_0 notier nll 3.625383  (M2c: code_py_0 1.056031 zh_0 3.647609; K3-10: 1.071680 3.625383)
+TIME tier: teacher_forced_mean_nll 1.055621 ppl 2.8738 over 199 tokens decode_ms_per_token 126.6 over 200 steps (cpu experts 96.8) vram_expert_slots 896 hit_rate 0.6694 
+CHECK_DONE

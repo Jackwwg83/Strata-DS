@@ -1,0 +1,98 @@
+{
+  "schema_version": 1,
+  "note": "Compatibility/integrity check, not publisher authenticity or runtime qualification.",
+  "files": [
+    {
+      "path": "recipes/exl3-3-r128-v16.json",
+      "sha256": "179c2c2eec349a453992406b7e201b147be622092b213f8073cdb089d140e73d"
+    },
+    {
+      "path": "recipes/exl3-3-r128-v24.json",
+      "sha256": "e3899a0a94d57182e62231859bcdaa7139cc9d548ff7334fcc188b5343518e94"
+    },
+    {
+      "path": "recipes/exl3-3-r192-v24.json",
+      "sha256": "0c0a5ade2e3eadc20e239ce6cc76b0a1846fb87e6c9c56d8e80375c2ccc27ec1"
+    },
+    {
+      "path": "recipes/exl3-3-r256-v16.json",
+      "sha256": "b25402355f06823ed2ae063ff780b5c71d7ea9f259ca8bf13aa5bad0b0c6c54f"
+    },
+    {
+      "path": "recipes/exl3-3-r256-v24.json",
+      "sha256": "714119cbb08d84ad97e106a83cc282b42a598555214224d0121faf487d8bfcfb"
+    },
+    {
+      "path": "recipes/exl3-3-r384-v24.json",
+      "sha256": "b91ce66b8832e40846ed8c7156855e311efa1e2c4b569ce782619feeb71e0c5d"
+    },
+    {
+      "path": "recipes/native-r384-v24.json",
+      "sha256": "7277904ea199141e1af09702f9b09b3535c4ef466e1753091591aac691fb0ed4"
+    },
+    {
+      "path": "recipes/q2-r128-v16.json",
+      "sha256": "f2642c1c64109c93282779c07993646152e6fdac59c4301092d23464414aa8e4"
+    },
+    {
+      "path": "recipes/q2-r128-v24.json",
+      "sha256": "e9cc8e92adfa395395766343ec21176a93f426fbe87e84acf7af88209aa47678"
+    },
+    {
+      "path": "recipes/q2-r192-v24.json",
+      "sha256": "3779e2df73071e44ad7f17db9944b256887d4c5bdb577f5174b2473684bc5f2f"
+    },
+    {
+      "path": "recipes/sage-1.59-r128-v24.json",
+      "sha256": "0cb66287d6534f2fb9662c92735fcdf21093569c18ccd701f532e5e9a14fe826"
+    },
+    {
+      "path": "specs/cloud-policy.json",
+      "sha256": "4009fbc41b1a2a5912b7da19ceb4a7e4c4f6076a30d73e812b04794c020b4f1a"
+    },
+    {
+      "path": "specs/models.json",
+      "sha256": "38a713610645cd31ca6df094629e8ffa2bc5e90ad252f091f678803130bae9a7"
+    },
+    {
+      "path": "specs/backlog.json",
+      "sha256": "bb38a06c897775d5ede4fc20f8991668cef6f4101f559330e194b9979c306ea8"
+    }
+  ],
+  "preserved_source_lock_keys": {
+    "schema_version": 1,
+    "recorded_on": "2026-10-04",
+    "lock_status": "PARTIAL; null fields block real execution",
+    "base_revision_for_quant_oracle": "df42c109f1defefcbfcedbe7d905718a12266e40",
+    "legacy_v01_base_revision_not_interchangeable": "2cba9e42aa026125f3ed06c6d98c1db82f7ca027",
+    "coolbho3k": {
+      "runtime_repo": "coolbho3k/DeepSeek-v4.1-Flash-2x-DGX-Spark",
+      "runtime_commit": "1d8ac64af01c6fec87f39eb1dd526ff183615c73",
+      "model_repo": "coolbho3k/DeepSeek-V4.1-Flash-EXL3-3bpw",
+      "model_revision": "650cae2c13aaaec303871a35301503570889c0be",
+      "model_manifest_sha256": "828b7b5d7a672c5f2e44caca3d72d9c114c39634e46eb51deabd067a0f44a2c9",
+      "engram_revision": "93a185660c42c90e26c326239ce8c8fd95179d64",
+      "engram_manifest_path": "engram-page15-v1/manifest.json",
+      "engram_manifest_sha256": "43b3b6305d3edd8ec24b9014fccd842c623f7cfce41014611cbd85244dc62854",
+      "runtime_scope": "TP2/DCP2 GB10; NOT an x86 single discrete GPU launch lock",
+      "our_single_gpu_image_digest": null,
+      "tokenizer_digest": null,
+      "template_digest": null,
+      "license_note": "weights MIT; specified derived Engram reader/integration AGPL-3.0-only"
+    },
+    "q2": {
+      "model_repo": "antirez/deepseek-v4.1-flash-gguf",
+      "model_revision": null,
+      "manifest_sha256": null,
+      "runtime_commit_from_prior_review": "0aaea5a238fb41a35106a551e73c8409dfb751ac",
+      "single_discrete_gpu_qualified": false
+    },
+    "sage": {
+      "model_repo": "vcruz305/DSV4.1-Flash-SAGE-EXL3-1.59bpw",
+      "model_revision": null,
+      "manifest_sha256": null
+    },
+    "weights_downloaded": false,
+    "gpu_model_validated": false
+  }
+}

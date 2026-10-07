@@ -1,0 +1,2 @@
+ds41: 275 VRAM expert slots (3.41 GiB)
+ds41 prefill: chunk 4096 tokens; scratch 2.07 GiB in lent slots; ring 64 slots in lent slots; 231 tier slots lent

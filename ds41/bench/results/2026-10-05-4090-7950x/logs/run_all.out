@@ -1,0 +1,41 @@
+=== machine 05:58:51
+=== membw 05:58:53
+{"threads": 1, "gib": 8, "read_gbps": 42.81, "copy_gbps_rw": 29.97, "sink": 0}
+{"threads": 2, "gib": 8, "read_gbps": 48.50, "copy_gbps_rw": 31.28, "sink": 0}
+{"threads": 4, "gib": 8, "read_gbps": 48.68, "copy_gbps_rw": 30.74, "sink": 0}
+{"threads": 8, "gib": 8, "read_gbps": 47.51, "copy_gbps_rw": 29.95, "sink": 0}
+{"threads": 16, "gib": 8, "read_gbps": 46.13, "copy_gbps_rw": 29.05, "sink": 0}
+{"threads": 32, "gib": 8, "read_gbps": 45.32, "copy_gbps_rw": 28.82, "sink": 0}
+=== gpu_pcie 05:59:32
+=== nvme 06:00:59
+=== expert_parity 06:03:47
+=== expert_gpu 06:03:52
+=== expert_cpu_auto 06:03:54
+=== expert_cpu_vnni 06:04:02
+=== expert_cpu_avx2 06:04:09
+=== expert_cpu_bg_h2d 06:04:20
+=== done 06:04:28
+total 144
+drwxr-xr-x 3 root root 4096 Oct  5 06:04 .
+drwxr-xr-x 3 root root   35 Oct  5 05:58 ..
+-rw-r--r-- 1 root root 5951 Oct  5 06:04 expert_cpu_auto.json
+-rw-r--r-- 1 root root 5954 Oct  5 06:04 expert_cpu_avx2.json
+-rw-r--r-- 1 root root 5948 Oct  5 06:04 expert_cpu_vnni.json
+-rw-r--r-- 1 root root 1009 Oct  5 06:04 expert_cpubg.json
+-rw-r--r-- 1 root root 2402 Oct  5 06:03 expert_gpu.json
+-rw-r--r-- 1 root root  640 Oct  5 06:03 expert_parity.json
+-rw-r--r-- 1 root root 6333 Oct  5 06:01 fio_prep_write.json
+-rw-r--r-- 1 root root 6385 Oct  5 06:02 fio_rand_13m_qd1.json
+-rw-r--r-- 1 root root 6414 Oct  5 06:02 fio_rand_13m_qd16.json
+-rw-r--r-- 1 root root 6390 Oct  5 06:02 fio_rand_13m_qd4.json
+-rw-r--r-- 1 root root 6336 Oct  5 06:03 fio_rand_4k_qd1.json
+-rw-r--r-- 1 root root 6372 Oct  5 06:03 fio_rand_4k_qd32.json
+-rw-r--r-- 1 root root 6388 Oct  5 06:03 fio_rand_4k_qd64x4.json
+-rw-r--r-- 1 root root 6380 Oct  5 06:01 fio_seq_13m_qd1.json
+-rw-r--r-- 1 root root 6385 Oct  5 06:01 fio_seq_13m_qd4.json
+-rw-r--r-- 1 root root 1071 Oct  5 06:00 gpu_pcie.json
+drwxr-xr-x 2 root root 4096 Oct  5 06:04 logs
+-rw-r--r-- 1 root root  453 Oct  5 05:58 machine.json
+-rw-r--r-- 1 root root 9915 Oct  5 05:58 machine.txt
+-rw-r--r-- 1 root root  476 Oct  5 05:59 membw.jsonl
+-rw-r--r-- 1 root root  930 Oct  5 06:03 nvme_summary.json

@@ -1,0 +1,21 @@
+NLL code_py_0 tokens 200 | prototype_fp16 1.076752 | step 1.049737 | prefill 1.033566 | chunk61 1.052743
+    prefill: prefill_tokens 200 ms 4900.4 tok_s 40.8 chunks 1 chunk_tokens 4096 engram_ms 69.9 stream_wait_ms 3397.6 vram_experts 41 streamed 4833 (ram 0 cache 4406 ssd 427)
+    chunk61: prefill_tokens 200 ms 9392.2 tok_s 21.3 chunks 4 chunk_tokens 61 engram_ms 77.4 stream_wait_ms 6858.5 vram_experts 410 streamed 9409 (ram 0 cache 9001 ssd 408)
+NLL zh_0 tokens 200 | prototype_fp16 3.644291 | step 3.555235 | prefill 3.586048 | chunk61 3.589440
+    prefill: prefill_tokens 200 ms 7843.9 tok_s 25.5 chunks 1 chunk_tokens 4096 engram_ms 73.9 stream_wait_ms 6423.5 vram_experts 43 streamed 7008 (ram 0 cache 2959 ssd 4049)
+    chunk61: prefill_tokens 200 ms 17543.7 tok_s 11.4 chunks 4 chunk_tokens 61 engram_ms 70.6 stream_wait_ms 15259.2 vram_experts 538 streamed 12346 (ram 0 cache 4951 ssd 7395)
+NLL en_0 tokens 200 | prototype_fp16 1.943494 | step 1.910794 | prefill 1.935054 | chunk61 1.918639
+    prefill: prefill_tokens 200 ms 7388.8 tok_s 27.1 chunks 1 chunk_tokens 4096 engram_ms 69.4 stream_wait_ms 6049.0 vram_experts 41 streamed 6722 (ram 0 cache 2823 ssd 3899)
+    chunk61: prefill_tokens 200 ms 15795.2 tok_s 12.7 chunks 4 chunk_tokens 61 engram_ms 69.6 stream_wait_ms 13398.8 vram_experts 389 streamed 12655 (ram 0 cache 6685 ssd 5970)
+NLL code_cpp_1 tokens 200 | prototype_fp16 2.146486 | step 2.166043 | prefill 2.176206 | chunk61 2.163859
+    prefill: prefill_tokens 200 ms 9275.1 tok_s 21.6 chunks 1 chunk_tokens 4096 engram_ms 120.5 stream_wait_ms 7819.6 vram_experts 42 streamed 6732 (ram 0 cache 679 ssd 6053)
+    chunk61: prefill_tokens 200 ms 24665.8 tok_s 8.1 chunks 4 chunk_tokens 61 engram_ms 74.6 stream_wait_ms 22618.5 vram_experts 651 streamed 12917 (ram 0 cache 1195 ssd 11722)
+NLL zh_2 tokens 200 | prototype_fp16 2.326274 | step 2.394029 | prefill 2.343196 | chunk61 2.420287
+    prefill: prefill_tokens 200 ms 5946.1 tok_s 33.6 chunks 1 chunk_tokens 4096 engram_ms 68.5 stream_wait_ms 4602.8 vram_experts 44 streamed 5694 (ram 0 cache 1368 ssd 4326)
+    chunk61: prefill_tokens 200 ms 19071.0 tok_s 10.5 chunks 4 chunk_tokens 61 engram_ms 75.4 stream_wait_ms 17031.5 vram_experts 607 streamed 11051 (ram 0 cache 2300 ssd 8751)
+LONG 3000 tokens | one chunk 1.240395 | chunks of 999 1.235292
+    one:   prefill_tokens 3000 ms 26853.0 tok_s 111.7 chunks 1 chunk_tokens 4096 engram_ms 646.6 stream_wait_ms 22701.9 vram_experts 44 streamed 15316 (ram 0 cache 1764 ssd 13552)
+    chunk: prefill_tokens 3000 ms 61318.1 tok_s 48.9 chunks 4 chunk_tokens 999 engram_ms 621.4 stream_wait_ms 55865.9 vram_experts 472 streamed 33205 (ram 0 cache 4075 ssd 29130)
+GEN step:    generated: 3405 7743 5395 2272 74 1269 5426 2699 21592 66035 19566 66035 19566 21 16 26 7505 64528 10275 3405 22604 2136 260 223 7207 1761 17907 15 41523 201 48076 10672 9934
+GEN prefill: prefill_tokens 300 ms 11724.5 tok_s 25.6 chunks 1 chunk_tokens 4096 engram_ms 96.2 stream_wait_ms 10213.2 vram_experts 44 streamed 8534 (ram 0 cache 407 ssd 8127) generated: 3405 7743 5395 2272 74 1269 5426 2699 21592 66035 19566 66035 19566 21 16 26 7505 64528 10275 3405 22604 2136 260 223 7207 36 15 41523 201 48076 10672 9934 decode_ms_per_token 373.0 over 31 steps 
+M3_VERIFY_DONE

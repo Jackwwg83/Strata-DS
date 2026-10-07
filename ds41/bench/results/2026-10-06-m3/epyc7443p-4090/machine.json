@@ -1,0 +1,18 @@
+{
+ "date_utc": "2026-10-06T04:43:14Z",
+ "cpu_model": "AMD EPYC 7443P 24-Core Processor",
+ "cpu_logical": 48,
+ "cpu_avx2": true,
+ "cpu_avx512f": false,
+ "cpu_avx512_vnni": false,
+ "cpu_avx512_vbmi": false,
+ "cpu_avx512_bf16": false,
+ "mem_total_gib": 503.57,
+ "cgroup_memory_max": "",
+ "gpu_name": "NVIDIA GeForce RTX 4090",
+ "gpu_cc": "8.9",
+ "gpu_mem_gib": 23.6,
+ "gpu_query": "615.71.09, 4, 1, 16, 16",
+ "torch": "2.8.0+cu128",
+ "torch_cuda": "12.8"
+}

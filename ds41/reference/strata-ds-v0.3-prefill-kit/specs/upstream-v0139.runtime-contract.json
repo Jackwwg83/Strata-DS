@@ -1,0 +1,91 @@
+{
+  "schema_version": 1,
+  "status": "DESIGN_NOT_RUNTIME_IMPLEMENTATION",
+  "default_slots": 1,
+  "memory": {
+    "static_v02_reserves_are_capacity_hints_only": true,
+    "unknown_bytes_block_admission": true,
+    "phases": [
+      "load",
+      "prefill",
+      "decode",
+      "capture",
+      "transition"
+    ],
+    "count_configured_or_actually_allocated_not_only_active_slots": true,
+    "allocation_order": [
+      "mandatory_dense_head_logits",
+      "approved_state_workspace",
+      "expert_cache"
+    ],
+    "missing_measurements": null
+  },
+  "io": {
+    "file_working_set": "union of expert ranges possibly read in this phase after residency, including borrowed-slot refills",
+    "available_snapshot": "after residency allocation",
+    "subtract_resident_again": false,
+    "engram_full_table_in_expert_working_set": false,
+    "engram_cache_and_io_counted_elsewhere": true,
+    "automatic_hdd_to_full_engram_ram_fallback": false,
+    "buffered_vs_direct_is_measured_policy": true
+  },
+  "ring": {
+    "unit": "bytes",
+    "stride_from_exact_expert_bundle": true,
+    "silent_minimum_overspend": false,
+    "backend_scratch_monotonicity_assumed": false,
+    "prefill_borrow_default": false
+  },
+  "sampling": {
+    "penalties_silently_ignored": false,
+    "rng_key": [
+      "request_seed",
+      "logical_position"
+    ],
+    "batch_row_index_affects_rng": false,
+    "default_speculation": false
+  },
+  "api": {
+    "transport": "Responses HTTP SSE",
+    "backend_connected": false,
+    "default_bind": "127.0.0.1",
+    "unknown_requested_capability": "400_UNSUPPORTED_PARAMETER",
+    "response_store": false,
+    "internal_prefix_cache_is_separate": true,
+    "silent_hosted_tool_drop": false,
+    "base64_as_encryption": false,
+    "opaque_reasoning_replay": "DISABLED_UNTIL_REAL_CRYPTO_AND_CLIENT_TEST",
+    "strict_schema": "REJECT_UNTIL_REAL_ENFORCEMENT_OR_EXPLICIT_VALIDATE_ONLY_CONTRACT",
+    "previous_response_id": false,
+    "background": false,
+    "images": false,
+    "reasoning_summaries": false,
+    "actual_codex_client_version": null
+  },
+  "metrics_required": [
+    "requested_slots",
+    "effective_slots",
+    "allocated_slots",
+    "active_rows",
+    "ring_bytes",
+    "ring_slots",
+    "ring_stride_bytes",
+    "prefill_chunk_tokens",
+    "loan_bytes",
+    "refill_bytes",
+    "gpu_hit_bytes",
+    "ram_hit_given_gpu_miss_bytes",
+    "logical_read_bytes",
+    "physical_io_bytes",
+    "h2d_bytes",
+    "queue_ms",
+    "preemption_wait_ms",
+    "ttft_thinking_ms",
+    "ttft_answer_ms",
+    "tpot_p95_ms",
+    "task_success",
+    "trial_total_cost"
+  ],
+  "source_preserved_model_pins": true,
+  "real_gpu_validated": false
+}

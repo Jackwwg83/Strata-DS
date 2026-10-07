@@ -1,0 +1,52 @@
+{
+  "date": "2026-10-04",
+  "artifact": "strata-ds-v0.2-design-kit",
+  "artifact_type": "design_and_offline_tooling_not_inference_engine",
+  "python": "3.13.5",
+  "os": "Linux",
+  "architecture": "x86_64",
+  "unittest": {
+    "command": "python -m unittest discover -s tests -v",
+    "test_cases": 75,
+    "passed": 75,
+    "failed": 0,
+    "skipped": 0,
+    "log": "results/unittest.txt"
+  },
+  "cpp": {
+    "command": "g++ -std=c++17 -Wall -Wextra -Werror -Iinclude -fsyntax-only tools/check_contract.cpp",
+    "status": "PASS_SYNTAX_ONLY",
+    "gpu_kernels_compiled": false,
+    "log": "results/cpp-contract.txt"
+  },
+  "recipes": {
+    "core": 8,
+    "optional": 3,
+    "all_status": "DESIGN_ONLY"
+  },
+  "executed_offline_commands": [
+    "plan --all",
+    "matrix --stage smoke",
+    "matrix --stage screen --recipes exl3-3-r256-v24 exl3-3-r192-v24 exl3-3-r128-v24",
+    "summarize examples/timings.synthetic.jsonl",
+    "cost-plan examples/normalized-quote.synthetic.json",
+    "backend-status"
+  ],
+  "not_performed": [
+    "real_model_download",
+    "GPU_kernel_or_model_execution",
+    "quantization_quality_benchmark",
+    "cloud_rental",
+    "GitHub_publish"
+  ],
+  "synthetic_outputs": [
+    "results/metrics.synthetic.json",
+    "results/cost.synthetic.json"
+  ],
+  "limitations": [
+    "CPU prototypes are not wired to a full-model runtime.",
+    "All real backends intentionally report not implemented.",
+    "Budget estimates are not admission or speed guarantees.",
+    "The 75 tests are this kit only; do not add legacy v0.1 test counts."
+  ]
+}

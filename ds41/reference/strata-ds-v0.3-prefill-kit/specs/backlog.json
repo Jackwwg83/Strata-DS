@@ -1,0 +1,314 @@
+{
+  "schema_version": 1,
+  "all_tasks_status": "PLANNED_NOT_IMPLEMENTED_BY_DESIGN_KIT",
+  "tasks": [
+    {
+      "id": "SD-000",
+      "priority": "P0",
+      "title": "锁定来源与许可证",
+      "depends_on": [],
+      "target_paths_design": [
+        "specs/sources.lock.json",
+        "docs/SOURCES.md"
+      ],
+      "acceptance": [
+        "解析Q2/SAGE不可变revision；校验EXL3两个manifest",
+        "标出AGPL来源和分发方案；旧v0.1 base revision不当oracle"
+      ],
+      "status": "planned"
+    },
+    {
+      "id": "SD-001",
+      "priority": "P0",
+      "title": "真实tensor manifest与text partition",
+      "depends_on": [
+        "SD-000"
+      ],
+      "target_paths_design": [
+        "strata_ds/catalog/",
+        "tests/test_real_manifest.py"
+      ],
+      "acceptance": [
+        "按tensor核实packed/scale/rotations/padding",
+        "明确text/vision/draft/Engram/mandatory device bytes，未知项fail closed"
+      ],
+      "status": "planned"
+    },
+    {
+      "id": "SD-002",
+      "priority": "P0",
+      "title": "EXL3单expert GPU executor",
+      "depends_on": [
+        "SD-001"
+      ],
+      "target_paths_design": [
+        "native/exl3/",
+        "strata_ds/backends/exl3/"
+      ],
+      "acceptance": [
+        "真实MUL1 gate/up/down对独立上游",
+        "目标GPU架构、batch1/2/5/prefill、bounded scratch，不能全层展开"
+      ],
+      "status": "planned"
+    },
+    {
+      "id": "SD-003",
+      "priority": "P0",
+      "title": "Engram file-backed provider",
+      "depends_on": [
+        "SD-001"
+      ],
+      "target_paths_design": [
+        "native/io/",
+        "strata_ds/storage/engram.py"
+      ],
+      "acceptance": [
+        "原始value/scale bytes一致，TP1 ownership正确",
+        "首末row、跨页、短读、取消；全表不clone"
+      ],
+      "status": "planned"
+    },
+    {
+      "id": "SD-004",
+      "priority": "P0",
+      "title": "有界expert source与事件lease",
+      "depends_on": [
+        "SD-002"
+      ],
+      "target_paths_design": [
+        "strata_ds/storage/experts.py",
+        "native/cache/"
+      ],
+      "acceptance": [
+        "singleflight、loading预算、真实CUDA事件后publish",
+        "消费者结束前不evict，晚到generation不能复活旧slot"
+      ],
+      "status": "planned"
+    },
+    {
+      "id": "SD-005",
+      "priority": "P0",
+      "title": "V4.1单层与全图bridge",
+      "depends_on": [
+        "SD-002",
+        "SD-003"
+      ],
+      "target_paths_design": [
+        "strata_ds/backends/exl3/runtime.py"
+      ],
+      "acceptance": [
+        "CSA2/Engram/HC/RoPE/router保持",
+        "独立oracle短输入逐层对照；无spec/vision"
+      ],
+      "status": "planned"
+    },
+    {
+      "id": "SD-006",
+      "priority": "P0",
+      "title": "真实全模型与offload双门槛",
+      "depends_on": [
+        "SD-004",
+        "SD-005"
+      ],
+      "target_paths_design": [
+        "tests/real_model/",
+        "tools/capture_logits.py"
+      ],
+      "acceptance": [
+        "固定量化oracle，不拿自身作reference",
+        "eager/graph、cache开关、SSD/host/GPU路径覆盖边界"
+      ],
+      "status": "planned"
+    },
+    {
+      "id": "SD-007",
+      "priority": "P0",
+      "title": "精确内存admission与preflight",
+      "depends_on": [
+        "SD-001",
+        "SD-004"
+      ],
+      "target_paths_design": [
+        "strata_ds/planning/",
+        "tools/preflight_worker.py"
+      ],
+      "acceptance": [
+        "加载/prefill/graph/session峰值分开",
+        "实际cgroup祖先和GPU free，不移除预算guard"
+      ],
+      "status": "planned"
+    },
+    {
+      "id": "SD-008",
+      "priority": "P0",
+      "title": "EXL3 256/24→192/24→128/24验收",
+      "depends_on": [
+        "SD-006",
+        "SD-007"
+      ],
+      "target_paths_design": [
+        "recipes/",
+        "private-results/"
+      ],
+      "acceptance": [
+        "同host受控sweep与真实hardware分开",
+        "SSD bytes与H2D bytes各自报告；失败不偷换模型"
+      ],
+      "status": "planned"
+    },
+    {
+      "id": "SD-009",
+      "priority": "P1",
+      "title": "Q2 DwarfStar对照bridge",
+      "depends_on": [
+        "SD-000",
+        "SD-001"
+      ],
+      "target_paths_design": [
+        "strata_ds/backends/gguf_q2/"
+      ],
+      "acceptance": [
+        "固定引擎和GGUF版本；完整指标接线",
+        "显式记录runtime差异，不归因全部到quant bit数"
+      ],
+      "status": "planned"
+    },
+    {
+      "id": "SD-010",
+      "priority": "P1",
+      "title": "grouped prefill与Agent append",
+      "depends_on": [
+        "SD-006"
+      ],
+      "target_paths_design": [
+        "native/prefill/",
+        "strata_ds/scheduler/"
+      ],
+      "acceptance": [
+        "专家批量去重，有界prefetch",
+        "8K/32K prefix+64/256/1024追加与初次prefill分开"
+      ],
+      "status": "planned"
+    },
+    {
+      "id": "SD-011",
+      "priority": "P1",
+      "title": "2/5会话真实batch和取消",
+      "depends_on": [
+        "SD-010"
+      ],
+      "target_paths_design": [
+        "strata_ds/scheduler/",
+        "strata_ds/session/"
+      ],
+      "acceptance": [
+        "不是串行轮转冒充batch",
+        "每session状态隔离、expected_position、最长请求不饿死"
+      ],
+      "status": "planned"
+    },
+    {
+      "id": "SD-012",
+      "priority": "P1",
+      "title": "快照完整状态及恢复",
+      "depends_on": [
+        "SD-006"
+      ],
+      "target_paths_design": [
+        "strata_ds/session/checkpoint.py"
+      ],
+      "acceptance": [
+        "身份/KV/layout/generation完整绑定",
+        "半压缩组/环形边界/原子提交/损坏拒绝"
+      ],
+      "status": "planned"
+    },
+    {
+      "id": "SD-013",
+      "priority": "P1",
+      "title": "Vast有界生命周期控制器",
+      "depends_on": [
+        "SD-000",
+        "SD-007"
+      ],
+      "target_paths_design": [
+        "tools/vast_controller/"
+      ],
+      "acceptance": [
+        "明确本地付费授权、exact instance journal、unknown-create恢复",
+        "watchdog不是硬费用保证；结果取回后destroy+provider确认"
+      ],
+      "status": "planned"
+    },
+    {
+      "id": "SD-014",
+      "priority": "P1",
+      "title": "Agent/中文/工具任务配对质量",
+      "depends_on": [
+        "SD-006",
+        "SD-009"
+      ],
+      "target_paths_design": [
+        "bench/tasks/",
+        "bench/quality/"
+      ],
+      "acceptance": [
+        "同base/tokenizer/template及隐藏集",
+        "任务成功率/CI与logit保真分开，threshold预签"
+      ],
+      "status": "planned"
+    },
+    {
+      "id": "SD-015",
+      "priority": "P2",
+      "title": "CPU EXL3 packed能力调查与可选实现",
+      "depends_on": [
+        "SD-002",
+        "SD-008"
+      ],
+      "target_paths_design": [
+        "native/exl3_cpu/"
+      ],
+      "acceptance": [
+        "不假定可用；先比较CPU DRAM和H2D瓶颈",
+        "若未实现则保留GPU-only模式，不静默Python fallback"
+      ],
+      "status": "planned"
+    },
+    {
+      "id": "SD-016",
+      "priority": "P2",
+      "title": "原生/SAGE/384G扩展",
+      "depends_on": [
+        "SD-008",
+        "SD-014"
+      ],
+      "target_paths_design": [
+        "recipes/",
+        "private-results/optional/"
+      ],
+      "acceptance": [
+        "独立manifest/format/质量门槛",
+        "没有预算批准不自动购买"
+      ],
+      "status": "planned"
+    },
+    {
+      "id": "SD-017",
+      "priority": "P2",
+      "title": "DSpark和量化KV扩展",
+      "depends_on": [
+        "SD-010",
+        "SD-011"
+      ],
+      "target_paths_design": [
+        "strata_ds/speculation/"
+      ],
+      "acceptance": [
+        "draft身份、拒绝回滚、acceptance实际测量",
+        "所有性能改变量独立开关，不预写加速倍率"
+      ],
+      "status": "planned"
+    }
+  ]
+}

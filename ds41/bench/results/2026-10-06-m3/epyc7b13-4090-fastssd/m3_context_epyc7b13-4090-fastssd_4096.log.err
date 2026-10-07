@@ -1,0 +1,4 @@
+ds41: 896 VRAM expert slots (11.12 GiB)
+ds41: RAM tier 7757 experts (96.2 GiB, locked), filled in 35.9 s
+ds41 prefill: pass 4096 tokens, sub-batch 4096; scratch 2.07 GiB in lent slots; ring 256 slots in lent slots; 423 tier slots lent
+ds41 prefill: 23.8 GiB available, 94.3 GiB of experts read from the pack: unbuffered (O_DIRECT): the file cache could not keep them
