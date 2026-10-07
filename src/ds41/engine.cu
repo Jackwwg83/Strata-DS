@@ -260,6 +260,10 @@ struct Engine::Impl {
     bool broken = false;
     bool pf_started = false;           // the running prefill has begun changing the state
     PrefillProgress progress;          // prefill progress (set_prefill_progress); a false return cancels
+    // snapshot slots: the window rings of all layers, then the compressor states of the kv sources with ratio > 1
+    struct Snapshot { int pos = -1; bf16* win = nullptr; float* comp = nullptr; };
+    std::vector<Snapshot> snaps;
+    size_t snap_comp_floats = 0;
     std::exception_ptr worker_error;   // set by the CPU worker; rethrown by the step that ran into it
     void usable() const {
         if (broken) throw std::runtime_error("ds41 engine: unusable after an earlier failure; create a new Engine");
@@ -413,6 +417,7 @@ struct Engine::Impl {
         weights_dev = dalloc_own<float>(kLayers * kTopK);
         cand_dev = dalloc_own<uint8_t>(max_seq + 1);
         history.reserve(max_seq);
+        alloc_snapshots();   // before the VRAM tier sizes itself from the free memory
         db = std::make_unique<ExpertDoorbell>(1, kTopK, kDim);
         gpu_sel = dalloc_own<int32_t>(kTopK);
         // decode stream, graph staging, outputs
@@ -1658,6 +1663,65 @@ struct Engine::Impl {
         verify_pending = verify_failed = false;
     }
 
+    void alloc_snapshots() {
+        snap_comp_floats = 0;
+        for (auto& y : L)
+            if (y.kv_state) snap_comp_floats += 2 * (size_t) y.ratio * kHeadDim;
+        snaps.resize(std::max(0, opt.snapshots));
+        for (auto& sn : snaps) {
+            sn.win = dalloc_own<bf16>((size_t) kLayers * kWindow * kHeadDim);
+            sn.comp = dalloc_own<float>(std::max<size_t>(1, snap_comp_floats));
+        }
+    }
+
+    Snapshot& snapshot_slot(int slot) {
+        if (slot < 0 || slot >= (int) snaps.size())
+            throw std::invalid_argument("ds41 snapshot: slot " + std::to_string(slot) + " does not exist");
+        return snaps[slot];
+    }
+
+    /// Copies the window rings and compressor states between the layers and a slot (to_slot: save). The device is
+    /// idle between calls (each step ends in a sync, a prefill in prefill_end's), so one stream and one sync suffice.
+    void snapshot_copy(Snapshot& sn, bool to_slot) {
+        const size_t win = (size_t) kWindow * kHeadDim * sizeof(bf16);
+        size_t c = 0;
+        for (int l = 0; l < kLayers; ++l) {
+            auto& y = L[l];
+            uint8_t* slot_win = (uint8_t*) sn.win + (size_t) l * win;
+            ck(cudaMemcpyAsync(to_slot ? (void*) slot_win : (void*) y.window, to_slot ? (void*) y.window : (void*) slot_win,
+                               win, cudaMemcpyDeviceToDevice, st), "snapshot window");
+            if (!y.kv_state) continue;
+            const size_t n = (size_t) y.ratio * kHeadDim;
+            for (float* state : {y.kv_state, y.score_state}) {
+                ck(cudaMemcpyAsync(to_slot ? sn.comp + c : state, to_slot ? state : sn.comp + c, n * sizeof(float),
+                                   cudaMemcpyDeviceToDevice, st), "snapshot compressor");
+                c += n;
+            }
+        }
+        ck(cudaStreamSynchronize(st), "snapshot");
+    }
+
+    void save_snapshot(int slot) {
+        usable();
+        if (verify_pending) throw std::logic_error("commit the pending verify window first");
+        Snapshot& sn = snapshot_slot(slot);
+        sn.pos = -1;   // a failed copy leaves the slot empty
+        snapshot_copy(sn, true);
+        sn.pos = (int) history.size();
+    }
+
+    int restore_snapshot(int slot) {
+        usable();
+        Snapshot& sn = snapshot_slot(slot);
+        if (sn.pos < 0) throw std::logic_error("ds41 snapshot: slot " + std::to_string(slot) + " is empty");
+        if (sn.pos > (int) history.size())
+            throw std::logic_error("ds41 snapshot: slot " + std::to_string(slot) + " is past the current position");
+        verify_pending = verify_failed = false;
+        snapshot_copy(sn, false);
+        history.resize(sn.pos);
+        return sn.pos;
+    }
+
     int step(int token, int pos, StepDump* dump, Timing& tm) {
         usable();
         check_token(token);
@@ -1802,6 +1866,12 @@ const std::vector<float>& Engine::last_logits() const { return impl_->lg; }
 void Engine::set_prefill_progress(PrefillProgress fn) { impl_->progress = std::move(fn); }
 
 void Engine::reset() { impl_->reset(); }
+
+void Engine::save_snapshot(int slot) { impl_->save_snapshot(slot); }
+
+int Engine::restore_snapshot(int slot) { return impl_->restore_snapshot(slot); }
+
+int Engine::snapshot_slots() const { return (int) impl_->snaps.size(); }
 
 int Engine::position() const { return (int) impl_->history.size(); }
 

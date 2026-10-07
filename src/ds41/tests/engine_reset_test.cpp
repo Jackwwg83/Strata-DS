@@ -5,6 +5,9 @@
 //   --case progress   the prefill callback runs at least once per layer, with done rising to the total
 //   --case cancel     a callback that returns false stops the prefill inside its pass: PrefillCancelled, position 0,
 //                     and the next prompt gives the reference logits
+//   --case snapshot   restore_snapshot() goes back to a saved position: after decode steps past it, and after a
+//                     pending verify window, the next tokens give the logits of a fresh engine fed the same tokens;
+//                     a snapshot past the current position, or an empty slot, is refused
 // Needs the model pack: --pack DIR (without it the test is skipped with code 77).
 #include "strata/ds41/config.hpp"
 #include "strata/ds41/engine.hpp"
@@ -12,6 +15,7 @@
 #include <algorithm>
 #include <cmath>
 #include <cstdio>
+#include <functional>
 #include <random>
 #include <string>
 #include <vector>
@@ -32,6 +36,15 @@ std::vector<int> prompt(int n, unsigned seed) {
     std::vector<int> v = {0};                           // BOS
     while ((int) v.size() < n) v.push_back(d(rng));
     return v;
+}
+
+bool throws(const std::function<void()>& fn) {
+    try {
+        fn();
+    } catch (const std::exception&) {
+        return true;
+    }
+    return false;
 }
 
 /// The largest |a - b| over the logits, and whether the argmax agrees
@@ -130,6 +143,41 @@ int main(int argc, char** argv) {
             e.set_prefill_progress(nullptr);
             e.prefill(b, 0);
             check(same_logits(e.last_logits(), ref, "after a cancelled prefill"), "the next prompt is right");
+        } else if (which == "snapshot") {
+            // reference: a fresh start fed a, then b's first 40 tokens (a batched prefill, as below)
+            const std::vector<int> tail(b.begin(), b.begin() + 40);
+            e.reset();
+            e.prefill(a, 0);
+            e.prefill(tail, (int) a.size());
+            const std::vector<float> want = e.last_logits();
+            // the case: a, a snapshot, decode steps past it, back to the snapshot, then the same tail
+            e.reset();
+            check(e.snapshot_slots() >= 2, "the engine has snapshot slots");
+            e.prefill(a, 0);
+            e.save_snapshot(1);
+            int next = e.step(5, (int) a.size());
+            for (int i = 1; i < 12; ++i) next = e.step(next, (int) a.size() + i);
+            check(e.restore_snapshot(1) == (int) a.size() && e.position() == (int) a.size(),
+                  "restore goes back to the saved position");
+            e.prefill(tail, (int) a.size());
+            check(same_logits(e.last_logits(), want, "after 12 decode steps and a restore"), "restore after decode");
+            e.restore_snapshot(1);
+            e.verify({7, 8, 9}, (int) a.size());   // a pending window, then a restore instead of commit
+            e.restore_snapshot(1);
+            e.prefill(tail, (int) a.size());
+            check(same_logits(e.last_logits(), want, "after a pending verify window"), "restore drops a pending window");
+            // the snapshot stays: a second restore works the same way (token by token this time)
+            e.restore_snapshot(1);
+            for (int i = 0; i < (int) tail.size(); ++i) e.step(tail[i], (int) a.size() + i);
+            const std::vector<float> by_steps = e.last_logits();
+            e.restore_snapshot(1);
+            for (int i = 0; i < (int) tail.size(); ++i) e.step(tail[i], (int) a.size() + i);
+            check(same_logits(e.last_logits(), by_steps, "token by token, twice"), "a snapshot can be restored again");
+            e.reset();
+            e.prefill(b, 0);   // shorter than the snapshot's position
+            check(throws([&] { e.restore_snapshot(1); }), "a snapshot past the current position is refused");
+            check(throws([&] { e.restore_snapshot(0); }), "an empty slot is refused");
+            check(throws([&] { e.save_snapshot(e.snapshot_slots()); }), "a slot past the last is refused");
         } else {
             std::printf("unknown --case %s\n", which.c_str());
             return 2;
