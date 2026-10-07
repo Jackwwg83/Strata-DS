@@ -17,11 +17,14 @@ constexpr int kIn = kHeads * kHeadDim / kOGroups;     // 4096
 constexpr int kBlock = 32;                            // scale block: 32 x 32
 constexpr int kUnroll = 8;                            // bytes in flight per lane (RTX 4090: 4 763, 8 873, 16 823 GB/s)
 
-/// FP8 E4M3 times an E8M0 scale: exact in float, so equal to the BF16 value convert.py stores
+// Match convert.py, including BF16 subnormal rounding.
 __device__ __forceinline__ float deq(uint8_t w, uint8_t e) {
     __nv_fp8_e4m3 v;
     v.__x = w;
-    return float(v) * __uint_as_float((uint32_t) e << 23);
+    const uint32_t bits = e == 0 ? 0x00400000u : (e == 255 ? 0x7FC00000u : (uint32_t) e << 23);
+    const float value = float(v) * __uint_as_float(bits);
+    // Codes 0..2 can fall between BF16 subnormals. Larger codes are exact in BF16.
+    return e <= 2 ? __bfloat162float(__float2bfloat16_rn(value)) : value;
 }
 
 // One warp per output row, as ops::wo_a_grouped: lane i adds elements i, i + 32, ... in this order, then the same

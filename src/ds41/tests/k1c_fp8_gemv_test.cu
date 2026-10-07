@@ -4,6 +4,7 @@
 // Every weight is read once per token from DRAM in the model, so the timing rotates through enough copies of
 // each weight (>= 256 MB) that none of them stays in the 72 MB L2 between calls.
 #include "bench_util.hpp"
+#include "test_validation.hpp"
 
 #include "strata/ds41/fp8_gemv.hpp"
 #include "strata/ds41/ops.hpp"
@@ -55,7 +56,7 @@ int main() {
             for (int r = 0; r < m; ++r) {
                 sd::ops::fp8_linear(x.p + (size_t) r * s.k, s.k, w.p, ws.p, s.n, ry.p, act.p);
                 std::vector<__nv_bfloat16> got(yh.begin() + (size_t) r * s.n, yh.begin() + (size_t) (r + 1) * s.n);
-                worst = std::max(worst, rel_l2(got, ry.down()));
+                worst = max_error(worst, rel_l2(got, ry.down()));
             }
             v.check(worst <= 2e-3, std::string(s.name) + ": error above 2e-3");
             if (m == 1 && &s == &shapes[0])

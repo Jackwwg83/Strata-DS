@@ -49,6 +49,64 @@ int main() {
     v.check(std::memcmp(a.data(), b.data(), a.size() * 2) == 0, "decode: FP8 wo_a equals the BF16 path bit for bit");
     v.check(std::memcmp(d.data(), wb.data(), wb.size() * 2) == 0, "prefill: dequant_wo_a equals convert.py's BF16");
 
+    // Boundary scales keep the same bit-for-bit BF16 contract.
+    for (int code : {0, 1, 2, 254, 255}) {
+        std::vector<uint8_t> edge_w(w.size()), edge_s(s.size(), (uint8_t) code);
+        for (size_t i = 0; i < edge_w.size(); ++i) {
+            edge_w[i] = (uint8_t) i;
+            if ((edge_w[i] & 0x7F) == 0x7F) edge_w[i] ^= 1;
+        }
+        auto reference = [&] {
+            std::vector<__nv_bfloat16> ref(edge_w.size());
+            const float sc = code == 255 ? NAN : std::ldexp(1.0f, code - 127);
+            for (size_t i = 0; i < edge_w.size(); ++i) {
+                __nv_fp8_e4m3 f;
+                f.__x = edge_w[i];
+                ref[i] = __float2bfloat16_rn(float(f) * sc);
+            }
+            return ref;
+        };
+        auto ref = reference();
+        dw.up(edge_w);
+        ds.up(edge_s);
+        sd::dequant_wo_a(dw.p, ds.p, deq.p);
+        const auto edge_d = deq.down();
+        const std::string label = "E8M0 code " + std::to_string(code);
+        if (code == 255) {
+            v.check(std::all_of(edge_d.begin(), edge_d.end(), [](auto x) {
+                return std::isnan(__bfloat162float(x));
+            }), label + ": dequant is NaN");
+        } else {
+            v.check(std::memcmp(edge_d.data(), ref.data(), ref.size() * 2) == 0,
+                    label + ": dequant equals convert.py BF16 bit for bit");
+        }
+        // Keep the high-scale decode finite. Dequant above still covers overflow.
+        for (auto& weight : edge_w) weight &= 0x7F;  // Avoid cancellation in decode.
+        if (code == 254) {
+            std::fill(edge_w.begin(), edge_w.end(), uint8_t(0x30));  // E4M3 0.5
+        }
+        ref = reference();
+        dw.up(edge_w);
+        std::vector<__nv_bfloat16> edge_x(o.size(), __float2bfloat16_rn(code == 254 ? 0x1p-120f : 1.0f));
+        dx.up(edge_x);
+        dwb.up(ref);
+        sd::ops::wo_a_grouped(dx.p, dwb.p, y_ref.p);
+        sd::wo_a_grouped_fp8(dx.p, dw.p, ds.p, y.p);
+        const auto edge_a = y_ref.down(), edge_b = y.down();
+        if (code == 255) {
+            v.check(std::all_of(edge_b.begin(), edge_b.end(), [](auto x) {
+                return std::isnan(__bfloat162float(x));
+            }), label + ": decode is NaN");
+        } else {
+            v.check(std::memcmp(edge_a.data(), edge_b.data(), edge_a.size() * 2) == 0,
+                    label + ": decode equals BF16 bit for bit");
+        }
+    }
+    dw.up(w);
+    ds.up(s);
+    dwb.up(wb);
+    dx.up(o);
+
     // timing: 4 copies of each weight (FP8 134 MB, BF16 268 MB), so every call reads DRAM
     constexpr int kCopies = 4, kIters = 200;
     Dev<uint8_t> w4(w.size() * kCopies), s4(s.size() * kCopies);
