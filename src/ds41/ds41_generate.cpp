@@ -83,10 +83,10 @@ static void generate(Engine& engine, const EngineOptions& opt, const std::vector
             next = engine.step(next, pos++);
             const auto& tm = engine.last_timing();
             if (step_log)
-                std::fprintf(step_log, "%d %.3f %.3f %.3f %.3f %d %d %d %d %d %d %d %d\n", pos - 1, tm.total_ms,
+                std::fprintf(step_log, "%d %.3f %.3f %.3f %.3f %d %d %d %d %d %d %d %d %d\n", pos - 1, tm.total_ms,
                              tm.gpu_ms, tm.cpu_experts_ms, tm.engram_ms, tm.expert_total, tm.expert_hits,
                              tm.zero_copy_experts(), tm.ram_experts, tm.file_experts, tm.ssd_experts, tm.vram_swaps,
-                             tm.warmed_useful);
+                             tm.warmed_useful, tm.prefetched);
             step_ms += tm.total_ms;
             hits += tm.expert_hits;
             routed += tm.expert_total;
@@ -154,7 +154,7 @@ int main(int argc, char** argv) {
             step_log = std::fopen(f.c_str(), "w");
             if (!step_log) { std::fprintf(stderr, "cannot write --step-log %s\n", f.c_str()); return 2; }
             std::fprintf(step_log, "# pos total_ms gpu_ms cpu_experts_ms engram_ms routed vram_hits zero_copy ram_cpu "
-                                   "file_cpu ssd swaps warmed_useful\n");
+                                   "file_cpu ssd swaps warmed_useful prefetched\n");
         }
         else if (a == "--force-ids") force_path = next();
         else { std::fprintf(stderr, "unknown argument %s\n", a.c_str()); return 2; }
