@@ -40,6 +40,9 @@ public:
     /// The experts layer `layer` really routed to the CPU's file tier: counts how many had been warmed.
     void observe(int layer, const int32_t* file_ids, int n);
 
+    /// The router of layer `layer` on x, now (on the calling thread): the k best ids (k <= n_experts)
+    void predict_now(int layer, const uint16_t* x, int k, int32_t* ids) const;
+
     struct Stats { int64_t predicted = 0, warmed = 0, useful = 0; };
     Stats take_stats();   ///< since the last call
 

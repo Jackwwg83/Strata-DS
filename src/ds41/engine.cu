@@ -11,6 +11,7 @@
 #include "strata/ds41/config.hpp"
 #include "strata/ds41/doorbell.hpp"
 #include "strata/ds41/engram_rows.hpp"
+#include "strata/ds41/expert_prefetch.hpp"
 #include "strata/ds41/expert_stream.hpp"
 #include "strata/ds41/host_experts.hpp"
 #include "strata/ds41/lookahead.hpp"
@@ -165,6 +166,8 @@ struct Engine::Impl {
     std::shared_ptr<void> zc_workspace; // used when there is no VRAM tier
     std::unique_ptr<ExpertStaging> zc_stage;
     std::shared_ptr<ExpertBlob> zc_blobs; // immutable [layers][experts] pack metadata
+    std::unique_ptr<ExpertPrefetch> prefetch;   // DS41_PREFETCH=N: the next layer's N guessed experts, copied ahead
+    std::atomic<int> worker_prefetched{0};
     int32_t* routes_dev = nullptr;     // [40][6]
     float* weights_dev = nullptr;      // [40][6]
     uint8_t* cand_dev = nullptr;       // [max_seq] candidate mask of the candidate layer
@@ -260,6 +263,34 @@ struct Engine::Impl {
     bool broken = false;
     bool pf_started = false;           // the running prefill has begun changing the state
     int file_trace = [] { const char* v = std::getenv("DS41_FILE_TRACE"); return v ? std::atoi(v) : 0; }();
+    // DS41_PREDICT_STATS=1: how well layer l+1's router on layer l's expert input predicts layer l+1's experts (the
+    // basis of a prefetch). Recall of all routed experts and of the misses (not in VRAM), with 6, 9 and 12 guesses.
+    static constexpr int kPredK = 12;
+    bool pred_stats = [] { const char* v = std::getenv("DS41_PREDICT_STATS"); return v && v[0] == '1'; }();
+    std::vector<int32_t> pred_ids = std::vector<int32_t>(kLayers * kPredK, -1);
+    int64_t pred_all[3] = {}, pred_miss[3] = {}, pred_n_all = 0, pred_n_miss = 0;
+    void predict_tally() {
+        static constexpr int ks[3] = {6, 9, 12};
+        for (int l = 1; l < kLayers; ++l)
+            for (int i = 0; i < kTopK; ++i) {
+                const int32_t e = routes_pinned[l * kTopK + i];
+                const bool miss = !vram || vram->res_host()[(size_t) l * kExperts + e] < 0;
+                ++pred_n_all;
+                pred_n_miss += miss;
+                for (int k = 0; k < 3; ++k) {
+                    const int32_t* p = pred_ids.data() + l * kPredK;
+                    const bool found = std::find(p, p + ks[k], e) != p + ks[k];
+                    pred_all[k] += found;
+                    pred_miss[k] += found && miss;
+                }
+            }
+        if (pred_n_all && pred_n_all % (kTopK * (kLayers - 1) * 64) == 0)
+            std::fprintf(stderr, "ds41 predict: recall all %.3f %.3f %.3f, misses %.3f %.3f %.3f (6 / 9 / 12 guesses, "
+                                 "%lld uses)\n", pred_all[0] / (double) pred_n_all, pred_all[1] / (double) pred_n_all,
+                         pred_all[2] / (double) pred_n_all, pred_miss[0] / (double) std::max<int64_t>(1, pred_n_miss),
+                         pred_miss[1] / (double) std::max<int64_t>(1, pred_n_miss),
+                         pred_miss[2] / (double) std::max<int64_t>(1, pred_n_miss), (long long) pred_n_all);
+    }
     PrefillProgress progress;          // prefill progress (set_prefill_progress); a false return cancels
     // snapshot slots: the window rings of all layers, then the compressor states of the kv sources with ratio > 1
     struct Snapshot { int pos = -1; bf16* win = nullptr; float* comp = nullptr; };
@@ -460,6 +491,16 @@ struct Engine::Impl {
             ck(cudaStreamSynchronize(nullptr), "staging initialization");
             std::fprintf(stderr, "ds41: zero-copy staging %d slots x %zu bytes (pack max %zu)\n",
                          kTopK, zc_stage->stride(), largest);
+            // the prefetch buffers before the VRAM tier takes the free memory (DS41_PREFETCH_MB per layer parity)
+            const char* pf_env = std::getenv("DS41_PREFETCH");
+            const int guesses = pf_env ? std::atoi(pf_env) : 0;
+            if (guesses > 0) {
+                const char* mb_env = std::getenv("DS41_PREFETCH_MB");
+                const size_t mb = mb_env ? (size_t) std::atoi(mb_env) : 96;
+                prefetch = std::make_unique<ExpertPrefetch>(std::min(guesses, ExpertPrefetch::kMaxGuesses),
+                                                            std::max<size_t>(mb, 1) << 20, kExperts, kDim);
+                std::fprintf(stderr, "ds41: prefetch %d guesses per layer, 2 x %zu MiB\n", prefetch->guesses(), mb);
+            }
         }
         // the VRAM expert tier last: an automatic slot count takes what the rest left free
         if (!opt.expert_profile.empty() && opt.vram_expert_slots != 0) {
@@ -575,6 +616,8 @@ struct Engine::Impl {
             for (int l = 0; l < kLayers; ++l) {
                 if (!db->wait_published(l + 1, stop)) return;
                 if (lookahead) lookahead->post(l, db->x());   // predict layer l+1 while this layer computes
+                if (lookahead && pred_stats && l + 1 < kLayers)   // DS41_PREDICT_STATS: layer l+1's top 12 from x_l
+                    lookahead->predict_now(l + 1, (const uint16_t*) db->x(), kPredK, pred_ids.data() + (l + 1) * kPredK);
                 c10::Half wh[kTopK];
                 for (int i = 0; i < kTopK; ++i) {
                     const __half hv = __float2half_rn(db->w()[i]);
@@ -604,7 +647,8 @@ struct Engine::Impl {
                 }
                 if (lookahead) lookahead->observe(l, file_ids, n_file);
                 // Keep expert_hits as VRAM hits. Timing derives CPU and zero-copy counts from the partition.
-                worker_misses += misses + db->counts().zero_copy;
+                worker_misses += misses + db->counts().zero_copy + db->counts().prefetched;
+                worker_prefetched += db->counts().prefetched;
                 const double t0 = now_ms();
                 try {
                     if (fault("worker")) throw std::runtime_error("ds41 test fault: CPU expert worker");
@@ -789,13 +833,24 @@ struct Engine::Impl {
         ops::to_half_fp8q(xf, x_half_dev, kDim, st);
         const bool tier = vram && vram->slots() > 0;
         const auto* ram = host && host->experts_dev() ? host->experts_dev() + (size_t) l * kExperts : nullptr;
+        // prefetch: layer l's guesses were planned and copied during layer l - 1 (none for layer 0)
+        const bool pf = prefetch && ram && zc_blobs;
         db->publish(x_half_dev, ids, w, 1, tier ? vram->res_dev() + (size_t) l * kExperts : nullptr, gpu_sel,
                     (uint32_t) (l + 1), st, tier ? vram->experts_dev() : nullptr, ram,
                     zc_quota ? zc_quota.get() + l : nullptr,
-                    ram ? zc_stage.get() : nullptr, ram && zc_blobs ? zc_blobs.get() + (size_t) l * kExperts : nullptr);
+                    ram ? zc_stage.get() : nullptr, ram && zc_blobs ? zc_blobs.get() + (size_t) l * kExperts : nullptr,
+                    pf && l > 0 ? prefetch->ids(l) : nullptr, pf && l > 0 ? prefetch->descs(l) : nullptr,
+                    pf ? prefetch->guesses() : 0);
+        // layer l + 1's guesses from this layer's expert input; their copy starts after this layer's own copies
+        if (pf && l + 1 < kLayers)
+            prefetch->plan(l + 1, xf, L[l + 1].gate_w, L[l + 1].gate_bias,
+                           tier ? vram->res_dev() + (size_t) (l + 1) * kExperts : nullptr,
+                           host->experts_dev() + (size_t) (l + 1) * kExperts,
+                           zc_blobs.get() + (size_t) (l + 1) * kExperts, st);
         const bool staged = ram && zc_stage;
         if (staged) zc_stage->fork_copy(st);
         ck(cudaMemsetAsync(routed, 0, kDim * sizeof(float), st), "routed");
+        if (pf && l > 0) prefetch->join(l, st);   // the GPU computes the prefetched experts below
         if (!staged && (tier || ram))
             kernels::exl3_moe_decode((const __half*) x_half_dev, 1, gpu_sel, w, kTopK, db->gpu_experts(), routed,
                                      vram ? vram->workspace() : zc_workspace.get(), VramExperts::kWorkspaceBytes, st);
@@ -809,6 +864,7 @@ struct Engine::Impl {
             kernels::exl3_moe_decode((const __half*) x_half_dev, 1, gpu_sel, w, kTopK, db->gpu_experts(), routed,
                                      vram ? vram->workspace() : zc_workspace.get(), VramExperts::kWorkspaceBytes, st);
         }
+        if (pf && l + 1 < kLayers) prefetch->copy(l + 1, st);
         db->wait_add(routed, 1, (uint32_t) (l + 1), st);
         ops::add_f32_bf16(routed, sh_out, ffn_out, kDim, st);
     }
@@ -1763,6 +1819,7 @@ struct Engine::Impl {
         worker_us = 0;
         worker_misses = 0;
         worker_ram = worker_file = worker_ssd = 0;
+        worker_prefetched = 0;
         {
             std::lock_guard<std::mutex> lk(mu);
             ++go;
@@ -1808,6 +1865,7 @@ struct Engine::Impl {
         }
         const int best = *hp_next;
         lg.assign(lg_pinned, lg_pinned + kVocab);
+        if (pred_stats && lookahead) predict_tally();
         if (vram) vram->count(routes_pinned, kTopK);
         if (dump) {
             float wv[kLayers * kTopK];
@@ -1830,6 +1888,7 @@ struct Engine::Impl {
         tm.ram_experts = worker_ram.load();
         tm.file_experts = worker_file.load();
         tm.ssd_experts = worker_ssd.load();
+        tm.prefetched = worker_prefetched.load();
         if (lookahead) {
             const auto st_ = lookahead->take_stats();
             tm.warmed = (int) st_.warmed;
