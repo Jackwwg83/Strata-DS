@@ -116,6 +116,10 @@ class DeepSeekOutputParser:
         self.call = None
         self.parameter = None
         self.first = True
+        # OutputParser's #1058 counters, which Service.run reads: DeepSeek calls are never taken from the reasoning
+        self.pending = []
+        self.rescued = 0
+        self.refused = 0
 
     def feed(self, delta):
         if self.state == 'done':
@@ -194,7 +198,8 @@ class DeepSeekOutputParser:
                 break
         return out
 
-    def finish(self):
+    def finish(self, reason=None):
+        """End of generation; `reason` (how the turn ended) is accepted as OutputParser.finish takes it."""
         out = self.feed('')
         if self.state in ('reasoning', 'content') and self.buf and not self.buf.strip('\n'):
             out.append(Event(self.state, self.buf))

@@ -211,6 +211,14 @@ class ParserEdgeTests(unittest.TestCase):
         for i in range(len(text) + 1):
             self.assertEqual(collect_parser([text[:i], text[i:]], False), whole)
 
+    def test_server_parser_interface(self):
+        # Service.run calls finish(reason) and reads pending / rescued / refused, as for OutputParser (#1058)
+        from serve.deepseek import DeepSeekOutputParser
+        for reason in (None, 'stop', 'length', 'cancel'):
+            parser = DeepSeekOutputParser(thinking=False)
+            self.assertEqual([(e.kind, e.text) for e in parser.feed('hi') + parser.finish(reason)], [('content', 'hi')])
+            self.assertEqual((parser.pending, parser.rescued, parser.refused), ([], 0, 0))
+
     def test_length_limit_preserves_plain_newlines(self):
         self.assertEqual(collect_parser(['hello\n'], False)['content'], 'hello\n')
         self.assertEqual(collect_parser(['hello\n\n'], False)['content'], 'hello\n\n')
@@ -234,6 +242,19 @@ class BudgetTests(unittest.TestCase):
         self.assertNotIn('<|im_', tok.decode(engine.last_prompt))
         self.assertEqual(''.join(ev.text for kind, ev in result if kind == 'event' and ev.kind == 'content'), 'Answer.\n')
         self.assertEqual(result[-1][1]['finish'], 'stop')
+
+
+class ToolChoiceTests(unittest.TestCase):
+    def test_forced_call_is_not_written_for_deepseek(self):
+        # forced_call writes the Qwen call opening (<tool_call> / <function=); DeepSeek calls are DSML, so a forced
+        # tool_choice acts as "auto" there instead of putting a foreign format into the reply
+        from serve.frontend import forced_call
+        tools = [TOOL]
+        self.assertIsNotNone(forced_call('required', tools))
+        for choice in ('required', {'type': 'function', 'function': {'name': 'lookup'}}, {'type': 'any'},
+                       {'type': 'tool', 'name': 'lookup'}):
+            with self.subTest(choice=choice):
+                self.assertIsNone(forced_call(choice, tools, deepseek=True))
 
 
 class ImageTests(unittest.TestCase):
