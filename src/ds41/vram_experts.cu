@@ -269,6 +269,7 @@ int VramExperts::commit_pending(bool wait) {
             for (const Pending& w : pending_) {
                 publish_residency(res_host_[(size_t) w.layer * E + w.in], w.vram_slot);
                 if (w.ram_slot >= 0) host_->point_to_file(w.layer, w.in);   // revokes its RAM descriptor
+                else if (host_) host_->release(w.layer, w.in);   // the adaptive RAM tier read it in meanwhile
             }
             upload_res();
             committed += (int) pending_.size();
@@ -276,7 +277,10 @@ int VramExperts::commit_pending(bool wait) {
             start_phase(3);
         } else {
             for (const Pending& w : pending_)
-                if (w.ram_slot >= 0) host_->assign(w.ram_slot, w.layer, w.out);   // the CPU reads `out` from RAM
+                if (w.ram_slot >= 0) {
+                    host_->assign(w.ram_slot, w.layer, w.out);   // the CPU reads `out` from RAM
+                    host_->unlock(w.ram_slot);
+                }
             pending_.clear();
             phase_ = 0;
         }
@@ -307,6 +311,7 @@ int VramExperts::between_steps() {
         const size_t need = ram >= 0 ? (pack_.expert(s.layer, s.out).bytes + 255) / 256 * 256 : 0;
         if (staged + need > staging_bytes_) break;
         pending_.push_back(Pending{s.layer, s.in, s.out, res_host_[(size_t) s.layer * E + s.out], ram, staged});
+        if (ram >= 0) host_->lock(ram);   // the adaptive RAM tier keeps the slot until `out` is written there
         staged += need;
     }
     if (pending_.empty()) return committed;

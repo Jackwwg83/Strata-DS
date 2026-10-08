@@ -16,12 +16,21 @@
 // VRAM to a pinned staging buffer, X from its RAM slot to VRAM, then Y from staging to the RAM slot. Nothing is read
 // from the SSD. While the copies run, X is computed from the file (its RAM slot is being overwritten). Y must fit the
 // slot's capacity (the VRAM tier only plans such swaps).
+//
+// The adaptive tier (DS41_RAM_ADAPT=N, ds41/docs/cache-design-2026-10-08.html): the static tier above holds the
+// profile's experts for good, and every other expert comes through the OS file cache, page fault by page fault. With
+// N > 0 the tier follows the conversation instead. N slots of each capacity stay free. An expert that is in no tier
+// when the CPU needs it is read from the SSD (O_DIRECT) into a free slot and computed there; it stays. Between steps
+// the new experts are published (the GPU may then read them too), and the least recently used experts leave until
+// each capacity has N free slots again. During a step only free slots are written, so no reader sees a slot change.
+// On the laptop's recorded conversations this cut the SSD reads per token from 17.5 to 6.5 (tools/ds41/cache_sim.py).
 #pragma once
 
 #include "strata/ds41/pack.hpp"
 
 #include <cstddef>
 #include <cstdint>
+#include <mutex>
 #include <string>
 #include <utility>
 #include <vector>
@@ -88,8 +97,34 @@ public:
         return slot_[i] >= 0 || (!held_.empty() && held_[i]);
     }
 
+    // ---- the adaptive tier ----
+    /// Keep `reserve` slots of each capacity free: per capacity, the lowest-ranked experts leave the tier (to the
+    /// file) until that many slots are free. Call once, between steps. 0: the static tier. Throws if the pack cannot
+    /// be opened for reading.
+    void enable_adapt(int reserve);
+    int reserve() const { return reserve_; }
+    /// During a step, on the CPU worker: read ids[0..n) of `layer`, which are in no tier, into free slots (for each
+    /// the smallest capacity that holds it) and point the CPU kernel at them. ok[i] is false when no free slot holds
+    /// expert i or its read failed: the CPU kernel then still reads it from the file. The RAM table and the device
+    /// descriptors do not change until end_step(). Returns the number read.
+    int admit(int layer, const int32_t* ids, int n, bool* ok);
+    /// Between steps: publish the experts admitted during the step, record the step's routes ([n_layers][topk],
+    /// negative ids ignored) as uses, then free the least recently used slots until each capacity has `reserve` free
+    /// slots. A locked slot is never freed. Returns the number of experts that left.
+    int end_step(const int32_t* routes, int topk);
+    /// A VRAM swap reads or writes `slot` until unlock(): end_step() does not free it.
+    void lock(int slot);
+    void unlock(int slot);
+    /// (layer, expert) entered VRAM: its RAM slot, if it has one, becomes free. Between steps.
+    void release(int layer, int expert);
+    /// free slots (all capacities)
+    int free_slots() const;
+    int64_t admitted_total() const { return admitted_total_; }
+    int64_t evicted_total() const { return evicted_total_; }
+
 private:
     void point(int layer, int expert, const uint8_t* bytes);
+    void free_slot(int slot);      ///< its expert (if any) leaves for the file; the slot joins the free ones
     void publish_descriptor(int layer, int expert, int slot);
 
     const Pack& pack_;
@@ -107,7 +142,17 @@ private:
     uint8_t* device_alias_ = nullptr;
     kernels::Exl3Expert* experts_dev_ = nullptr;
     std::vector<int32_t> slot_;                     ///< [n_layers][n_experts] RAM slot or -1
-    std::vector<std::pair<int, int>> holder_;       ///< [slots] (layer, expert) in each slot
+    std::vector<std::pair<int, int>> holder_;       ///< [slots] (layer, expert) in each slot; (-1, -1): free
+    // adaptive tier
+    int reserve_ = 0;
+    int dfd_ = -1;                                  ///< experts.bin opened with O_DIRECT (-1: copy from the map)
+    std::vector<uint8_t> free_, busy_;              ///< [slots] free; locked by a VRAM swap
+    std::vector<uint64_t> age_;                     ///< [slots] last use
+    uint64_t clock_ = 0;
+    std::vector<std::vector<int>> classes_;         ///< slots by capacity, smallest capacity first
+    std::mutex admit_mu_;
+    std::vector<std::pair<int, std::pair<int, int>>> admitted_;   ///< (slot, (layer, expert)) read this step
+    int64_t admitted_total_ = 0, evicted_total_ = 0;
 };
 
 }  // namespace strata::ds41

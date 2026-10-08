@@ -19,6 +19,8 @@
 #include <cstdlib>
 #include <cstring>
 #include <fstream>
+#include <map>
+#include <memory>
 #include <stdexcept>
 #include <string>
 #include <thread>
@@ -191,6 +193,7 @@ HostExperts::HostExperts(const Pack& pack, const std::vector<std::pair<int, int>
 }
 
 HostExperts::~HostExperts() {
+    if (dfd_ >= 0) close(dfd_);
     cudaFree(experts_dev_);
     if (!arena_) return;
     if (registered_) cudaHostUnregister(arena_);
@@ -245,13 +248,178 @@ void HostExperts::assign(int slot, int layer, int expert) {
     if (pack_.expert(layer, expert).bytes > slot_capacity(slot))
         throw std::invalid_argument("HostExperts::assign: the expert is larger than the slot");
     const auto [ol, oe] = holder_[slot];
-    publish_descriptor(ol, oe, -1);
-    publish_residency(slot_[(size_t) ol * n_experts_ + oe], -1);
+    if (ol >= 0) {   // (-1, -1): a free slot of the adaptive tier
+        publish_descriptor(ol, oe, -1);
+        publish_residency(slot_[(size_t) ol * n_experts_ + oe], -1);
+    }
     holder_[slot] = {layer, expert};
     if (!held_.empty()) held_[(size_t) layer * n_experts_ + expert] = 0;
     publish_residency(slot_[(size_t) layer * n_experts_ + expert], slot);
     point(layer, expert, slot_ptr(slot));
     publish_descriptor(layer, expert, slot);
+    if (!age_.empty()) {   // adaptive: the expert comes from VRAM, where it was in use until now
+        age_[slot] = clock_;
+        free_[slot] = 0;
+    }
+}
+
+// ------------------------------------------------------------------------------------------------ adaptive tier
+
+void HostExperts::free_slot(int slot) {
+    const auto [l, e] = holder_[slot];
+    // point_to_file only when the table still names this slot (a VRAM swap may have moved the expert on)
+    if (l >= 0 && slot_of(l, e) == slot) point_to_file(l, e);
+    holder_[slot] = {-1, -1};
+    free_[slot] = 1;
+}
+
+void HostExperts::enable_adapt(int reserve) {
+    if (reserve <= 0 || slots_ == 0) return;
+    if (reserve_ > 0) throw std::logic_error("HostExperts::enable_adapt: already enabled");
+    // O_DIRECT where the file system allows it: a miss is read once and kept here, so the file cache would only hold
+    // a second copy (on the laptop the cache kept about 8 of its 24 free GiB useful)
+    dfd_ = open((pack_.dir() + "/experts.bin").c_str(), O_RDONLY | O_DIRECT);
+    free_.assign(slots_, 0);
+    busy_.assign(slots_, 0);
+    age_.assign(slots_, 0);
+    std::map<size_t, std::vector<int>> by_capacity;
+    for (int s = 0; s < slots_; ++s) by_capacity[slot_capacity(s)].push_back(s);
+    for (auto& [cap, v] : by_capacity) classes_.push_back(std::move(v));
+    reserve_ = reserve;
+    // the slots follow the profile's rank: a capacity's last slots hold its lowest-ranked experts
+    for (const auto& v : classes_)
+        for (int k = 0; k < reserve && k < (int) v.size(); ++k) free_slot(v[v.size() - 1 - k]);
+}
+
+int HostExperts::free_slots() const {
+    int n = 0;
+    for (uint8_t f : free_) n += f;
+    return n;
+}
+
+void HostExperts::lock(int slot) {
+    if (!busy_.empty()) busy_.at(slot) = 1;
+}
+
+void HostExperts::unlock(int slot) {
+    if (!busy_.empty()) busy_.at(slot) = 0;
+}
+
+void HostExperts::release(int layer, int expert) {
+    if (!reserve_) return;
+    const int s = slot_of(layer, expert);
+    if (s >= 0 && !busy_[s]) free_slot(s);
+}
+
+int HostExperts::admit(int layer, const int32_t* ids, int n, bool* ok) {
+    for (int i = 0; i < n; ++i) ok[i] = false;
+    if (!reserve_ || n <= 0) return 0;
+    std::vector<int> pick(n, -1);
+    {
+        std::lock_guard<std::mutex> lk(admit_mu_);
+        for (int i = 0; i < n; ++i) {
+            if (ids[i] < 0) continue;
+            const uint64_t bytes = pack_.expert(layer, ids[i]).bytes;
+            for (const auto& v : classes_) {   // the smallest capacity with a free slot that holds it
+                if (slot_capacity(v[0]) < bytes) continue;
+                for (int s : v)
+                    if (free_[s] && !busy_[s]) { pick[i] = s; break; }
+                if (pick[i] >= 0) break;
+            }
+            if (pick[i] >= 0) free_[pick[i]] = 0;
+        }
+    }
+    // the reads: 1 MiB parts of every picked expert on up to 8 threads, so several reads are in flight (the laptop's
+    // SSD reads about 6 GB/s with parallel O_DIRECT readers)
+    struct Part { int i; size_t at, len; };
+    std::vector<Part> parts;
+    constexpr size_t kPart = 1u << 20;
+    for (int i = 0; i < n; ++i) {
+        if (pick[i] < 0) continue;
+        const ExpertSlot& x = pack_.expert(layer, ids[i]);
+        if (dfd_ < 0 || x.offset % 4096 != 0) {   // copied from the mapped pack (an unaligned expert: tests)
+            parts.push_back({i, 0, 0});
+            continue;
+        }
+        for (size_t at = 0; at < x.bytes; at += kPart) parts.push_back({i, at, std::min(kPart, (size_t) x.bytes - at)});
+    }
+    std::unique_ptr<std::atomic<bool>[]> failed(new std::atomic<bool>[n]);
+    for (int i = 0; i < n; ++i) failed[i] = false;
+    std::atomic<size_t> next{0};
+    run_parallel(std::min<size_t>(parts.size(), 8), [&](size_t) {
+        for (size_t k; (k = next++) < parts.size();) {
+            const Part& p = parts[k];
+            const ExpertSlot& x = pack_.expert(layer, ids[p.i]);
+            uint8_t* dst = slot_ptr(pick[p.i]);
+            if (p.len == 0) {
+                std::memcpy(dst, pack_.expert_base() + x.offset, x.bytes);
+                continue;
+            }
+            // O_DIRECT needs 4 KiB multiples: the last part reads up to the next boundary (the slot holds it)
+            const size_t want = (p.len + 4095) / 4096 * 4096;
+            size_t got = 0;
+            while (got < p.len) {
+                const ssize_t r = pread(dfd_, dst + p.at + got, want - got, (off_t) (x.offset + p.at + got));
+                if (r <= 0) break;
+                got += (size_t) r;
+            }
+            if (got < p.len) failed[p.i] = true;
+        }
+    });
+    int read = 0;
+    std::lock_guard<std::mutex> lk(admit_mu_);
+    for (int i = 0; i < n; ++i) {
+        if (pick[i] < 0) continue;
+        if (failed[i]) {   // the CPU kernel keeps reading it from the file
+            free_[pick[i]] = 1;
+            continue;
+        }
+        point(layer, ids[i], slot_ptr(pick[i]));
+        admitted_.push_back({pick[i], {layer, ids[i]}});
+        ok[i] = true;
+        ++read;
+    }
+    return read;
+}
+
+int HostExperts::end_step(const int32_t* routes, int topk) {
+    if (!reserve_) return 0;
+    ++clock_;
+    {
+        std::lock_guard<std::mutex> lk(admit_mu_);
+        for (const auto& [slot, le] : admitted_) {
+            const auto [l, e] = le;
+            holder_[slot] = {l, e};
+            publish_residency(slot_[(size_t) l * n_experts_ + e], slot);
+            publish_descriptor(l, e, slot);
+            age_[slot] = clock_;
+            ++admitted_total_;
+        }
+        admitted_.clear();
+    }
+    for (int l = 0; l < pack_.n_layers(); ++l)
+        for (int k = 0; k < topk; ++k) {
+            const int32_t e = routes[(size_t) l * topk + k];
+            if (e < 0) continue;
+            const int32_t s = slot_[(size_t) l * n_experts_ + e];
+            if (s >= 0) age_[s] = clock_;
+        }
+    int evicted = 0;
+    for (const auto& v : classes_) {
+        int nfree = 0;
+        for (int s : v) nfree += free_[s];
+        while (nfree < reserve_) {
+            int victim = -1;   // least recently used; ties: the later slot (the lower-ranked expert)
+            for (int s : v)
+                if (!free_[s] && !busy_[s] && (victim < 0 || age_[s] <= age_[victim])) victim = s;
+            if (victim < 0) break;
+            free_slot(victim);
+            ++nfree;
+            ++evicted;
+        }
+    }
+    evicted_total_ += evicted;
+    return evicted;
 }
 
 }  // namespace strata::ds41
