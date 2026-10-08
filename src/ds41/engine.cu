@@ -158,9 +158,21 @@ struct Engine::Impl {
     std::unique_ptr<VramExperts> vram;  // the VRAM tier (null: none)
     std::unique_ptr<HostExperts> host;  // the RAM tier (null: none); the rest is read from the mapped file
     std::atomic<int> worker_ram{0}, worker_file{0}, worker_ssd{0};   // CPU experts of the step by tier
+    std::atomic<bool> admit_warned{false};
     std::vector<unsigned char> mincore_buf;
     std::unique_ptr<RouterLookahead> lookahead;   // warms the next layer's file-tier experts (DS41_LOOKAHEAD=0: off)
     bool fetch_now = true;             // ask for a layer's missing file pages before computing (DS41_FETCH_NOW=0: off)
+    // DS41_RAM_ADAPT=N (N > 0): the adaptive RAM tier (HostExperts::enable_adapt) keeps N free slots per slot size; a
+    // miss is read into one and stays. Its default budget keeps 8 GiB free instead of 24 (the file cache it replaces
+    // needs no room). ds41/docs/cache-design-2026-10-08.html
+    int ram_adapt = [] {
+        const char* v = std::getenv("DS41_RAM_ADAPT");
+        if (!v || !*v) return 0;
+        char* end = nullptr;
+        const long n = std::strtol(v, &end, 10);
+        if (end == v || *end || n < 0 || n > 64) throw std::invalid_argument("DS41_RAM_ADAPT must be an integer in [0, 64]");
+        return (int) n;
+    }();
     int32_t* gpu_sel = nullptr;        // [6] per-call descriptor indices (-1: CPU)
     std::shared_ptr<int> zc_quota;      // [layers] device values; update only between steps
     std::shared_ptr<void> zc_workspace; // used when there is no VRAM tier
@@ -539,7 +551,7 @@ struct Engine::Impl {
         }
         // the RAM tier after it: the hottest experts the VRAM tier does not hold (upstream's resident budget)
         if (!opt.expert_profile.empty() && opt.ram_budget_gib != 0) {
-            const size_t budget = opt.ram_budget_gib < 0 ? auto_ram_budget(24ull << 30)
+            const size_t budget = opt.ram_budget_gib < 0 ? auto_ram_budget(ram_adapt ? 8ull << 30 : 24ull << 30)
                                                          : (size_t) (opt.ram_budget_gib * (double) (1ull << 30));
             std::vector<int64_t> handles;
             for (const auto& y : L) handles.push_back(y.moe_handle);
@@ -551,6 +563,11 @@ struct Engine::Impl {
             std::fprintf(stderr, "ds41: RAM tier %d experts (%.1f GiB, %s), filled in %.1f s\n", host->slots(),
                          host->arena_bytes() / (double) (1ull << 30),
                          host->locked() ? "locked" : "not locked", (now_ms() - t0) / 1000.0);
+            if (ram_adapt) {
+                host->enable_adapt(ram_adapt);
+                std::fprintf(stderr, "ds41: adaptive RAM tier, %d free slots per slot size (%d free)\n", ram_adapt,
+                             host->free_slots());
+            }
         }
         if (host && host->experts_dev()) {
             // Four PCIe reads cost about 1.05 ms; two CPU experts cost about 1.0-1.2 ms.
@@ -577,8 +594,10 @@ struct Engine::Impl {
         // the router lookahead: every expert outside the VRAM and RAM tiers is read from the file (upstream turns it
         // on with a RAM budget; here the file tier exists whenever the experts do not all fit in RAM)
         if (const char* f = std::getenv("DS41_FETCH_NOW")) fetch_now = f[0] != '0';
+        // With the adaptive RAM tier a miss is read with O_DIRECT, past the file cache: pages warmed there would only
+        // take SSD time from those reads. DS41_LOOKAHEAD=1 keeps the lookahead on.
         const char* la_env = std::getenv("DS41_LOOKAHEAD");
-        if (!(la_env && la_env[0] == '0')) {
+        if (la_env ? la_env[0] != '0' : !(host && host->reserve() > 0)) {
             std::vector<std::vector<uint16_t>> rw(kLayers, std::vector<uint16_t>((size_t) kExperts * kDim));
             std::vector<std::vector<float>> rb(kLayers, std::vector<float>(kExperts));
             for (int l = 0; l < kLayers; ++l) {
@@ -662,12 +681,25 @@ struct Engine::Impl {
                                      host ? host->slot_of(l, e) : -2, (int) history.size() - 1);
                     }
                     file_ids[n_file++] = e;
-                    if (file_pages_missing(l, e)) {
-                        ++worker_ssd;
-                        // upstream fetches a layer's missing experts in one batch before computing: ask for the whole
-                        // range now, so the reads run in parallel instead of page fault by page fault
-                        if (fetch_now) warm_file_expert(l, e);
+                }
+                // the adaptive RAM tier reads the layer's file experts into free slots, all at once; the rest (no free
+                // slot, or a failed read) come from the file as before
+                bool kept[kTopK] = {};
+                if (host && host->reserve() > 0 && n_file > 0) {
+                    try {
+                        worker_ssd += host->admit(l, file_ids, n_file, kept);
+                    } catch (const std::exception& ex) {   // e.g. no thread for the reads: the file path still works
+                        for (bool& k : kept) k = false;
+                        if (!admit_warned.exchange(true))
+                            std::fprintf(stderr, "ds41: adaptive RAM tier read failed (%s); using the file\n", ex.what());
                     }
+                }
+                for (int j = 0; j < n_file; ++j) {
+                    if (kept[j] || !file_pages_missing(l, file_ids[j])) continue;
+                    ++worker_ssd;
+                    // upstream fetches a layer's missing experts in one batch before computing: ask for the whole
+                    // range now, so the reads run in parallel instead of page fault by page fault
+                    if (fetch_now) warm_file_expert(l, file_ids[j]);
                 }
                 if (lookahead) lookahead->observe(l, file_ids, n_file);
                 // Keep expert_hits as VRAM hits. Timing derives CPU and zero-copy counts from the partition.
@@ -1910,6 +1942,7 @@ struct Engine::Impl {
         lg.assign(lg_pinned, lg_pinned + kVocab);
         if (pred_stats && lookahead) predict_tally();
         if (vram) vram->count(routes_pinned, kTopK);
+        if (host && host->reserve() > 0) host->end_step(routes_pinned, kTopK);   // publish this step's reads, evict
         if (dump) {
             float wv[kLayers * kTopK];
             ck(cudaMemcpy(wv, weights_dev, sizeof wv, cudaMemcpyDeviceToHost), "dump weights");

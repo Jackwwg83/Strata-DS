@@ -101,6 +101,7 @@ HostExperts::HostExperts(const Pack& pack, const std::vector<std::pair<int, int>
     const auto plan = plan_ram_tier(ranked, vram_res, n_experts_, bytes, budget);
     slots_ = (int) plan.size();
     if (slots_ == 0) return;
+    busy_.assign(slots_, 0);   // VRAM swap locks count from the start, so enable_adapt() sees swaps in flight
     for (const auto& [l, e] : plan) {
         const uint64_t b = bytes[(size_t) l * n_experts_ + e];
         off_.push_back(off_.back() + b);
@@ -276,11 +277,13 @@ void HostExperts::free_slot(int slot) {
 void HostExperts::enable_adapt(int reserve) {
     if (reserve <= 0 || slots_ == 0) return;
     if (reserve_ > 0) throw std::logic_error("HostExperts::enable_adapt: already enabled");
+    // a VRAM swap in flight reads or writes its RAM slot: freeing that slot now would let a miss overwrite it
+    if (std::find(busy_.begin(), busy_.end(), 1) != busy_.end())
+        throw std::logic_error("HostExperts::enable_adapt: a VRAM swap is in flight");
     // O_DIRECT where the file system allows it: a miss is read once and kept here, so the file cache would only hold
     // a second copy (on the laptop the cache kept about 8 of its 24 free GiB useful)
     dfd_ = open((pack_.dir() + "/experts.bin").c_str(), O_RDONLY | O_DIRECT);
     free_.assign(slots_, 0);
-    busy_.assign(slots_, 0);
     age_.assign(slots_, 0);
     std::map<size_t, std::vector<int>> by_capacity;
     for (int s = 0; s < slots_; ++s) by_capacity[slot_capacity(s)].push_back(s);

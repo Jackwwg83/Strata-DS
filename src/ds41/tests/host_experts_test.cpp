@@ -154,6 +154,11 @@ int main() {
         int last[4] = {-1, -1, -1, -1};
         for (int s = 0; s < h.slots(); ++s) last[h.slot_capacity(s) / unit] = s;
         check(last[1] >= 0 && last[2] >= 0 && last[3] >= 0, tag + "the tier holds experts of 1, 2 and 3 units");
+        h.lock(0);   // a VRAM swap in flight: enabling now would free slots it uses
+        bool refused = false;
+        try { h.enable_adapt(1); } catch (const std::logic_error&) { refused = true; }
+        check(refused && h.reserve() == 0, tag + "enable_adapt refuses while a swap holds a slot");
+        h.unlock(0);
         h.enable_adapt(1);
         check(h.free_slots() == 3, tag + "one free slot per capacity, got " + std::to_string(h.free_slots()));
         for (int m = 1; m <= 3; ++m)

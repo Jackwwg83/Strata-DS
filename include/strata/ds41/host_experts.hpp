@@ -99,8 +99,8 @@ public:
 
     // ---- the adaptive tier ----
     /// Keep `reserve` slots of each capacity free: per capacity, the lowest-ranked experts leave the tier (to the
-    /// file) until that many slots are free. Call once, between steps. 0: the static tier. Throws if the pack cannot
-    /// be opened for reading.
+    /// file) until that many slots are free. Call once, between steps, with no VRAM swap in flight (it throws
+    /// otherwise). 0: the static tier.
     void enable_adapt(int reserve);
     int reserve() const { return reserve_; }
     /// During a step, on the CPU worker: read ids[0..n) of `layer`, which are in no tier, into free slots (for each
