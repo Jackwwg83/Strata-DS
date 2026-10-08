@@ -41,7 +41,8 @@ MOUNT = Path(os.environ.get("STRATA_SYCL_ROOT") or ROOT.parent)   # what strata-
 
 # Battlemage / Alchemist PCI device ids -> (name, VRAM GB). lspci's database lags new cards (an Arc Pro B70 reads
 # "Intel Corporation Device [8086:e223]"), so the sysfs id is the reliable signal and the name table is ours.
-INTEL_ARC = {"e223": ("Arc Pro B70", 32.0), "e221": ("Arc Pro B60", 24.0), "e20b": ("Arc B580", 12.0),
+INTEL_ARC = {"e223": ("Arc Pro B70", 32.0), "e221": ("Arc Pro B60", 24.0), "e211": ("Arc Pro B60", 24.0),
+             "e20b": ("Arc B580", 12.0),
              "e20c": ("Arc B570", 10.0), "e212": ("Arc B50", 16.0),
              "56a0": ("Arc A770", 16.0), "56a1": ("Arc A750", 8.0), "56a2": ("Arc A580", 8.0),
              "56a5": ("Arc A380", 6.0), "56a6": ("Arc A310", 4.0), "5690": ("Arc A770M", 16.0)}
@@ -85,10 +86,6 @@ def sycl_engine():
     exe = next((b for b in (ROOT / "build-sycl-aot" / "strata", ROOT / "build-sycl" / "strata") if b.exists()), None)
     if exe is None:
         return None, "it is not built (sycl/tools/build.sh; docs/INTEL.md)"
-    if not shutil.which("docker"):
-        return None, "docker is not installed (the engine runs in the oneAPI image)"
-    if subprocess.run(["docker", "image", "inspect", SYCL_IMAGE], capture_output=True).returncode != 0:
-        return None, f"the runtime image {SYCL_IMAGE} is missing (sycl/tools/Dockerfile)"
     return exe, None
 
 
@@ -118,7 +115,7 @@ def drop(args, name, value=False):
         del args[i:i + 1 + int(value)]
 
 
-def to_sycl(cfg: dict, exe: Path, ram: float, keep: dict) -> dict:
+def to_sycl(cfg: dict, exe: Path, ram: float, keep: dict, vram_gb: float = 0.0) -> dict:
     """setup's config (written for its HIP path) -> the SYCL port's: the container's paths, experts streamed from the
     GGUF into VRAM (every expert must fit, so the VRAM reserve is the smallest that leaves the KV and the prompt
     buffers room - docs/INTEL.md), KV streaming from 64K up when the RAM holds the KV (the B70 at 256K decodes at
@@ -140,9 +137,11 @@ def to_sycl(cfg: dict, exe: Path, ram: float, keep: dict) -> dict:
         S.ok(f"KV streaming on: the context's KV cache lives in RAM ({kv_ram:.1f} GB), every expert stays in VRAM")
     drop(args, "--vram-reserve-mib", True)
     args += ["--stream-experts", "--vram-reserve-mib", "1024" if ctx <= 32768 else "2048"]
-    if ctx > 32768:                                     # long contexts: 4096-token chunks keep the prompt buffers small
-        drop(args, "--prefill", True)
-        args += ["--prefill", "4096"]
+    if ctx > 32768 or vram_gb >= 24:                    # long contexts: 4096-token chunks keep the prompt buffers small; a
+        drop(args, "--prefill", True)                   # 24 GB+ card with part of the experts in the RAM mirror streams those
+        args += ["--prefill", "4096"]                   # over PCIe once per chunk, so fewer, bigger chunks read the prompt
+                                                        # faster (Arc Pro B70, IQ3_S, a 4,095-token prompt: 2,048-token
+                                                        # chunks 618 tok/s, 4,096: 1,002; docs/INTEL.md); it costs ~700 cache slots
     out = {k: v for k, v in cfg.items() if k not in ("lib_dirs", "env", "vision", "gpus")}
     out.update({"backend": "sycl", "exe": str(SYCL_WRAPPER), "args": args, "sycl_root": str(MOUNT)})
     env = {}
@@ -208,11 +207,11 @@ def install(argv) -> None:
 
     write = S.write_run_script
 
-    def write_run_script(model, cfg_path, port):
+    def write_run_script(model, cfg_path, port, open_browser=True):   # setup.write_run_script's signature (#870)
         cfg = json.loads(Path(cfg_path).read_text(encoding="utf-8"))
-        cfg = to_sycl(cfg, exe, real_ram, keep.get(Path(cfg_path).name, {}))
+        cfg = to_sycl(cfg, exe, real_ram, keep.get(Path(cfg_path).name, {}), intel[0]["vram_gb"])
         Path(cfg_path).write_text(json.dumps(cfg, indent=1), encoding="utf-8")
-        script = write(model, cfg_path, port)
+        script = write(model, cfg_path, port, open_browser)
         script.write_text(script.read_text().replace(str(ROOT / "serve" / "server.py"), str(SERVER)))
         return script
     S.write_run_script = write_run_script

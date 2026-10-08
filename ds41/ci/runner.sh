@@ -19,8 +19,9 @@
 # "<issue number>\n<markdown comment>", and ds41/ci/relay.sh on the reviewer's machine posts and archives them.
 #
 # Env: REPO_DIR (clone of the repo), BASE (default origin/feature/ds41), POLL (default 60), CUDA_ARCH (default 89: RTX
-# 4090; 86 for an RTX 3060/3090), CMAKE_EXTRA (more configure options, e.g. -DSTRATA_GGML_DIR=/workspace/llama.cpp so a
-# configure does not clone llama.cpp each time).
+# 4090; 86 for an RTX 3060/3090; 120 for an RTX 50), CMAKE_EXTRA (more configure options, e.g.
+# -DSTRATA_GGML_DIR=/workspace/llama.cpp so a configure does not clone llama.cpp each time), MIN_FREE_MIB (default 4096:
+# a test starts only when the GPU has this much free memory; on a shared GPU the queue waits instead of failing).
 set -u
 REPO_DIR=${REPO_DIR:-/workspace/ci/repo}
 BASE=${BASE:-origin/feature/ds41}
@@ -70,10 +71,12 @@ test_branch() {
 
     {
         echo "== $branch $sha  $(date -u +%FT%TZ)"
+        local launch=""
+        command -v ccache > /dev/null && launch="-DCMAKE_CUDA_COMPILER_LAUNCHER=ccache -DCMAKE_CXX_COMPILER_LAUNCHER=ccache"
         cmake -S "$wt" -B "$wt/build" -DSTRATA_ENABLE_CUDA=ON -DCMAKE_CUDA_ARCHITECTURES=${CUDA_ARCH:-89} -DSTRATA_BUILD_TESTS=ON \
-              -DCMAKE_BUILD_TYPE=Release -DCMAKE_CUDA_COMPILER_LAUNCHER=ccache -DCMAKE_CXX_COMPILER_LAUNCHER=ccache \
-              ${CMAKE_EXTRA:-} 2>&1 | tail -3
+              -DCMAKE_BUILD_TYPE=Release $launch ${CMAKE_EXTRA:-} 2>&1 | tail -3
         cmake --build "$wt/build" -j"$(nproc)" --target $targets 2>&1 | grep -E "error|warning: unused|Error" | head -40
+        wait_gpu
         echo "== test: $test"
         (cd "$wt/build" && timeout 900 bash -c "$test") 2>&1 | tail -60
     } > "$log" 2>&1
@@ -81,6 +84,16 @@ test_branch() {
     verdict=$(grep -E '^RESULT (pass|fail)' "$log" | tail -1)
     [ -n "$verdict" ] || verdict="RESULT fail no-result-line (build or test error, see log tail)"
     record "$task" "$branch" "$sha" "$(echo "$verdict" | awk '{print $2}')" "$(echo "$verdict" | cut -d' ' -f3-)" "$issue"
+}
+
+wait_gpu() {  # until the GPU has MIN_FREE_MIB free (another program may hold it); a note on stderr while it waits
+    local said=0 free
+    while true; do
+        free=$(nvidia-smi --query-gpu=memory.free --format=csv,noheader,nounits 2>/dev/null | head -1)
+        [ -n "$free" ] && [ "$free" -ge "${MIN_FREE_MIB:-4096}" ] && return
+        [ $said = 1 ] || { echo "runner: waiting for ${MIN_FREE_MIB:-4096} MiB of free GPU memory ($free free)" >&2; said=1; }
+        sleep 60
+    done
 }
 
 record() {  # record <task> <branch> <sha> <pass|fail> <details> <issue>
