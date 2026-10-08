@@ -59,6 +59,20 @@ int main() {
     std::vector<float> bias(n);
     for (auto& v : bias) v = nd(g) * 0.05f;
 
+    // 0. speed: the prediction must finish within a layer (about 1.4 ms per layer on the laptop with the adaptive
+    // RAM tier); a single running sum took about 1.6 ms. Loose bound, printed for the record.
+    {
+        std::vector<uint16_t> x(dim);
+        for (auto& v : x) v = to_f16(nd(g));
+        int32_t ids[k];
+        const auto t0 = std::chrono::steady_clock::now();
+        const int reps = 20;
+        for (int r = 0; r < reps; ++r) cpu_router_topk(x.data(), w.data(), bias.data(), n, dim, k, ids);
+        const double ms = std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - t0).count() / reps;
+        std::printf("cpu_router_topk %.3f ms per call (384 x 5120)\n", ms);
+        check(ms < 1.0, "the router prediction runs in under 1 ms, took " + std::to_string(ms) + " ms");
+    }
+
     // 1. selection against a double-precision reference
     int exact = 0, near_tie = 0;
     const int trials = 50;
