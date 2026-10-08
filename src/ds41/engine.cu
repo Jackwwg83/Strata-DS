@@ -572,7 +572,10 @@ struct Engine::Impl {
         if (host && host->experts_dev()) {
             // Four PCIe reads cost about 1.05 ms; two CPU experts cost about 1.0-1.2 ms.
             // This is a starting quota for six misses, not a measured optimum.
-            int quota = 4;
+            // With the adaptive RAM tier the CPU no longer waits for page faults and computes RAM experts faster than
+            // the GPU reads them over PCIe: on the laptop (PCIe 5.0 x8, 256 tokens, code and agent prompts) quota
+            // 0 / 1 / 2 / 4 / 6 took 59.7 / 60.1 / 61.7 / 63.7 / 66.6 ms per token. Its default is 0.
+            int quota = ram_adapt ? 0 : 4;
             if (const char* value = std::getenv("DS41_ZC_QUOTA")) {
                 char* end = nullptr;
                 const long parsed = std::strtol(value, &end, 10);
@@ -684,18 +687,26 @@ struct Engine::Impl {
                 }
                 // the adaptive RAM tier reads the layer's file experts into free slots, all at once; the rest (no free
                 // slot, or a failed read) come from the file as before
-                bool kept[kTopK] = {};
-                if (host && host->reserve() > 0 && n_file > 0) {
-                    try {
-                        worker_ssd += host->admit(l, file_ids, n_file, kept);
+                bool kept[kTopK] = {}, missing[kTopK] = {};
+                const bool adaptive = host && host->reserve() > 0 && n_file > 0;
+                if (adaptive && !host->reads_direct())   // copied from the map: only missing pages read the SSD
+                    for (int j = 0; j < n_file; ++j) missing[j] = file_pages_missing(l, file_ids[j]);
+                if (adaptive) {
+                    try {   // kept[] holds what was read even when admit() throws
+                        host->admit(l, file_ids, n_file, kept);
                     } catch (const std::exception& ex) {   // e.g. no thread for the reads: the file path still works
-                        for (bool& k : kept) k = false;
                         if (!admit_warned.exchange(true))
                             std::fprintf(stderr, "ds41: adaptive RAM tier read failed (%s); using the file\n", ex.what());
                     }
                 }
                 for (int j = 0; j < n_file; ++j) {
-                    if (kept[j] || !file_pages_missing(l, file_ids[j])) continue;
+                    if (kept[j]) {   // computed from its new RAM slot
+                        --worker_file;
+                        ++worker_ram;
+                        if (host->reads_direct() || missing[j]) ++worker_ssd;
+                        continue;
+                    }
+                    if (!file_pages_missing(l, file_ids[j])) continue;
                     ++worker_ssd;
                     // upstream fetches a layer's missing experts in one batch before computing: ask for the whole
                     // range now, so the reads run in parallel instead of page fault by page fault

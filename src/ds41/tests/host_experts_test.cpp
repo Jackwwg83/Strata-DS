@@ -185,6 +185,15 @@ int main() {
             return r;
         };
         const auto a = out[1][0], b = out[1][1], c = out[3][0], d = out[3][1];
+        {   // a read that throws: the picked slot is free again and the expert stays in the file
+            detail::admit_fault() = true;
+            bool threw = false;
+            try { admit1(a); } catch (const std::runtime_error&) { threw = true; }
+            check(threw && h.free_slots() == 3 && h.slot_of(a.first, a.second) == -1,
+                  tag + "a failed admit gives its slot back");
+            std::vector<int32_t> none((size_t) ds41test::L * 6, -1);
+            check(h.end_step(none.data(), 6) == 0 && h.admitted_total() == 0, tag + "and publishes nothing");
+        }
         check(admit1(a), tag + "a 1-unit expert is read into the free 1-unit slot");
         check(h.slot_of(a.first, a.second) == -1, tag + "the RAM table does not change during the step");
         check(admit1(b), tag + "the next 1-unit expert takes the free 2-unit slot (the smallest free one that holds it)");

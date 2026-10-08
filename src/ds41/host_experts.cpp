@@ -332,6 +332,19 @@ int HostExperts::admit(int layer, const int32_t* ids, int n, bool* ok) {
             if (pick[i] >= 0) free_[pick[i]] = 0;
         }
     }
+    int read = 0;
+    try {
+        read = read_picked(layer, ids, n, pick, ok);
+    } catch (...) {   // the picked slots that did not get their expert are free again; no pointer moved for them
+        std::lock_guard<std::mutex> lk(admit_mu_);
+        for (int i = 0; i < n; ++i)
+            if (pick[i] >= 0 && !ok[i]) free_[pick[i]] = 1;
+        throw;
+    }
+    return read;
+}
+
+int HostExperts::read_picked(int layer, const int32_t* ids, int n, const std::vector<int>& pick, bool* ok) {
     // the reads: 1 MiB parts of every picked expert on up to 8 threads, so several reads are in flight (the laptop's
     // SSD reads about 6 GB/s with parallel O_DIRECT readers)
     struct Part { int i; size_t at, len; };
@@ -350,6 +363,7 @@ int HostExperts::admit(int layer, const int32_t* ids, int n, bool* ok) {
     for (int i = 0; i < n; ++i) failed[i] = false;
     std::atomic<size_t> next{0};
     run_parallel(std::min<size_t>(parts.size(), 8), [&](size_t) {
+        if (detail::admit_fault().exchange(false)) throw std::runtime_error("ds41 RAM tier: test fault in admit");
         for (size_t k; (k = next++) < parts.size();) {
             const Part& p = parts[k];
             const ExpertSlot& x = pack_.expert(layer, ids[p.i]);
@@ -377,13 +391,15 @@ int HostExperts::admit(int layer, const int32_t* ids, int n, bool* ok) {
             free_[pick[i]] = 1;
             continue;
         }
-        point(layer, ids[i], slot_ptr(pick[i]));
+        // recorded before the CPU kernel is pointed at it: end_step() then always knows the slot's expert
         admitted_.push_back({pick[i], {layer, ids[i]}});
         ok[i] = true;
         ++read;
+        point(layer, ids[i], slot_ptr(pick[i]));
     }
     return read;
 }
+
 
 int HostExperts::end_step(const int32_t* routes, int topk) {
     if (!reserve_) return 0;

@@ -28,6 +28,7 @@
 
 #include "strata/ds41/pack.hpp"
 
+#include <atomic>
 #include <cstddef>
 #include <cstdint>
 #include <mutex>
@@ -38,6 +39,14 @@
 namespace strata::ds41 {
 
 namespace kernels { struct Exl3Expert; }
+
+namespace detail {
+/// tests: the next HostExperts::admit() read throws once
+inline std::atomic<bool>& admit_fault() {
+    static std::atomic<bool> f{false};
+    return f;
+}
+}  // namespace detail
 
 /// The experts the RAM tier holds: the profile's pairs in rank order, skipping the ones the VRAM tier holds
 /// (vram_res >= 0) and the ones that do not fit the rest of `budget`. vram_res and bytes: [n_layers][n_experts].
@@ -103,6 +112,8 @@ public:
     /// otherwise). 0: the static tier.
     void enable_adapt(int reserve);
     int reserve() const { return reserve_; }
+    /// admit() reads with O_DIRECT (each read goes to the SSD); false: it copies from the mapped pack
+    bool reads_direct() const { return dfd_ >= 0; }
     /// During a step, on the CPU worker: read ids[0..n) of `layer`, which are in no tier, into free slots (for each
     /// the smallest capacity that holds it) and point the CPU kernel at them. ok[i] is false when no free slot holds
     /// expert i or its read failed: the CPU kernel then still reads it from the file. The RAM table and the device
@@ -125,6 +136,8 @@ public:
 private:
     void point(int layer, int expert, const uint8_t* bytes);
     void free_slot(int slot);      ///< its expert (if any) leaves for the file; the slot joins the free ones
+    /// admit()'s reads into the picked slots (pick[i] < 0: none); records and points the ones read
+    int read_picked(int layer, const int32_t* ids, int n, const std::vector<int>& pick, bool* ok);
     void publish_descriptor(int layer, int expert, int slot);
 
     const Pack& pack_;
