@@ -2,6 +2,7 @@
 // host reference computes them), the plan skips VRAM residents, experts outside the RAM tier and what does not fit the
 // buffer, and the copied bytes and rebased descriptors point at the expert in the buffer. Then the doorbell's publish:
 // a routed miss that was prefetched goes to the GPU with the buffer's descriptor, outside the zero-copy quota.
+// Both copy modes: the copy kernel, and DMA (a host thread copies with the copy engine; the GPU waits for its flag).
 #include "strata/ds41/doorbell.hpp"
 #include "strata/ds41/expert_prefetch.hpp"
 #include "bench_util.hpp"
@@ -12,7 +13,9 @@
 #include <algorithm>
 #include <cmath>
 #include <cstring>
+#include <memory>
 #include <numeric>
+#include <string>
 #include <random>
 #include <vector>
 
@@ -73,7 +76,7 @@ int main() {
     size_t cap = 0;
     for (size_t i = 0; i + 1 < eligible.size(); ++i) cap = (cap + 255) / 256 * 256 + blobs[eligible[i]].bytes;
     std::vector<int> want(eligible.begin(), eligible.end() - 1);   // the last eligible guess does not fit
-    sd::ExpertPrefetch pf(G, cap, N, D);
+    std::unique_ptr<sd::ExpertPrefetch> pfp;
 
     __nv_bfloat16 *dx, *dw;
     float* db;
@@ -96,6 +99,12 @@ int main() {
     cudaStreamCreateWithFlags(&st, cudaStreamNonBlocking);
     // layers 7 and 8 eagerly (both buffers), then layer 9 captured as a graph and replayed (the engine's decode step
     // is a graph): plan() forks the guesses and the copy to the prefetch stream; ready() and join() bring them back
+    for (const bool dma : {false, true}) {
+    pfp = std::make_unique<sd::ExpertPrefetch>(G, cap, N, D, dma);
+    sd::ExpertPrefetch& pf = *pfp;
+    const std::string mode = dma ? "DMA: " : "copy kernel: ";
+    v.check(pf.dma() == dma, mode + "the mode");
+    pf.begin_step();
     cudaGraphExec_t replay = nullptr;
     for (int layer : {7, 8, 9}) {
         if (layer == 9) {
@@ -113,17 +122,17 @@ int main() {
             pf.ready(layer, st);
             pf.join(layer, st);
         }
-        v.check(cudaStreamSynchronize(st) == cudaSuccess, "the prefetch ran");
+        v.check(cudaStreamSynchronize(st) == cudaSuccess, mode + "the prefetch ran");
         int32_t ranked[G], ids[G];
         sd::kernels::Exl3Expert descs[G];
         cudaMemcpy(ranked, pf.ranked(layer), sizeof ranked, cudaMemcpyDeviceToHost);
         cudaMemcpy(ids, pf.ids(layer), sizeof ids, cudaMemcpyDeviceToHost);
         cudaMemcpy(descs, pf.descs(layer), sizeof descs, cudaMemcpyDeviceToHost);
-        v.check(std::equal(ranked, ranked + G, order.begin()), "layer " + std::to_string(layer) +
+        v.check(std::equal(ranked, ranked + G, order.begin()), mode + "layer " + std::to_string(layer) +
                                                                     ": the guesses are the router's best, in order");
         bool ids_ok = true;
         for (int k = 0; k < G; ++k) ids_ok &= ids[k] == (k < (int) want.size() ? want[k] : -1);
-        v.check(ids_ok, "layer " + std::to_string(layer) +
+        v.check(ids_ok, mode + "layer " + std::to_string(layer) +
                             ": VRAM residents, experts outside RAM and what does not fit are not copied");
         bool bytes_ok = true;
         for (size_t k = 0; k < want.size(); ++k) {
@@ -134,9 +143,11 @@ int main() {
             bytes_ok &= cudaMemcpy(got.data(), dst, bytes, cudaMemcpyDeviceToHost) == cudaSuccess &&
                         std::memcmp(got.data(), host + (size_t) e * (1u << 20), bytes) == 0;
             bytes_ok &= (const uint8_t*) descs[k].w2.svh - (const uint8_t*) descs[k].w1.trellis == 24576 - 512;
+            cudaMemset((void*) dst, 0xee, bytes);   // layer 9 uses this buffer again: it must copy again
         }
-        v.check(bytes_ok, "layer " + std::to_string(layer) + ": the buffer holds each copied expert, the descriptors "
-                                                              "point at it");
+        v.check(bytes_ok, mode + "layer " + std::to_string(layer) + ": the buffer holds each copied expert, the "
+                                                                     "descriptors point at it");
+    }
     }
     // publish: routes = ranks 0 (VRAM), 2 (prefetched), 1 (RAM descriptor missing: CPU), and three RAM experts that
     // were not guessed; quota 1: one of those three is zero-copy, two go to the CPU
@@ -144,8 +155,8 @@ int main() {
         const int layer = 8;
         int32_t ids_h[G];
         sd::kernels::Exl3Expert descs_h[G];
-        cudaMemcpy(ids_h, pf.ids(layer), sizeof ids_h, cudaMemcpyDeviceToHost);
-        cudaMemcpy(descs_h, pf.descs(layer), sizeof descs_h, cudaMemcpyDeviceToHost);
+        cudaMemcpy(ids_h, pfp->ids(layer), sizeof ids_h, cudaMemcpyDeviceToHost);
+        cudaMemcpy(descs_h, pfp->descs(layer), sizeof descs_h, cudaMemcpyDeviceToHost);
         std::vector<int32_t> others;
         for (int e = 0; e < N && others.size() < 3; ++e)
             if (std::find(order.begin(), order.begin() + G, e) == order.begin() + G) others.push_back(e);
@@ -171,8 +182,8 @@ int main() {
         cudaMemcpy(dvram, vram_desc.data(), 16 * sizeof(sd::kernels::Exl3Expert), cudaMemcpyHostToDevice);
         cudaMemset(dxh, 0, D * 2);
         sd::ExpertDoorbell db(1, 6, D);
-        db.publish(dxh, droutes, dwts, 1, dres, dsel, 1, st, dvram, dram, dquota, nullptr, nullptr, pf.ids(layer),
-                   pf.descs(layer), G);
+        db.publish(dxh, droutes, dwts, 1, dres, dsel, 1, st, dvram, dram, dquota, nullptr, nullptr, pfp->ids(layer),
+                   pfp->descs(layer), G);
         v.check(cudaStreamSynchronize(st) == cudaSuccess, "publish ran");
         int32_t sel[6];
         sd::kernels::Exl3Expert call[6];

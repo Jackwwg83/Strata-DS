@@ -535,9 +535,13 @@ struct Engine::Impl {
             if (guesses > 0) {
                 const char* mb_env = std::getenv("DS41_PREFETCH_MB");
                 const size_t mb = mb_env ? (size_t) std::atoi(mb_env) : 96;
+                // DS41_PREFETCH_DMA=1: copy with the copy engine from a host thread instead of the copy kernel
+                const char* dma_env = std::getenv("DS41_PREFETCH_DMA");
+                const bool dma = dma_env && dma_env[0] == '1';
                 prefetch = std::make_unique<ExpertPrefetch>(std::min(guesses, ExpertPrefetch::kMaxGuesses),
-                                                            std::max<size_t>(mb, 1) << 20, kExperts, kDim);
-                std::fprintf(stderr, "ds41: prefetch %d guesses per layer, 2 x %zu MiB\n", prefetch->guesses(), mb);
+                                                            std::max<size_t>(mb, 1) << 20, kExperts, kDim, dma);
+                std::fprintf(stderr, "ds41: prefetch %d guesses per layer, 2 x %zu MiB, %s\n", prefetch->guesses(), mb,
+                             dma ? "DMA copies" : "copy kernel");
             }
         }
         alloc_slots();   // the batch slots' state and staging, before the VRAM tier sizes itself
@@ -1923,6 +1927,7 @@ struct Engine::Impl {
         if (vram) tm.vram_swaps = vram->between_steps();   // the device is idle: the last step ended in a sync
         tm.swaps_ms = now_ms() - t_swaps;
         db->reset();
+        if (prefetch) prefetch->begin_step();
         worker_us = 0;
         worker_misses = 0;
         worker_ram = worker_file = worker_ssd = 0;
@@ -1962,6 +1967,7 @@ struct Engine::Impl {
             enqueue_step(dump);
         }
         ck(cudaStreamSynchronize(st), "step");
+        if (prefetch && prefetch->failed()) throw std::runtime_error("ds41 prefetch: a DMA copy failed");
         const double t_end = now_ms();
         {
             std::lock_guard<std::mutex> lk(mu);
