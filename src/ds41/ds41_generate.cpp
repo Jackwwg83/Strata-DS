@@ -9,6 +9,8 @@
 // prefill (M3) instead of step() token by token; generation then continues with step().
 // --force-ids feeds a fixed token sequence (from the oracle) instead of the engine's own predictions, so a
 // per-layer comparison stays aligned even after the first differing token. Tokenization stays in Python.
+// --continue-ids FILE decodes as usual (prompt, then step() per token, --step-log) but feeds the file's tokens after
+// the prompt instead of the engine's own predictions: every run of a speed A/B then routes the same experts.
 #include "strata/ds41/config.hpp"
 #include "strata/ds41/engine.hpp"
 #include "strata/ds41/suffix_drafter.hpp"
@@ -59,7 +61,7 @@ static void print_prefill(const Engine& engine, size_t n) {
 static std::FILE* step_log = nullptr;
 
 static void generate(Engine& engine, const EngineOptions& opt, const std::vector<int>& prompt,
-                     int count, bool batched, bool suffix, int max_t, int eos) {
+                     int count, bool batched, bool suffix, int max_t, int eos, const std::vector<int>& cont = {}) {
     if (prompt.empty()) throw std::invalid_argument("generation needs a nonempty prompt");
     int next = -1;
     if (batched) {
@@ -71,6 +73,7 @@ static void generate(Engine& engine, const EngineOptions& opt, const std::vector
     SuffixDrafter drafter(3, 64, size_t(opt.max_seq)+8);
     for (int token : prompt) drafter.append(token);
     std::vector<int> out;
+    if (!cont.empty()) next = cont[0];   // --continue-ids: the file's tokens replace the predictions
     if (count > 0) { out.push_back(next); drafter.append(next); }
     int pos = int(prompt.size()), rounds = 0, accepted = 0;
     double step_ms = 0;            // plain decode: the engine's step times, as the forced path reports them
@@ -91,6 +94,7 @@ static void generate(Engine& engine, const EngineOptions& opt, const std::vector
             step_ms += tm.total_ms;
             hits += tm.expert_hits;
             routed += tm.expert_total;
+            if (!cont.empty()) next = cont[out.size()];
             out.push_back(next); drafter.append(next); ++rounds;
             continue;
         }
@@ -126,7 +130,7 @@ static void generate(Engine& engine, const EngineOptions& opt, const std::vector
 }
 
 int main(int argc, char** argv) {
-    std::string pack, ids_s, dump_path, force_path, spec = "none";
+    std::string pack, ids_s, dump_path, force_path, cont_path, spec = "none";
     int spec_max = kVerifyMaxTokens, eos = -1;
     int gen = 32;
     bool batched = false;
@@ -162,6 +166,7 @@ int main(int argc, char** argv) {
                                    "swaps_ms end_ms\n");
         }
         else if (a == "--force-ids") force_path = next();
+        else if (a == "--continue-ids") cont_path = next();
         else { std::fprintf(stderr, "unknown argument %s\n", a.c_str()); return 2; }
     }
     if (pack.empty() || (ids_s.empty() && force_path.empty())) {
@@ -174,22 +179,30 @@ int main(int argc, char** argv) {
         std::string all((std::istreambuf_iterator<char>(f)), std::istreambuf_iterator<char>());
         forced = parse_ids(all);
     }
+    std::vector<int> cont;
+    if (!cont_path.empty()) {
+        std::ifstream f(cont_path);
+        std::string all((std::istreambuf_iterator<char>(f)), std::istreambuf_iterator<char>());
+        cont = parse_ids(all);
+    }
     try {
         // the teacher-forced path reads logits at the next forced id before the engine sees it
-        for (const auto* ids : {&prompt, &forced})
+        for (const auto* ids : {&prompt, &forced, &cont})
             for (int t : *ids)
                 if (t < 0 || t >= kVocab) throw std::invalid_argument("token id " + std::to_string(t) + " is outside the vocabulary");
         if (gen < 0 || spec_max < 1 || spec_max > 8 || (spec != "none" && spec != "suffix"))
             throw std::invalid_argument("use --gen >= 0, --spec none|suffix, --spec-max 1..8");
         if (spec == "suffix" && (!force_path.empty() || !dump_path.empty()))
             throw std::invalid_argument("--spec suffix cannot be combined with --force-ids or --dump");
+        if (!cont_path.empty() && ((int) cont.size() < gen || spec != "none" || !force_path.empty() || !dump_path.empty()))
+            throw std::invalid_argument("--continue-ids needs at least --gen tokens, without --spec, --force-ids, --dump");
         if (spec_max > kVerifyMaxTokens) {
             std::fprintf(stderr, "spec: cap T at %d until CPU rows 5..8 are validated\n", kVerifyMaxTokens);
             spec_max = kVerifyMaxTokens;
         }
         Engine engine(pack, opt);
         if (force_path.empty() && dump_path.empty()) {
-            generate(engine, opt, prompt, gen, batched, spec == "suffix", spec_max, eos);
+            generate(engine, opt, prompt, gen, batched, spec == "suffix", spec_max, eos, cont);
             return 0;
         }
         if (batched) {   // prefill the prompt (or the forced sequence) in one call, then decode with step()
