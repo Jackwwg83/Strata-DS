@@ -31,6 +31,7 @@
 #include <atomic>
 #include <cstddef>
 #include <cstdint>
+#include <memory>
 #include <mutex>
 #include <string>
 #include <utility>
@@ -39,12 +40,18 @@
 namespace strata::ds41 {
 
 namespace kernels { struct Exl3Expert; }
+class ThreadPool;
 
 namespace detail {
 /// tests: the next HostExperts::admit() read throws once
 inline std::atomic<bool>& admit_fault() {
     static std::atomic<bool> f{false};
     return f;
+}
+/// tests: the size of admit()'s read parts (a multiple of 4 KiB; 1 MiB in use)
+inline std::atomic<size_t>& admit_part_bytes() {
+    static std::atomic<size_t> b{1u << 20};
+    return b;
 }
 }  // namespace detail
 
@@ -159,6 +166,7 @@ private:
     // adaptive tier
     int reserve_ = 0;
     int dfd_ = -1;                                  ///< experts.bin opened with O_DIRECT (-1: copy from the map)
+    std::unique_ptr<ThreadPool> readers_;           ///< admit()'s reader threads, started with the adaptive tier
     std::vector<uint8_t> free_, busy_;              ///< [slots] free; locked by a VRAM swap
     std::vector<uint64_t> age_;                     ///< [slots] last use
     uint64_t clock_ = 0;

@@ -242,6 +242,52 @@ int main() {
         check(h.free_slots() == before + 1, tag + "release of an expert without a slot changes nothing");
     }
 
+    // one admit of several experts, each read in several parts (4 KiB parts here, 1 MiB in use): the parts go to the
+    // reader threads, and every slot must hold its expert's bytes; twice, so the readers are reused
+    for (const uint64_t gap : {(uint64_t) 256, (uint64_t) 4096}) {
+        const std::string tag = "parts, gap " + std::to_string(gap) + ": ";
+        const std::string dir = "ds41_fake_pack_parts_" + std::to_string(gap);
+        ds41test::write_fake_pack(dir, true, gap);
+        Pack pack(dir);
+        pack.map_experts();
+        std::vector<std::pair<int, int>> ranked;
+        for (int i = 0; i < 40; ++i) ranked.push_back({i % ds41test::L, (i * 7) % ds41test::E});
+        const std::vector<int32_t> res((size_t) ds41test::L * ds41test::E, -1);
+        uint64_t budget = 0;
+        for (int i = 0; i < 24; ++i) budget += pack.expert(ranked[i].first, ranked[i].second).bytes;
+        HostExperts h(pack, ranked, res, budget, {}, 2);
+        h.enable_adapt(3);
+        detail::admit_part_bytes() = 4096;
+        std::vector<std::pair<int, int>> big;   // 3-unit experts outside the tier, of one layer
+        for (int l = 0; l < ds41test::L && big.size() < 3; ++l) {
+            big.clear();
+            for (int e = 0; e < ds41test::E && big.size() < 3; ++e) {
+                bool ranked_pair = false;
+                for (auto& p : ranked) ranked_pair |= p == std::make_pair(l, e);
+                if (!ranked_pair && ds41test::fake_mult(l, e) == 3) big.push_back({l, e});
+            }
+        }
+        check(big.size() == 3, tag + "three 3-unit experts of one layer outside the tier");
+        for (int round = 0; round < 2 && big.size() == 3; ++round) {
+            const int layer = big[0].first;
+            int32_t ids[3] = {big[0].second, big[1].second, big[2].second};
+            bool ok[3] = {};
+            const int n = h.admit(layer, ids, 3, ok);
+            std::vector<int32_t> routes((size_t) ds41test::L * 6, -1);
+            for (int k = 0; k < 3; ++k) routes[(size_t) layer * 6 + k] = ids[k];
+            h.end_step(routes.data(), 6);
+            bool same = n == 3 && ok[0] && ok[1] && ok[2];
+            for (int k = 0; k < 3 && same; ++k) {
+                const int s = h.slot_of(layer, ids[k]);
+                const ExpertSlot& x = pack.expert(layer, ids[k]);
+                same &= s >= 0 && std::memcmp(h.slot_ptr(s), pack.expert_base() + x.offset, x.bytes) == 0;
+            }
+            check(same, tag + "round " + std::to_string(round) + ": one admit read three experts in parts, bytes equal");
+            for (auto& [l, e] : big) h.release(l, e);   // free their slots for the next round
+        }
+        detail::admit_part_bytes() = 1u << 20;
+    }
+
     const size_t b = auto_ram_budget(4ull << 30);
     uint64_t avail_kb = 0;
     {

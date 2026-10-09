@@ -274,6 +274,10 @@ void HostExperts::free_slot(int slot) {
     free_[slot] = 1;
 }
 
+namespace {
+constexpr size_t kReaders = 8;   // admit()'s reader threads, the caller included
+}  // namespace
+
 void HostExperts::enable_adapt(int reserve) {
     if (reserve <= 0 || slots_ == 0) return;
     if (reserve_ > 0) throw std::logic_error("HostExperts::enable_adapt: already enabled");
@@ -283,6 +287,8 @@ void HostExperts::enable_adapt(int reserve) {
     // O_DIRECT where the file system allows it: a miss is read once and kept here, so the file cache would only hold
     // a second copy (on the laptop the cache kept about 8 of its 24 free GiB useful)
     dfd_ = open((pack_.dir() + "/experts.bin").c_str(), O_RDONLY | O_DIRECT);
+    // persistent readers: new threads for every admit made a 7 MB read 17% slower (laptop SSD, 0.26 -> 0.216 ms/MB)
+    readers_ = std::make_unique<ThreadPool>(kReaders);
     free_.assign(slots_, 0);
     age_.assign(slots_, 0);
     std::map<size_t, std::vector<int>> by_capacity;
@@ -349,7 +355,7 @@ int HostExperts::read_picked(int layer, const int32_t* ids, int n, const std::ve
     // SSD reads about 6 GB/s with parallel O_DIRECT readers)
     struct Part { int i; size_t at, len; };
     std::vector<Part> parts;
-    constexpr size_t kPart = 1u << 20;
+    const size_t kPart = detail::admit_part_bytes().load();
     for (int i = 0; i < n; ++i) {
         if (pick[i] < 0) continue;
         const ExpertSlot& x = pack_.expert(layer, ids[i]);
@@ -362,7 +368,7 @@ int HostExperts::read_picked(int layer, const int32_t* ids, int n, const std::ve
     std::unique_ptr<std::atomic<bool>[]> failed(new std::atomic<bool>[n]);
     for (int i = 0; i < n; ++i) failed[i] = false;
     std::atomic<size_t> next{0};
-    run_parallel(std::min<size_t>(parts.size(), 8), [&](size_t) {
+    auto read_parts = [&](size_t) {
         if (detail::admit_fault().exchange(false)) throw std::runtime_error("ds41 RAM tier: test fault in admit");
         for (size_t k; (k = next++) < parts.size();) {
             const Part& p = parts[k];
@@ -382,7 +388,10 @@ int HostExperts::read_picked(int layer, const int32_t* ids, int n, const std::ve
             }
             if (got < p.len) failed[p.i] = true;
         }
-    });
+    };
+    const size_t threads = std::min<size_t>(parts.size(), kReaders);
+    if (readers_) readers_->run(threads, read_parts);
+    else run_parallel(threads, read_parts);
     int read = 0;
     std::lock_guard<std::mutex> lk(admit_mu_);
     for (int i = 0; i < n; ++i) {
