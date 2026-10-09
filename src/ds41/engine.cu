@@ -529,15 +529,19 @@ struct Engine::Impl {
             ck(cudaStreamSynchronize(nullptr), "staging initialization");
             std::fprintf(stderr, "ds41: zero-copy staging %d slots x %zu bytes (pack max %zu)\n",
                          kTopK, zc_stage->stride(), largest);
-            // the prefetch buffers before the VRAM tier takes the free memory (DS41_PREFETCH_MB per layer parity)
+            // the prefetch buffers before the VRAM tier takes the free memory (DS41_PREFETCH_MB per layer parity).
+            // With the adaptive RAM tier 4 guesses by default: on the laptop (50 GiB tier, fixed continuations, 2
+            // rounds) code 52.2 -> 49.6 ms per token, agent 58.2 -> 53.6, zh_chat 52.3 -> 50.3 (3 guesses: 49.4,
+            // 54.3, 50.4; 6: code 51.0)
             const char* pf_env = std::getenv("DS41_PREFETCH");
-            const int guesses = pf_env ? std::atoi(pf_env) : 0;
+            const int guesses = pf_env ? std::atoi(pf_env) : (ram_adapt ? 4 : 0);
             if (guesses > 0) {
                 const char* mb_env = std::getenv("DS41_PREFETCH_MB");
                 const size_t mb = mb_env ? (size_t) std::atoi(mb_env) : 96;
-                // DS41_PREFETCH_DMA=1: copy with the copy engine from a host thread instead of the copy kernel
+                // copies with the copy engine from a host thread; DS41_PREFETCH_DMA=0: the copy kernel (slower at
+                // every guess count: it slows the main stream's kernels while it reads host memory)
                 const char* dma_env = std::getenv("DS41_PREFETCH_DMA");
-                const bool dma = dma_env && dma_env[0] == '1';
+                const bool dma = !(dma_env && dma_env[0] == '0');
                 prefetch = std::make_unique<ExpertPrefetch>(std::min(guesses, ExpertPrefetch::kMaxGuesses),
                                                             std::max<size_t>(mb, 1) << 20, kExperts, kDim, dma);
                 std::fprintf(stderr, "ds41: prefetch %d guesses per layer, 2 x %zu MiB, %s\n", prefetch->guesses(), mb,
