@@ -22,6 +22,12 @@
 using namespace ds41test;
 namespace sd = strata::ds41;
 
+/// spins about `ns` nanoseconds (keeps the stream busy)
+__global__ void hold_k(unsigned long long ns) {
+    const unsigned long long t0 = clock64();
+    while (clock64() - t0 < ns) __nanosleep(1000);
+}
+
 int main() {
     Verdict v;
     int devices = 0;
@@ -200,6 +206,18 @@ int main() {
         v.check(sel[3] == 3 && sel[4] == -1 && sel[5] == -1, "the quota still caps the zero-copy misses");
         for (void* p : {(void*) droutes, (void*) dwts, (void*) dsel, (void*) dxh, (void*) dquota, (void*) dvram})
             cudaFree(p);
+    }
+    // DMA mode, destroyed while main still waits for a copy the copier has not made yet (a step that threw): the
+    // destructor must release the wait, else the device never idles and freeing the shared memory hangs
+    {
+        auto late = std::make_unique<sd::ExpertPrefetch>(G, cap, N, D, true);
+        late->begin_step();
+        hold_k<<<1, 1, 0, st>>>(50000000ull);   // the plan below runs only after the copier stopped
+        late->plan(1, dx, dw, db, dres, dram, dblobs, st);
+        late->ready(1, st);
+        late->join(1, st);
+        late.reset();
+        v.check(cudaStreamSynchronize(st) == cudaSuccess, "DMA: destroying the prefetch releases a pending wait");
     }
     cudaStreamDestroy(st);
     return v.finish();

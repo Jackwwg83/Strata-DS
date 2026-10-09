@@ -141,6 +141,9 @@ ExpertPrefetch::ExpertPrefetch(int guesses, size_t buffer_bytes, int n_experts, 
 ExpertPrefetch::~ExpertPrefetch() {
     stop_ = true;
     if (thread_.joinable()) thread_.join();
+    // a wait still queued on main (a step that threw before its sync) would never see its copy: release every wait,
+    // so the device can idle before the shared memory is freed
+    if (shared_) __atomic_store_n(&shared_->done, ~0ull, __ATOMIC_RELEASE);
     if (dma_stream_) {
         cudaStreamSynchronize(dma_stream_);
         cudaStreamDestroy(dma_stream_);
