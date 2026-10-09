@@ -94,10 +94,25 @@ int main() {
     cudaMemcpy(dblobs, blobs.data(), N * sizeof(sd::ExpertBlob), cudaMemcpyHostToDevice);
     cudaStream_t st;
     cudaStreamCreateWithFlags(&st, cudaStreamNonBlocking);
-    for (int layer : {7, 8}) {   // both buffers
-        pf.plan(layer, dx, dw, db, dres, dram, dblobs, st);
-        pf.copy(layer, st);
-        pf.join(layer, st);
+    // layers 7 and 8 eagerly (both buffers), then layer 9 captured as a graph and replayed (the engine's decode step
+    // is a graph): plan() forks the guesses and the copy to the prefetch stream; ready() and join() bring them back
+    cudaGraphExec_t replay = nullptr;
+    for (int layer : {7, 8, 9}) {
+        if (layer == 9) {
+            cudaGraph_t g;
+            v.check(cudaStreamBeginCapture(st, cudaStreamCaptureModeGlobal) == cudaSuccess, "capture begins");
+            pf.plan(layer, dx, dw, db, dres, dram, dblobs, st);
+            pf.ready(layer, st);
+            pf.join(layer, st);
+            v.check(cudaStreamEndCapture(st, &g) == cudaSuccess && cudaGraphInstantiate(&replay, g, 0) == cudaSuccess,
+                    "plan, ready and join capture into one graph (the prefetch stream joins main again)");
+            cudaMemsetAsync((void*) pf.ids(layer), 0x55, G * sizeof(int32_t), st);   // stale ids must be replaced
+            v.check(cudaGraphLaunch(replay, st) == cudaSuccess, "the graph replays");
+        } else {
+            pf.plan(layer, dx, dw, db, dres, dram, dblobs, st);
+            pf.ready(layer, st);
+            pf.join(layer, st);
+        }
         v.check(cudaStreamSynchronize(st) == cudaSuccess, "the prefetch ran");
         int32_t ranked[G], ids[G];
         sd::kernels::Exl3Expert descs[G];

@@ -98,6 +98,7 @@ ExpertPrefetch::ExpertPrefetch(int guesses, size_t buffer_bytes, int n_experts, 
         ck(cudaStreamCreateWithFlags(&copy_, cudaStreamNonBlocking), "stream");
         for (int p = 0; p < 2; ++p) {
             ck(cudaEventCreateWithFlags(&ready_[p], cudaEventDisableTiming), "event");
+            ck(cudaEventCreateWithFlags(&planned_[p], cudaEventDisableTiming), "event");
             ck(cudaEventCreateWithFlags(&done_[p], cudaEventDisableTiming), "event");
         }
     } catch (...) {
@@ -110,8 +111,9 @@ ExpertPrefetch::~ExpertPrefetch() {
     if (copy_) cudaStreamSynchronize(copy_);
     for (int p = 0; p < 2; ++p) {
         if (ready_[p]) cudaEventDestroy(ready_[p]);
+        if (planned_[p]) cudaEventDestroy(planned_[p]);
         if (done_[p]) cudaEventDestroy(done_[p]);
-        ready_[p] = done_[p] = nullptr;
+        ready_[p] = planned_[p] = done_[p] = nullptr;
     }
     if (copy_) cudaStreamDestroy(copy_);
     copy_ = nullptr;
@@ -130,21 +132,22 @@ void ExpertPrefetch::plan(int layer, const __nv_bfloat16* x, const __nv_bfloat16
                           const int32_t* res, const kernels::Exl3Expert* ram, const ExpertBlob* blobs,
                           cudaStream_t main) {
     const int p = layer & 1;
-    ops::bf16_linear(x, nullptr, w, dim_, n_experts_, nullptr, logits_, main);
-    plan_k<<<1, n_experts_, 0, main>>>(logits_, bias, n_experts_, guesses_, res, ram, blobs,
-                                       buffer_ + (size_t) p * buffer_bytes_, buffer_bytes_,
-                                       ranked_ + p * kMaxGuesses, ids_ + p * kMaxGuesses,
-                                       descs_ + p * kMaxGuesses, jobs_ + p * kMaxGuesses, count_ + p);
-    ck(cudaGetLastError(), "plan launch");
-}
-
-void ExpertPrefetch::copy(int layer, cudaStream_t main) {
-    const int p = layer & 1;
     ck(cudaEventRecord(ready_[p], main), "record");
     ck(cudaStreamWaitEvent(copy_, ready_[p], 0), "wait");
+    ops::bf16_linear(x, nullptr, w, dim_, n_experts_, nullptr, logits_, copy_);
+    plan_k<<<1, n_experts_, 0, copy_>>>(logits_, bias, n_experts_, guesses_, res, ram, blobs,
+                                        buffer_ + (size_t) p * buffer_bytes_, buffer_bytes_,
+                                        ranked_ + p * kMaxGuesses, ids_ + p * kMaxGuesses,
+                                        descs_ + p * kMaxGuesses, jobs_ + p * kMaxGuesses, count_ + p);
+    ck(cudaGetLastError(), "plan launch");
+    ck(cudaEventRecord(planned_[p], copy_), "record plan");
     copy_k<<<68, 256, 0, copy_>>>(jobs_ + p * kMaxGuesses, count_ + p);
     ck(cudaGetLastError(), "copy launch");
     ck(cudaEventRecord(done_[p], copy_), "record copy");
+}
+
+void ExpertPrefetch::ready(int layer, cudaStream_t main) {
+    ck(cudaStreamWaitEvent(main, planned_[layer & 1], 0), "ready");
 }
 
 void ExpertPrefetch::join(int layer, cudaStream_t main) {

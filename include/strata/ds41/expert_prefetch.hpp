@@ -2,9 +2,11 @@
 //
 // While layer l computes, layer l+1's router applied to layer l's expert input guesses layer l+1's experts (upstream's
 // router lookahead, docs/DETAILS.md, here on the GPU). The guesses outside VRAM that the RAM tier holds are copied to
-// a VRAM buffer, one per layer parity, on a stream of their own that starts after layer l's own expert copies. When
-// layer l+1 routes, a miss that was guessed is computed by the GPU from the buffer (the doorbell's publish gets the
-// guessed ids and their descriptors), so its copy is off the critical path.
+// a VRAM buffer, one per layer parity. The guesses and the copy run on a stream of their own, beside layer l's shared
+// expert, its experts and the wait for the CPU: on the main stream they cost 32 + 10 us per layer and the copy waited
+// for layer l's experts (RTX 5090 Laptop, nsys, 2026-10-10). When layer l+1 routes, a miss that was guessed is
+// computed by the GPU from the buffer (the doorbell's publish gets the guessed ids and their descriptors), so its
+// copy is off the critical path.
 // Measured on SAGE 1.59bpw (RTX 3090 box, DS41_PREDICT_STATS): 9 guesses hold 77-79% of the misses, 6 hold 66%.
 // Everything is enqueued on the device (capturable): no host wait.
 #pragma once
@@ -31,13 +33,14 @@ public:
 
     int guesses() const { return guesses_; }
 
-    /// On `main`: layer `layer`'s guesses from x (bf16 [dim], the previous layer's expert input) and its router
-    /// (w [n_experts][dim] bf16, bias [n_experts]); the copy plan: in rank order, each guess outside VRAM (res[id] < 0)
-    /// that the RAM tier holds (ram[id].w1.trellis set) while the buffer has room. res, ram, blobs: the layer's rows.
+    /// On the prefetch stream, after the work enqueued on `main` so far: layer `layer`'s guesses from x (bf16 [dim],
+    /// the previous layer's expert input) and its router (w [n_experts][dim] bf16, bias [n_experts]); the copy plan: in
+    /// rank order, each guess outside VRAM (res[id] < 0) that the RAM tier holds (ram[id].w1.trellis set) while the
+    /// buffer has room (res, ram, blobs: the layer's rows); then the copy. The buffer of this parity must be free.
     void plan(int layer, const __nv_bfloat16* x, const __nv_bfloat16* w, const float* bias, const int32_t* res,
               const kernels::Exl3Expert* ram, const ExpertBlob* blobs, cudaStream_t main);
-    /// Starts the planned copy of `layer` on the prefetch stream, after the work enqueued on `main` so far.
-    void copy(int layer, cudaStream_t main);
+    /// `main` waits for the guesses of `layer` (ids() and descs()); x may be written after this.
+    void ready(int layer, cudaStream_t main);
     /// `main` waits for the copy of `layer` (before the GPU computes the layer's experts).
     void join(int layer, cudaStream_t main);
 
@@ -59,7 +62,7 @@ private:
     ExpertCopy* jobs_ = nullptr;                ///< [2][kMaxGuesses]
     int* count_ = nullptr;                      ///< [2]
     cudaStream_t copy_ = nullptr;
-    cudaEvent_t ready_[2] = {}, done_[2] = {};
+    cudaEvent_t ready_[2] = {}, planned_[2] = {}, done_[2] = {};
 };
 
 }  // namespace strata::ds41

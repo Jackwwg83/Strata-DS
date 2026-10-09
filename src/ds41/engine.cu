@@ -928,7 +928,7 @@ struct Engine::Impl {
                     ram ? zc_stage.get() : nullptr, ram && zc_blobs ? zc_blobs.get() + (size_t) l * kExperts : nullptr,
                     pf && l > 0 ? prefetch->ids(l) : nullptr, pf && l > 0 ? prefetch->descs(l) : nullptr,
                     pf ? prefetch->guesses() : 0);
-        // layer l + 1's guesses from this layer's expert input; their copy starts after this layer's own copies
+        // layer l + 1's guesses from this layer's expert input, and their copy, beside the rest of this layer
         if (pf && l + 1 < kLayers)
             prefetch->plan(l + 1, xf, L[l + 1].gate_w, L[l + 1].gate_bias,
                            tier ? vram->res_dev() + (size_t) (l + 1) * kExperts : nullptr,
@@ -951,8 +951,9 @@ struct Engine::Impl {
             kernels::exl3_moe_decode((const __half*) x_half_dev, 1, gpu_sel, w, kTopK, db->gpu_experts(), routed,
                                      vram ? vram->workspace() : zc_workspace.get(), VramExperts::kWorkspaceBytes, st);
         }
-        if (pf && l + 1 < kLayers) prefetch->copy(l + 1, st);
         db->wait_add(routed, 1, (uint32_t) (l + 1), st);
+        // layer l + 1's guesses are read by its publish, and the next layer overwrites xf, which they read
+        if (pf && l + 1 < kLayers) prefetch->ready(l + 1, st);
         ops::add_f32_bf16(routed, sh_out, ffn_out, kDim, st);
     }
 
