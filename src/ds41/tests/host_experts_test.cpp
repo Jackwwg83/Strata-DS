@@ -13,7 +13,6 @@
 #include <fcntl.h>
 #include <unistd.h>
 #include <fstream>
-#include <stdexcept>
 #include <string>
 
 using namespace strata::ds41;
@@ -77,31 +76,7 @@ int main() {
             check(same, std::string("DS41_FILL_DIRECT=") + direct + ": every slot holds its expert's bytes");
         }
         unsetenv("DS41_FILL_DIRECT");
-        // DS41_RAM_HUGEPAGES=1: the arena starts on a 2 MiB boundary (transparent huge pages), same bytes
-        {
-            setenv("DS41_RAM_HUGEPAGES", "1", 1);
-            HostExperts h(pack, ranked, res, want, {}, 2);
-            check(h.huge_pages() && (uintptr_t) h.slot_ptr(0) % (2u << 20) == 0,
-                  "DS41_RAM_HUGEPAGES=1: the arena is 2 MiB aligned and asks for huge pages");
-            bool same = h.slots() == 20;
-            for (int i = 0; i < h.slots(); ++i) {
-                const ExpertSlot& x = pack.expert(ranked[i].first, ranked[i].second);
-                same &= std::memcmp(h.slot_ptr(h.slot_of(ranked[i].first, ranked[i].second)),
-                                    pack.expert_base() + x.offset, x.bytes) == 0;
-            }
-            check(same, "DS41_RAM_HUGEPAGES=1: every slot holds its expert's bytes");
-            setenv("DS41_RAM_HUGEPAGES", "yes", 1);
-            bool threw = false;
-            try {
-                HostExperts bad(pack, ranked, res, want, {}, 2);
-            } catch (const std::invalid_argument&) {
-                threw = true;
-            }
-            check(threw, "DS41_RAM_HUGEPAGES other than 0 or 1 is refused");
-            unsetenv("DS41_RAM_HUGEPAGES");
-        }
         HostExperts host(pack, ranked, res, want, {}, 2);
-        check(!host.huge_pages(), "huge pages are off by default");
         check(host.slots() == 20, "the budget of the first 20 experts' bytes holds 20 of them, got " +
                                       std::to_string(host.slots()));
         check(host.arena_bytes() == want, "the arena is the sum of the experts' bytes (no slot of the largest size)");

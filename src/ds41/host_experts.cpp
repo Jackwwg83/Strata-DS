@@ -108,22 +108,9 @@ HostExperts::HostExperts(const Pack& pack, const std::vector<std::pair<int, int>
         max_slot_bytes_ = std::max<size_t>(max_slot_bytes_, b);
     }
     arena_bytes_ = off_.back();
-    if (const char* v = std::getenv("DS41_RAM_HUGEPAGES")) {
-        if (std::strcmp(v, "0") != 0 && std::strcmp(v, "1") != 0)
-            throw std::invalid_argument("DS41_RAM_HUGEPAGES must be 0 or 1");
-        huge_ = v[0] == '1';
-    }
-    constexpr size_t kHuge = 2u << 20;
-    map_bytes_ = arena_bytes_ + (huge_ ? kHuge : 0);
-    void* p = mmap(nullptr, map_bytes_, PROT_READ | PROT_WRITE, MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
+    void* p = mmap(nullptr, arena_bytes_, PROT_READ | PROT_WRITE, MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
     if (p == MAP_FAILED) throw std::runtime_error("ds41 RAM tier: cannot reserve " + std::to_string(arena_bytes_) + " B");
-    map_ = p;
     arena_ = (uint8_t*) p;
-    if (huge_) {   // before the fill touches a page: the pages are then allocated as 2 MiB pages where the kernel can
-        arena_ = (uint8_t*) (((uintptr_t) p + kHuge - 1) & ~(uintptr_t) (kHuge - 1));
-        if (madvise(arena_, arena_bytes_, MADV_HUGEPAGE) != 0)
-            std::fprintf(stderr, "ds41 RAM tier: madvise(MADV_HUGEPAGE) failed; the arena keeps 4 KiB pages\n");
-    }
     holder_ = plan;
     // Read the slots with O_DIRECT, 16 readers: the file cache cannot keep a pack beside a RAM tier this large, and
     // filling the tier through it (page faults on the mapped pack) ran at 0.5 GB/s on a 120 GiB container whose SSD
@@ -159,7 +146,7 @@ HostExperts::HostExperts(const Pack& pack, const std::vector<std::pair<int, int>
     });
     if (dfd >= 0) close(dfd);
     if (failed) {
-        munmap(map_, map_bytes_);
+        munmap(arena_, arena_bytes_);
         arena_ = nullptr;
         throw std::runtime_error("ds41 RAM tier: a read of " + pack.dir() + "/experts.bin failed");
     }
@@ -196,7 +183,7 @@ HostExperts::HostExperts(const Pack& pack, const std::vector<std::pair<int, int>
         } catch (...) {
             cudaFree(experts_dev_);
             cudaHostUnregister(arena_);
-            munmap(map_, map_bytes_);
+            munmap(arena_, arena_bytes_);
             throw;
         }
     }
@@ -212,7 +199,7 @@ HostExperts::~HostExperts() {
     if (!arena_) return;
     if (registered_) cudaHostUnregister(arena_);
     else if (locked_) munlock(arena_, arena_bytes_);
-    munmap(map_, map_bytes_);
+    munmap(arena_, arena_bytes_);
 }
 
 void HostExperts::point(int layer, int expert, const uint8_t* bytes) {

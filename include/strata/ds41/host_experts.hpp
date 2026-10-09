@@ -73,9 +73,6 @@ public:
     int slots() const { return slots_; }
     /// the arena: the slots' capacities summed
     size_t arena_bytes() const { return arena_bytes_; }
-    /// DS41_RAM_HUGEPAGES=1: the arena starts on a 2 MiB boundary and asks the kernel for transparent huge pages
-    /// (fewer page-table entries for the GPU's zero-copy reads of the RAM experts)
-    bool huge_pages() const { return huge_; }
     /// the largest slot
     size_t max_slot_bytes() const { return max_slot_bytes_; }
     bool locked() const { return locked_; }
@@ -151,9 +148,6 @@ private:
     size_t max_slot_bytes_ = 0;
     uint8_t* arena_ = nullptr;
     size_t arena_bytes_ = 0;
-    void* map_ = nullptr;          ///< the mapping that holds the arena (larger by 2 MiB with huge pages)
-    size_t map_bytes_ = 0;
-    bool huge_ = false;
     bool locked_ = false;
     bool filled_direct_ = false;
     std::vector<uint8_t> held_;   ///< [n_layers][n_experts] pointed at a swap buffer (point_to)
