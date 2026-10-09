@@ -154,6 +154,12 @@ public:
         int ram_experts = 0, file_experts = 0, ssd_experts = 0;
         int warmed = 0, warmed_useful = 0;   ///< lookahead: file-tier experts warmed, and of those, used next layer
         int prefetched = 0;   ///< misses the GPU computed from the prefetch buffer (DS41_PREFETCH), in zero_copy_experts()
+        /// the decode step's critical path, seen from the CPU expert worker (step() only): step start to the worker's
+        /// wake (lead), the worker's wake to its last layer done (span); inside the span, the waits for the GPU to
+        /// publish a layer (layer 0's wait alone: first_wait) and the adaptive RAM tier's reads (admit). Outside it:
+        /// the VRAM tier's between_steps (swaps) and the work after the device sync (end).
+        double worker_lead_ms = 0, worker_span_ms = 0, worker_wait_ms = 0, worker_first_wait_ms = 0, admit_ms = 0;
+        double swaps_ms = 0, end_ms = 0;
     };
     /// VRAM expert slots in use (0: no tier)
     int vram_expert_slots() const;

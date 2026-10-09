@@ -154,6 +154,9 @@ struct Engine::Impl {
     uint64_t go = 0;                   // steps released to the worker
     std::atomic<bool> stop{false};
     std::atomic<int64_t> worker_us{0}; // CPU expert time of the current step
+    // the worker's critical-path timing of the current step (Timing::worker_*): stored by the worker before it marks
+    // the last layer done, read after the step's device sync (the GPU cannot finish before that mark)
+    std::atomic<double> worker_wake_at{0}, worker_end_at{0}, worker_wait{0}, worker_first_wait{0}, worker_admit{0};
     std::atomic<int> worker_misses{0}; // routed uses outside VRAM (CPU plus zero-copy)
     std::unique_ptr<VramExperts> vram;  // the VRAM tier (null: none)
     std::unique_ptr<HostExperts> host;  // the RAM tier (null: none); the rest is read from the mapped file
@@ -659,8 +662,13 @@ struct Engine::Impl {
                 if (stop) return;
                 seen = go;
             }
+            const double wake = now_ms();
+            double ready = wake, wait = 0, first_wait = 0, admit = 0;   // ready: since when the worker waits for the GPU
             for (int l = 0; l < kLayers; ++l) {
                 if (!db->wait_published(l + 1, stop)) return;
+                const double published = now_ms();
+                wait += published - ready;
+                if (l == 0) first_wait = published - ready;
                 if (lookahead) lookahead->post(l, db->x());   // predict layer l+1 while this layer computes
                 if (lookahead && pred_stats && l + 1 < kLayers)   // DS41_PREDICT_STATS: layer l+1's top 12 from x_l
                     lookahead->predict_now(l + 1, (const uint16_t*) db->x(), kPredK, pred_ids.data() + (l + 1) * kPredK);
@@ -692,12 +700,14 @@ struct Engine::Impl {
                 if (adaptive && !host->reads_direct())   // copied from the map: only missing pages read the SSD
                     for (int j = 0; j < n_file; ++j) missing[j] = file_pages_missing(l, file_ids[j]);
                 if (adaptive) {
+                    const double a0 = now_ms();
                     try {   // kept[] holds what was read even when admit() throws
                         host->admit(l, file_ids, n_file, kept);
                     } catch (const std::exception& ex) {   // e.g. no thread for the reads: the file path still works
                         if (!admit_warned.exchange(true))
                             std::fprintf(stderr, "ds41: adaptive RAM tier read failed (%s); using the file\n", ex.what());
                     }
+                    admit += now_ms() - a0;
                 }
                 for (int j = 0; j < n_file; ++j) {
                     if (kept[j]) {   // computed from its new RAM slot
@@ -731,6 +741,14 @@ struct Engine::Impl {
                     if (!worker_error) worker_error = std::current_exception();
                 }
                 worker_us += (int64_t) ((now_ms() - t0) * 1000.0);
+                ready = now_ms();
+                if (l + 1 == kLayers) {
+                    worker_wake_at = wake;
+                    worker_wait = wait;
+                    worker_first_wait = first_wait;
+                    worker_admit = admit;
+                    worker_end_at = ready;
+                }
                 db->mark_done(l + 1);
             }
         }
@@ -1900,7 +1918,9 @@ struct Engine::Impl {
             engram_read_all();
             tm.engram_ms = now_ms() - t0;
         }
+        const double t_swaps = now_ms();
         if (vram) tm.vram_swaps = vram->between_steps();   // the device is idle: the last step ended in a sync
+        tm.swaps_ms = now_ms() - t_swaps;
         db->reset();
         worker_us = 0;
         worker_misses = 0;
@@ -1941,6 +1961,7 @@ struct Engine::Impl {
             enqueue_step(dump);
         }
         ck(cudaStreamSynchronize(st), "step");
+        const double t_end = now_ms();
         {
             std::lock_guard<std::mutex> lk(mu);
             if (worker_error) {
@@ -1969,6 +1990,12 @@ struct Engine::Impl {
             for (int i = 0; i < 8; ++i) dump->top_logits.push_back({order[i], lg[order[i]]});
         }
         tm.total_ms = now_ms() - t_start;
+        tm.end_ms = now_ms() - t_end;
+        tm.worker_lead_ms = worker_wake_at.load() - t_start;
+        tm.worker_span_ms = worker_end_at.load() - worker_wake_at.load();
+        tm.worker_wait_ms = worker_wait.load();
+        tm.worker_first_wait_ms = worker_first_wait.load();
+        tm.admit_ms = worker_admit.load();
         tm.cpu_experts_ms = worker_us.load() / 1000.0;
         tm.expert_total = kLayers * kTopK;
         tm.expert_hits = tm.expert_total - worker_misses.load();
