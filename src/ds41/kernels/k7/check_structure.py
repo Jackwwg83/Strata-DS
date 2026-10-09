@@ -23,17 +23,20 @@ assert 'sizeof(Workspace) == 7168' in source
 assert 'if (entry.device == device) return entry.workspace;' in source
 print('PASS unchanged repaired-control workspace, finish math, collapse and host launch path')
 
-# Explicitly model the current/future pairs including the separate drain.
-current = [0, 1]
-loads, consumed = [0, 1], []
-for step in range(0, 78, 2):
-    future = [step + 2, step + 3]
-    loads += future
-    assert current == [step, step + 1]
-    consumed += current
-    current = future
-consumed += current
-assert loads == consumed == list(range(80))
+# Model the register ring of register_prefetch.hpp: Depth loads first, then step s is consumed in order and its
+# slot refilled with step s + Depth while that is a legal step.
+def depth(m): return 16 if m <= 2 else 8 if m <= 4 else 2
+for m in range(1, 9):
+    d = depth(m)
+    ring = list(range(d))
+    loads, consumed = list(range(d)), []
+    for step in range(80):
+        assert ring[step % d] == step
+        if step + d < 80:
+            ring[step % d] = step + d
+            loads.append(step + d)
+        consumed.append(step)
+    assert loads == consumed == list(range(80)), m
 
 for m in range(1, 9):
     writers, weights, norm = set(), set(), set()

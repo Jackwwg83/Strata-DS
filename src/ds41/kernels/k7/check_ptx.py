@@ -12,13 +12,12 @@ for body in ptx.split('.entry ')[1:]:
     m = int(match[1])
     seen.add(m)
     assert 'ld.local' not in body and 'st.local' not in body and 'bar.sync' not in body
-    loops = body.split('.pragma "nounroll";')[1:]
-    assert loops
-    for loop in loops:
-        prefix = loop[:loop.index('fma.rn.f32')]
-        assert prefix.count('ld.global.nc.f32') == 2, (m, 'future weights')
-        assert prefix.count('ld.global.nc.u16') == 2 * m, (m, 'future input pair')
+    # each specialization loads its 80 weights and 80*m inputs exactly once (m > 4: the two-step loop, in its body)
+    # CUDA 12 prints the loads as .f32/.u16, CUDA 13 as .b32/.b16
+    w = body.count('ld.global.nc.f32') + body.count('ld.global.nc.b32')
+    x = body.count('ld.global.nc.u16') + body.count('ld.global.nc.b16')
+    assert (w, x) == ((80, 80 * m) if m <= 4 else (4, 4 * m)), (m, 'loads', w, x)
     assert body.count('shfl.sync.down.b32') >= m * 10
-    print(f'PASS m={m}: two future FP32 weights and {2*m} BF16 loads precede current FMAs; no local memory')
+    print(f'PASS m={m}: {w} weight and {x} input load instructions; no local memory')
 assert seen == set(range(1, 9))
-print('PASS all 8 producer specializations retain load-ahead in PTX; no SASS or timing claim')
+print('PASS all 8 producer specializations: every load once, no local memory; no SASS or timing claim')
