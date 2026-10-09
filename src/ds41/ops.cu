@@ -114,6 +114,33 @@ __global__ void rmsnorm_k(const bf16* x, const bf16* w, bf16* y, int n, float ep
     for (int i = threadIdx.x; i < n; i += blockDim.x) y[i] = tobf(bf(w[i]) * (bf(x[i]) * r));
 }
 
+// rmsnorm_k for n <= 1024 * ITERS: the same arithmetic in the same order, with x and w held in registers, so the
+// loads are issued together and x is read once. n = 5120: 2.38 -> 1.42 us (RTX 5090 Laptop), bit for bit equal.
+template <int ITERS>
+__global__ void rmsnorm_reg_k(const bf16* x, const bf16* w, bf16* y, int n, float eps) {
+    __shared__ float sh[32];
+    x += (int64_t) blockIdx.x * n;
+    y += (int64_t) blockIdx.x * n;
+    float xv[ITERS], wv[ITERS];
+#pragma unroll
+    for (int k = 0; k < ITERS; ++k) {
+        const int i = threadIdx.x + k * 1024;
+        xv[k] = i < n ? bf(x[i]) : 0.0f;
+        wv[k] = i < n ? bf(w[i]) : 0.0f;
+    }
+    float ss = 0.0f;
+#pragma unroll
+    for (int k = 0; k < ITERS; ++k)
+        if (threadIdx.x + k * 1024 < n) ss += xv[k] * xv[k];
+    ss = block_sum<1024>(ss, sh);
+    const float r = rsqrtf(ss / (float) n + eps);
+#pragma unroll
+    for (int k = 0; k < ITERS; ++k) {
+        const int i = threadIdx.x + k * 1024;
+        if (i < n) y[i] = tobf(wv[k] * (xv[k] * r));
+    }
+}
+
 // hc_mixes: rsqrt over the flattened 4x5120 stream, then 24 dot products with hc_fn, then Sinkhorn
 __global__ void hc_rsqrt_k(const bf16* x, float* out) {
     __shared__ float sh[32];
@@ -506,7 +533,16 @@ void embed(const bf16* table, int token, bf16* h, cudaStream_t stream) {
     LAUNCH_CHECK("embed");
 }
 void rmsnorm(const bf16* x, const bf16* w, bf16* y, int n, float eps, int rows, cudaStream_t stream) {
-    if (rows > 0) rmsnorm_k<<<rows, 1024, 0, stream>>>(x, w, y, n, eps);
+    if (rows > 0) {
+        switch ((n + 1023) / 1024) {
+            case 1: rmsnorm_reg_k<1><<<rows, 1024, 0, stream>>>(x, w, y, n, eps); break;
+            case 2: rmsnorm_reg_k<2><<<rows, 1024, 0, stream>>>(x, w, y, n, eps); break;
+            case 3: rmsnorm_reg_k<3><<<rows, 1024, 0, stream>>>(x, w, y, n, eps); break;
+            case 4: rmsnorm_reg_k<4><<<rows, 1024, 0, stream>>>(x, w, y, n, eps); break;
+            case 5: rmsnorm_reg_k<5><<<rows, 1024, 0, stream>>>(x, w, y, n, eps); break;
+            default: rmsnorm_k<<<rows, 1024, 0, stream>>>(x, w, y, n, eps);
+        }
+    }
     LAUNCH_CHECK("rmsnorm");
 }
 void hc_mixes(const bf16* x, const float* fn, const float* scale, const float* base, float* pre, float* post,
