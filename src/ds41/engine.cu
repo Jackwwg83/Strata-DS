@@ -1787,7 +1787,9 @@ struct Engine::Impl {
                "engram rows");
         ops::window_index_device(dp + 1, idx_dev, st);
         ops::embed_device(embed, dp, h, st);
-        ck(cudaMemcpyAsync(pre_mix, one_hot_dev, kHc * 4, cudaMemcpyDeviceToDevice, st), "pre_mix");
+        // the stream's collapse weights: one-hot at the first layer, then the previous layer's ffn_pre. Read in place:
+        // a 16-byte copy node per layer left a 12-24 us gap on the GPU chain (nsys, RTX 5090 Laptop)
+        const float* pre_in = one_hot_dev;
         int eng_i = 0;
         for (int l = 0; l < kLayers; ++l) {
             auto& y = L[l];
@@ -1795,7 +1797,7 @@ struct Engine::Impl {
             const bool dbg_layer = dbg && (l == 1 || l == 2);
             if (dbg_layer) dbg_write(h, kHc * kDim);                    // block input (after engram)
             // attention sub-block: h -> h2
-            kernels::hc_mixes_pre(h, 1, y.hc_attn_fn, y.hc_attn_scale, y.hc_attn_base, pre_mix, xa, attn_pre, attn_post,
+            kernels::hc_mixes_pre(h, 1, y.hc_attn_fn, y.hc_attn_scale, y.hc_attn_base, pre_in, xa, attn_pre, attn_post,
                                   attn_comb, st);
             ops::rmsnorm(xa, y.attn_norm, xa, kDim, kNormEps, 1, st);
             if (dbg_layer) dbg_write(xa, kDim);                         // attention input
@@ -1810,14 +1812,14 @@ struct Engine::Impl {
             moe(l);
             if (dbg_layer) dbg_write(ffn_out, kDim);                    // ffn output
             ops::hc_post(ffn_out, h2, ffn_post, ffn_comb, h, 1, st);
-            ck(cudaMemcpyAsync(pre_mix, ffn_pre, kHc * 4, cudaMemcpyDeviceToDevice, st), "pre_mix");
+            pre_in = ffn_pre;   // read by the next layer before its ffn sub-block writes ffn_pre again
             if (dump) {
                 ck(cudaStreamSynchronize(st), "dump hidden");
                 ck(cudaMemcpy(dump->hidden.data() + (size_t) l * kHc * kDim, h, kHc * kDim * 2, cudaMemcpyDeviceToHost),
                    "dump hidden");
             }
         }
-        ops::hc_pre(h, pre_mix, final_x, 1, st);
+        ops::hc_pre(h, pre_in, final_x, 1, st);
         ops::rmsnorm(final_x, final_norm, final_x, kDim, kNormEps, 1, st);
         ops::bf16_linear(final_x, nullptr, head, kDim, kVocab, nullptr, logits, st);
         ops::argmax_logits(logits, d_next, st);
