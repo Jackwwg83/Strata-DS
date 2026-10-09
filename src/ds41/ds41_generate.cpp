@@ -97,12 +97,15 @@ static void generate(Engine& engine, const EngineOptions& opt, const std::vector
         const int proposed = drafter.propose(limit-1, draft);
         std::vector<int> window{next};
         window.insert(window.end(), draft, draft+proposed);
+        const auto v0 = std::chrono::steady_clock::now();
         auto result = engine.verify(window, pos);
+        const double verify_ms = std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - v0).count();
         int keep = accepted_inputs(window, result.next);
         for (int i = 0; i < keep; ++i)
             if (result.next[i] == eos) { keep = i+1; break; }
         engine.commit(keep);
-        std::printf("spec_window pos %d T %zu accepted %d emitted %d\n", pos, window.size(), keep-1, keep);
+        std::printf("spec_window pos %d T %zu accepted %d emitted %d ms %.1f\n", pos, window.size(), keep-1, keep,
+                    verify_ms);
         for (int i = 0; i < keep; ++i) { out.push_back(result.next[i]); drafter.append(result.next[i]); }
         accepted += keep-1; ++rounds;
         next = result.next[keep-1]; pos += keep;
