@@ -3,6 +3,7 @@
 #include "strata/ds41/config.hpp"
 #include "k8/math.hpp"
 
+#include <climits>
 #include <cstdio>
 #include <cstdlib>
 #include <mutex>
@@ -99,12 +100,28 @@ __global__ void tile_scores(const __nv_bfloat16* __restrict__ x,
     }
 }
 
-__device__ __forceinline__ void warp_best(double& value, int& id) {
+// The biased score as an integer with the same order: a > b in double exactly when key(a) > key(b), and equal
+// doubles give equal keys (-0 is folded to +0). The selector compares keys, because FP64 compares are slow on GPUs
+// with few FP64 units (RTX 5090 Laptop: select_top6 9.7 -> 3.4 us). A NaN gets the lowest key, below the -inf of
+// the empty candidate: as with the double compare, it never wins a comparison.
+__device__ __forceinline__ long long order_key(double value) {
+    const long long bits = __double_as_longlong(value);
+    const long long magnitude = bits & 0x7fffffffffffffffll;
+    if (magnitude > 0x7ff0000000000000ll) return LLONG_MIN;
+    if (magnitude == 0) return 0;
+    return bits < 0 ? (bits ^ 0x7fffffffffffffffll) : bits;
+}
+
+__device__ __forceinline__ bool better_key(long long a, int ai, long long b, int bi) {
+    return a > b || (a == b && ai < bi);
+}
+
+__device__ __forceinline__ void warp_best(long long& key, int& id) {
     for (int offset = 16; offset > 0; offset >>= 1) {
-        const double other = __shfl_down_sync(0xffffffffu, value, offset);
+        const long long other = __shfl_down_sync(0xffffffffu, key, offset);
         const int other_id = __shfl_down_sync(0xffffffffu, id, offset);
-        if (k8_detail::better(other, other_id, value, id)) {
-            value = other;
+        if (better_key(other, other_id, key, id)) {
+            key = other;
             id = other_id;
         }
     }
@@ -119,37 +136,39 @@ __global__ void select_top6(const double* __restrict__ scores,
     const int lane = threadIdx.x;
     // Twelve register-resident candidates per lane, with the original expert
     // IDs retained for ties. Each token is an independent, full-warp CTA.
+    // The comparisons use order_key(score + bias): the same order as k8_detail::better.
     double raw[kPerThread];
-    double values[kPerThread];
+    long long keys[kPerThread];
     int expert_ids[kPerThread];
 #pragma unroll
     for (int j = 0; j < kPerThread; ++j) {
         const int id = lane + j * kWarp;
         raw[j] = scores[token * kExperts + id];
-        values[j] = raw[j] + double(bias[id]);
+        keys[j] = order_key(raw[j] + double(bias[id]));
         expert_ids[j] = id;
     }
+    const long long none = order_key(-INFINITY);
     double selected = 0.0;
     double sum = 0.0;
 #pragma unroll
     for (int i = 0; i < kTopK; ++i) {
-        double value = -INFINITY;
+        long long key = none;
         int id = kExperts;
 #pragma unroll
         for (int j = 0; j < kPerThread; ++j) {
-            if (k8_detail::better(values[j], expert_ids[j], value, id)) {
-                value = values[j];
+            if (better_key(keys[j], expert_ids[j], key, id)) {
+                key = keys[j];
                 id = expert_ids[j];
             }
         }
-        warp_best(value, id);
+        warp_best(key, id);
         const int chosen = __shfl_sync(0xffffffffu, id, 0);
         double unbiased = 0.0;
 #pragma unroll
         for (int j = 0; j < kPerThread; ++j) {
             if (expert_ids[j] == chosen) {
                 unbiased = raw[j];
-                values[j] = -INFINITY;
+                keys[j] = none;
                 expert_ids[j] = kExperts;
             }
         }
