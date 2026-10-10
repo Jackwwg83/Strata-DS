@@ -153,7 +153,7 @@ HostExperts::HostExperts(const Pack& pack, const std::vector<std::pair<int, int>
     // Map the anonymous arena only. Pageable file experts must stay CPU-only. Pinning fails when memory is short at
     // that moment (the laptop: a 50 GiB tier of 60 GB, right after another process ended); an unpinned tier is paged
     // out and the GPU cannot read it (a token then took 86 instead of 54 ms). So the lowest-ranked slots at the
-    // arena's end leave, a step at a time (1/16 of the arena, at most 2 GiB), until the pin fits; at most half goes.
+    // arena's end leave, in doubling steps (below), until the pin fits; at most half goes.
     auto pin = [&] {
         const size_t limit = detail::register_limit().load();
         if (limit && arena_bytes_ > limit) return false;   // tests: a pin that does not fit
@@ -164,10 +164,16 @@ HostExperts::HostExperts(const Pack& pack, const std::vector<std::pair<int, int>
     };
     bool pinned = pin();
     const size_t full_bytes = arena_bytes_;
-    const size_t step = std::max<size_t>(std::min<size_t>(full_bytes / 16, 2ull << 30), 1);
-    while (!pinned && slots_ > 1 && arena_bytes_ - std::min(step, arena_bytes_) >= full_bytes / 2) {
+    // steps of 512 MiB, doubling (0.5, 1, 2, 4 GiB ...): a pin that fails now and then costs 0.5 GiB of tier (it
+    // failed and then fit 0.5 GiB lower in 3 of 6 laptop starts; a failed attempt takes 1.4-3.9 s), one that keeps
+    // failing still ends within ~7 attempts. The last step stops at half the arena.
+    size_t step = std::max<size_t>(std::min<size_t>(full_bytes / 64, 512ull << 20), 1);
+    while (!pinned && slots_ > 1 && arena_bytes_ > full_bytes / 2) {
+        const size_t target = arena_bytes_ - std::min(step, arena_bytes_ - full_bytes / 2);
         int keep = slots_;
-        while (keep > 1 && off_[keep] > arena_bytes_ - step) --keep;
+        while (keep > 1 && off_[keep] > target) --keep;
+        if (off_[keep] < full_bytes / 2 && keep < slots_) ++keep;   // whole slots: never below half
+        if (keep == slots_) break;   // nothing left to drop above half
         munmap(arena_ + off_[keep], arena_bytes_ - off_[keep]);   // slot offsets are 4 KiB aligned
         slots_ = keep;
         off_.resize((size_t) keep + 1);
@@ -180,6 +186,7 @@ HostExperts::HostExperts(const Pack& pack, const std::vector<std::pair<int, int>
         if (pinned)
             std::fprintf(stderr, "ds41 RAM tier: pinned after dropping to %.1f GiB (%d experts)\n",
                          arena_bytes_ / 1073741824.0, slots_);
+        step *= 2;
     }
     if (pinned) {
         locked_ = registered_ = true;
