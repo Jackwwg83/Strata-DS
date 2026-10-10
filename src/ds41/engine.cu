@@ -219,6 +219,12 @@ struct Engine::Impl {
     // dependent values come from fixed pinned staging, copied to the device by the graph's first node
     struct StepParams { int token, pos, t1, t2, eng_epoch; };   // t1, t2: compressed lengths at ratio 1 and 2
     cudaStream_t st = nullptr;
+    // decode attention: the kv branch (wkv, its norm, rope and window row; the compressor's projections) runs on st_kv
+    // beside the q branch (wq_a, q_norm, wq_b), forked after xa and joined before the indexer; act_kv is its FP8
+    // activation scratch
+    cudaStream_t st_kv = nullptr;
+    cudaEvent_t kv_fork = nullptr, kv_join = nullptr;
+    float* act_kv = nullptr;
     StepParams* hp = nullptr;          // pinned staging of the next replay
     int* dp = nullptr;                 // device copy: dp[0] token, dp[1] pos, dp[2] t1, dp[3] t2, dp[4] engram epoch
     // decode engram rows read beside the step's first layer: a reader thread fills eng_host and raises eng_flag
@@ -291,6 +297,9 @@ struct Engine::Impl {
         if (lg_pinned) cudaFreeHost(lg_pinned);
         if (routes_pinned) cudaFreeHost(routes_pinned);
         if (st) cudaStreamDestroy(st);
+        if (st_kv) cudaStreamDestroy(st_kv);
+        if (kv_fork) cudaEventDestroy(kv_fork);
+        if (kv_join) cudaEventDestroy(kv_join);
         if (pfh.base) cudaFreeHost(pfh.base);
     }
 
@@ -503,6 +512,7 @@ struct Engine::Impl {
         eng_kv = dalloc_own<bf16>((kHc + 1) * kDim);
         final_x = dalloc_own<bf16>(kDim);
         act = dalloc_own<float>(8192);
+        act_kv = dalloc_own<float>(8192);
         pre_mix = dalloc_own<float>(kHc);
         pre = dalloc_own<float>(kHc);
         post = dalloc_own<float>(kHc);
@@ -529,6 +539,9 @@ struct Engine::Impl {
         gpu_sel = dalloc_own<int32_t>(kTopK);
         // decode stream, graph staging, outputs
         ck(cudaStreamCreateWithFlags(&st, cudaStreamNonBlocking), "decode stream");
+        ck(cudaStreamCreateWithFlags(&st_kv, cudaStreamNonBlocking), "decode kv stream");
+        ck(cudaEventCreateWithFlags(&kv_fork, cudaEventDisableTiming), "kv fork");
+        ck(cudaEventCreateWithFlags(&kv_join, cudaEventDisableTiming), "kv join");
         ck(cudaHostAlloc((void**) &hp, sizeof(StepParams), cudaHostAllocDefault), "step params");
         ck(cudaHostAlloc((void**) &hp_next, sizeof(int), cudaHostAllocDefault), "next token");
         ck(cudaHostAlloc((void**) &lg_pinned, (size_t) kVocab * 4, cudaHostAllocDefault), "logits");
@@ -691,9 +704,10 @@ struct Engine::Impl {
     }
 
     /// model.py linear() for one token: K1's activation quantizer, then K1's GEMV (act holds up to 8192 floats)
-    void fp8_linear(const bf16* x, const Fp8& w, bf16* y) {
-        fp8_quantize_activation_f32((const uint16_t*) x, 1, w.k, act, st);
-        fp8_block_gemv_q(act, 1, w.k, w.w, w.s, w.n, (uint16_t*) y, st);
+    void fp8_linear(const bf16* x, const Fp8& w, bf16* y) { fp8_linear_on(x, w, y, act, st); }
+    void fp8_linear_on(const bf16* x, const Fp8& w, bf16* y, float* scratch, cudaStream_t s) {
+        fp8_quantize_activation_f32((const uint16_t*) x, 1, w.k, scratch, s);
+        fp8_block_gemv_q(scratch, 1, w.k, w.w, w.s, w.n, (uint16_t*) y, s);
     }
 
     // ------------------------------------------------------------------------------------- cpu experts
@@ -990,37 +1004,43 @@ struct Engine::Impl {
         auto& y = L[l];
         const bool yarn = y.ratio > 0;
         const float* rope = yarn ? rope_yarn : rope_plain;
+        // kv branch on st_kv (it reads xa only), beside the q branch on st
+        ck(cudaEventRecord(kv_fork, st), "kv fork");
+        ck(cudaStreamWaitEvent(st_kv, kv_fork, 0), "kv fork wait");
+        // sliding window: row pos % 128
+        fp8_linear_on(xa, y.wkv, kvv, act_kv, st_kv);
+        ops::rmsnorm(kvv, y.kv_norm, kvv, kHeadDim, kNormEps, 1, st_kv);
+        ops::rope_device(kvv, 1, kHeadDim, rope, dp + 1, 0, false, st_kv);
+        ops::act_quant_inplace(kvv, kHeadDim, st_kv);
+        ops::row_copy_device(y.window, kvv, kHeadDim * 2, dp + 1, 1, kWindow, st_kv);
+        bool have_latent = false;
+        if (y.ratio > 0 && is_kv_source(l)) {
+            const int ratio = y.ratio;
+            if (ratio == 1) {
+                ops::bf16_linear(xa, nullptr, y.c_wkv, kDim, kHeadDim, latent, nullptr, st_kv);
+                ops::rmsnorm(latent, y.c_norm, latent, kHeadDim, kNormEps, 1, st_kv);
+                have_latent = true;
+            } else {   // ratio 2: slot pos % 2; a group completes at odd positions (one graph per parity)
+                ops::bf16_linear(xa, nullptr, y.c_wkv, kDim, kHeadDim, nullptr, y.kv_state + parity * kHeadDim, st_kv);
+                ops::bf16_linear(xa, nullptr, y.c_wgate, kDim, kHeadDim, nullptr, y.score_state + parity * kHeadDim,
+                                 st_kv);
+                if (parity == ratio - 1) {
+                    ops::compress_pool(y.kv_state, y.score_state, ratio, latent, 1, st_kv);
+                    ops::rmsnorm(latent, y.c_norm, latent, kHeadDim, kNormEps, 1, st_kv);
+                    have_latent = true;
+                }
+            }
+            cur_comp = y.comp;
+        }
+        ck(cudaEventRecord(kv_join, st_kv), "kv join");
         fp8_linear(xa, y.wq_a, qr);
         ops::rmsnorm(qr, y.q_norm, qr, kQLora, kNormEps, 1, st);
         fp8_linear(qr, y.wq_b, q);
         ops::rope_device(q, kHeads, kHeadDim, rope, dp + 1, 0, false, st);
-        // sliding window: row pos % 128
-        fp8_linear(xa, y.wkv, kvv);
-        ops::rmsnorm(kvv, y.kv_norm, kvv, kHeadDim, kNormEps, 1, st);
-        ops::rope_device(kvv, 1, kHeadDim, rope, dp + 1, 0, false, st);
-        ops::act_quant_inplace(kvv, kHeadDim, st);
-        ops::row_copy_device(y.window, kvv, kHeadDim * 2, dp + 1, 1, kWindow, st);
+        ck(cudaStreamWaitEvent(st, kv_join, 0), "kv join wait");
         // idx_dev holds the window part for the whole step (window_index_device at step start)
         if (y.ratio > 0) {
             const int ratio = y.ratio;
-            bool have_latent = false;
-            if (is_kv_source(l)) {
-                if (ratio == 1) {
-                    ops::bf16_linear(xa, nullptr, y.c_wkv, kDim, kHeadDim, latent, nullptr, st);
-                    ops::rmsnorm(latent, y.c_norm, latent, kHeadDim, kNormEps, 1, st);
-                    have_latent = true;
-                } else {   // ratio 2: slot pos % 2; a group completes at odd positions (one graph per parity)
-                    ops::bf16_linear(xa, nullptr, y.c_wkv, kDim, kHeadDim, nullptr, y.kv_state + parity * kHeadDim, st);
-                    ops::bf16_linear(xa, nullptr, y.c_wgate, kDim, kHeadDim, nullptr, y.score_state + parity * kHeadDim,
-                                     st);
-                    if (parity == ratio - 1) {
-                        ops::compress_pool(y.kv_state, y.score_state, ratio, latent, 1, st);
-                        ops::rmsnorm(latent, y.c_norm, latent, kHeadDim, kNormEps, 1, st);
-                        have_latent = true;
-                    }
-                }
-                cur_comp = y.comp;
-            }
             if (is_index_source(l)) indexer(l, have_latent);
             if (have_latent) {
                 ops::rope_device(latent, 1, kHeadDim, rope_yarn, dp + 1, 1 - ratio, false, st);
