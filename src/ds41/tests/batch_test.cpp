@@ -52,7 +52,7 @@ int main(int argc, char** argv) {
     opt.expert_profile = profile;
     opt.vram_expert_slots = profile.empty() ? 0 : -1;
     opt.adapt_every = 0;   // static residency
-    setenv("DS41_RAM_ADAPT", "0", 1);   // the RAM tier static too (adaptive is the default)
+    // (adapt_every 0 keeps the RAM tier static too: the engine's rule, not the test's)
     opt.batch_slots = 3;
     constexpr int kGen = 20, kBatched = 14;
     std::vector<std::vector<int>> prompts = {prompt(300, 1), prompt(41, 2), prompt(150, 3)};

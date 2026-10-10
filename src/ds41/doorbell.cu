@@ -117,7 +117,7 @@ __global__ void wait_add_k(const volatile uint32_t* done, uint32_t round, const 
 }  // namespace
 
 ExpertDoorbell::ExpertDoorbell(int max_m, int topk, int dim) : max_m_(max_m), topk_(topk), dim_(dim) {
-    if (max_m < 1 || topk < 1 || topk > 32 || dim < 8 || dim % 8 != 0) throw std::invalid_argument("ExpertDoorbell: bad shape");
+    if (max_m < 1 || topk < 1 || topk > 31 || dim < 8 || dim % 8 != 0) throw std::invalid_argument("ExpertDoorbell: bad shape");
     const size_t sel = (size_t) max_m * topk, rows = (size_t) max_m * dim;
     const size_t o_seq = 0, o_done = kAlign, o_x = 2 * kAlign;
     const size_t o_ids = o_x + up(rows * 2), o_w = o_ids + up(sel * 4), o_y = o_w + up(sel * 4);

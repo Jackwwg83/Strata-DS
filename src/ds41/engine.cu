@@ -367,6 +367,10 @@ struct Engine::Impl {
     }
 
     void init() {
+        // A caller that asks for static residency (adapt_every 0) gets a static RAM tier too, unless DS41_RAM_ADAPT
+        // says otherwise: with the adaptive tier the prefetch computes guessed RAM experts on the GPU, following the
+        // tier's history, and step() and step_slots() would no longer give the same tokens (engine.hpp's promise)
+        if (opt.adapt_every == 0 && !std::getenv("DS41_RAM_ADAPT")) ram_adapt = 0;
         pack.upload_dense();
         pack.map_experts();
         embed = bf("embed.weight");
@@ -713,7 +717,10 @@ struct Engine::Impl {
                     // wake the CPU expert pool before the reads: its workers nap after ~1 ms idle. Laptop, 4 pairs
                     // (code, agent): 0.6-1.2 ms per token less, mostly as shorter reads (busy cores, quicker I/O
                     // completions); in the bench a nap costs a call ~100 us after a 2 ms gap
-                    exl3_moe_cpu_pool_prime(cpu_threads);
+                    try {
+                        exl3_moe_cpu_pool_prime(cpu_threads);
+                    } catch (...) {   // e.g. no thread could start: the forward below reports it as before
+                    }
                     const double a0 = now_ms();
                     try {   // kept[] holds what was read even when admit() throws
                         host->admit(l, file_ids, n_file, kept);
