@@ -27,6 +27,31 @@
 
 namespace strata::ds41 {
 
+namespace detail {
+/// DMA mode: the layer the copy thread copies next: the lowest layer of this step (`epoch`) above `last` in the two
+/// parity tags (read(p) loads tag p: epoch * 64 + layer), or -1. Once a candidate is seen, the other parity's tag is
+/// read again: plans run in layer order on one stream and each tag follows a system fence, so that second read sees
+/// an earlier layer that the first read missed (reading the tags once let a descheduled thread take layer l + 1 before
+/// layer l, which was then never copied). No later plan can overwrite that tag first: it waits for layer l's copy.
+template <class Read>
+int next_copy_layer(Read read, unsigned long long epoch, int last) {
+    int layer = -1;
+    for (int p = 0; p < 2; ++p) {
+        const unsigned long long t = read(p);
+        if (t / 64 != epoch) continue;
+        const int l = (int) (t % 64);
+        if (l > last && (layer < 0 || l < layer)) layer = l;
+    }
+    if (layer < 0) return -1;
+    const unsigned long long t = read((layer & 1) ^ 1);
+    if (t / 64 == epoch) {
+        const int l = (int) (t % 64);
+        if (l > last && l < layer) layer = l;
+    }
+    return layer;
+}
+}  // namespace detail
+
 class ExpertPrefetch {
 public:
     static constexpr int kMaxGuesses = 16;

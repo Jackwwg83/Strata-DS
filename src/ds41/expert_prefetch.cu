@@ -211,13 +211,8 @@ void ExpertPrefetch::copier() {
             epoch = e;
             last = 0;
         }
-        int layer = -1;   // the lowest layer planned in this step and not copied yet
-        for (int p = 0; p < 2; ++p) {
-            const unsigned long long t = __atomic_load_n(&shared_->tag[p], __ATOMIC_ACQUIRE);
-            if (t / 64 != epoch) continue;
-            const int l = (int) (t % 64);
-            if (l > last && (layer < 0 || l < layer)) layer = l;
-        }
+        const int layer = detail::next_copy_layer(   // the lowest layer planned in this step and not copied yet
+            [&](int p) { return __atomic_load_n(&shared_->tag[p], __ATOMIC_ACQUIRE); }, epoch, last);
         if (layer < 0) {   // spin during a step (a plan comes about every 1.3 ms); nap when idle for long
             if (++idle < 400000) cpu_relax();
             else std::this_thread::sleep_for(std::chrono::microseconds(50));

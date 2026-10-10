@@ -28,8 +28,49 @@ __global__ void hold_k(unsigned long long ns) {
     while (clock64() - t0 < ns) __nanosleep(1000);
 }
 
+namespace {
+
+// The copy thread's choice of the next layer, with the parity tags read through a script: the regression of a skip
+// seen on the laptop (32 CPU threads): the thread read tag 0 (an old layer), was descheduled while the plans of two
+// layers landed, then read tag 1 and took the later layer first; the earlier one was never copied and the GPU
+// computed its experts from a stale buffer.
+void check_next_layer(Verdict& v) {
+    using sd::detail::next_copy_layer;
+    const unsigned long long E = 9, at = E * 64;
+    struct Script {
+        std::vector<std::pair<int, unsigned long long>> reads;   // (parity, value) in the order they are read
+        size_t i = 0;
+        bool ok = true;
+        unsigned long long operator()(int p) {
+            if (i >= reads.size() || reads[i].first != p) { ok = false; return 0; }
+            return reads[i++].second;
+        }
+    };
+    {   // the skip: tag 0 still 34 at the first read, tag 1 already 37, tag 0 then 36
+        Script s{{{0, at + 34}, {1, at + 37}, {0, at + 36}}};
+        const int l = next_copy_layer([&](int p) { return s(p); }, E, 35);
+        v.check(l == 36, "a later layer seen first: the earlier layer of the other parity is copied first, got " +
+                             std::to_string(l));
+    }
+    {   // in order: 36 planned, 37 not yet
+        Script s{{{0, at + 36}, {1, at + 35}, {1, at + 35}}};
+        v.check(next_copy_layer([&](int p) { return s(p); }, E, 35) == 36, "the next planned layer");
+    }
+    {   // nothing new
+        Script s{{{0, at + 34}, {1, at + 35}}};
+        v.check(next_copy_layer([&](int p) { return s(p); }, E, 35) == -1, "no layer above the last copied one");
+    }
+    {   // tags of the previous step are ignored
+        Script s{{{0, (E - 1) * 64 + 38}, {1, (E - 1) * 64 + 39}}};
+        v.check(next_copy_layer([&](int p) { return s(p); }, E, 0) == -1, "an earlier step's tags are not this step's");
+    }
+}
+
+}  // namespace
+
 int main() {
     Verdict v;
+    check_next_layer(v);
     int devices = 0;
     if (cudaGetDeviceCount(&devices) != cudaSuccess || devices == 0) {
         std::printf("RESULT skip (no GPU)\n");
