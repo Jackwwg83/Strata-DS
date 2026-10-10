@@ -150,8 +150,38 @@ HostExperts::HostExperts(const Pack& pack, const std::vector<std::pair<int, int>
         arena_ = nullptr;
         throw std::runtime_error("ds41 RAM tier: a read of " + pack.dir() + "/experts.bin failed");
     }
-    // Map the anonymous arena only. Pageable file experts must stay CPU-only.
-    if (cudaHostRegister(arena_, arena_bytes_, cudaHostRegisterMapped | cudaHostRegisterPortable) == cudaSuccess) {
+    // Map the anonymous arena only. Pageable file experts must stay CPU-only. Pinning fails when memory is short at
+    // that moment (the laptop: a 50 GiB tier of 60 GB, right after another process ended); an unpinned tier is paged
+    // out and the GPU cannot read it (a token then took 86 instead of 54 ms). So the lowest-ranked slots at the
+    // arena's end leave, a step at a time (1/16 of the arena, at most 2 GiB), until the pin fits; at most half goes.
+    auto pin = [&] {
+        const size_t limit = detail::register_limit().load();
+        if (limit && arena_bytes_ > limit) return false;   // tests: a pin that does not fit
+        if (cudaHostRegister(arena_, arena_bytes_, cudaHostRegisterMapped | cudaHostRegisterPortable) == cudaSuccess)
+            return true;
+        cudaGetLastError();
+        return false;
+    };
+    bool pinned = pin();
+    const size_t full_bytes = arena_bytes_;
+    const size_t step = std::max<size_t>(std::min<size_t>(full_bytes / 16, 2ull << 30), 1);
+    while (!pinned && slots_ > 1 && arena_bytes_ - std::min(step, arena_bytes_) >= full_bytes / 2) {
+        int keep = slots_;
+        while (keep > 1 && off_[keep] > arena_bytes_ - step) --keep;
+        munmap(arena_ + off_[keep], arena_bytes_ - off_[keep]);   // slot offsets are 4 KiB aligned
+        slots_ = keep;
+        off_.resize((size_t) keep + 1);
+        holder_.resize((size_t) keep);
+        busy_.resize((size_t) keep);
+        arena_bytes_ = off_.back();
+        max_slot_bytes_ = 0;
+        for (int s = 0; s < slots_; ++s) max_slot_bytes_ = std::max<size_t>(max_slot_bytes_, off_[s + 1] - off_[s]);
+        pinned = pin();
+        if (pinned)
+            std::fprintf(stderr, "ds41 RAM tier: pinned after dropping to %.1f GiB (%d experts)\n",
+                         arena_bytes_ / 1073741824.0, slots_);
+    }
+    if (pinned) {
         locked_ = registered_ = true;
         void* alias = nullptr;
         if (cudaHostGetDevicePointer(&alias, arena_, 0) == cudaSuccess)
@@ -159,7 +189,6 @@ HostExperts::HostExperts(const Pack& pack, const std::vector<std::pair<int, int>
         else
             cudaGetLastError();
     } else {
-        cudaGetLastError();
         locked_ = mlock(arena_, arena_bytes_) == 0;
     }
     if (!locked_)

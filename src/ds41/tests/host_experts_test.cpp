@@ -288,6 +288,44 @@ int main() {
         detail::admit_part_bytes() = 1u << 20;
     }
 
+    // pinning that fails while the arena is large (memory short at start): the tier drops its lowest-ranked slots, a
+    // step at a time, until the GPU can map it, instead of staying unpinned (paged out, CPU only)
+    {
+        const std::string dir = "ds41_fake_pack_pin";
+        ds41test::write_fake_pack(dir, true, 4096);
+        Pack pack(dir);
+        pack.map_experts();
+        std::vector<std::pair<int, int>> ranked;
+        for (int i = 0; i < 40; ++i) ranked.push_back({i % ds41test::L, (i * 7) % ds41test::E});
+        const std::vector<int32_t> res((size_t) ds41test::L * ds41test::E, -1);
+        uint64_t budget = 0;
+        for (int i = 0; i < 32; ++i) budget += pack.expert(ranked[i].first, ranked[i].second).bytes;
+        HostExperts full(pack, ranked, res, budget, {}, 2);
+        if (!full.mapped()) {
+            std::printf("pin fallback: skipped (no GPU mapping here)\n");
+        } else {
+            const size_t limit = full.arena_bytes() * 6 / 10;
+            detail::register_limit() = limit;
+            HostExperts h(pack, ranked, res, budget, {}, 2);
+            detail::register_limit() = 0;
+            check(h.mapped() && h.locked(), "pin fallback: the smaller tier is pinned and mapped");
+            check(h.arena_bytes() <= limit && h.arena_bytes() >= full.arena_bytes() / 2 && h.slots() < full.slots(),
+                  "pin fallback: it dropped slots until the pin fit, not more than half the arena");
+            bool prefix = true;
+            for (const auto& [l, e] : ranked) {
+                const int s = full.slot_of(l, e);
+                if (s < 0) continue;
+                const ExpertSlot& x = pack.expert(l, e);
+                if (s < h.slots())
+                    prefix &= h.slot_of(l, e) == s &&
+                              std::memcmp(h.slot_ptr(s), pack.expert_base() + x.offset, x.bytes) == 0;
+                else
+                    prefix &= h.slot_of(l, e) == -1;
+            }
+            check(prefix, "pin fallback: the highest-ranked slots stay with their bytes; the dropped ones use the file");
+        }
+    }
+
     const size_t b = auto_ram_budget(4ull << 30);
     uint64_t avail_kb = 0;
     {

@@ -48,6 +48,11 @@ inline std::atomic<bool>& admit_fault() {
     static std::atomic<bool> f{false};
     return f;
 }
+/// tests: pinning the arena fails while it is larger than this many bytes (0: never)
+inline std::atomic<size_t>& register_limit() {
+    static std::atomic<size_t> b{0};
+    return b;
+}
 /// tests: the size of admit()'s read parts (a multiple of 4 KiB; 1 MiB in use)
 inline std::atomic<size_t>& admit_part_bytes() {
     static std::atomic<size_t> b{1u << 20};
@@ -83,6 +88,8 @@ public:
     /// the largest slot
     size_t max_slot_bytes() const { return max_slot_bytes_; }
     bool locked() const { return locked_; }
+    /// the GPU can read the arena (pinned and mapped)
+    bool mapped() const { return device_alias_ != nullptr; }
     /// the slots were read with O_DIRECT (else copied from the mapped pack, through the file cache)
     bool filled_direct() const { return filled_direct_; }
     /// [n_layers][n_experts] on the device. Null when mapping is unavailable.
