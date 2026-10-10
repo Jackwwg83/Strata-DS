@@ -708,6 +708,10 @@ struct Engine::Impl {
                 if (adaptive && !host->reads_direct())   // copied from the map: only missing pages read the SSD
                     for (int j = 0; j < n_file; ++j) missing[j] = file_pages_missing(l, file_ids[j]);
                 if (adaptive) {
+                    // wake the CPU expert pool before the reads: its workers nap after ~1 ms idle. Laptop, 4 pairs
+                    // (code, agent): 0.6-1.2 ms per token less, mostly as shorter reads (busy cores, quicker I/O
+                    // completions); in the bench a nap costs a call ~100 us after a 2 ms gap
+                    exl3_moe_cpu_pool_prime(cpu_threads);
                     const double a0 = now_ms();
                     try {   // kept[] holds what was read even when admit() throws
                         host->admit(l, file_ids, n_file, kept);
