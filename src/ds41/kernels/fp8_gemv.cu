@@ -2,6 +2,7 @@
 #include "strata/ds41/fp8_gemv.hpp"
 #include "strata/kernels/bf16_bits.hpp"
 
+#include <cuda_fp8.h>
 #include <cuda_runtime.h>
 
 #include <cstdio>
@@ -47,6 +48,17 @@ __global__ void quantize(const uint16_t* __restrict__ x, int64_t blocks,
     }
 }
 
+// Four E4M3 bytes times the block scale, with the hardware conversion (E4M3 -> FP16 -> FP32 is exact, as is the
+// power-of-two scale): the same floats as detail::decode_e4m3 for every non-NaN byte. The software decode cost
+// 20-35% of the GEMV time (RTX 5090 Laptop: wq_b 80 -> 61-66 us, shared w2 20 -> 16 us).
+__device__ __forceinline__ float4 decode4_e4m3(uint32_t word, float scale) {
+    const __half2_raw lo = __nv_cvt_fp8x2_to_halfraw2(__nv_fp8x2_storage_t(word & 0xffffu), __NV_E4M3);
+    const __half2_raw hi = __nv_cvt_fp8x2_to_halfraw2(__nv_fp8x2_storage_t(word >> 16), __NV_E4M3);
+    const float2 a = __half22float2(*reinterpret_cast<const __half2*>(&lo));
+    const float2 b = __half22float2(*reinterpret_cast<const __half2*>(&hi));
+    return make_float4(a.x * scale, a.y * scale, b.x * scale, b.y * scale);
+}
+
 // SPLIT warps cooperate on ROWS output rows. Small N gets more independent K slices;
 // adjacent output rows reuse each float4 activation load and have independent accumulators.
 // Every weight vector is loaded and decoded once for all M activation rows.
@@ -90,10 +102,7 @@ __global__ void gemv(const float* __restrict__ x, const uint8_t* __restrict__ w,
                 for (int r = 0; r < ROWS; ++r) {
                     const uint32_t word = j == 0 ? packed[r].x : j == 1 ? packed[r].y :
                                           j == 2 ? packed[r].z : packed[r].w;
-                    weight[r] = make_float4(detail::decode_e4m3(uint8_t(word)) * sw,
-                                            detail::decode_e4m3(uint8_t(word >> 8)) * sw,
-                                            detail::decode_e4m3(uint8_t(word >> 16)) * sw,
-                                            detail::decode_e4m3(uint8_t(word >> 24)) * sw);
+                    weight[r] = decode4_e4m3(word, sw);
                 }
                 #pragma unroll
                 for (int t = 0; t < M; ++t) {
