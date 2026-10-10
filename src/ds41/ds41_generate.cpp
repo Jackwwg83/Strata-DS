@@ -148,6 +148,7 @@ int main(int argc, char** argv) {
         else if (a == "--max-seq") opt.max_seq = std::stoi(next());
         else if (a == "--expert-profile") opt.expert_profile = next();
         else if (a == "--vram-slots") opt.vram_expert_slots = std::stoll(next());
+        else if (a == "--vram-reserve-mib") opt.vram_reserve_bytes = (size_t) std::stoll(next()) << 20;
         else if (a == "--adapt-every") opt.adapt_every = std::stoi(next());
         else if (a == "--adapt-swaps") opt.adapt_swaps = std::stoi(next());
         else if (a == "--ram-budget-gib") opt.ram_budget_gib = std::stod(next());

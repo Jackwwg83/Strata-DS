@@ -31,7 +31,10 @@ struct EngineOptions {
     int cpu_threads = 8;
     std::string expert_profile;             ///< STRP profile for the VRAM expert tier; empty: no tier
     int64_t vram_expert_slots = -1;         ///< with a profile: -1 = as many as fit, 0 = none
-    size_t vram_reserve_bytes = 1536ull << 20;   ///< VRAM left free when the slot count is automatic
+    /// VRAM left free when the slot count is automatic (--vram-reserve-mib). 700 MiB, upstream's default: on the RTX
+    /// 5090 Laptop 1536 -> 700 MiB gave 97 more slots, code 50.27 -> 49.62 ms/token, agent 53.63 -> 52.97, and a
+    /// 16K-token prompt and verify windows still ran (512 MiB too)
+    size_t vram_reserve_bytes = 700ull << 20;
     int adapt_every = 4;                    ///< adaptive tier: steps between swaps (0 = static residency)
     float adapt_decay = 0.7f;
     int adapt_swaps = 96;

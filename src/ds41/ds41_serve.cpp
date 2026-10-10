@@ -190,7 +190,7 @@ struct Options {
     std::fprintf(stderr,
                  "ds41_serve: %s\n"
                  "usage: ds41_serve --serve --pack DIR [--max-context N] [--threads T] [--expert-profile F]\n"
-                 "       [--vram-slots N] [--ram-budget-gib G] [--adapt-every N] [--adapt-swaps N] [--prefill-chunk N]\n"
+                 "       [--vram-slots N] [--vram-reserve-mib M] [--ram-budget-gib G] [--adapt-every N] [--adapt-swaps N] [--prefill-chunk N]\n"
                  "       [--prefill-batch N] [--prefill-ring N] [--prefill-threads N] [--window-prompt-max N]\n"
                  "       [--snapshots N] [--batch N]\n"
                  "       [--eos-id ID ...]\n",
@@ -223,6 +223,7 @@ Options parse_args(int argc, char** argv) {
         else if (a == "--threads") o.eng.cpu_threads = (int) num(next());
         else if (a == "--expert-profile") o.eng.expert_profile = next();
         else if (a == "--vram-slots") o.eng.vram_expert_slots = (int64_t) num(next());
+        else if (a == "--vram-reserve-mib") o.eng.vram_reserve_bytes = (size_t) num(next()) << 20;
         else if (a == "--ram-budget-gib") o.eng.ram_budget_gib = num(next());
         else if (a == "--adapt-every") o.eng.adapt_every = (int) num(next());
         else if (a == "--adapt-swaps") o.eng.adapt_swaps = (int) num(next());
