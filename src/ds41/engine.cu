@@ -165,12 +165,14 @@ struct Engine::Impl {
     std::vector<unsigned char> mincore_buf;
     std::unique_ptr<RouterLookahead> lookahead;   // warms the next layer's file-tier experts (DS41_LOOKAHEAD=0: off)
     bool fetch_now = true;             // ask for a layer's missing file pages before computing (DS41_FETCH_NOW=0: off)
-    // DS41_RAM_ADAPT=N (N > 0): the adaptive RAM tier (HostExperts::enable_adapt) keeps N free slots per slot size; a
-    // miss is read into one and stays. Its default budget keeps 8 GiB free instead of 24 (the file cache it replaces
-    // needs no room). ds41/docs/cache-design-2026-10-08.html
+    // The adaptive RAM tier (HostExperts::enable_adapt) keeps N free slots per slot size (DS41_RAM_ADAPT=N, default
+    // 8; 0: the static tier); a miss is read into one and stays. Its default budget keeps 8 GiB free instead of 24 (the
+    // file cache it replaces needs no room). ds41/docs/cache-design-2026-10-08.html. The default since 2026-10-10:
+    // RTX 5090 Laptop, 60 GB RAM, automatic budgets, 256 tokens: code 11.4 -> 19.4 tok/s, agent 9.6 -> 17.6, zh_chat
+    // 10.7 -> 19.2 (static 29 GiB tier against adaptive 47 GiB)
     int ram_adapt = [] {
         const char* v = std::getenv("DS41_RAM_ADAPT");
-        if (!v || !*v) return 0;
+        if (!v || !*v) return 8;
         char* end = nullptr;
         const long n = std::strtol(v, &end, 10);
         if (end == v || *end || n < 0 || n > 64) throw std::invalid_argument("DS41_RAM_ADAPT must be an integer in [0, 64]");

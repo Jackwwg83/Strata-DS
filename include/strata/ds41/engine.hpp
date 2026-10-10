@@ -36,7 +36,8 @@ struct EngineOptions {
     float adapt_decay = 0.7f;
     int adapt_swaps = 96;
     /// with a profile: RAM tier size in GiB (upstream's resident budget); -1 = automatic, the available RAM less
-    /// 24 GiB (upstream setup's default N = RAM - 24 GB: N = 40 on a 64 GB PC); 0 = none. Measured on an RTX 4090
+    /// 8 GiB with the adaptive tier (the default), less 24 GiB with DS41_RAM_ADAPT=0 (upstream setup's default
+    /// N = RAM - 24 GB: N = 40 on a 64 GB PC); 0 = none. Measured on an RTX 4090
     /// with 119.9 GiB of container RAM and an 8.8 GB/s SSD (2026-10-06, 3bpw): no tier, 8K prompt 318 tok/s and
     /// decode 168-250 ms/token; 96 GiB, 582 tok/s and 103-109 ms/token (32K: 966 -> 1,031 tok/s).
     double ram_budget_gib = -1;

@@ -17,7 +17,7 @@
 // from the SSD. While the copies run, X is computed from the file (its RAM slot is being overwritten). Y must fit the
 // slot's capacity (the VRAM tier only plans such swaps).
 //
-// The adaptive tier (DS41_RAM_ADAPT=N, ds41/docs/cache-design-2026-10-08.html): the static tier above holds the
+// The adaptive tier (the default; DS41_RAM_ADAPT=N, 0 = static; ds41/docs/cache-design-2026-10-08.html): the static tier above holds the
 // profile's experts for good, and every other expert comes through the OS file cache, page fault by page fault. With
 // N > 0 the tier follows the conversation instead. N slots of each capacity stay free. An expert that is in no tier
 // when the CPU needs it is read from the SSD (O_DIRECT) into a free slot and computed there; it stays. Between steps
