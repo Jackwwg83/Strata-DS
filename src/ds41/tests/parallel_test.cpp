@@ -97,6 +97,18 @@ int main() {
         check(again.load() == 4, "the pool runs again after an exception");
         pool.run(0, [&](size_t) { check(false, "no pool part for n = 0"); });
     }
+    {   // a helper start that fails with something else than system_error: the started helpers are joined, the
+        // exception reaches the caller (no std::terminate from a joinable thread)
+        detail::spawn_alloc_fault() = 3;
+        bool caught = false;
+        try {
+            ThreadPool pool(8);
+        } catch (const std::bad_alloc&) {
+            caught = true;
+        }
+        detail::spawn_alloc_fault() = -1;
+        check(caught, "a ThreadPool whose fourth helper cannot be allocated throws bad_alloc after joining three");
+    }
     std::printf("RESULT %s parallel\n", failures ? "fail" : "pass");
     return failures ? 1 : 0;
 }

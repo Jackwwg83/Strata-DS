@@ -17,6 +17,7 @@
 #include <exception>
 #include <functional>
 #include <mutex>
+#include <new>
 #include <system_error>
 #include <thread>
 #include <vector>
@@ -25,6 +26,11 @@ namespace strata::ds41 {
 namespace detail {
 /// tests: the start of thread number k (0 = the first one started) throws; -1 = never
 inline std::atomic<int>& spawn_fault() {
+    static std::atomic<int> k{-1};
+    return k;
+}
+/// tests: ThreadPool's start of helper k throws std::bad_alloc; -1 = never
+inline std::atomic<int>& spawn_alloc_fault() {
     static std::atomic<int> k{-1};
     return k;
 }
@@ -74,25 +80,24 @@ class ThreadPool {
 public:
     /// `threads` counts the caller: threads - 1 helpers
     explicit ThreadPool(size_t threads) {
-        for (size_t k = 0; k + 1 < threads; ++k) {
-            try {
-                if (detail::spawn_fault().load() == (int) k)
-                    throw std::system_error(std::make_error_code(std::errc::resource_unavailable_try_again));
-                helpers_.emplace_back([this, k] { loop(k + 1); });
-            } catch (const std::system_error&) {
-                break;
+        try {
+            helpers_.reserve(threads > 1 ? threads - 1 : 0);
+            for (size_t k = 0; k + 1 < threads; ++k) {
+                try {
+                    if (detail::spawn_fault().load() == (int) k)
+                        throw std::system_error(std::make_error_code(std::errc::resource_unavailable_try_again));
+                    if (detail::spawn_alloc_fault().load() == (int) k) throw std::bad_alloc();
+                    helpers_.emplace_back([this, k] { loop(k + 1); });
+                } catch (const std::system_error&) {
+                    break;
+                }
             }
+        } catch (...) {   // e.g. bad_alloc: the destructor does not run, so stop and join the helpers that started
+            stop_helpers();
+            throw;
         }
     }
-    ~ThreadPool() {
-        {
-            std::lock_guard<std::mutex> lk(mu_);
-            stop_ = true;
-            ++gen_;
-        }
-        cv_.notify_all();
-        for (auto& t : helpers_) t.join();
-    }
+    ~ThreadPool() { stop_helpers(); }
     ThreadPool(const ThreadPool&) = delete;
     ThreadPool& operator=(const ThreadPool&) = delete;
 
@@ -128,6 +133,16 @@ public:
     }
 
 private:
+    void stop_helpers() {
+        {
+            std::lock_guard<std::mutex> lk(mu_);
+            stop_ = true;
+            ++gen_;
+        }
+        cv_.notify_all();
+        for (auto& t : helpers_)
+            if (t.joinable()) t.join();
+    }
     void part(std::function<void(size_t)>& job, size_t i) {
         try {
             job(i);
