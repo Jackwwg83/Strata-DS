@@ -144,8 +144,9 @@ public:
     /// FP32 logits of the last step (all 129280)
     const std::vector<float>& last_logits() const;
 
-    /// engram_ms: the engram reads at the step start. gpu_ms: the rest of the step (wall time). cpu_experts_ms: the
-    /// time the CPU thread spent computing experts, inside gpu_ms.
+    /// engram_ms: the engram reads (step(): on their own thread beside layer 0, so gpu_ms is the whole step; verify
+    /// and batch: before the window, and gpu_ms is the rest). cpu_experts_ms: the time the CPU thread spent computing
+    /// experts, inside gpu_ms.
     /// expert_hits: routed experts of the step computed from VRAM slots, of expert_total.
     struct Timing {
         double gpu_ms = 0, cpu_experts_ms = 0, engram_ms = 0, total_ms = 0;

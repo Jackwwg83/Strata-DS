@@ -104,6 +104,14 @@ std::vector<float> rope_table(int seqlen, bool yarn) {
     return t;
 }
 
+/// decode: wait until the engram rows of this step are in the pinned buffer (the host's reader raises the flag to the
+/// step's engram epoch, dp[4])
+__global__ void wait_engram_k(const volatile uint32_t* flag, const int* dp) {
+    const uint32_t want = (uint32_t) dp[4];
+    while (*flag < want) __nanosleep(200);
+    __threadfence_system();
+}
+
 }  // namespace
 
 struct Engine::Impl {
@@ -209,10 +217,21 @@ struct Engine::Impl {
 
     // decode on its own stream, captured as CUDA graphs (upstream session_capture_token / Verifier): the position
     // dependent values come from fixed pinned staging, copied to the device by the graph's first node
-    struct StepParams { int token, pos, t1, t2; };   // t1, t2: compressed lengths at ratio 1 and 2
+    struct StepParams { int token, pos, t1, t2, eng_epoch; };   // t1, t2: compressed lengths at ratio 1 and 2
     cudaStream_t st = nullptr;
     StepParams* hp = nullptr;          // pinned staging of the next replay
-    int* dp = nullptr;                 // device copy: dp[0] token, dp[1] pos, dp[2] t1, dp[3] t2
+    int* dp = nullptr;                 // device copy: dp[0] token, dp[1] pos, dp[2] t1, dp[3] t2, dp[4] engram epoch
+    // decode engram rows read beside the step's first layer: a reader thread fills eng_host and raises eng_flag
+    // (mapped) to the step's epoch; the graph waits for it before copying the rows, just before layer 1
+    uint32_t* eng_flag = nullptr;      // mapped host word
+    uint32_t* eng_flag_dev = nullptr;
+    uint32_t eng_epoch = 0;
+    std::thread eng_thread;
+    std::mutex eng_mu;
+    std::condition_variable eng_cv;
+    bool eng_posted = false, eng_done = true, eng_quit = false;
+    std::exception_ptr eng_error;
+    double eng_read_ms = 0;
     int* d_next = nullptr;             // device argmax of the logits
     int* hp_next = nullptr;            // pinned: the argmax, the logits and the routes, after the step
     float* lg_pinned = nullptr;
@@ -245,6 +264,13 @@ struct Engine::Impl {
         }
         cv.notify_all();
         if (worker.joinable()) worker.join();
+        {
+            std::lock_guard<std::mutex> lk(eng_mu);
+            eng_quit = true;
+        }
+        eng_cv.notify_all();
+        if (eng_thread.joinable()) eng_thread.join();
+        if (eng_flag) __atomic_store_n(eng_flag, ~0u, __ATOMIC_RELEASE);   // a step that threw: release its wait
         // the lookahead calls into both tiers, and the VRAM tier's copy thread writes into RAM slots: stop them first
         lookahead.reset();
         vram.reset();
@@ -259,6 +285,7 @@ struct Engine::Impl {
         for (cudaEvent_t e : pfp.ev) cudaEventDestroy(e);
         if (dbg) std::fclose(dbg);
         if (eng_host) cudaFreeHost(eng_host);
+        if (eng_flag) cudaFreeHost(eng_flag);
         if (hp) cudaFreeHost(hp);
         if (hp_next) cudaFreeHost(hp_next);
         if (lg_pinned) cudaFreeHost(lg_pinned);
@@ -447,6 +474,10 @@ struct Engine::Impl {
         const size_t eng_bytes = (size_t) n_eng * kEngRows * (256 + 8);
         ck(cudaHostAlloc((void**) &eng_host, std::max<size_t>(eng_bytes, 1), cudaHostAllocDefault), "engram pinned");
         eng_dev = dalloc_own<uint8_t>(std::max<size_t>(eng_bytes, 1));
+        ck(cudaHostAlloc((void**) &eng_flag, sizeof(uint32_t), cudaHostAllocMapped), "engram flag");
+        *eng_flag = 0;
+        ck(cudaHostGetDevicePointer((void**) &eng_flag_dev, eng_flag, 0), "engram flag alias");
+        if (n_eng) eng_thread = std::thread([this] { engram_worker(); });
         // scratch
         h = dalloc_own<bf16>(kHc * kDim);
         h2 = dalloc_own<bf16>(kHc * kDim);
@@ -502,7 +533,7 @@ struct Engine::Impl {
         ck(cudaHostAlloc((void**) &hp_next, sizeof(int), cudaHostAllocDefault), "next token");
         ck(cudaHostAlloc((void**) &lg_pinned, (size_t) kVocab * 4, cudaHostAllocDefault), "logits");
         ck(cudaHostAlloc((void**) &routes_pinned, kLayers * kTopK * 4, cudaHostAllocDefault), "routes");
-        dp = dalloc_own<int>(4);
+        dp = dalloc_own<int>(5);
         d_next = dalloc_own<int>(1);
         one_hot_dev = dalloc_own<float>(kHc);
         {
@@ -863,6 +894,56 @@ struct Engine::Impl {
             s.push_back(base + kEngRows * 256);
         }
         eng_rows->read(ids, cols, w, s);
+    }
+
+    /// The decode engram reader: one step's rows at a time (post_engram), then the flag the graph waits for. The flag
+    /// rises even when the read fails (the GPU must not wait forever); finish_engram rethrows the error after the
+    /// step. Reading beside layer 0 instead of before the step hides most of the read (~1.4 ms on the laptop).
+    void engram_worker() {
+        std::unique_lock<std::mutex> lk(eng_mu);
+        while (true) {
+            eng_cv.wait(lk, [&] { return eng_quit || eng_posted; });
+            if (!eng_posted) return;
+            eng_posted = false;
+            const uint32_t epoch = eng_epoch;
+            lk.unlock();
+            const double t0 = now_ms();
+            std::exception_ptr error;
+            try {
+                engram_read_all();
+            } catch (...) {
+                error = std::current_exception();
+            }
+            const double ms = now_ms() - t0;
+            __atomic_store_n(eng_flag, epoch, __ATOMIC_RELEASE);
+            lk.lock();
+            eng_error = error;
+            eng_read_ms = ms;
+            eng_done = true;
+            eng_cv.notify_all();
+        }
+    }
+    /// step_body: this step's rows (engram_ids filled), read beside the step's first layer; returns the epoch
+    uint32_t post_engram() {
+        std::unique_lock<std::mutex> lk(eng_mu);
+        eng_cv.wait(lk, [&] { return eng_done; });   // a previous step that threw may still be reading
+        ++eng_epoch;
+        eng_done = false;
+        eng_posted = true;
+        eng_error = nullptr;
+        eng_cv.notify_all();
+        return eng_epoch;
+    }
+    /// after the step's sync: the read time, and the read's error if it failed
+    void finish_engram(Timing& tm) {
+        std::unique_lock<std::mutex> lk(eng_mu);
+        eng_cv.wait(lk, [&] { return eng_done; });
+        tm.engram_ms = eng_read_ms;
+        if (eng_error) {
+            std::exception_ptr e = eng_error;
+            eng_error = nullptr;
+            std::rethrow_exception(e);
+        }
     }
 
     /// Engram.forward for layer l (engram layer li) from the rows engram_read put on the device.
@@ -1823,9 +1904,6 @@ struct Engine::Impl {
     /// dump: eager only (it reads the device between layers).
     void enqueue_step(StepDump* dump) {
         ck(cudaMemcpyAsync(dp, hp, sizeof(StepParams), cudaMemcpyHostToDevice, st), "step params");
-        if (n_eng)
-            ck(cudaMemcpyAsync(eng_dev, eng_host, (size_t) n_eng * kEngRows * (256 + 8), cudaMemcpyHostToDevice, st),
-               "engram rows");
         ops::window_index_device(dp + 1, idx_dev, st);
         ops::embed_device(embed, dp, h, st);
         // the stream's collapse weights: one-hot at the first layer, then the previous layer's ffn_pre. Read in place:
@@ -1834,6 +1912,12 @@ struct Engine::Impl {
         int eng_i = 0;
         for (int l = 0; l < kLayers; ++l) {
             auto& y = L[l];
+            if (is_engram_layer(l) && eng_i == 0) {   // every table's rows, read beside the layers before
+                wait_engram_k<<<1, 1, 0, st>>>(eng_flag_dev, dp);
+                ck(cudaGetLastError(), "engram wait");
+                ck(cudaMemcpyAsync(eng_dev, eng_host, (size_t) n_eng * kEngRows * (256 + 8), cudaMemcpyHostToDevice,
+                                   st), "engram rows");
+            }
             if (is_engram_layer(l)) engram(l, eng_i++);
             const bool dbg_layer = dbg && (l == 1 || l == 2);
             if (dbg_layer) dbg_write(h, kHc * kDim);                    // block input (after engram)
@@ -1962,14 +2046,12 @@ struct Engine::Impl {
         const double t_start = now_ms();
         history.push_back(pack.engram_hash().token_map[token]);
         {
-            const double t0 = now_ms();
             int li = 0;
             for (int l = 0; l < kLayers; ++l)
                 if (is_engram_layer(l)) engram_ids(l, li++, pos);
             if (fault("engram")) throw std::runtime_error("ds41 test fault: engram read");
-            engram_read_all();
-            tm.engram_ms = now_ms() - t0;
         }
+        const uint32_t engram_epoch = n_eng ? post_engram() : 0;   // read beside layer 0; the graph waits before layer 1
         const double t_swaps = now_ms();
         if (vram) tm.vram_swaps = vram->between_steps();   // the device is idle: the last step ended in a sync
         tm.swaps_ms = now_ms() - t_swaps;
@@ -1990,7 +2072,7 @@ struct Engine::Impl {
             dump->routes.assign(kLayers, {});
             dump->weights.assign(kLayers, {});
         }
-        *hp = StepParams{token, pos, pos + 1, (pos + 1) / 2};
+        *hp = StepParams{token, pos, pos + 1, (pos + 1) / 2, (int) engram_epoch};
         parity = pos & 1;
         tcap1 = cap_of(pos + 1, max_seq + 1);
         tcap2 = cap_of((pos + 1) / 2, max_seq / 2 + 1);
@@ -2014,6 +2096,7 @@ struct Engine::Impl {
             enqueue_step(dump);
         }
         ck(cudaStreamSynchronize(st), "step");
+        if (n_eng) finish_engram(tm);
         if (prefetch && prefetch->failed()) throw std::runtime_error("ds41 prefetch: a DMA copy failed");
         const double t_end = now_ms();
         {
@@ -2062,7 +2145,7 @@ struct Engine::Impl {
             tm.warmed = (int) st_.warmed;
             tm.warmed_useful = (int) st_.useful;
         }
-        tm.gpu_ms = tm.total_ms - tm.engram_ms;
+        tm.gpu_ms = tm.total_ms;   // the engram rows are read beside layer 0, not before the step
         return best;
     }
 };
