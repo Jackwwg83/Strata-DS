@@ -243,6 +243,12 @@ struct Engine::Impl {
     // (0: attention, 1: ffn). A whole hc_finish held the norm back ~3 us twice per layer
     cudaStream_t st_hc = nullptr;
     cudaEvent_t hc_fork[2] = {}, hc_done[2] = {};
+    // decode shared expert: on st_sh after the publish, beside K10 (the GPU's routed experts; compute bound, while the
+    // shared expert's FP8 GEMVs are bandwidth bound) and the CPU experts; joined before the outputs add up. act_sh is
+    // its FP8 activation scratch
+    cudaStream_t st_sh = nullptr;
+    cudaEvent_t sh_fork = nullptr, sh_done = nullptr;
+    float* act_sh = nullptr;
     cudaEvent_t eng_fork = nullptr;
     std::vector<cudaEvent_t> eng_join;
     float* act_eng = nullptr;
@@ -327,6 +333,9 @@ struct Engine::Impl {
         if (kv_join) cudaEventDestroy(kv_join);
         if (st_eng) cudaStreamDestroy(st_eng);
         if (st_hc) cudaStreamDestroy(st_hc);
+        if (st_sh) cudaStreamDestroy(st_sh);
+        if (sh_fork) cudaEventDestroy(sh_fork);
+        if (sh_done) cudaEventDestroy(sh_done);
         for (cudaEvent_t e : {hc_fork[0], hc_fork[1], hc_done[0], hc_done[1]})
             if (e) cudaEventDestroy(e);
         if (eng_fork) cudaEventDestroy(eng_fork);
@@ -551,6 +560,7 @@ struct Engine::Impl {
         act = dalloc_own<float>(8192);
         act_kv = dalloc_own<float>(8192);
         act_eng = dalloc_own<float>(8192);
+        act_sh = dalloc_own<float>(8192);
         pre_mix = dalloc_own<float>(kHc);
         pre = dalloc_own<float>(kHc);
         post = dalloc_own<float>(kHc);
@@ -587,6 +597,9 @@ struct Engine::Impl {
         }
         ck(cudaEventCreateWithFlags(&eng_fork, cudaEventDisableTiming), "engram fork");
         ck(cudaStreamCreateWithFlags(&st_hc, cudaStreamNonBlocking), "decode hc stream");
+        ck(cudaStreamCreateWithFlags(&st_sh, cudaStreamNonBlocking), "decode shared expert stream");
+        ck(cudaEventCreateWithFlags(&sh_fork, cudaEventDisableTiming), "shared fork");
+        ck(cudaEventCreateWithFlags(&sh_done, cudaEventDisableTiming), "shared done");
         for (int i = 0; i < 2; ++i) {
             ck(cudaEventCreateWithFlags(&hc_fork[i], cudaEventDisableTiming), "hc fork");
             ck(cudaEventCreateWithFlags(&hc_done[i], cudaEventDisableTiming), "hc done");
@@ -1155,6 +1168,14 @@ struct Engine::Impl {
                            tier ? vram->res_dev() + (size_t) (l + 1) * kExperts : nullptr,
                            host->experts_dev() + (size_t) (l + 1) * kExperts,
                            zc_blobs.get() + (size_t) (l + 1) * kExperts, st);
+        // the shared expert reads xf only: beside everything below until the outputs add up
+        ck(cudaEventRecord(sh_fork, st), "shared fork");
+        ck(cudaStreamWaitEvent(st_sh, sh_fork, 0), "shared fork wait");
+        fp8_linear_on(xf, y.sh_w1, g, act_sh, st_sh);
+        fp8_linear_on(xf, y.sh_w3, u, act_sh, st_sh);
+        ops::swiglu(g, u, kSwigluLimit, sh_h, kMoeInter, st_sh);
+        fp8_linear_on(sh_h, y.sh_w2, sh_out, act_sh, st_sh);
+        ck(cudaEventRecord(sh_done, st_sh), "shared done");
         const bool staged = ram && zc_stage;
         if (staged) zc_stage->fork_copy(st);
         ck(cudaMemsetAsync(routed, 0, kDim * sizeof(float), st), "routed");
@@ -1162,11 +1183,7 @@ struct Engine::Impl {
         if (!staged && (tier || ram))
             kernels::exl3_moe_decode((const __half*) x_half_dev, 1, gpu_sel, w, kTopK, db->gpu_experts(), routed,
                                      vram ? vram->workspace() : zc_workspace.get(), VramExperts::kWorkspaceBytes, st);
-        // Shared expert overlaps the staging copy and CPU work. One K10 call preserves route reduction order.
-        fp8_linear(xf, y.sh_w1, g);
-        fp8_linear(xf, y.sh_w3, u);
-        ops::swiglu(g, u, kSwigluLimit, sh_h, kMoeInter, st);
-        fp8_linear(sh_h, y.sh_w2, sh_out);
+        // One K10 call preserves route reduction order.
         if (staged) {
             zc_stage->join(st);
             kernels::exl3_moe_decode((const __half*) x_half_dev, 1, gpu_sel, w, kTopK, db->gpu_experts(), routed,
@@ -1175,6 +1192,7 @@ struct Engine::Impl {
         db->wait_add(routed, 1, (uint32_t) (l + 1), st);
         // layer l + 1's guesses are read by its publish, and the next layer overwrites xf, which they read
         if (pf && l + 1 < kLayers) prefetch->ready(l + 1, st);
+        ck(cudaStreamWaitEvent(st, sh_done, 0), "shared join");
         ops::add_f32_bf16(routed, sh_out, ffn_out, kDim, st);
     }
 
