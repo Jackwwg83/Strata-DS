@@ -114,6 +114,11 @@ public:
     /// VRAM slot to a RAM slot, held in a swap buffer); held() is true until assign() or point_to_file(). The device
     /// descriptor is revoked: the GPU does not read it from there. Call only between steps.
     void point_to(int layer, int expert, const uint8_t* bytes);
+    /// Between steps, for a batch of the calls above: the device descriptor updates collect on the host (the last
+    /// one of an entry wins) until flush_descriptors() writes them in one kernel and synchronizes. One update at a
+    /// time cost a synchronous copy each (~5 us; a 96-swap phase spent 0.5-0.9 ms on them).
+    void defer_descriptors();
+    void flush_descriptors();
     /// the CPU reads (layer, expert) from host memory: its RAM slot or a swap buffer (not the file)
     bool in_memory(int layer, int expert) const {
         const size_t i = (size_t) layer * n_experts_ + expert;
@@ -153,6 +158,14 @@ private:
     /// admit()'s reads into the picked slots (pick[i] < 0: none); records and points the ones read
     int read_picked(int layer, const int32_t* ids, int n, const std::vector<int>& pick, bool* ok);
     void publish_descriptor(int layer, int expert, int slot);
+    void reserve_pending(int n);
+
+    // deferred descriptor updates (defer_descriptors): entry index and descriptor, in mapped pinned memory
+    bool defer_ = false;
+    int n_pend_ = 0, cap_pend_ = 0;
+    int32_t* pend_idx_ = nullptr;
+    kernels::Exl3Expert* pend_desc_ = nullptr;
+    std::vector<int32_t> pend_pos_;   ///< [n_layers][n_experts] position in the pending list or -1
 
     const Pack& pack_;
     std::vector<int64_t> handles_;

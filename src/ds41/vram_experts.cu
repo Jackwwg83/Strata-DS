@@ -156,6 +156,24 @@ void VramExperts::cleanup() noexcept {
     cudaFree(ws_);
 }
 
+namespace {
+__global__ void scatter_descriptors_k(kernels::Exl3Expert* table, const int32_t* idx, const kernels::Exl3Expert* desc,
+                                      int n) {
+    for (int i = blockIdx.x * blockDim.x + threadIdx.x; i < n; i += gridDim.x * blockDim.x) table[idx[i]] = desc[i];
+}
+}  // namespace
+
+void VramExperts::scatter_descriptors(kernels::Exl3Expert* table, const int32_t* idx, const kernels::Exl3Expert* desc,
+                                      int n) {
+    if (n <= 0) return;
+    int32_t* d_idx = nullptr;
+    kernels::Exl3Expert* d_desc = nullptr;
+    ck(cudaHostGetDevicePointer((void**) &d_idx, (void*) idx, 0), "descriptor index alias");
+    ck(cudaHostGetDevicePointer((void**) &d_desc, (void*) desc, 0), "descriptor alias");
+    scatter_descriptors_k<<<(n + 127) / 128, 128>>>(table, d_idx, d_desc, n);
+    ck(cudaGetLastError(), "descriptor scatter");
+}
+
 kernels::Exl3Expert VramExperts::describe(int layer, int expert, int slot) const {
     return describe_at(pack_, layer, expert, arena_ + off_[slot]);
 }
@@ -254,6 +272,15 @@ int VramExperts::commit_pending(bool wait) {
         copier_.join();
         if (copy_error_) throw std::runtime_error("ds41 vram experts: an adaptive expert copy failed");
         const int E = pack_.n_experts();
+        // the RAM descriptors change together below, published before the phase's next copy; on a throw the
+        // guard publishes what was collected
+        if (host_) host_->defer_descriptors();
+        struct Batch {
+            HostExperts* h;
+            ~Batch() {
+                if (h) try { h->flush_descriptors(); } catch (...) {}
+            }
+        } batch{host_};
         if (phase_ == 1) {
             // `out` leaves VRAM: the CPU reads it from the swap buffer (or the file); the slot now describes `in`
             for (const Pending& w : pending_) {
@@ -262,6 +289,7 @@ int VramExperts::commit_pending(bool wait) {
                 if (w.ram_slot >= 0) host_->point_to(w.layer, w.out, staging_ + w.staged);
                 else if (host_) host_->point_to_file(w.layer, w.out);
             }
+            if (host_) host_->flush_descriptors();
             upload_res();   // before the copy into the slots: no step reads a slot that is being overwritten
             start_phase(2);
         } else if (phase_ == 2) {
@@ -271,6 +299,7 @@ int VramExperts::commit_pending(bool wait) {
                 if (w.ram_slot >= 0) host_->point_to_file(w.layer, w.in);   // revokes its RAM descriptor
                 else if (host_) host_->release(w.layer, w.in);   // the adaptive RAM tier read it in meanwhile
             }
+            if (host_) host_->flush_descriptors();
             upload_res();
             committed += (int) pending_.size();
             swaps_total_ += (int) pending_.size();
@@ -281,6 +310,7 @@ int VramExperts::commit_pending(bool wait) {
                     host_->assign(w.ram_slot, w.layer, w.out);   // the CPU reads `out` from RAM
                     host_->unlock(w.ram_slot);
                 }
+            if (host_) host_->flush_descriptors();
             pending_.clear();
             phase_ = 0;
         }

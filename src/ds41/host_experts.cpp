@@ -232,6 +232,8 @@ HostExperts::HostExperts(const Pack& pack, const std::vector<std::pair<int, int>
 HostExperts::~HostExperts() {
     if (dfd_ >= 0) close(dfd_);
     cudaFree(experts_dev_);
+    if (pend_idx_) cudaFreeHost(pend_idx_);
+    if (pend_desc_) cudaFreeHost(pend_desc_);
     if (!arena_) return;
     if (registered_) cudaHostUnregister(arena_);
     else if (locked_) munlock(arena_, arena_bytes_);
@@ -256,10 +258,57 @@ void HostExperts::point(int layer, int expert, const uint8_t* bytes) {
     exl3_moe_cpu_set_expert_raw(handles_[layer], expert, &g, &u, &d, 0);
 }
 
+void HostExperts::reserve_pending(int n) {
+    if (n <= cap_pend_) return;
+    const int cap = std::max(n, std::max(2 * cap_pend_, 256));
+    int32_t* idx = nullptr;
+    kernels::Exl3Expert* desc = nullptr;
+    ck(cudaHostAlloc((void**) &idx, (size_t) cap * sizeof(int32_t), cudaHostAllocMapped), "pending descriptors");
+    if (cudaHostAlloc((void**) &desc, (size_t) cap * sizeof(kernels::Exl3Expert), cudaHostAllocMapped) != cudaSuccess) {
+        cudaFreeHost(idx);
+        ck(cudaErrorMemoryAllocation, "pending descriptors");
+    }
+    if (n_pend_) {
+        std::memcpy(idx, pend_idx_, (size_t) n_pend_ * sizeof(int32_t));
+        std::memcpy((void*) desc, pend_desc_, (size_t) n_pend_ * sizeof(kernels::Exl3Expert));
+    }
+    if (pend_idx_) cudaFreeHost(pend_idx_);
+    if (pend_desc_) cudaFreeHost(pend_desc_);
+    pend_idx_ = idx;
+    pend_desc_ = desc;
+    cap_pend_ = cap;
+}
+
+void HostExperts::defer_descriptors() {
+    if (!experts_dev_) return;
+    if (pend_pos_.empty()) pend_pos_.assign(slot_.size(), -1);
+    defer_ = true;
+}
+
+void HostExperts::flush_descriptors() {
+    if (!defer_) return;
+    defer_ = false;
+    if (!n_pend_) return;
+    VramExperts::scatter_descriptors(experts_dev_, pend_idx_, pend_desc_, n_pend_);
+    ck(cudaStreamSynchronize(nullptr), "descriptor publication");   // as publish_descriptor: before any step
+    for (int i = 0; i < n_pend_; ++i) pend_pos_[pend_idx_[i]] = -1;
+    n_pend_ = 0;
+}
+
 void HostExperts::publish_descriptor(int layer, int expert, int slot) {
     if (!experts_dev_) return;
     kernels::Exl3Expert desc{};
     if (slot >= 0) desc = VramExperts::describe_at(pack_, layer, expert, device_alias_ + off_[slot]);
+    if (defer_) {
+        const int32_t i = (int32_t) ((size_t) layer * n_experts_ + expert);
+        if (pend_pos_[i] < 0) {
+            reserve_pending(n_pend_ + 1);
+            pend_pos_[i] = n_pend_;
+            pend_idx_[n_pend_++] = i;
+        }
+        pend_desc_[pend_pos_[i]] = desc;
+        return;
+    }
     ck(cudaMemcpy(experts_dev_ + (size_t) layer * n_experts_ + expert, &desc, sizeof(desc),
                   cudaMemcpyHostToDevice), "descriptor update");
     ck(cudaStreamSynchronize(nullptr), "descriptor publication");
@@ -448,6 +497,14 @@ int HostExperts::read_picked(int layer, const int32_t* ids, int n, const std::ve
 
 int HostExperts::end_step(const int32_t* routes, int topk) {
     if (!reserve_) return 0;
+    defer_descriptors();
+    struct Flush {   // when a call below throws: publish what was collected, keep the first error
+        HostExperts* h;
+        bool armed = true;
+        ~Flush() {
+            if (armed) try { h->flush_descriptors(); } catch (...) {}
+        }
+    } flush{this};
     ++clock_;
     {
         std::lock_guard<std::mutex> lk(admit_mu_);
@@ -483,6 +540,8 @@ int HostExperts::end_step(const int32_t* routes, int topk) {
         }
     }
     evicted_total_ += evicted;
+    flush.armed = false;
+    flush_descriptors();
     return evicted;
 }
 
