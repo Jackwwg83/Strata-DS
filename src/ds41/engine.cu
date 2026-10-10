@@ -785,6 +785,34 @@ struct Engine::Impl {
         return true;
     }
 
+    /// verify and batch rows (on their CPU worker): a layer's misses that are in no tier are read into the adaptive
+    /// RAM tier, each expert once for all rows, as the decode worker does. ids: [n], -1 for none. The rows' routes
+    /// are recorded with host->end_step() after the window is committed or the batch step ends.
+    int admit_rows(int l, const int32_t* ids, int n) {
+        if (!(host && host->reserve() > 0)) return 0;
+        int32_t uniq[kVerifyMaxTokens * kTopK];
+        int u = 0;
+        for (int i = 0; i < n && u < kVerifyMaxTokens * kTopK; ++i) {
+            const int32_t e = ids[i];
+            if (e < 0 || e >= kExperts || host->in_memory(l, e)) continue;
+            if (vram && vram->res_host()[(size_t) l * kExperts + e] >= 0) continue;
+            if (std::find(uniq, uniq + u, e) == uniq + u) uniq[u++] = e;
+        }
+        if (u == 0) return 0;
+        try {
+            exl3_moe_cpu_pool_prime(cpu_threads);
+        } catch (...) {
+        }
+        bool kept[kVerifyMaxTokens * kTopK] = {};
+        try {
+            return host->admit(l, uniq, u, kept);
+        } catch (const std::exception& ex) {   // the file path still works
+            if (!admit_warned.exchange(true))
+                std::fprintf(stderr, "ds41: adaptive RAM tier read failed (%s); using the file\n", ex.what());
+            return 0;
+        }
+    }
+
     /// True when some page of (layer, expert) in the mapped file is not in RAM: computing it reads the SSD.
     bool file_pages_missing(int l, int e) {
         const ExpertSlot& x = pack.expert(l, e);
