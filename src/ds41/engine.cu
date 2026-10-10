@@ -112,6 +112,13 @@ __global__ void wait_engram_k(const volatile uint32_t* flag, const int* dp) {
     __threadfence_system();
 }
 
+/// decode: the engram rows from the mapped pinned buffer to the device. A copy node shared the copy engine with the
+/// DMA prefetch and queued behind a 7 MB expert copy (111 us of idle GPU per token, nsys, RTX 5090 Laptop).
+/// Uncached loads: the host rewrites the buffer every step.
+__global__ void engram_rows_k(const uint4* src, uint4* dst, int n16) {
+    for (int i = blockIdx.x * blockDim.x + threadIdx.x; i < n16; i += gridDim.x * blockDim.x) dst[i] = __ldcv(src + i);
+}
+
 }  // namespace
 
 struct Engine::Impl {
@@ -153,6 +160,7 @@ struct Engine::Impl {
     static constexpr int kEngRows = 24;
     uint8_t* eng_host = nullptr;       // pinned: per engram layer, kEngRows*256 weight bytes then kEngRows*8 scales
     uint8_t* eng_dev = nullptr;        // the same on the device
+    const uint8_t* eng_host_dev = nullptr;   // eng_host's device alias (mapped), read by engram_rows_k
 
     // routed experts: the CPU thread and its doorbell (round l+1 = layer l)
     std::unique_ptr<ExpertDoorbell> db;
@@ -481,7 +489,9 @@ struct Engine::Impl {
             eng_ids.assign(n_eng, std::vector<int64_t>(kEngRows, 0));
         }
         const size_t eng_bytes = (size_t) n_eng * kEngRows * (256 + 8);
-        ck(cudaHostAlloc((void**) &eng_host, std::max<size_t>(eng_bytes, 1), cudaHostAllocDefault), "engram pinned");
+        static_assert(kEngRows * (256 + 8) % 16 == 0, "engram_rows_k copies 16-byte words");
+        ck(cudaHostAlloc((void**) &eng_host, std::max<size_t>(eng_bytes, 16), cudaHostAllocMapped), "engram pinned");
+        ck(cudaHostGetDevicePointer((void**) &eng_host_dev, eng_host, 0), "engram pinned alias");
         eng_dev = dalloc_own<uint8_t>(std::max<size_t>(eng_bytes, 1));
         ck(cudaHostAlloc((void**) &eng_flag, sizeof(uint32_t), cudaHostAllocMapped), "engram flag");
         *eng_flag = 0;
@@ -1935,8 +1945,11 @@ struct Engine::Impl {
             if (is_engram_layer(l) && eng_i == 0) {   // every table's rows, read beside the layers before
                 wait_engram_k<<<1, 1, 0, st>>>(eng_flag_dev, dp);
                 ck(cudaGetLastError(), "engram wait");
-                ck(cudaMemcpyAsync(eng_dev, eng_host, (size_t) n_eng * kEngRows * (256 + 8), cudaMemcpyHostToDevice,
-                                   st), "engram rows");
+                const int n16 = n_eng * kEngRows * (256 + 8) / 16;
+                if (n16 > 0) {
+                    engram_rows_k<<<(n16 + 255) / 256, 256, 0, st>>>((const uint4*) eng_host_dev, (uint4*) eng_dev, n16);
+                    ck(cudaGetLastError(), "engram rows");
+                }
             }
             if (is_engram_layer(l)) engram(l, eng_i++);
             const bool dbg_layer = dbg && (l == 1 || l == 2);
