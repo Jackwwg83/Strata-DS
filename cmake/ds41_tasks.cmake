@@ -9,6 +9,11 @@ foreach(task k2_fp8_gemm k3_sparse_attn k5_indexer k7_hc k8_router k10_exl3_moe 
   add_test(NAME ${task}_test COMMAND ${task}_test)
   set_tests_properties(${task}_test PROPERTIES SKIP_RETURN_CODE 77 TIMEOUT 900)
 endforeach()
+# K7's split variant (the decode graph's coefficients on a side stream) against hc_mixes_pre, bit for bit
+add_executable(k7_split_test src/ds41/tests/k7_split_test.cu)
+target_link_libraries(k7_split_test PRIVATE ds41_k7_hc strata_ds41_engine)
+add_test(NAME k7_split_test COMMAND k7_split_test)
+set_tests_properties(k7_split_test PROPERTIES SKIP_RETURN_CODE 77 TIMEOUT 900)
 # K8's own GPU regression test (outside the fixed acceptance test): graph replays, exact ties, and negative and
 # mixed-sign biased scores against the CPU oracle
 add_executable(k8_graph_validation src/ds41/kernels/k8/graph_validation.cu)

@@ -238,6 +238,11 @@ struct Engine::Impl {
     // CPU experts; the engram layer waits for eng_join[li], then applies eng_kv + li * (kHc + 1) * kDim to h.
     // act_eng is the GEMV's FP8 activation scratch
     cudaStream_t st_eng = nullptr;
+    // decode hyper-connections: each sub-block's coefficients (pre, post, comb; the Sinkhorn steps in one CTA) run on
+    // st_hc after the partial sums, beside the collapse, the norm and the sub-block; hc_post waits for hc_done[i]
+    // (0: attention, 1: ffn). A whole hc_finish held the norm back ~3 us twice per layer
+    cudaStream_t st_hc = nullptr;
+    cudaEvent_t hc_fork[2] = {}, hc_done[2] = {};
     cudaEvent_t eng_fork = nullptr;
     std::vector<cudaEvent_t> eng_join;
     float* act_eng = nullptr;
@@ -321,6 +326,9 @@ struct Engine::Impl {
         if (kv_fork) cudaEventDestroy(kv_fork);
         if (kv_join) cudaEventDestroy(kv_join);
         if (st_eng) cudaStreamDestroy(st_eng);
+        if (st_hc) cudaStreamDestroy(st_hc);
+        for (cudaEvent_t e : {hc_fork[0], hc_fork[1], hc_done[0], hc_done[1]})
+            if (e) cudaEventDestroy(e);
         if (eng_fork) cudaEventDestroy(eng_fork);
         for (cudaEvent_t e : eng_join) cudaEventDestroy(e);
         if (pfh.base) cudaFreeHost(pfh.base);
@@ -578,6 +586,11 @@ struct Engine::Impl {
             ck(cudaStreamCreateWithPriority(&st_eng, cudaStreamNonBlocking, lo), "decode engram stream");
         }
         ck(cudaEventCreateWithFlags(&eng_fork, cudaEventDisableTiming), "engram fork");
+        ck(cudaStreamCreateWithFlags(&st_hc, cudaStreamNonBlocking), "decode hc stream");
+        for (int i = 0; i < 2; ++i) {
+            ck(cudaEventCreateWithFlags(&hc_fork[i], cudaEventDisableTiming), "hc fork");
+            ck(cudaEventCreateWithFlags(&hc_done[i], cudaEventDisableTiming), "hc done");
+        }
         eng_join.assign(n_eng, nullptr);
         for (cudaEvent_t& e : eng_join) ck(cudaEventCreateWithFlags(&e, cudaEventDisableTiming), "engram join");
         ck(cudaHostAlloc((void**) &hp, sizeof(StepParams), cudaHostAllocDefault), "step params");
@@ -1995,20 +2008,22 @@ struct Engine::Impl {
             const bool dbg_layer = dbg && (l == 1 || l == 2);
             if (dbg_layer) dbg_write(h, kHc * kDim);                    // block input (after engram)
             // attention sub-block: h -> h2
-            kernels::hc_mixes_pre(h, 1, y.hc_attn_fn, y.hc_attn_scale, y.hc_attn_base, pre_in, xa, attn_pre, attn_post,
-                                  attn_comb, st);
+            kernels::hc_mixes_pre_split(h, y.hc_attn_fn, y.hc_attn_scale, y.hc_attn_base, pre_in, xa, attn_pre,
+                                        attn_post, attn_comb, st, st_hc, hc_fork[0], hc_done[0]);
             ops::rmsnorm(xa, y.attn_norm, xa, kDim, kNormEps, 1, st);
             if (dbg_layer) dbg_write(xa, kDim);                         // attention input
             attention(l);
             if (dbg_layer) dbg_write(attn_out, kDim);                   // attention output
+            ck(cudaStreamWaitEvent(st, hc_done[0], 0), "hc join");   // attn_post, attn_comb; attn_pre below
             ops::hc_post(attn_out, h, attn_post, attn_comb, h2, 1, st);
             // ffn sub-block: h2 -> h
-            kernels::hc_mixes_pre(h2, 1, y.hc_ffn_fn, y.hc_ffn_scale, y.hc_ffn_base, attn_pre, xf, ffn_pre, ffn_post,
-                                  ffn_comb, st);
+            kernels::hc_mixes_pre_split(h2, y.hc_ffn_fn, y.hc_ffn_scale, y.hc_ffn_base, attn_pre, xf, ffn_pre, ffn_post,
+                                        ffn_comb, st, st_hc, hc_fork[1], hc_done[1]);
             ops::rmsnorm(xf, y.ffn_norm, xf, kDim, kNormEps, 1, st);
             if (dbg_layer) dbg_write(xf, kDim);                         // ffn input
             moe(l);
             if (dbg_layer) dbg_write(ffn_out, kDim);                    // ffn output
+            ck(cudaStreamWaitEvent(st, hc_done[1], 0), "hc join");   // ffn_post, ffn_comb; ffn_pre next layer
             ops::hc_post(ffn_out, h2, ffn_post, ffn_comb, h, 1, st);
             pre_in = ffn_pre;   // read by the next layer before its ffn sub-block writes ffn_pre again
             if (dump) {
