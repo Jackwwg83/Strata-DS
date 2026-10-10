@@ -16,12 +16,23 @@
 // VRAM to a pinned staging buffer, X from its RAM slot to VRAM, then Y from staging to the RAM slot. Nothing is read
 // from the SSD. While the copies run, X is computed from the file (its RAM slot is being overwritten). Y must fit the
 // slot's capacity (the VRAM tier only plans such swaps).
+//
+// The adaptive tier (the default; DS41_RAM_ADAPT=N, 0 = static; ds41/docs/cache-design-2026-10-08.html): the static tier above holds the
+// profile's experts for good, and every other expert comes through the OS file cache, page fault by page fault. With
+// N > 0 the tier follows the conversation instead. N slots of each capacity stay free. An expert that is in no tier
+// when the CPU needs it is read from the SSD (O_DIRECT) into a free slot and computed there; it stays. Between steps
+// the new experts are published (the GPU may then read them too), and the least recently used experts leave until
+// each capacity has N free slots again. During a step only free slots are written, so no reader sees a slot change.
+// On the laptop's recorded conversations this cut the SSD reads per token from 17.5 to 6.5 (tools/ds41/cache_sim.py).
 #pragma once
 
 #include "strata/ds41/pack.hpp"
 
+#include <atomic>
 #include <cstddef>
 #include <cstdint>
+#include <memory>
+#include <mutex>
 #include <string>
 #include <utility>
 #include <vector>
@@ -29,6 +40,25 @@
 namespace strata::ds41 {
 
 namespace kernels { struct Exl3Expert; }
+class ThreadPool;
+
+namespace detail {
+/// tests: the next HostExperts::admit() read throws once
+inline std::atomic<bool>& admit_fault() {
+    static std::atomic<bool> f{false};
+    return f;
+}
+/// tests: pinning the arena fails while it is larger than this many bytes (0: never)
+inline std::atomic<size_t>& register_limit() {
+    static std::atomic<size_t> b{0};
+    return b;
+}
+/// tests: the size of admit()'s read parts (a multiple of 4 KiB; 1 MiB in use)
+inline std::atomic<size_t>& admit_part_bytes() {
+    static std::atomic<size_t> b{1u << 20};
+    return b;
+}
+}  // namespace detail
 
 /// The experts the RAM tier holds: the profile's pairs in rank order, skipping the ones the VRAM tier holds
 /// (vram_res >= 0) and the ones that do not fit the rest of `budget`. vram_res and bytes: [n_layers][n_experts].
@@ -58,6 +88,8 @@ public:
     /// the largest slot
     size_t max_slot_bytes() const { return max_slot_bytes_; }
     bool locked() const { return locked_; }
+    /// the GPU can read the arena (pinned and mapped)
+    bool mapped() const { return device_alias_ != nullptr; }
     /// the slots were read with O_DIRECT (else copied from the mapped pack, through the file cache)
     bool filled_direct() const { return filled_direct_; }
     /// [n_layers][n_experts] on the device. Null when mapping is unavailable.
@@ -82,15 +114,58 @@ public:
     /// VRAM slot to a RAM slot, held in a swap buffer); held() is true until assign() or point_to_file(). The device
     /// descriptor is revoked: the GPU does not read it from there. Call only between steps.
     void point_to(int layer, int expert, const uint8_t* bytes);
+    /// Between steps, for a batch of the calls above: the device descriptor updates collect on the host (the last
+    /// one of an entry wins) until flush_descriptors() writes them in one kernel and synchronizes. One update at a
+    /// time cost a synchronous copy each (~5 us; a 96-swap phase spent 0.5-0.9 ms on them).
+    void defer_descriptors();
+    void flush_descriptors();
     /// the CPU reads (layer, expert) from host memory: its RAM slot or a swap buffer (not the file)
     bool in_memory(int layer, int expert) const {
         const size_t i = (size_t) layer * n_experts_ + expert;
         return slot_[i] >= 0 || (!held_.empty() && held_[i]);
     }
 
+    // ---- the adaptive tier ----
+    /// Keep `reserve` slots of each capacity free: per capacity, the lowest-ranked experts leave the tier (to the
+    /// file) until that many slots are free. Call once, between steps, with no VRAM swap in flight (it throws
+    /// otherwise). 0: the static tier.
+    void enable_adapt(int reserve);
+    int reserve() const { return reserve_; }
+    /// admit() reads with O_DIRECT (each read goes to the SSD); false: it copies from the mapped pack
+    bool reads_direct() const { return dfd_ >= 0; }
+    /// During a step, on the CPU worker: read ids[0..n) of `layer`, which are in no tier, into free slots (for each
+    /// the smallest capacity that holds it) and point the CPU kernel at them. ok[i] is false when no free slot holds
+    /// expert i or its read failed: the CPU kernel then still reads it from the file. The RAM table and the device
+    /// descriptors do not change until end_step(). Returns the number read.
+    int admit(int layer, const int32_t* ids, int n, bool* ok);
+    /// Between steps: publish the experts admitted during the step, record the step's routes ([n_layers][topk],
+    /// negative ids ignored) as uses, then free the least recently used slots until each capacity has `reserve` free
+    /// slots. A locked slot is never freed. Returns the number of experts that left.
+    int end_step(const int32_t* routes, int topk);
+    /// A VRAM swap reads or writes `slot` until unlock(): end_step() does not free it.
+    void lock(int slot);
+    void unlock(int slot);
+    /// (layer, expert) entered VRAM: its RAM slot, if it has one, becomes free. Between steps.
+    void release(int layer, int expert);
+    /// free slots (all capacities)
+    int free_slots() const;
+    int64_t admitted_total() const { return admitted_total_; }
+    int64_t evicted_total() const { return evicted_total_; }
+
 private:
     void point(int layer, int expert, const uint8_t* bytes);
+    void free_slot(int slot);      ///< its expert (if any) leaves for the file; the slot joins the free ones
+    /// admit()'s reads into the picked slots (pick[i] < 0: none); records and points the ones read
+    int read_picked(int layer, const int32_t* ids, int n, const std::vector<int>& pick, bool* ok);
     void publish_descriptor(int layer, int expert, int slot);
+    void reserve_pending(int n);
+
+    // deferred descriptor updates (defer_descriptors): entry index and descriptor, in mapped pinned memory
+    bool defer_ = false;
+    int n_pend_ = 0, cap_pend_ = 0;
+    int32_t* pend_idx_ = nullptr;
+    kernels::Exl3Expert* pend_desc_ = nullptr;
+    std::vector<int32_t> pend_pos_;   ///< [n_layers][n_experts] position in the pending list or -1
 
     const Pack& pack_;
     std::vector<int64_t> handles_;
@@ -107,7 +182,18 @@ private:
     uint8_t* device_alias_ = nullptr;
     kernels::Exl3Expert* experts_dev_ = nullptr;
     std::vector<int32_t> slot_;                     ///< [n_layers][n_experts] RAM slot or -1
-    std::vector<std::pair<int, int>> holder_;       ///< [slots] (layer, expert) in each slot
+    std::vector<std::pair<int, int>> holder_;       ///< [slots] (layer, expert) in each slot; (-1, -1): free
+    // adaptive tier
+    int reserve_ = 0;
+    int dfd_ = -1;                                  ///< experts.bin opened with O_DIRECT (-1: copy from the map)
+    std::unique_ptr<ThreadPool> readers_;           ///< admit()'s reader threads, started with the adaptive tier
+    std::vector<uint8_t> free_, busy_;              ///< [slots] free; locked by a VRAM swap
+    std::vector<uint64_t> age_;                     ///< [slots] last use
+    uint64_t clock_ = 0;
+    std::vector<std::vector<int>> classes_;         ///< slots by capacity, smallest capacity first
+    std::mutex admit_mu_;
+    std::vector<std::pair<int, std::pair<int, int>>> admitted_;   ///< (slot, (layer, expert)) read this step
+    int64_t admitted_total_ = 0, evicted_total_ = 0;
 };
 
 }  // namespace strata::ds41

@@ -43,10 +43,18 @@ float bf16(uint16_t v) {
 void cpu_router_topk(const uint16_t* x, const uint16_t* w, const float* bias, int n, int dim, int k, int32_t* ids) {
     std::vector<float> xf(dim), biased(n);
     for (int i = 0; i < dim; ++i) xf[i] = f16(x[i]);
+    // 16 partial sums: independent lanes the compiler vectorizes (one running sum is a 4-cycle add chain per
+    // element, about 1.6 ms per layer on the laptop, longer than the layer the prediction must run ahead of)
+    constexpr int kLanes = 16;
     for (int e = 0; e < n; ++e) {
         const uint16_t* r = w + (size_t) e * dim;
+        float lane[kLanes] = {};
+        int i = 0;
+        for (; i + kLanes <= dim; i += kLanes)
+            for (int j = 0; j < kLanes; ++j) lane[j] += xf[i + j] * bf16(r[i + j]);
         float acc = 0.f;
-        for (int i = 0; i < dim; ++i) acc += xf[i] * bf16(r[i]);
+        for (int j = 0; j < kLanes; ++j) acc += lane[j];
+        for (; i < dim; ++i) acc += xf[i] * bf16(r[i]);
         const float sp = acc > 20.f ? acc : std::log1p(std::exp(acc));
         biased[e] = std::sqrt(sp) + bias[e];
     }

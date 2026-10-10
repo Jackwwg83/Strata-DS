@@ -108,6 +108,9 @@ public:
     const kernels::Exl3Expert& desc(int slot) const { return desc_host_[slot]; }
     /// The descriptor of (layer, expert) whose pack bytes sit at `dev` in device memory
     static kernels::Exl3Expert describe_at(const Pack& pack, int layer, int expert, const uint8_t* dev);
+    /// table[idx[i]] = desc[i] for i < n on the legacy default stream (idx, desc: host memory mapped to the device)
+    static void scatter_descriptors(kernels::Exl3Expert* table, const int32_t* idx, const kernels::Exl3Expert* desc,
+                                    int n);
 
 private:
     void cleanup() noexcept;

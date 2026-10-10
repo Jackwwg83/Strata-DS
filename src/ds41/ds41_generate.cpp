@@ -2,13 +2,15 @@
 //
 //   ds41_generate --pack DIR --ids 0,128000,... [--gen 32] [--threads 8] [--dump steps.bin] [--force-ids FILE]
 //                 [--expert-profile ds41/data/expert-profile.bin [--vram-slots N] [--adapt-every 4] [--adapt-swaps 96]
-//                  [--ram-budget-gib N (-1 available RAM less 24 GiB: default, as upstream setup; 0 none)]]
+//                  [--ram-budget-gib N (-1 available RAM less 8 GiB: default; less 24 GiB with DS41_RAM_ADAPT=0; 0 none)]]
 //                 [--prefill [--prefill-chunk 65536] [--prefill-batch 4096] [--prefill-ring 256] [--prefill-threads 8]]
 //
 // --prefill runs the prompt (or, with --force-ids, the whole forced sequence for its nll) through the batched
 // prefill (M3) instead of step() token by token; generation then continues with step().
 // --force-ids feeds a fixed token sequence (from the oracle) instead of the engine's own predictions, so a
 // per-layer comparison stays aligned even after the first differing token. Tokenization stays in Python.
+// --continue-ids FILE decodes as usual (prompt, then step() per token, --step-log) but feeds the file's tokens after
+// the prompt instead of the engine's own predictions: every run of a speed A/B then routes the same experts.
 #include "strata/ds41/config.hpp"
 #include "strata/ds41/engine.hpp"
 #include "strata/ds41/suffix_drafter.hpp"
@@ -59,7 +61,7 @@ static void print_prefill(const Engine& engine, size_t n) {
 static std::FILE* step_log = nullptr;
 
 static void generate(Engine& engine, const EngineOptions& opt, const std::vector<int>& prompt,
-                     int count, bool batched, bool suffix, int max_t, int eos) {
+                     int count, bool batched, bool suffix, int max_t, int eos, const std::vector<int>& cont = {}) {
     if (prompt.empty()) throw std::invalid_argument("generation needs a nonempty prompt");
     int next = -1;
     if (batched) {
@@ -71,6 +73,7 @@ static void generate(Engine& engine, const EngineOptions& opt, const std::vector
     SuffixDrafter drafter(3, 64, size_t(opt.max_seq)+8);
     for (int token : prompt) drafter.append(token);
     std::vector<int> out;
+    if (!cont.empty()) next = cont[0];   // --continue-ids: the file's tokens replace the predictions
     if (count > 0) { out.push_back(next); drafter.append(next); }
     int pos = int(prompt.size()), rounds = 0, accepted = 0;
     double step_ms = 0;            // plain decode: the engine's step times, as the forced path reports them
@@ -83,13 +86,15 @@ static void generate(Engine& engine, const EngineOptions& opt, const std::vector
             next = engine.step(next, pos++);
             const auto& tm = engine.last_timing();
             if (step_log)
-                std::fprintf(step_log, "%d %.3f %.3f %.3f %.3f %d %d %d %d %d %d %d %d %d\n", pos - 1, tm.total_ms,
-                             tm.gpu_ms, tm.cpu_experts_ms, tm.engram_ms, tm.expert_total, tm.expert_hits,
-                             tm.zero_copy_experts(), tm.ram_experts, tm.file_experts, tm.ssd_experts, tm.vram_swaps,
-                             tm.warmed_useful, tm.prefetched);
+                std::fprintf(step_log, "%d %.3f %.3f %.3f %.3f %d %d %d %d %d %d %d %d %d %.3f %.3f %.3f %.3f %.3f %.3f %.3f\n",
+                             pos - 1, tm.total_ms, tm.gpu_ms, tm.cpu_experts_ms, tm.engram_ms, tm.expert_total,
+                             tm.expert_hits, tm.zero_copy_experts(), tm.ram_experts, tm.file_experts, tm.ssd_experts,
+                             tm.vram_swaps, tm.warmed_useful, tm.prefetched, tm.worker_lead_ms, tm.worker_span_ms,
+                             tm.worker_wait_ms, tm.worker_first_wait_ms, tm.admit_ms, tm.swaps_ms, tm.end_ms);
             step_ms += tm.total_ms;
             hits += tm.expert_hits;
             routed += tm.expert_total;
+            if (!cont.empty()) next = cont[out.size()];
             out.push_back(next); drafter.append(next); ++rounds;
             continue;
         }
@@ -97,12 +102,15 @@ static void generate(Engine& engine, const EngineOptions& opt, const std::vector
         const int proposed = drafter.propose(limit-1, draft);
         std::vector<int> window{next};
         window.insert(window.end(), draft, draft+proposed);
+        const auto v0 = std::chrono::steady_clock::now();
         auto result = engine.verify(window, pos);
+        const double verify_ms = std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - v0).count();
         int keep = accepted_inputs(window, result.next);
         for (int i = 0; i < keep; ++i)
             if (result.next[i] == eos) { keep = i+1; break; }
         engine.commit(keep);
-        std::printf("spec_window pos %d T %zu accepted %d emitted %d\n", pos, window.size(), keep-1, keep);
+        std::printf("spec_window pos %d T %zu accepted %d emitted %d ms %.1f\n", pos, window.size(), keep-1, keep,
+                    verify_ms);
         for (int i = 0; i < keep; ++i) { out.push_back(result.next[i]); drafter.append(result.next[i]); }
         accepted += keep-1; ++rounds;
         next = result.next[keep-1]; pos += keep;
@@ -122,7 +130,7 @@ static void generate(Engine& engine, const EngineOptions& opt, const std::vector
 }
 
 int main(int argc, char** argv) {
-    std::string pack, ids_s, dump_path, force_path, spec = "none";
+    std::string pack, ids_s, dump_path, force_path, cont_path, spec = "none";
     int spec_max = kVerifyMaxTokens, eos = -1;
     int gen = 32;
     bool batched = false;
@@ -140,6 +148,7 @@ int main(int argc, char** argv) {
         else if (a == "--max-seq") opt.max_seq = std::stoi(next());
         else if (a == "--expert-profile") opt.expert_profile = next();
         else if (a == "--vram-slots") opt.vram_expert_slots = std::stoll(next());
+        else if (a == "--vram-reserve-mib") opt.vram_reserve_bytes = (size_t) std::stoll(next()) << 20;
         else if (a == "--adapt-every") opt.adapt_every = std::stoi(next());
         else if (a == "--adapt-swaps") opt.adapt_swaps = std::stoi(next());
         else if (a == "--ram-budget-gib") opt.ram_budget_gib = std::stod(next());
@@ -154,9 +163,11 @@ int main(int argc, char** argv) {
             step_log = std::fopen(f.c_str(), "w");
             if (!step_log) { std::fprintf(stderr, "cannot write --step-log %s\n", f.c_str()); return 2; }
             std::fprintf(step_log, "# pos total_ms gpu_ms cpu_experts_ms engram_ms routed vram_hits zero_copy ram_cpu "
-                                   "file_cpu ssd swaps warmed_useful prefetched\n");
+                                   "file_cpu ssd swaps warmed_useful prefetched lead_ms span_ms wait_ms first_wait_ms admit_ms "
+                                   "swaps_ms end_ms\n");
         }
         else if (a == "--force-ids") force_path = next();
+        else if (a == "--continue-ids") cont_path = next();
         else { std::fprintf(stderr, "unknown argument %s\n", a.c_str()); return 2; }
     }
     if (pack.empty() || (ids_s.empty() && force_path.empty())) {
@@ -169,22 +180,30 @@ int main(int argc, char** argv) {
         std::string all((std::istreambuf_iterator<char>(f)), std::istreambuf_iterator<char>());
         forced = parse_ids(all);
     }
+    std::vector<int> cont;
+    if (!cont_path.empty()) {
+        std::ifstream f(cont_path);
+        std::string all((std::istreambuf_iterator<char>(f)), std::istreambuf_iterator<char>());
+        cont = parse_ids(all);
+    }
     try {
         // the teacher-forced path reads logits at the next forced id before the engine sees it
-        for (const auto* ids : {&prompt, &forced})
+        for (const auto* ids : {&prompt, &forced, &cont})
             for (int t : *ids)
                 if (t < 0 || t >= kVocab) throw std::invalid_argument("token id " + std::to_string(t) + " is outside the vocabulary");
         if (gen < 0 || spec_max < 1 || spec_max > 8 || (spec != "none" && spec != "suffix"))
             throw std::invalid_argument("use --gen >= 0, --spec none|suffix, --spec-max 1..8");
         if (spec == "suffix" && (!force_path.empty() || !dump_path.empty()))
             throw std::invalid_argument("--spec suffix cannot be combined with --force-ids or --dump");
+        if (!cont_path.empty() && ((int) cont.size() < gen || spec != "none" || !force_path.empty() || !dump_path.empty()))
+            throw std::invalid_argument("--continue-ids needs at least --gen tokens, without --spec, --force-ids, --dump");
         if (spec_max > kVerifyMaxTokens) {
             std::fprintf(stderr, "spec: cap T at %d until CPU rows 5..8 are validated\n", kVerifyMaxTokens);
             spec_max = kVerifyMaxTokens;
         }
         Engine engine(pack, opt);
         if (force_path.empty() && dump_path.empty()) {
-            generate(engine, opt, prompt, gen, batched, spec == "suffix", spec_max, eos);
+            generate(engine, opt, prompt, gen, batched, spec == "suffix", spec_max, eos, cont);
             return 0;
         }
         if (batched) {   // prefill the prompt (or the forced sequence) in one call, then decode with step()

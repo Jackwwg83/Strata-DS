@@ -3,6 +3,7 @@
 #include "strata/ds41/config.hpp"
 #include "k8/math.hpp"
 
+#include <climits>
 #include <cstdio>
 #include <cstdlib>
 #include <mutex>
@@ -15,6 +16,7 @@ constexpr int kMaxTokens = 8;  // Fixed interface, not a benchmark-derived limit
 constexpr int kWarp = 32;
 constexpr int kSelectThreads = kWarp;  // One independent warp CTA per token.
 static_assert(kDim == 5120 && kExperts == 384 && kTopK == 6);
+static_assert(384 % 8 == 0);
 
 void check(cudaError_t error, const char* where) {
     if (error != cudaSuccess) {
@@ -55,11 +57,17 @@ __device__ __forceinline__ float warp_sum(float value) {
     return value;
 }
 
+// One warp per expert, kDecodeWarps experts per CTA. The warps' logits meet in shared memory and one lane per expert
+// computes the double score: a warp's lane 0 doing it alone issued kDecodeWarps times as many FP64 instructions on
+// the SM's few FP64 units (RTX 5090 Laptop: 12.3 -> 10.5 us; the score bits are unchanged).
+constexpr int kDecodeWarps = 8;
 __global__ void decode_scores(const __nv_bfloat16* __restrict__ x,
                               const __nv_bfloat16* __restrict__ w,
                               double* __restrict__ scores) {
+    __shared__ float logits[kDecodeWarps];
     const int lane = threadIdx.x & 31;
-    const int expert = blockIdx.x * 4 + (threadIdx.x >> 5);
+    const int warp = threadIdx.x >> 5;
+    const int expert = blockIdx.x * kDecodeWarps + warp;
     const __nv_bfloat16* row = w + expert * kDim;
     float acc = 0.0f;
 #pragma unroll 8
@@ -67,7 +75,10 @@ __global__ void decode_scores(const __nv_bfloat16* __restrict__ x,
         acc = __fmaf_rn(__bfloat162float(x[d]), __bfloat162float(row[d]), acc);
     }
     acc = warp_sum(acc);
-    if (lane == 0) scores[expert] = k8_detail::score(acc);
+    if (lane == 0) logits[warp] = acc;
+    __syncthreads();
+    if (threadIdx.x < kDecodeWarps)
+        scores[blockIdx.x * kDecodeWarps + threadIdx.x] = k8_detail::score(logits[threadIdx.x]);
 }
 
 template <int Tokens>
@@ -99,12 +110,28 @@ __global__ void tile_scores(const __nv_bfloat16* __restrict__ x,
     }
 }
 
-__device__ __forceinline__ void warp_best(double& value, int& id) {
+// The biased score as an integer with the same order: a > b in double exactly when key(a) > key(b), and equal
+// doubles give equal keys (-0 is folded to +0). The selector compares keys, because FP64 compares are slow on GPUs
+// with few FP64 units (RTX 5090 Laptop: select_top6 9.7 -> 3.4 us). A NaN gets the lowest key, below the -inf of
+// the empty candidate: as with the double compare, it never wins a comparison.
+__device__ __forceinline__ long long order_key(double value) {
+    const long long bits = __double_as_longlong(value);
+    const long long magnitude = bits & 0x7fffffffffffffffll;
+    if (magnitude > 0x7ff0000000000000ll) return LLONG_MIN;
+    if (magnitude == 0) return 0;
+    return bits < 0 ? (bits ^ 0x7fffffffffffffffll) : bits;
+}
+
+__device__ __forceinline__ bool better_key(long long a, int ai, long long b, int bi) {
+    return a > b || (a == b && ai < bi);
+}
+
+__device__ __forceinline__ void warp_best(long long& key, int& id) {
     for (int offset = 16; offset > 0; offset >>= 1) {
-        const double other = __shfl_down_sync(0xffffffffu, value, offset);
+        const long long other = __shfl_down_sync(0xffffffffu, key, offset);
         const int other_id = __shfl_down_sync(0xffffffffu, id, offset);
-        if (k8_detail::better(other, other_id, value, id)) {
-            value = other;
+        if (better_key(other, other_id, key, id)) {
+            key = other;
             id = other_id;
         }
     }
@@ -119,37 +146,39 @@ __global__ void select_top6(const double* __restrict__ scores,
     const int lane = threadIdx.x;
     // Twelve register-resident candidates per lane, with the original expert
     // IDs retained for ties. Each token is an independent, full-warp CTA.
+    // The comparisons use order_key(score + bias): the same order as k8_detail::better.
     double raw[kPerThread];
-    double values[kPerThread];
+    long long keys[kPerThread];
     int expert_ids[kPerThread];
 #pragma unroll
     for (int j = 0; j < kPerThread; ++j) {
         const int id = lane + j * kWarp;
         raw[j] = scores[token * kExperts + id];
-        values[j] = raw[j] + double(bias[id]);
+        keys[j] = order_key(raw[j] + double(bias[id]));
         expert_ids[j] = id;
     }
+    const long long none = order_key(-INFINITY);
     double selected = 0.0;
     double sum = 0.0;
 #pragma unroll
     for (int i = 0; i < kTopK; ++i) {
-        double value = -INFINITY;
+        long long key = none;
         int id = kExperts;
 #pragma unroll
         for (int j = 0; j < kPerThread; ++j) {
-            if (k8_detail::better(values[j], expert_ids[j], value, id)) {
-                value = values[j];
+            if (better_key(keys[j], expert_ids[j], key, id)) {
+                key = keys[j];
                 id = expert_ids[j];
             }
         }
-        warp_best(value, id);
+        warp_best(key, id);
         const int chosen = __shfl_sync(0xffffffffu, id, 0);
         double unbiased = 0.0;
 #pragma unroll
         for (int j = 0; j < kPerThread; ++j) {
             if (expert_ids[j] == chosen) {
                 unbiased = raw[j];
-                values[j] = -INFINITY;
+                keys[j] = none;
                 expert_ids[j] = kExperts;
             }
         }
@@ -184,7 +213,7 @@ void router_topk(const __nv_bfloat16* x, int m, const __nv_bfloat16* w, const fl
     if (m < 1 || m > kMaxTokens) return;
     double* scores = workspace();
     switch (m) {
-        case 1: decode_scores<<<kExperts / 4, 128, 0, stream>>>(x, w, scores); break;
+        case 1: decode_scores<<<kExperts / kDecodeWarps, kDecodeWarps * kWarp, 0, stream>>>(x, w, scores); break;
         case 2: launch_tile<2>(x, w, scores, stream); break;
         case 3: launch_tile<3>(x, w, scores, stream); break;
         case 4: launch_tile<4>(x, w, scores, stream); break;

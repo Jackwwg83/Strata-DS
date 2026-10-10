@@ -530,6 +530,9 @@ double gpu_case(const Shape& shape, int m, const std::vector<uint8_t>& w,
     check(cudaStreamSynchronize(stream), "GEMV completion");
     const double error = relative_error(got, ref);
     require(error <= 2e-3, "GPU q relative L2 error > 2e-3");
+    // The kernel's own arithmetic, bit for bit: decoded weights, lane ownership, FMA order and reduction tree.
+    // A change of the weight decode (or anything else) that moves one output bit fails here.
+    require(got == host_lane_model(x, w, scales, m, shape), "GPU output bits differ from the host lane model");
     std::vector<uint16_t> other(got.size());
     auto read_other = [&] {
         check(cudaMemcpyAsync(other.data(), dy.p, other.size() * sizeof(uint16_t), cudaMemcpyDeviceToHost, stream),
@@ -562,7 +565,7 @@ double gpu_case(const Shape& shape, int m, const std::vector<uint8_t>& w,
         std::sort(samples.begin(), samples.end()); us = samples[samples.size() / 2];
     }
     const double gbps = us > 0 ? double(w.size() + scales.size()) / (us * 1000) : 0;
-    std::printf("%-18s N=%lld K=%lld m=%d rel=%.9g double_rel=%.9g time_us=%.3f GB/s=%.3f quant=bitwise api=q wrapper=equal%s\n",
+    std::printf("%-18s N=%lld K=%lld m=%d rel=%.9g double_rel=%.9g time_us=%.3f GB/s=%.3f quant=bitwise lanes=bitwise api=q wrapper=equal%s\n",
                 shape.name, (long long)shape.n, (long long)shape.k, m, error, relative_error(got, ref, false),
                 us, gbps, timing ? "" : " (untimed)");
     std::fflush(stdout);

@@ -2098,15 +2098,35 @@ struct Pool
         pin_self(idx);
         uint64_t seen = 0;
         int idle = 0;
+#ifdef __linux__
+        // Strata-DS patch: spin for a time, not a count, before the first nap. 65536 pauses last ~0.8 ms on a Zen 5
+        // laptop, shorter than the gap between two layers' calls in the DeepSeek engine (GPU work, SSD reads), so the
+        // workers napped between layers and each call waited for them: 95 us of its first phase (16 us without naps)
+        // and 15.0 -> 12.6 ms of CPU experts per token on that laptop (code prompt, 2 runs). EXL3_MOE_CPU_SPIN_US
+        // overrides the 10 ms. Back-to-back calls (the K11 benchmark) are not affected.
+        static const double spin_us = [] {
+            const char* e = getenv("EXL3_MOE_CPU_SPIN_US");
+            return e ? atof(e) : 10000.0;
+        }();
+        auto idle_since = std::chrono::steady_clock::now();
+#endif
         while (true) {
             const uint64_t g = dispatch.load(std::memory_order_acquire);
             if (g == seen)
             {
-                // Matches the outer job-ring poll's threshold (moe_handoff.cu)
-                if (++idle < 65536) { cpu_pause(); continue; }
 #ifdef __linux__
+                if (++idle < 1024 || (idle % 1024 != 0) ||
+                    std::chrono::duration<double, std::micro>(std::chrono::steady_clock::now() - idle_since).count() <
+                        spin_us)
+                {
+                    cpu_pause();
+                    continue;
+                }
+                --idle;   // stay past the threshold: every later check naps
                 std::this_thread::sleep_for(std::chrono::microseconds(50));
 #else
+                // Matches the outer job-ring poll's threshold (moe_handoff.cu)
+                if (++idle < 65536) { cpu_pause(); continue; }
                 // Never a timed nap here: Windows rounds short sleeps up to the timer quantum
                 // (default 15.6 ms), and the run() barrier turns one late waker into everyone
                 // oversleeping the next phase dispatc
@@ -2117,6 +2137,9 @@ struct Pool
             }
             idle = 0;
             seen = g;
+#ifdef __linux__
+            idle_since = std::chrono::steady_clock::now();
+#endif
 
             // The participant count may sit below this worker's index (pool shrink, or a
             // small-job dispatch cap): surplus workers must not run the function (their

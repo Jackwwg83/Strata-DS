@@ -324,6 +324,7 @@ VerifyResult Engine::Impl::verify(const std::vector<int>& window, int pos, bool 
                             }
                         }
                     }
+                    if (misses) admit_rows(l, v.db->ids(), m*kTopK);   // the adaptive RAM tier keeps them
                     const double start = now_ms();
                     if (misses)
                         // moe_mul1 groups rows by expert before its weight passes. m never exceeds four.
@@ -397,12 +398,13 @@ void Engine::Impl::commit_verify(int keep) {
     ck(cudaStreamSynchronize(st), "verify commit");
     for (int t = 0; t < keep; ++t) history.push_back(pack.engram_hash().token_map[v.tokens[t]]);
     lg.assign(v.logits_host+(keep-1)*kVocab, v.logits_host+keep*kVocab);
-    if (vram) {
+    if (vram || (host && host->reserve() > 0)) {
         int32_t row[kLayers*kTopK];
         for (int t = 0; t < keep; ++t) {
             for (int l = 0; l < kLayers; ++l)
                 std::copy_n(v.routes_host+(l*VerifyWorkspace::M+t)*kTopK, kTopK, row+l*kTopK);
-            vram->count(row, kTopK);
+            if (vram) vram->count(row, kTopK);
+            if (host && host->reserve() > 0) host->end_step(row, kTopK);   // publish the window's reads, record uses
         }
     }
     // Step reconstructs its index list and candidate mask. No tentative row uses its scratch.
