@@ -12,6 +12,7 @@
 #include "strata/ds41/config.hpp"
 #include "strata/ds41/engine.hpp"
 
+#include <cstdlib>
 #include <algorithm>
 #include <cmath>
 #include <cstdio>
@@ -77,6 +78,9 @@ int main(int argc, char** argv) {
     opt.expert_profile = profile;
     opt.vram_expert_slots = profile.empty() ? 0 : -1;
     opt.adapt_every = 0;   // static residency: the same experts on the same path in every run
+    // the RAM tier static too (adaptive is the default): its prefetch computes guessed RAM experts on the GPU, which
+    // follows the tier's history
+    setenv("DS41_RAM_ADAPT", "0", 1);
     const std::vector<int> a = prompt(700, 1), b = prompt(600, 2);
     try {
         Engine e(pack, opt);
