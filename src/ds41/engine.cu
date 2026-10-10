@@ -153,7 +153,7 @@ struct Engine::Impl {
     float* rope_yarn = nullptr;
 
     // engram: rows of both engram layers for the current step, read before the step's GPU work
-    std::unique_ptr<EngramRows> eng_rows;   // O_DIRECT reads (upstream DirectFile): the rows bypass the file cache
+    std::vector<std::unique_ptr<EngramRows>> eng_rows;   // per table; O_DIRECT reads (upstream DirectFile): no file cache
     int n_eng = 0;                     // engram tables
     std::vector<std::vector<int64_t>> eng_ids;   // [table][kEngRows] the rows of the current step
     std::vector<int32_t> history;      // compressed token ids fed so far
@@ -233,11 +233,21 @@ struct Engine::Impl {
     cudaStream_t st_kv = nullptr;
     cudaEvent_t kv_fork = nullptr, kv_join = nullptr;
     float* act_kv = nullptr;
+    // decode engram: its rows depend on the tokens only, so each table's wait, row copy, dequant and wkv GEMV (157 MB,
+    // ~208 us) run on st_eng (low priority) from the step's start, beside layers 0.. while the GPU mostly waits for the
+    // CPU experts; the engram layer waits for eng_join[li], then applies eng_kv + li * (kHc + 1) * kDim to h.
+    // act_eng is the GEMV's FP8 activation scratch
+    cudaStream_t st_eng = nullptr;
+    cudaEvent_t eng_fork = nullptr;
+    std::vector<cudaEvent_t> eng_join;
+    float* act_eng = nullptr;
     StepParams* hp = nullptr;          // pinned staging of the next replay
     int* dp = nullptr;                 // device copy: dp[0] token, dp[1] pos, dp[2] t1, dp[3] t2, dp[4] engram epoch
-    // decode engram rows read beside the step's first layer: a reader thread fills eng_host and raises eng_flag
-    // (mapped) to the step's epoch; the graph waits for it before copying the rows, just before layer 1
-    uint32_t* eng_flag = nullptr;      // mapped host word
+    // decode engram rows read beside the step's first layers: a reader thread fills eng_host table by table and
+    // raises the table's flag (mapped) to the step's epoch; the graph waits for a table's flag before copying its rows,
+    // just before its engram layer (layer 1 waits for table 0 only, layer 14 for table 1)
+    static constexpr int kEngFlagStride = 16;   // one flag per table, 64 bytes apart
+    uint32_t* eng_flag = nullptr;      // mapped host words: table li's flag at eng_flag[li * kEngFlagStride]
     uint32_t* eng_flag_dev = nullptr;
     uint32_t eng_epoch = 0;
     std::thread eng_thread;
@@ -284,7 +294,9 @@ struct Engine::Impl {
         }
         eng_cv.notify_all();
         if (eng_thread.joinable()) eng_thread.join();
-        if (eng_flag) __atomic_store_n(eng_flag, ~0u, __ATOMIC_RELEASE);   // a step that threw: release its wait
+        if (eng_flag)   // a step that threw: release its waits
+            for (int li = 0; li < std::max(n_eng, 1); ++li)
+                __atomic_store_n(eng_flag + li * kEngFlagStride, ~0u, __ATOMIC_RELEASE);
         // the lookahead calls into both tiers, and the VRAM tier's copy thread writes into RAM slots: stop them first
         lookahead.reset();
         vram.reset();
@@ -308,6 +320,9 @@ struct Engine::Impl {
         if (st_kv) cudaStreamDestroy(st_kv);
         if (kv_fork) cudaEventDestroy(kv_fork);
         if (kv_join) cudaEventDestroy(kv_join);
+        if (st_eng) cudaStreamDestroy(st_eng);
+        if (eng_fork) cudaEventDestroy(eng_fork);
+        for (cudaEvent_t e : eng_join) cudaEventDestroy(e);
         if (pfh.base) cudaFreeHost(pfh.base);
     }
 
@@ -483,9 +498,12 @@ struct Engine::Impl {
             std::vector<EngramRows::Table> tabs;
             for (const auto& t : pack.engram_tables()) tabs.push_back({t.path, t.weight_offset, t.scale_offset});
             n_eng = (int) tabs.size();
-            // every request of a step in flight at once: 24 rows x (weight, scale) per table, one thread each (on a disk
-            // with 0.6 ms random-read latency, 16 threads made it 5.9 ms per token)
-            if (n_eng) eng_rows = std::make_unique<EngramRows>(tabs, kEngRows, 256, 8, 2 * kEngRows);   // per table
+            // every request of a table in flight at once: 24 rows x (weight, scale), one thread each (on a disk with
+            // 0.6 ms random-read latency, 16 threads made it 5.9 ms per token). One reader per table: the decode reads
+            // table 0 first (laptop, idle: one table 0.50 ms, both together 1.05 ms)
+            for (const auto& t : tabs)
+                eng_rows.push_back(std::make_unique<EngramRows>(std::vector<EngramRows::Table>{t}, kEngRows, 256, 8,
+                                                                2 * kEngRows));
             eng_ids.assign(n_eng, std::vector<int64_t>(kEngRows, 0));
         }
         const size_t eng_bytes = (size_t) n_eng * kEngRows * (256 + 8);
@@ -493,8 +511,9 @@ struct Engine::Impl {
         ck(cudaHostAlloc((void**) &eng_host, std::max<size_t>(eng_bytes, 16), cudaHostAllocMapped), "engram pinned");
         ck(cudaHostGetDevicePointer((void**) &eng_host_dev, eng_host, 0), "engram pinned alias");
         eng_dev = dalloc_own<uint8_t>(std::max<size_t>(eng_bytes, 1));
-        ck(cudaHostAlloc((void**) &eng_flag, sizeof(uint32_t), cudaHostAllocMapped), "engram flag");
-        *eng_flag = 0;
+        const size_t flag_bytes = (size_t) std::max(n_eng, 1) * kEngFlagStride * sizeof(uint32_t);
+        ck(cudaHostAlloc((void**) &eng_flag, flag_bytes, cudaHostAllocMapped), "engram flags");
+        std::memset(eng_flag, 0, flag_bytes);
         ck(cudaHostGetDevicePointer((void**) &eng_flag_dev, eng_flag, 0), "engram flag alias");
         if (n_eng) eng_thread = std::thread([this] { engram_worker(); });
         // scratch
@@ -519,10 +538,11 @@ struct Engine::Impl {
         sh_out = dalloc_own<bf16>(kDim);
         ffn_out = dalloc_own<bf16>(kDim);
         eng_vals = dalloc_own<bf16>(24 * 256);
-        eng_kv = dalloc_own<bf16>((kHc + 1) * kDim);
+        eng_kv = dalloc_own<bf16>((size_t) std::max(n_eng, 1) * (kHc + 1) * kDim);   // per table
         final_x = dalloc_own<bf16>(kDim);
         act = dalloc_own<float>(8192);
         act_kv = dalloc_own<float>(8192);
+        act_eng = dalloc_own<float>(8192);
         pre_mix = dalloc_own<float>(kHc);
         pre = dalloc_own<float>(kHc);
         post = dalloc_own<float>(kHc);
@@ -552,6 +572,14 @@ struct Engine::Impl {
         ck(cudaStreamCreateWithFlags(&st_kv, cudaStreamNonBlocking), "decode kv stream");
         ck(cudaEventCreateWithFlags(&kv_fork, cudaEventDisableTiming), "kv fork");
         ck(cudaEventCreateWithFlags(&kv_join, cudaEventDisableTiming), "kv join");
+        {
+            int lo = 0, hi = 0;   // st_eng gets the lowest priority: the layer chain's blocks go first
+            ck(cudaDeviceGetStreamPriorityRange(&lo, &hi), "stream priorities");
+            ck(cudaStreamCreateWithPriority(&st_eng, cudaStreamNonBlocking, lo), "decode engram stream");
+        }
+        ck(cudaEventCreateWithFlags(&eng_fork, cudaEventDisableTiming), "engram fork");
+        eng_join.assign(n_eng, nullptr);
+        for (cudaEvent_t& e : eng_join) ck(cudaEventCreateWithFlags(&e, cudaEventDisableTiming), "engram join");
         ck(cudaHostAlloc((void**) &hp, sizeof(StepParams), cudaHostAllocDefault), "step params");
         ck(cudaHostAlloc((void**) &hp_next, sizeof(int), cudaHostAllocDefault), "next token");
         ck(cudaHostAlloc((void**) &lg_pinned, (size_t) kVocab * 4, cudaHostAllocDefault), "logits");
@@ -904,25 +932,23 @@ struct Engine::Impl {
             throw std::runtime_error("engram table order does not match engram_hash.txt");
     }
 
-    /// The rows of every engram table for this step, into the pinned buffer, all reads in flight together.
-    void engram_read_all() {
-        if (!n_eng) return;
+    /// The rows of engram table li for this step, into the pinned buffer, all reads of the table in flight together.
+    void engram_read(int li) {
         const auto& hs = pack.engram_hash();
         const int cols = (hs.max_ngram - 1) * hs.n_heads;
-        std::vector<const int64_t*> ids;
-        std::vector<uint8_t*> w, s;
-        for (int li = 0; li < n_eng; ++li) {
-            uint8_t* base = eng_host + (size_t) li * kEngRows * (256 + 8);
-            ids.push_back(eng_ids[li].data());
-            w.push_back(base);
-            s.push_back(base + kEngRows * 256);
-        }
-        eng_rows->read(ids, cols, w, s);
+        uint8_t* base = eng_host + (size_t) li * kEngRows * (256 + 8);
+        if (li == 0 && fault("engram_read")) throw std::runtime_error("ds41 test fault: engram row read");
+        eng_rows[li]->read({eng_ids[li].data()}, cols, {base}, {base + kEngRows * 256});
+    }
+    /// The rows of every engram table for this step, table by table.
+    void engram_read_all() {
+        for (int li = 0; li < n_eng; ++li) engram_read(li);
     }
 
-    /// The decode engram reader: one step's rows at a time (post_engram), then the flag the graph waits for. The flag
-    /// rises even when the read fails (the GPU must not wait forever); finish_engram rethrows the error after the
-    /// step. Reading beside layer 0 instead of before the step hides most of the read (~1.4 ms on the laptop).
+    /// The decode engram reader: one step's rows at a time (post_engram), table by table, each table's flag raised
+    /// when its rows are in. Every flag rises even when a read fails (the GPU must not wait forever); finish_engram
+    /// rethrows the error after the step. Reading beside layer 0 instead of before the step hides most of the read
+    /// (~1.4 ms on the laptop); a flag per table lets layer 1 start once table 0 is in.
     void engram_worker() {
         std::unique_lock<std::mutex> lk(eng_mu);
         while (true) {
@@ -933,13 +959,17 @@ struct Engine::Impl {
             lk.unlock();
             const double t0 = now_ms();
             std::exception_ptr error;
-            try {
-                engram_read_all();
-            } catch (...) {
-                error = std::current_exception();
+            for (int li = 0; li < n_eng; ++li) {
+                if (!error) {
+                    try {
+                        engram_read(li);
+                    } catch (...) {
+                        error = std::current_exception();
+                    }
+                }
+                __atomic_store_n(eng_flag + li * kEngFlagStride, epoch, __ATOMIC_RELEASE);
             }
             const double ms = now_ms() - t0;
-            __atomic_store_n(eng_flag, epoch, __ATOMIC_RELEASE);
             lk.lock();
             eng_error = error;
             eng_read_ms = ms;
@@ -970,14 +1000,32 @@ struct Engine::Impl {
         }
     }
 
-    /// Engram.forward for layer l (engram layer li) from the rows engram_read put on the device.
-    void engram(int l, int li) {
+    /// Engram.forward for every table, the part that reads no hidden state, on st_eng: the table's rows (once the
+    /// reader raised its flag), dequant and the wkv GEMV into the table's eng_kv, then eng_join[li].
+    void engram_kv() {
         const auto& hs = pack.engram_hash();
         const int cols = (hs.max_ngram - 1) * hs.n_heads;
-        const uint8_t* w = eng_dev + (size_t) li * kEngRows * (256 + 8);
-        ops::engram_dequant(w, w + kEngRows * 256, cols, eng_vals, st);
-        fp8_linear(eng_vals, L[l].eng_wkv, eng_kv);
-        ops::engram_apply(h, eng_kv, L[l].eng_qw, L[l].eng_kw, kNormEps, 1, st);
+        ck(cudaEventRecord(eng_fork, st), "engram fork");   // after the step parameters (dp[4], the epoch)
+        ck(cudaStreamWaitEvent(st_eng, eng_fork, 0), "engram fork wait");
+        for (int li = 0; li < n_eng; ++li) {
+            wait_engram_k<<<1, 1, 0, st_eng>>>(eng_flag_dev + li * kEngFlagStride, dp);
+            ck(cudaGetLastError(), "engram wait");
+            const size_t off = (size_t) li * kEngRows * (256 + 8);
+            const int n16 = kEngRows * (256 + 8) / 16;
+            engram_rows_k<<<(n16 + 255) / 256, 256, 0, st_eng>>>((const uint4*) (eng_host_dev + off),
+                                                                 (uint4*) (eng_dev + off), n16);
+            ck(cudaGetLastError(), "engram rows");
+            const uint8_t* w = eng_dev + off;
+            ops::engram_dequant(w, w + kEngRows * 256, cols, eng_vals, st_eng);
+            fp8_linear_on(eng_vals, L[pack.engram_tables()[li].layer].eng_wkv, eng_kv + (size_t) li * (kHc + 1) * kDim,
+                          act_eng, st_eng);
+            ck(cudaEventRecord(eng_join[li], st_eng), "engram join");
+        }
+    }
+    /// Engram.forward for layer l (engram layer li): wait for its eng_kv, apply it to h.
+    void engram(int l, int li) {
+        ck(cudaStreamWaitEvent(st, eng_join[li], 0), "engram join wait");
+        ops::engram_apply(h, eng_kv + (size_t) li * (kHc + 1) * kDim, L[l].eng_qw, L[l].eng_kw, kNormEps, 1, st);
     }
 
     // ------------------------------------------------------------------------------------- indexer
@@ -1936,22 +1984,14 @@ struct Engine::Impl {
         ck(cudaMemcpyAsync(dp, hp, sizeof(StepParams), cudaMemcpyHostToDevice, st), "step params");
         ops::window_index_device(dp + 1, idx_dev, st);
         ops::embed_device(embed, dp, h, st);
+        if (n_eng) engram_kv();
         // the stream's collapse weights: one-hot at the first layer, then the previous layer's ffn_pre. Read in place:
         // a 16-byte copy node per layer left a 12-24 us gap on the GPU chain (nsys, RTX 5090 Laptop)
         const float* pre_in = one_hot_dev;
         int eng_i = 0;
         for (int l = 0; l < kLayers; ++l) {
             auto& y = L[l];
-            if (is_engram_layer(l) && eng_i == 0) {   // every table's rows, read beside the layers before
-                wait_engram_k<<<1, 1, 0, st>>>(eng_flag_dev, dp);
-                ck(cudaGetLastError(), "engram wait");
-                const int n16 = n_eng * kEngRows * (256 + 8) / 16;
-                if (n16 > 0) {
-                    engram_rows_k<<<(n16 + 255) / 256, 256, 0, st>>>((const uint4*) eng_host_dev, (uint4*) eng_dev, n16);
-                    ck(cudaGetLastError(), "engram rows");
-                }
-            }
-            if (is_engram_layer(l)) engram(l, eng_i++);
+            if (is_engram_layer(l) && eng_i < n_eng) engram(l, eng_i++);
             const bool dbg_layer = dbg && (l == 1 || l == 2);
             if (dbg_layer) dbg_write(h, kHc * kDim);                    // block input (after engram)
             // attention sub-block: h -> h2

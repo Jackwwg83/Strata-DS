@@ -1,6 +1,8 @@
 // src/ds41/tests/engine_failure_test.cpp - the engine's input checks and failure paths (PR #10 review).
 //   --case tokens       an out-of-range token is refused before any state changes; the engine stays usable
 //   --case engram       a failure before the step reaches the device: the history is restored, the step can be retried
+//   --case engram_read  a failed row read in the engram reader thread (table 0): every table's flag still rises, so the
+//                       step does not hang on the device; the step rethrows the read error
 //   --case worker       an exception in the CPU expert worker is rethrown by the step (not std::terminate); the engine
 //                       then refuses every call
 //   --case prefill      a failure before the first prefill pass leaves the engine usable; one inside a pass does not
@@ -83,6 +85,12 @@ int main(int argc, char** argv) {
             int next = -1;
             check(!throws([&] { next = e.step(prompt[0], 0); }), "the same position can be retried");
             check(!throws([&] { e.step(prompt[1], 1); }), "and decoding continues");
+        } else if (which == "engram_read") {
+            setenv("DS41_TEST_FAULT", "engram_read", 1);
+            Engine e(pack, opt);
+            std::string msg;
+            check(throws([&] { e.step(prompt[0], 0); }, &msg) && msg.find("engram") != std::string::npos,
+                  "the failed engram read surfaces (and the step returned: no table's wait hung)");
         } else if (which == "worker") {
             setenv("DS41_TEST_FAULT", "worker", 1);
             Engine e(pack, opt);
