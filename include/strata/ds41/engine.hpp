@@ -152,13 +152,14 @@ public:
         double gpu_ms = 0, cpu_experts_ms = 0, engram_ms = 0, total_ms = 0;
         int expert_hits = 0, expert_total = 0;   ///< VRAM hits and all routed uses
         int cpu_experts() const { return ram_experts + file_experts; }
-        int zero_copy_experts() const { return expert_total - expert_hits - cpu_experts(); }
+        int zero_copy_experts() const { return expert_total - expert_hits - cpu_experts() - skipped; }
         int vram_swaps = 0;   ///< adaptive swaps committed before this step
         /// the CPU's experts by tier: from the RAM copy, from the mapped file, and of those, the ones with pages
         /// missing from RAM when computed (read from the SSD)
         int ram_experts = 0, file_experts = 0, ssd_experts = 0;
         int warmed = 0, warmed_useful = 0;   ///< lookahead: file-tier experts warmed, and of those, used next layer
         int prefetched = 0;   ///< misses the GPU computed from the prefetch buffer (DS41_PREFETCH), in zero_copy_experts()
+        int skipped = 0;      ///< uses left out by the route tail skip (DS41_ROUTE_TAIL_SKIP), outside VRAM hits
         /// the decode step's critical path, seen from the CPU expert worker (step() only): step start to the worker's
         /// wake (lead), the worker's wake to its last layer done (span); inside the span, the waits for the GPU to
         /// publish a layer (layer 0's wait alone: first_wait) and the adaptive RAM tier's reads (admit). Outside it:

@@ -288,7 +288,7 @@ void Engine::Impl::enqueue_verify(int m) {
         v.db->publish(v.half, ids, w, m, tier ? vram->res_dev()+size_t(l)*kExperts : nullptr, v.selected,
                       l+1, st, tier ? vram->experts_dev() : nullptr, ram, zc_quota ? zc_quota.get()+l : nullptr,
                       nullptr, nullptr, pf && l > 0 ? prefetch->ids(l) : nullptr,
-                      pf && l > 0 ? prefetch->descs(l) : nullptr, pf ? ExpertPrefetch::kMaxGuesses : 0);
+                      pf && l > 0 ? prefetch->descs(l) : nullptr, pf ? ExpertPrefetch::kMaxGuesses : 0, tail_rank);
         if (pf && l+1 < kLayers)
             prefetch->plan_rows(l+1, v.xf, m, L[l+1].gate_w, L[l+1].gate_bias,
                                 tier ? vram->res_dev()+size_t(l+1)*kExperts : nullptr,
@@ -392,6 +392,7 @@ VerifyResult Engine::Impl::verify(const std::vector<int>& window, int pos, bool 
     worker_misses = 0;
     worker_ram = worker_file = worker_ssd = 0;
     worker_prefetched = 0;
+    worker_skipped = 0;
     {
         std::lock_guard<std::mutex> lk(mu);
         job_db = v.db.get();
@@ -439,6 +440,7 @@ VerifyResult Engine::Impl::verify(const std::vector<int>& window, int pos, bool 
     tm.file_experts = worker_file.load();
     tm.ssd_experts = worker_ssd.load();
     tm.prefetched = worker_prefetched.load();
+    tm.skipped = worker_skipped.load();
     tm.cpu_experts_ms = worker_us.load() / 1000.0;
     tm.worker_lead_ms = worker_wake_at.load() - begin;
     tm.worker_span_ms = worker_end_at.load() - worker_wake_at.load();

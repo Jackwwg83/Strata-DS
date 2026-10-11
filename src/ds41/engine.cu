@@ -206,6 +206,13 @@ struct Engine::Impl {
     std::shared_ptr<ExpertBlob> zc_blobs; // immutable [layers][experts] pack metadata
     std::unique_ptr<ExpertPrefetch> prefetch;   // DS41_PREFETCH=N: the next layer's N guessed experts, copied ahead
     std::atomic<int> worker_prefetched{0};
+    std::atomic<int> worker_skipped{0};
+    /// upstream's route tail skip (STRATA_ROUTE_TAIL_SKIP, on by default on CUDA since 0.1.42): an expert outside VRAM
+    /// that every token of a step or window routes at rank tail_rank or lower (0 = best of 6) is neither copied nor
+    /// computed; the others keep their weights. DS41_ROUTE_TAIL_SKIP=R sets the rank, 0 turns it off; off by default
+    /// when the VRAM tier holds 90% of the experts or more (upstream #1884), and for batch slots. Changes the output.
+    int tail_rank = 0;
+    static constexpr int kDefaultTailRank = 4;   // ranks 4 and 5 of 0..5: the last two of six (upstream: the last 3 of 10)
     int32_t* routes_dev = nullptr;     // [40][6]
     float* weights_dev = nullptr;      // [40][6]
     uint8_t* cand_dev = nullptr;       // [max_seq] candidate mask of the candidate layer
@@ -699,6 +706,16 @@ struct Engine::Impl {
             std::fprintf(stderr, "ds41: %d VRAM expert slots (%.2f GiB)\n", vram->slots(),
                          vram->arena_bytes() / (double) (1ull << 30));
         }
+        {
+            const char* e = std::getenv("DS41_ROUTE_TAIL_SKIP");
+            const double cached = vram ? (double) vram->slots() / (double) (kLayers * kExperts) : 0.0;
+            tail_rank = e ? std::atoi(e) : (vram && cached < 0.90 ? kDefaultTailRank : 0);
+            if (tail_rank < 0 || tail_rank >= kTopK) tail_rank = 0;
+            if (tail_rank)
+                std::fprintf(stderr, "ds41: route tail skip ON%s: an expert outside VRAM that every token routes at rank "
+                                     "%d or lower (of %d) is left out; DS41_ROUTE_TAIL_SKIP=0 turns it off\n",
+                             e ? "" : " (default)", tail_rank + 1, kTopK);
+        }
         // the RAM tier after it: the hottest experts the VRAM tier does not hold (upstream's resident budget)
         if (!opt.expert_profile.empty() && opt.ram_budget_gib != 0) {
             const size_t budget = opt.ram_budget_gib < 0 ? auto_ram_budget(ram_adapt ? 8ull << 30 : 24ull << 30)
@@ -900,7 +917,8 @@ struct Engine::Impl {
             }
             if (lookahead && m == 1) lookahead->observe(l, file_ids, n_file);
             // Keep expert_hits as VRAM hits. Timing derives CPU and zero-copy counts from the partition.
-            worker_misses += misses + d->counts().zero_copy + d->counts().prefetched;
+            worker_misses += misses + d->counts().zero_copy + d->counts().prefetched + d->counts().skipped;
+            worker_skipped += d->counts().skipped;
             worker_prefetched += d->counts().prefetched;
             const double t0 = now_ms();
             try {
@@ -1201,7 +1219,7 @@ struct Engine::Impl {
                     zc_quota ? zc_quota.get() + l : nullptr,
                     ram ? zc_stage.get() : nullptr, ram && zc_blobs ? zc_blobs.get() + (size_t) l * kExperts : nullptr,
                     pf && l > 0 ? prefetch->ids(l) : nullptr, pf && l > 0 ? prefetch->descs(l) : nullptr,
-                    pf ? prefetch->guesses() : 0);
+                    pf ? prefetch->guesses() : 0, tail_rank);
         // layer l + 1's guesses from this layer's expert input, and their copy, beside the rest of this layer
         if (pf && l + 1 < kLayers)
             prefetch->plan(l + 1, xf, L[l + 1].gate_w, L[l + 1].gate_bias,
@@ -2207,6 +2225,7 @@ struct Engine::Impl {
         worker_misses = 0;
         worker_ram = worker_file = worker_ssd = 0;
         worker_prefetched = 0;
+        worker_skipped = 0;
         {
             std::lock_guard<std::mutex> lk(mu);
             job_db = db.get();
@@ -2289,6 +2308,7 @@ struct Engine::Impl {
         tm.file_experts = worker_file.load();
         tm.ssd_experts = worker_ssd.load();
         tm.prefetched = worker_prefetched.load();
+        tm.skipped = worker_skipped.load();
         if (lookahead) {
             const auto st_ = lookahead->take_stats();
             tm.warmed = (int) st_.warmed;

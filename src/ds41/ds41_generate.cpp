@@ -81,7 +81,7 @@ static void generate(Engine& engine, const EngineOptions& opt, const std::vector
     int pos = int(prompt.size()), rounds = 0, accepted = 0;
     double step_ms = 0;            // plain decode: the engine's step times, as the forced path reports them
     int differ = 0;                // oracle: rows whose prediction differs from the file
-    int64_t hits = 0, routed = 0;
+    int64_t hits = 0, routed = 0, skipped = 0;
     const auto begin = std::chrono::steady_clock::now();
     while (int(out.size()) < count && next != eos) {
         const int limit = std::min({max_t, count-int(out.size()), opt.max_seq-pos});
@@ -96,6 +96,7 @@ static void generate(Engine& engine, const EngineOptions& opt, const std::vector
                              tm.vram_swaps, tm.warmed_useful, tm.prefetched, tm.worker_lead_ms, tm.worker_span_ms,
                              tm.worker_wait_ms, tm.worker_first_wait_ms, tm.admit_ms, tm.swaps_ms, tm.end_ms);
             step_ms += tm.total_ms;
+            skipped += tm.skipped;
             hits += tm.expert_hits;
             routed += tm.expert_total;
             if (!cont.empty()) next = cont[out.size()];
@@ -120,6 +121,8 @@ static void generate(Engine& engine, const EngineOptions& opt, const std::vector
                     "hits %d of %d wait_ms %.2f admit_ms %.2f ssd %d ram %d\n", pos, window.size(), keep-1, keep,
                     verify_ms, tm.engram_ms, tm.cpu_experts_ms, tm.expert_hits, tm.expert_total, tm.worker_wait_ms,
                     tm.admit_ms, tm.ssd_experts, tm.ram_experts);
+        skipped += tm.skipped;
+        routed += tm.expert_total;
         for (int i = 0; i < keep; ++i) {
             const int t = oracle ? cont[out.size()] : result.next[i];
             if (oracle && result.next[i] != t) ++differ;
@@ -138,6 +141,7 @@ static void generate(Engine& engine, const EngineOptions& opt, const std::vector
     const double ms = suffix ? seconds * 1000.0 : step_ms;
     std::printf("decode_ms_per_token %.1f over %d steps\n", decoded > 0 ? ms / decoded : 0.0, decoded);
     if (oracle) std::printf("oracle_rows_differing %d of %d\n", differ, decoded);
+    std::printf("tail_skipped %lld of %lld routed uses\n", (long long) skipped, (long long) routed);
     if (!suffix)
         std::printf("vram_expert_slots %d hit_rate %.4f\n", engine.vram_expert_slots(),
                     routed ? (double) hits / routed : 0.0);
