@@ -356,47 +356,24 @@ VerifyResult Engine::Impl::verify(const std::vector<int>& window, int pos, bool 
         executable = it->second;
     }
     v.db->reset();
-    std::atomic<bool> cancel{false};
-    std::exception_ptr worker_error;
-    // The original decode worker is idle. Use a separate doorbell and leave its protocol unchanged.
-    std::thread cpu([&] {
-        for (int l = 0; l < kLayers; ++l) {
-            if (!v.db->wait_published(l+1, cancel)) return;
-            const auto counts = v.db->counts();
-            tm.expert_hits += counts.vram;
-            if (!worker_error) {
-                try {
-                    c10::Half weights[kVerifyMaxTokens*kTopK];
-                    int misses = 0;
-                    for (int i = 0; i < m*kTopK; ++i) {
-                        weights[i] = c10::Half(__half_as_ushort(__float2half_rn(v.db->w()[i])), c10::Half::from_bits());
-                        const int e = v.db->ids()[i];
-                        if (e < 0) continue;
-                        ++misses;
-                        if (host && host->slot_of(l, e) >= 0) ++tm.ram_experts;
-                        else {
-                            ++tm.file_experts;
-                            if (file_pages_missing(l, e)) {
-                                ++tm.ssd_experts;
-                                if (fetch_now) warm_file_expert(l, e);
-                            }
-                        }
-                    }
-                    if (misses) admit_rows(l, v.db->ids(), m*kTopK);   // the adaptive RAM tier keeps them
-                    const double start = now_ms();
-                    if (misses)
-                        // moe_mul1 groups rows by expert before its weight passes. m never exceeds four.
-                        exl3_moe_cpu_forward_raw(L[l].moe_handle, (const at::Half*)v.db->x(), v.db->ids(), weights,
-                                                v.db->y(), m, kTopK, cpu_threads);
-                    else std::fill_n(v.db->y(), m*kDim, 0.0f);
-                    tm.cpu_experts_ms += now_ms()-start;
-                } catch (...) { worker_error = std::current_exception(); }
-            }
-            // Finish the protocol on failure. The caller rejects the entire window after the stream drains.
-            if (worker_error) std::fill_n(v.db->y(), m*kDim, 0.0f);
-            v.db->mark_done(l+1);
-        }
-    });
+    // the decode worker computes the window's CPU experts: the job is the window's doorbell and its m rows
+    worker_us = 0;
+    worker_misses = 0;
+    worker_ram = worker_file = worker_ssd = 0;
+    worker_prefetched = 0;
+    {
+        std::lock_guard<std::mutex> lk(mu);
+        job_db = v.db.get();
+        job_m = m;
+        job_cancel = false;
+        ++go;
+    }
+    cv.notify_all();
+    const uint64_t job = go;
+    auto job_end = [&] {
+        std::unique_lock<std::mutex> lk(mu);
+        cv.wait(lk, [&] { return jobs_done >= job; });
+    };
     verify_pending = true;
     verify_failed = true;
     try {
@@ -404,16 +381,35 @@ VerifyResult Engine::Impl::verify(const std::vector<int>& window, int pos, bool 
         else enqueue_verify(m);
         ck(cudaStreamSynchronize(st), "verify completion");
     } catch (...) {
-        cancel = true;
-        cpu.join();
+        job_cancel = true;
+        job_end();
         // Release any enqueued wait before workspace destruction. Never commit this failed window.
         v.db->mark_done(kLayers);
         cudaStreamSynchronize(st);
         throw;
     }
-    cpu.join();
+    job_end();
     if (n_eng) finish_engram(tm);
-    if (worker_error) std::rethrow_exception(worker_error);
+    {
+        std::lock_guard<std::mutex> lk(mu);
+        if (worker_error) {
+            std::exception_ptr e = worker_error;
+            worker_error = nullptr;
+            std::rethrow_exception(e);
+        }
+    }
+    tm.expert_total = m*kLayers*kTopK;
+    tm.expert_hits = tm.expert_total - worker_misses.load();
+    tm.ram_experts = worker_ram.load();
+    tm.file_experts = worker_file.load();
+    tm.ssd_experts = worker_ssd.load();
+    tm.prefetched = worker_prefetched.load();
+    tm.cpu_experts_ms = worker_us.load() / 1000.0;
+    tm.worker_lead_ms = worker_wake_at.load() - begin;
+    tm.worker_span_ms = worker_end_at.load() - worker_wake_at.load();
+    tm.worker_wait_ms = worker_wait.load();
+    tm.worker_first_wait_ms = worker_first_wait.load();
+    tm.admit_ms = worker_admit.load();
     v.warmed = true;
     VerifyResult result;
     result.graph_reused = reused;
@@ -423,7 +419,6 @@ VerifyResult Engine::Impl::verify(const std::vector<int>& window, int pos, bool 
         for (int t = 0; t < m; ++t)
             result.logits[t].assign(v.logits_host+t*kVocab, v.logits_host+(t+1)*kVocab);
     }
-    tm.expert_total = m*kLayers*kTopK;
     tm.total_ms = now_ms()-begin;
     tm.gpu_ms = tm.total_ms;   // the engram rows are read beside the first layers
     verify_failed = false;

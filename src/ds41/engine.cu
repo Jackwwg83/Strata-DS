@@ -167,8 +167,13 @@ struct Engine::Impl {
     std::thread worker;
     std::mutex mu;
     std::condition_variable cv;
-    uint64_t go = 0;                   // steps released to the worker
+    uint64_t go = 0;                   // jobs released to the worker
+    uint64_t jobs_done = 0;            // jobs the worker finished (all layers, or cancelled), under mu
     std::atomic<bool> stop{false};
+    // the released job: a step (db, 1 row) or a verify window (its doorbell, m rows); job_cancel ends its waits
+    ExpertDoorbell* job_db = nullptr;
+    int job_m = 1;
+    std::atomic<bool> job_cancel{false};
     std::atomic<int64_t> worker_us{0}; // CPU expert time of the current step
     // the worker's critical-path timing of the current step (Timing::worker_*): stored by the worker before it marks
     // the last layer done, read after the step's device sync (the GPU cannot finish before that mark)
@@ -306,6 +311,7 @@ struct Engine::Impl {
         {
             std::lock_guard<std::mutex> lk(mu);
             stop = true;
+            job_cancel = true;
         }
         cv.notify_all();
         if (worker.joinable()) worker.join();
@@ -795,111 +801,131 @@ struct Engine::Impl {
 
     // ------------------------------------------------------------------------------------- cpu experts
     /// The CPU expert thread: per released step, layers 0..39 in order, each when the GPU publishes it.
+    /// The CPU expert thread: per released job (a step: db, one row; a verify window: its doorbell, m rows), layers
+    /// 0..39 in order, each when the GPU publishes it. A layer's misses that are in no tier are read into the adaptive
+    /// RAM tier once for all rows; one exl3_moe_cpu_forward_raw call computes every row's CPU experts.
     void worker_loop() {
         uint64_t seen = 0;
         for (;;) {
+            ExpertDoorbell* d = nullptr;
+            int m = 1;
             {
                 std::unique_lock<std::mutex> lk(mu);
                 cv.wait(lk, [&] { return stop.load() || go != seen; });
                 if (stop) return;
                 seen = go;
+                d = job_db;
+                m = job_m;
             }
-            const double wake = now_ms();
-            double ready = wake, wait = 0, first_wait = 0, admit = 0;   // ready: since when the worker waits for the GPU
-            for (int l = 0; l < kLayers; ++l) {
-                if (!db->wait_published(l + 1, stop)) return;
-                const double published = now_ms();
-                wait += published - ready;
-                if (l == 0) first_wait = published - ready;
-                if (lookahead) lookahead->post(l, db->x());   // predict layer l+1 while this layer computes
-                if (lookahead && pred_stats && l + 1 < kLayers)   // DS41_PREDICT_STATS: layer l+1's top 12 from x_l
-                    lookahead->predict_now(l + 1, (const uint16_t*) db->x(), kPredK, pred_ids.data() + (l + 1) * kPredK);
-                c10::Half wh[kTopK];
-                for (int i = 0; i < kTopK; ++i) {
-                    const __half hv = __float2half_rn(db->w()[i]);
-                    wh[i] = c10::Half(__half_as_ushort(hv), c10::Half::from_bits());
+            run_job(d, m);
+            {
+                std::lock_guard<std::mutex> lk(mu);
+                jobs_done = seen;
+            }
+            cv.notify_all();
+            if (stop) return;
+        }
+    }
+
+    void run_job(ExpertDoorbell* d, const int m) {
+        constexpr int kMaxUses = kVerifyMaxTokens * kTopK;
+        const int uses = m * kTopK;
+        const double wake = now_ms();
+        double ready = wake, wait = 0, first_wait = 0, admit = 0;   // ready: since when the worker waits for the GPU
+        for (int l = 0; l < kLayers; ++l) {
+            if (!d->wait_published(l + 1, job_cancel)) return;
+            const double published = now_ms();
+            wait += published - ready;
+            if (l == 0) first_wait = published - ready;
+            if (lookahead && m == 1) lookahead->post(l, d->x());   // predict layer l+1 while this layer computes
+            if (lookahead && m == 1 && pred_stats && l + 1 < kLayers)   // DS41_PREDICT_STATS: layer l+1's top 12
+                lookahead->predict_now(l + 1, (const uint16_t*) d->x(), kPredK, pred_ids.data() + (l + 1) * kPredK);
+            c10::Half wh[kMaxUses];
+            for (int i = 0; i < uses; ++i) {
+                const __half hv = __float2half_rn(d->w()[i]);
+                wh[i] = c10::Half(__half_as_ushort(hv), c10::Half::from_bits());
+            }
+            int misses = 0, n_file = 0;
+            int32_t file_ids[kMaxUses];   // the layer's file experts, each once for all rows
+            for (int i = 0; i < uses; ++i) {
+                const int32_t e = d->ids()[i];
+                if (e < 0) continue;
+                ++misses;
+                if (host && host->in_memory(l, e)) { ++worker_ram; continue; }
+                ++worker_file;
+                if (std::find(file_ids, file_ids + n_file, e) != file_ids + n_file) continue;
+                if (file_trace > 0) {   // DS41_FILE_TRACE=N: the first N CPU experts read from the file
+                    --file_trace;
+                    std::fprintf(stderr, "ds41 file expert: layer %d expert %d vram %d ram %d step pos %d\n", l, e,
+                                 vram ? vram->res_host()[(size_t) l * kExperts + e] : -2,
+                                 host ? host->slot_of(l, e) : -2, (int) history.size() - 1);
                 }
-                int misses = 0, n_file = 0;
-                int32_t file_ids[kTopK];
-                for (int i = 0; i < kTopK; ++i) {
-                    const int32_t e = db->ids()[i];
-                    if (e < 0) continue;
-                    ++misses;
-                    if (host && host->in_memory(l, e)) { ++worker_ram; continue; }
-                    ++worker_file;
-                    if (file_trace > 0) {   // DS41_FILE_TRACE=N: the first N CPU experts read from the file
-                        --file_trace;
-                        std::fprintf(stderr, "ds41 file expert: layer %d expert %d vram %d ram %d step pos %d\n", l, e,
-                                     vram ? vram->res_host()[(size_t) l * kExperts + e] : -2,
-                                     host ? host->slot_of(l, e) : -2, (int) history.size() - 1);
-                    }
-                    file_ids[n_file++] = e;
-                }
-                // the adaptive RAM tier reads the layer's file experts into free slots, all at once; the rest (no free
-                // slot, or a failed read) come from the file as before
-                bool kept[kTopK] = {}, missing[kTopK] = {};
-                const bool adaptive = host && host->reserve() > 0 && n_file > 0;
-                if (adaptive && !host->reads_direct())   // copied from the map: only missing pages read the SSD
-                    for (int j = 0; j < n_file; ++j) missing[j] = file_pages_missing(l, file_ids[j]);
-                if (adaptive) {
-                    // wake the CPU expert pool before the reads: its workers nap after ~1 ms idle. Laptop, 4 pairs
-                    // (code, agent): 0.6-1.2 ms per token less, mostly as shorter reads (busy cores, quicker I/O
-                    // completions); in the bench a nap costs a call ~100 us after a 2 ms gap
-                    try {
-                        exl3_moe_cpu_pool_prime(cpu_threads);
-                    } catch (...) {   // e.g. no thread could start: the forward below reports it as before
-                    }
-                    const double a0 = now_ms();
-                    try {   // kept[] holds what was read even when admit() throws
-                        host->admit(l, file_ids, n_file, kept);
-                    } catch (const std::exception& ex) {   // e.g. no thread for the reads: the file path still works
-                        if (!admit_warned.exchange(true))
-                            std::fprintf(stderr, "ds41: adaptive RAM tier read failed (%s); using the file\n", ex.what());
-                    }
-                    admit += now_ms() - a0;
-                }
-                for (int j = 0; j < n_file; ++j) {
-                    if (kept[j]) {   // computed from its new RAM slot
-                        --worker_file;
-                        ++worker_ram;
-                        if (host->reads_direct() || missing[j]) ++worker_ssd;
-                        continue;
-                    }
-                    if (!file_pages_missing(l, file_ids[j])) continue;
-                    ++worker_ssd;
-                    // upstream fetches a layer's missing experts in one batch before computing: ask for the whole
-                    // range now, so the reads run in parallel instead of page fault by page fault
-                    if (fetch_now) warm_file_expert(l, file_ids[j]);
-                }
-                if (lookahead) lookahead->observe(l, file_ids, n_file);
-                // Keep expert_hits as VRAM hits. Timing derives CPU and zero-copy counts from the partition.
-                worker_misses += misses + db->counts().zero_copy + db->counts().prefetched;
-                worker_prefetched += db->counts().prefetched;
-                const double t0 = now_ms();
+                file_ids[n_file++] = e;
+            }
+            // the adaptive RAM tier reads the layer's file experts into free slots, all at once; the rest (no free
+            // slot, or a failed read) come from the file as before
+            bool kept[kMaxUses] = {}, missing[kMaxUses] = {};
+            const bool adaptive = host && host->reserve() > 0 && n_file > 0;
+            if (adaptive && !host->reads_direct())   // copied from the map: only missing pages read the SSD
+                for (int j = 0; j < n_file; ++j) missing[j] = file_pages_missing(l, file_ids[j]);
+            if (adaptive) {
+                // wake the CPU expert pool before the reads: its workers nap after ~1 ms idle. Laptop, 4 pairs
+                // (code, agent): 0.6-1.2 ms per token less, mostly as shorter reads (busy cores, quicker I/O
+                // completions); in the bench a nap costs a call ~100 us after a 2 ms gap
                 try {
-                    if (fault("worker")) throw std::runtime_error("ds41 test fault: CPU expert worker");
-                    if (misses)
-                        exl3_moe_cpu_forward_raw(L[l].moe_handle, (const at::Half*) db->x(), db->ids(), wh, db->y(), 1,
-                                                 kTopK, cpu_threads);
-                    else
-                        std::fill_n(db->y(), kDim, 0.0f);
-                } catch (...) {
-                    // keep the protocol (the GPU waits for this layer); the step rethrows after its sync
-                    std::fill_n(db->y(), kDim, 0.0f);
-                    std::lock_guard<std::mutex> lk(mu);
-                    if (!worker_error) worker_error = std::current_exception();
+                    exl3_moe_cpu_pool_prime(cpu_threads);
+                } catch (...) {   // e.g. no thread could start: the forward below reports it as before
                 }
-                worker_us += (int64_t) ((now_ms() - t0) * 1000.0);
-                ready = now_ms();
-                if (l + 1 == kLayers) {
-                    worker_wake_at = wake;
-                    worker_wait = wait;
-                    worker_first_wait = first_wait;
-                    worker_admit = admit;
-                    worker_end_at = ready;
+                const double a0 = now_ms();
+                try {   // kept[] holds what was read even when admit() throws
+                    host->admit(l, file_ids, n_file, kept);
+                } catch (const std::exception& ex) {   // e.g. no thread for the reads: the file path still works
+                    if (!admit_warned.exchange(true))
+                        std::fprintf(stderr, "ds41: adaptive RAM tier read failed (%s); using the file\n", ex.what());
                 }
-                db->mark_done(l + 1);
+                admit += now_ms() - a0;
             }
+            for (int j = 0; j < n_file; ++j) {
+                if (kept[j]) {   // computed from its new RAM slot
+                    --worker_file;
+                    ++worker_ram;
+                    if (host->reads_direct() || missing[j]) ++worker_ssd;
+                    continue;
+                }
+                if (!file_pages_missing(l, file_ids[j])) continue;
+                ++worker_ssd;
+                // upstream fetches a layer's missing experts in one batch before computing: ask for the whole
+                // range now, so the reads run in parallel instead of page fault by page fault
+                if (fetch_now) warm_file_expert(l, file_ids[j]);
+            }
+            if (lookahead && m == 1) lookahead->observe(l, file_ids, n_file);
+            // Keep expert_hits as VRAM hits. Timing derives CPU and zero-copy counts from the partition.
+            worker_misses += misses + d->counts().zero_copy + d->counts().prefetched;
+            worker_prefetched += d->counts().prefetched;
+            const double t0 = now_ms();
+            try {
+                if (fault("worker")) throw std::runtime_error("ds41 test fault: CPU expert worker");
+                if (misses)
+                    exl3_moe_cpu_forward_raw(L[l].moe_handle, (const at::Half*) d->x(), d->ids(), wh, d->y(), m,
+                                             kTopK, cpu_threads);
+                else
+                    std::fill_n(d->y(), (size_t) m * kDim, 0.0f);
+            } catch (...) {
+                // keep the protocol (the GPU waits for this layer); the step rethrows after its sync
+                std::fill_n(d->y(), (size_t) m * kDim, 0.0f);
+                std::lock_guard<std::mutex> lk(mu);
+                if (!worker_error) worker_error = std::current_exception();
+            }
+            worker_us += (int64_t) ((now_ms() - t0) * 1000.0);
+            ready = now_ms();
+            if (l + 1 == kLayers) {
+                worker_wake_at = wake;
+                worker_wait = wait;
+                worker_first_wait = first_wait;
+                worker_admit = admit;
+                worker_end_at = ready;
+            }
+            d->mark_done(l + 1);
         }
     }
 
@@ -2183,6 +2209,9 @@ struct Engine::Impl {
         worker_prefetched = 0;
         {
             std::lock_guard<std::mutex> lk(mu);
+            job_db = db.get();
+            job_m = 1;
+            job_cancel = false;
             ++go;
         }
         released = true;
