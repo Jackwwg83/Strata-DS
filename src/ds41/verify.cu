@@ -41,13 +41,24 @@ struct Engine::Impl::VerifyWorkspace {
     uint8_t *candidates, *eng, *eng_host;
     size_t eng_bytes;
     std::unique_ptr<ExpertDoorbell> db;
+    // the window's engram rows, read by the engine's reader thread beside the first layers (post_engram): per table
+    // the rows of all tokens, M * kEngRows weights then M * kEngRows scales (TB bytes), in mapped pinned memory;
+    // the GPU copies a table once its flag rises, on st_eng, and computes its wkv GEMV there (veng_kv)
+    static constexpr size_t TB = size_t(M) * kEngRows * (256 + 8);
+    std::vector<std::unique_ptr<EngramRows>> veng_rows;
+    std::vector<std::vector<int64_t>> veng_ids;
+    uint8_t *veng = nullptr, *veng_host = nullptr;
+    const uint8_t* veng_host_dev = nullptr;
+    bf16* veng_kv = nullptr;
+    float* act_eng = nullptr;
+    EngJob job;
     std::map<std::array<int64_t, 4>, cudaGraphExec_t> graphs;
     std::vector<int> tokens;
     int pos = 0, m = 0;
     bool warmed = false;
     VerifyWorkspace(Impl& e) {
         const int S = e.max_seq;
-        params = alloc<int>(M * 4); params_host = pin<int>(M * 4);
+        params = alloc<int>(M * 4 + 1); params_host = pin<int>(M * 4 + 1);   // [M * 4]: the engram epoch
         next = alloc<int>(M); next_host = pin<int>(M);
         h = alloc<bf16>(M*kHc*kDim); h2 = alloc<bf16>(M*kHc*kDim);
         xa = alloc<bf16>(M*kDim); xf = alloc<bf16>(M*kDim);
@@ -68,6 +79,27 @@ struct Engine::Impl::VerifyWorkspace {
         eng_bytes = size_t(e.n_eng)*kEngRows*(256+8);
         eng = alloc<uint8_t>(M*eng_bytes); eng_host = pin<uint8_t>(M*eng_bytes);
         db = std::make_unique<ExpertDoorbell>(M, kTopK, kDim);
+        if (e.n_eng) {
+            veng = alloc<uint8_t>(e.n_eng * TB);
+            ck(cudaHostAlloc((void**)&veng_host, e.n_eng * TB, cudaHostAllocMapped), "verify engram pinned");
+            pinned.emplace_back(veng_host, [](void* q) { cudaFreeHost(q); });
+            ck(cudaHostGetDevicePointer((void**)&veng_host_dev, veng_host, 0), "verify engram alias");
+            veng_kv = alloc<bf16>(size_t(e.n_eng) * M * (kHc + 1) * kDim);
+            act_eng = alloc<float>(M * 8192);
+            const auto& hs = e.pack.engram_hash();
+            job.rows = 0;   // set per window: m * cols
+            for (int li = 0; li < e.n_eng; ++li) {
+                const auto& t = e.pack.engram_tables()[li];
+                veng_rows.push_back(std::make_unique<EngramRows>(
+                    std::vector<EngramRows::Table>{{t.path, t.weight_offset, t.scale_offset}},
+                    M * ((hs.max_ngram - 1) * hs.n_heads), 256, 8, 128));
+                veng_ids.emplace_back(size_t(M) * kEngRows, 0);
+                job.reader.push_back(veng_rows.back().get());
+                job.ids.push_back(veng_ids.back().data());
+                job.w.push_back(veng_host + li * TB);
+                job.s.push_back(veng_host + li * TB + size_t(M) * kEngRows * 256);
+            }
+        }
         for (int l = 0; l < kLayers; ++l) {
             auto& s = state[l];
             s.ring = alloc<bf16>(kWindow*kHeadDim); s.rows = alloc<bf16>(M*kHeadDim);
@@ -94,8 +126,33 @@ void Engine::Impl::enqueue_verify(int m) {
         fp8_quantize_activation_f32((const uint16_t*)x, m, w.k, v.act, st);
         fp8_block_gemv_q(v.act, m, w.k, w.w, w.s, w.n, (uint16_t*)out, st);
     };
-    ck(cudaMemcpyAsync(v.params, v.params_host, m*4*sizeof(int), cudaMemcpyHostToDevice, st), "verify params");
-    if (n_eng) ck(cudaMemcpyAsync(v.eng, v.eng_host, m*v.eng_bytes, cudaMemcpyHostToDevice, st), "verify engram");
+    ck(cudaMemcpyAsync(v.params, v.params_host, (VerifyWorkspace::M*4+1)*sizeof(int), cudaMemcpyHostToDevice, st),
+       "verify params");
+    if (n_eng) {
+        // per table on st_eng, as the step's engram_kv: wait for the rows, copy, dequantize (token by token, rows of
+        // cols ids), the wkv GEMV of all m rows; the engram layer waits for eng_join[li]
+        const int cols = (pack.engram_hash().max_ngram-1)*pack.engram_hash().n_heads;
+        ck(cudaEventRecord(eng_fork, st), "verify engram fork");
+        ck(cudaStreamWaitEvent(st_eng, eng_fork, 0), "verify engram fork wait");
+        for (int li = 0; li < n_eng; ++li) {
+            const auto& y = L[pack.engram_tables()[li].layer];
+            wait_engram_k<<<1, 1, 0, st_eng>>>(eng_flag_dev + li*kEngFlagStride, v.params + VerifyWorkspace::M*4 - 4);
+            ck(cudaGetLastError(), "verify engram wait");
+            const int n16 = int(VerifyWorkspace::TB / 16);
+            engram_rows_k<<<(n16+255)/256, 256, 0, st_eng>>>((const uint4*)(v.veng_host_dev + li*VerifyWorkspace::TB),
+                                                            (uint4*)(v.veng + li*VerifyWorkspace::TB), n16);
+            ck(cudaGetLastError(), "verify engram rows");
+            const uint8_t* tw = v.veng + li*VerifyWorkspace::TB;
+            const uint8_t* ts = tw + size_t(VerifyWorkspace::M)*kEngRows*256;
+            for (int t = 0; t < m; ++t)
+                ops::engram_dequant(tw + size_t(t)*cols*256, ts + size_t(t)*cols*8, cols, v.eng_vals+t*y.eng_wkv.k,
+                                    st_eng);
+            fp8_quantize_activation_f32((const uint16_t*)v.eng_vals, m, y.eng_wkv.k, v.act_eng, st_eng);
+            fp8_block_gemv_q(v.act_eng, m, y.eng_wkv.k, y.eng_wkv.w, y.eng_wkv.s, y.eng_wkv.n,
+                             (uint16_t*)(v.veng_kv + size_t(li)*VerifyWorkspace::M*(kHc+1)*kDim), st_eng);
+            ck(cudaEventRecord(eng_join[li], st_eng), "verify engram join");
+        }
+    }
     for (int t = 0; t < m; ++t) {
         ops::window_index_device(v.params+t*4+1, v.indices+t*(kWindow+kIndexTopK), st);
         ops::embed_device(embed, v.params+t*4, v.h+t*kHc*kDim, st);
@@ -119,14 +176,10 @@ void Engine::Impl::enqueue_verify(int m) {
                 copy(s.score, y.score_state, 2*kHeadDim*sizeof(float));
             }
         }
-        if (is_engram_layer(l)) {
-            const int cols = (pack.engram_hash().max_ngram-1)*pack.engram_hash().n_heads;
-            for (int t = 0; t < m; ++t) {
-                const auto* w = v.eng+t*v.eng_bytes+size_t(eng_i)*kEngRows*(256+8);
-                ops::engram_dequant(w, w+kEngRows*256, cols, v.eng_vals+t*y.eng_wkv.k, st);
-            }
-            linear(v.eng_vals, y.eng_wkv, v.eng_kv);
-            ops::engram_apply(v.h, v.eng_kv, y.eng_qw, y.eng_kw, kNormEps, m, st);
+        if (is_engram_layer(l) && eng_i < n_eng) {
+            ck(cudaStreamWaitEvent(st, eng_join[eng_i], 0), "verify engram join wait");
+            ops::engram_apply(v.h, v.veng_kv + size_t(eng_i)*VerifyWorkspace::M*(kHc+1)*kDim, y.eng_qw, y.eng_kw,
+                              kNormEps, m, st);
             ++eng_i;
         }
         kernels::hc_mixes_pre(v.h, m, y.hc_attn_fn, y.hc_attn_scale, y.hc_attn_base, v.mix,
@@ -202,9 +255,10 @@ void Engine::Impl::enqueue_verify(int m) {
                 kernels::sparse_attn_decode(qt, s.ring, nullptr, idx, 1, kWindow, y.sink,
                                             float(std::pow(kHeadDim,-0.5)), ot, st);
             ops::rope_device(ot, kHeads, kHeadDim, rope, p+1, 0, true, st);
-            if (y.wo_a8.w) wo_a_grouped_fp8(ot, y.wo_a8.w, y.wo_a8.s, v.oa+t*kOGroups*kOLora, st);
-            else ops::wo_a_grouped(ot, y.wo_a, v.oa+t*kOGroups*kOLora, st);
+            if (!y.wo_a8.w) ops::wo_a_grouped(ot, y.wo_a, v.oa+t*kOGroups*kOLora, st);
         }
+        // every row at once, the weight read once (each row as wo_a_grouped_fp8 computes it)
+        if (y.wo_a8.w) wo_a_grouped_fp8_rows(v.o, m, y.wo_a8.w, y.wo_a8.s, v.oa, st);
         linear(v.oa, y.wo_b, v.attn_out);
         ops::hc_post(v.attn_out, v.h, v.apost, v.acomb, v.h2, m, st);
         kernels::hc_mixes_pre(v.h2, m, y.hc_ffn_fn, y.hc_ffn_scale, y.hc_ffn_base, v.apre,
@@ -232,10 +286,8 @@ void Engine::Impl::enqueue_verify(int m) {
     }
     ops::hc_pre(v.h, v.mix, v.final_x, m, st);
     ops::rmsnorm(v.final_x, final_norm, v.final_x, kDim, kNormEps, m, st);
-    for (int t = 0; t < m; ++t) {
-        ops::bf16_linear(v.final_x+t*kDim, nullptr, head, kDim, kVocab, nullptr, v.logits+t*kVocab, st);
-        ops::argmax_logits(v.logits+t*kVocab, v.next+t, st);
-    }
+    ops::bf16_linear_rows(v.final_x, m, head, kDim, kVocab, v.logits, st);   // the head read once (1.3 GB)
+    for (int t = 0; t < m; ++t) ops::argmax_logits(v.logits+t*kVocab, v.next+t, st);
     ck(cudaMemcpyAsync(v.next_host, v.next, m*sizeof(int), cudaMemcpyDeviceToHost, st), "verify next");
     ck(cudaMemcpyAsync(v.logits_host, v.logits, size_t(m)*kVocab*sizeof(float), cudaMemcpyDeviceToHost, st), "verify logits");
     ck(cudaMemcpyAsync(v.routes_host, v.routes, kLayers*VerifyWorkspace::M*kTopK*sizeof(int32_t), cudaMemcpyDeviceToHost, st), "verify routes");
@@ -254,21 +306,27 @@ VerifyResult Engine::Impl::verify(const std::vector<int>& window, int pos, bool 
     v.tokens = window; v.pos = pos; v.m = m;
     tm = Timing{};
     const double begin = now_ms();
-    // Stage hashes from each tentative prefix. Restore formal history even if an I/O read fails.
+    // Stage hashes from each tentative prefix; the rows of all tokens are read beside the first layers.
+    const int cols = n_eng ? (pack.engram_hash().max_ngram-1)*pack.engram_hash().n_heads : 0;
     try {
         for (int t = 0; t < m; ++t) {
             history.push_back(pack.engram_hash().token_map[window[t]]);
             int li = 0;
             for (int l = 0; l < kLayers; ++l)
-                if (is_engram_layer(l)) engram_ids(l, li++, pos+t);
-            engram_read_all();
-            if (n_eng) std::memcpy(v.eng_host+t*v.eng_bytes, eng_host, v.eng_bytes);
+                if (is_engram_layer(l)) {
+                    engram_ids(l, li, pos+t);
+                    std::copy_n(eng_ids[li].data(), cols, v.veng_ids[li].data()+size_t(t)*cols);
+                    ++li;
+                }
             const int params[] = {window[t], pos+t, pos+t+1, (pos+t+1)/2};
             std::copy_n(params, 4, v.params_host+4*t);
         }
     } catch (...) { history.resize(pos); throw; }
     history.resize(pos);
-    tm.engram_ms = now_ms()-begin;
+    if (n_eng) {
+        v.job.rows = m*cols;
+        v.params_host[VerifyWorkspace::M*4] = int(post_engram(v.job));
+    }
     if (vram) tm.vram_swaps = vram->between_steps();
     parity = pos&1;
     tcap1 = cap_of(pos+m, max_seq+1);
@@ -354,6 +412,7 @@ VerifyResult Engine::Impl::verify(const std::vector<int>& window, int pos, bool 
         throw;
     }
     cpu.join();
+    if (n_eng) finish_engram(tm);
     if (worker_error) std::rethrow_exception(worker_error);
     v.warmed = true;
     VerifyResult result;
@@ -366,7 +425,7 @@ VerifyResult Engine::Impl::verify(const std::vector<int>& window, int pos, bool 
     }
     tm.expert_total = m*kLayers*kTopK;
     tm.total_ms = now_ms()-begin;
-    tm.gpu_ms = tm.total_ms-tm.engram_ms;
+    tm.gpu_ms = tm.total_ms;   // the engram rows are read beside the first layers
     verify_failed = false;
     return result;
 }

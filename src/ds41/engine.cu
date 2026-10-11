@@ -267,6 +267,16 @@ struct Engine::Impl {
     bool eng_posted = false, eng_done = true, eng_quit = false;
     std::exception_ptr eng_error;
     double eng_read_ms = 0;
+    /// What the reader thread reads for one post_engram: per table its reader, rows and destinations (the weights,
+    /// row i at w + i * 256; the scales, row i at s + i * 8). A step reads kEngRows rows per table into eng_host; a
+    /// verify window reads all its tokens' rows at once into its own buffer.
+    struct EngJob {
+        std::vector<EngramRows*> reader;
+        std::vector<const int64_t*> ids;
+        std::vector<uint8_t*> w, s;
+        int rows = 0;
+    };
+    EngJob eng_job, eng_step_job;
     int* d_next = nullptr;             // device argmax of the logits
     int* hp_next = nullptr;            // pinned: the argmax, the logits and the routes, after the step
     float* lg_pinned = nullptr;
@@ -532,6 +542,15 @@ struct Engine::Impl {
         ck(cudaHostAlloc((void**) &eng_flag, flag_bytes, cudaHostAllocMapped), "engram flags");
         std::memset(eng_flag, 0, flag_bytes);
         ck(cudaHostGetDevicePointer((void**) &eng_flag_dev, eng_flag, 0), "engram flag alias");
+        for (int li = 0; li < n_eng; ++li) {
+            uint8_t* base = eng_host + (size_t) li * kEngRows * (256 + 8);
+            eng_step_job.reader.push_back(eng_rows[li].get());
+            eng_step_job.ids.push_back(eng_ids[li].data());
+            eng_step_job.w.push_back(base);
+            eng_step_job.s.push_back(base + kEngRows * 256);
+        }
+        if (n_eng)
+            eng_step_job.rows = (pack.engram_hash().max_ngram - 1) * pack.engram_hash().n_heads;
         if (n_eng) eng_thread = std::thread([this] { engram_worker(); });
         // scratch
         h = dalloc_own<bf16>(kHc * kDim);
@@ -958,17 +977,10 @@ struct Engine::Impl {
             throw std::runtime_error("engram table order does not match engram_hash.txt");
     }
 
-    /// The rows of engram table li for this step, into the pinned buffer, all reads of the table in flight together.
-    void engram_read(int li) {
-        const auto& hs = pack.engram_hash();
-        const int cols = (hs.max_ngram - 1) * hs.n_heads;
-        uint8_t* base = eng_host + (size_t) li * kEngRows * (256 + 8);
+    /// The rows of engram table li of the posted job, all reads of the table in flight together.
+    void engram_read(const EngJob& job, int li) {
         if (li == 0 && fault("engram_read")) throw std::runtime_error("ds41 test fault: engram row read");
-        eng_rows[li]->read({eng_ids[li].data()}, cols, {base}, {base + kEngRows * 256});
-    }
-    /// The rows of every engram table for this step, table by table.
-    void engram_read_all() {
-        for (int li = 0; li < n_eng; ++li) engram_read(li);
+        job.reader[li]->read({job.ids[li]}, job.rows, {job.w[li]}, {job.s[li]});
     }
 
     /// The decode engram reader: one step's rows at a time (post_engram), table by table, each table's flag raised
@@ -982,13 +994,14 @@ struct Engine::Impl {
             if (!eng_posted) return;
             eng_posted = false;
             const uint32_t epoch = eng_epoch;
+            const EngJob job = eng_job;
             lk.unlock();
             const double t0 = now_ms();
             std::exception_ptr error;
             for (int li = 0; li < n_eng; ++li) {
                 if (!error) {
                     try {
-                        engram_read(li);
+                        engram_read(job, li);
                     } catch (...) {
                         error = std::current_exception();
                     }
@@ -1003,10 +1016,11 @@ struct Engine::Impl {
             eng_cv.notify_all();
         }
     }
-    /// step_body: this step's rows (engram_ids filled), read beside the step's first layer; returns the epoch
-    uint32_t post_engram() {
+    /// step_body (the step's job) or verify (the window's): the rows read beside the first layers; returns the epoch
+    uint32_t post_engram(const EngJob& job) {
         std::unique_lock<std::mutex> lk(eng_mu);
         eng_cv.wait(lk, [&] { return eng_done; });   // a previous step that threw may still be reading
+        eng_job = job;
         ++eng_epoch;
         eng_done = false;
         eng_posted = true;
@@ -2157,7 +2171,7 @@ struct Engine::Impl {
                 if (is_engram_layer(l)) engram_ids(l, li++, pos);
             if (fault("engram")) throw std::runtime_error("ds41 test fault: engram read");
         }
-        const uint32_t engram_epoch = n_eng ? post_engram() : 0;   // read beside layer 0; the graph waits before layer 1
+        const uint32_t engram_epoch = n_eng ? post_engram(eng_step_job) : 0;   // read beside layer 0; the graph waits before layer 1
         const double t_swaps = now_ms();
         if (vram) tm.vram_swaps = vram->between_steps();   // the device is idle: the last step ended in a sync
         tm.swaps_ms = now_ms() - t_swaps;
