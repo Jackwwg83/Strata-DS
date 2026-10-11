@@ -48,11 +48,15 @@ public:
                  uint32_t round, cudaStream_t stream,
                  const kernels::Exl3Expert* vram = nullptr, const kernels::Exl3Expert* ram = nullptr,
                  const int* quota = nullptr, ExpertStaging* stage = nullptr, const ExpertBlob* blobs = nullptr,
-                 const int32_t* pf_ids = nullptr, const kernels::Exl3Expert* pf_desc = nullptr, int pf_n = 0);
+                 const int32_t* pf_ids = nullptr, const kernels::Exl3Expert* pf_desc = nullptr, int pf_n = 0,
+                 int tail_rank = 0);
     /// Per-call descriptors. Consume on the publish stream before the next publish.
     const kernels::Exl3Expert* gpu_experts() const { return gpu_experts_; }
-    /// prefetched: misses the GPU computes from the prefetch buffer (pf_ids / pf_desc of publish), outside the quota
-    struct Counts { int vram, zero_copy, cpu, prefetched; };
+    /// prefetched: misses the GPU computes from the prefetch buffer (pf_ids / pf_desc of publish), outside the quota.
+    /// skipped: with tail_rank R > 0 (upstream's STRATA_ROUTE_TAIL_SKIP), the uses of an expert outside VRAM that every
+    /// token of the call routes at rank R or lower (ids in router order, 0 = best): neither the GPU nor the CPU computes
+    /// them, they add nothing, the other experts keep their weights. Only for calls of up to 5 tokens (one pass).
+    struct Counts { int vram, zero_copy, cpu, prefetched, skipped; };
     /// Read after wait_published, before mark_done. Counts refer to this call.
     Counts counts() const { return *h_counts_; }
     /// Wait until the CPU raised done to `round`, then out[i] += its rows [m][dim] (FP32).

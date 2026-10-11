@@ -172,5 +172,42 @@ int main() {
         cudaStreamDestroy(s);
         for (int r = 0; r < kRounds; ++r) { delete dx[r]; delete dids[r]; delete dw[r]; delete dout[r]; }
     }
+    // 4. upstream's route tail skip (tail_rank 4: ranks 4 and 5 of 0..5). Experts with id % 3 == 0 are resident.
+    //    token 0: 1 2 4 5 7 8      token 1: 11 13 14 16 5 18
+    //    7 (rank 4) and 8 (rank 5) are missed and every token routes them low: skipped. 5 is rank 4 in token 1 but rank 3
+    //    in token 0: kept for both. 18 (rank 5) is resident: a VRAM hit, never skipped.
+    {
+        const int m = 2;
+        ExpertDoorbell db(m, kTopK, kDim);
+        std::vector<int32_t> ids = {1, 2, 4, 5, 7, 8, 11, 13, 14, 16, 5, 18};
+        std::vector<int32_t> res(kExperts, -1);
+        for (int i = 0; i < kExperts; i += 3) res[i] = 100 + i;
+        Dev<uint16_t> dx(std::vector<uint16_t>(m * kDim, 0));
+        Dev<int32_t> did(ids), dres(res), sel(m * kTopK);
+        Dev<float> dw(std::vector<float>(m * kTopK, 0.5f)), dout(std::vector<float>(m * kDim, 0.0f));
+        cudaStream_t s;
+        ck(cudaStreamCreateWithFlags(&s, cudaStreamNonBlocking), "stream");
+        std::vector<int32_t> mids;
+        ExpertDoorbell::Counts counts{};
+        std::atomic<bool> stop{false};
+        std::thread th([&] {
+            if (!db.wait_published(1, stop)) return;
+            mids.assign(db.ids(), db.ids() + m * kTopK);
+            counts = db.counts();
+            std::fill_n(db.y(), m * kDim, 0.0f);
+            db.mark_done(1);
+        });
+        db.publish(dx.p, did.p, dw.p, m, dres.p, sel.p, 1, s, nullptr, nullptr, nullptr, nullptr, nullptr, nullptr,
+                   nullptr, 0, 4);
+        db.wait_add(dout.p, m, 1, s);
+        ck(cudaStreamSynchronize(s), "tail skip");
+        th.join();
+        const std::vector<int32_t> want = {1, 2, 4, 5, -1, -1, 11, 13, 14, 16, 5, -1};
+        v.check(mids == want, "tail skip: the low-ranked misses go to neither the CPU nor the GPU; a shared expert ranked "
+                              "higher by another token and a resident one stay");
+        v.check(counts.skipped == 2 && counts.vram == 1 && counts.cpu == 9,
+                "tail skip counts: 2 skipped, 1 VRAM hit, 9 CPU uses");
+        cudaStreamDestroy(s);
+    }
     return v.finish();
 }
