@@ -269,6 +269,28 @@ __global__ void bf16_gemv_k(const bf16* x, const float* xf, const bf16* w, int64
     }
 }
 
+// bf16_gemv_k for M rows: each weight element is loaded once and used by every row in bf16_gemv_k's order
+template <int M>
+__global__ void bf16_gemv_rows_k(const bf16* x, const bf16* w, int64_t k, int64_t n, float* yf) {
+    const int64_t row = (int64_t) blockIdx.x * (blockDim.x / 32) + (threadIdx.x >> 5);
+    const int lane = threadIdx.x & 31;
+    if (row >= n) return;
+    const bf16* wr = w + row * k;
+    float acc[M];
+#pragma unroll
+    for (int t = 0; t < M; ++t) acc[t] = 0.0f;
+    for (int64_t i = lane; i < k; i += 32) {
+        const float wv = bf(wr[i]);
+#pragma unroll
+        for (int t = 0; t < M; ++t) acc[t] += bf(x[t * k + i]) * wv;
+    }
+#pragma unroll
+    for (int t = 0; t < M; ++t) {
+        for (int off = 16; off > 0; off >>= 1) acc[t] += __shfl_down_sync(0xffffffffu, acc[t], off);
+        if (lane == 0) yf[t * n + row] = acc[t];
+    }
+}
+
 // ------------------------------------------------------------------------------------------- rope, quant
 
 __global__ void rope_k(bf16* v, int n_vec, int stride, const float* cs, bool inverse, const int* pos_dev = nullptr, int offset = 0) {
@@ -568,6 +590,16 @@ void fp8_linear(const bf16* x, int64_t k, const uint8_t* w, const uint8_t* w_sca
 void bf16_linear(const bf16* x, const float* x_f32, const bf16* w, int64_t k, int64_t n, bf16* yb, float* yf, cudaStream_t stream) {
     bf16_gemv_k<<<grid(n, 8), 256, 0, stream>>>(x, x_f32, w, k, n, yb, yf);
     LAUNCH_CHECK("bf16_linear");
+}
+void bf16_linear_rows(const bf16* x, int m, const bf16* w, int64_t k, int64_t n, float* yf, cudaStream_t stream) {
+    switch (m) {
+        case 1: bf16_gemv_rows_k<1><<<grid(n, 8), 256, 0, stream>>>(x, w, k, n, yf); break;
+        case 2: bf16_gemv_rows_k<2><<<grid(n, 8), 256, 0, stream>>>(x, w, k, n, yf); break;
+        case 3: bf16_gemv_rows_k<3><<<grid(n, 8), 256, 0, stream>>>(x, w, k, n, yf); break;
+        case 4: bf16_gemv_rows_k<4><<<grid(n, 8), 256, 0, stream>>>(x, w, k, n, yf); break;
+        default: std::fprintf(stderr, "bf16_linear_rows: m %d outside 1..4\n", m); std::abort();
+    }
+    LAUNCH_CHECK("bf16_linear_rows");
 }
 void rope(bf16* v, int n_vec, int stride, const float* cs, bool inverse, cudaStream_t stream) {
     rope_k<<<grid((int64_t) n_vec * (kRopeDim / 2), 256), 256, 0, stream>>>(v, n_vec, stride, cs, inverse);

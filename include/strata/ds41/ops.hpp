@@ -34,6 +34,9 @@ void fp8_linear(const bf16* x, int64_t k, const uint8_t* w, const uint8_t* w_sca
 /// y = x @ W^T with a BF16 weight, FP32 accumulation; output BF16 (yb) or FP32 (yf), whichever is non-null.
 /// x_f32 non-null means the input is FP32 (the compressor and the router take x.float()).
 void bf16_linear(const bf16* x, const float* x_f32, const bf16* w, int64_t k, int64_t n, bf16* yb, float* yf, cudaStream_t stream = 0);
+/// bf16_linear for m rows (1..4) of x (BF16, k apart) into FP32 rows yf (n apart), the weight read once: every row's
+/// output equals bf16_linear's for that row bit for bit (the same lanes, order and reduction)
+void bf16_linear_rows(const bf16* x, int m, const bf16* w, int64_t k, int64_t n, float* yf, cudaStream_t stream = 0);
 
 /// RoPE on the last 64 values of each of `n_vec` vectors spaced `stride` apart. cs holds 32 (cos, sin) pairs.
 void rope(bf16* v, int n_vec, int stride, const float* cs, bool inverse, cudaStream_t stream = 0);
