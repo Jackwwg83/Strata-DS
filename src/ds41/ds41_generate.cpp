@@ -11,6 +11,8 @@
 // per-layer comparison stays aligned even after the first differing token. Tokenization stays in Python.
 // --continue-ids FILE decodes as usual (prompt, then step() per token, --step-log) but feeds the file's tokens after
 // the prompt instead of the engine's own predictions: every run of a speed A/B then routes the same experts.
+// --spec oracle --continue-ids FILE measures the verify window: every window is --spec-max tokens, its drafts are the
+// file's next tokens and every row is committed (the cost at full acceptance; the file is a greedy run's output).
 #include "strata/ds41/config.hpp"
 #include "strata/ds41/engine.hpp"
 #include "strata/ds41/suffix_drafter.hpp"
@@ -61,7 +63,8 @@ static void print_prefill(const Engine& engine, size_t n) {
 static std::FILE* step_log = nullptr;
 
 static void generate(Engine& engine, const EngineOptions& opt, const std::vector<int>& prompt,
-                     int count, bool batched, bool suffix, int max_t, int eos, const std::vector<int>& cont = {}) {
+                     int count, bool batched, bool suffix, int max_t, int eos, const std::vector<int>& cont = {},
+                     bool oracle = false) {
     if (prompt.empty()) throw std::invalid_argument("generation needs a nonempty prompt");
     int next = -1;
     if (batched) {
@@ -77,6 +80,7 @@ static void generate(Engine& engine, const EngineOptions& opt, const std::vector
     if (count > 0) { out.push_back(next); drafter.append(next); }
     int pos = int(prompt.size()), rounds = 0, accepted = 0;
     double step_ms = 0;            // plain decode: the engine's step times, as the forced path reports them
+    int differ = 0;                // oracle: rows whose prediction differs from the file
     int64_t hits = 0, routed = 0;
     const auto begin = std::chrono::steady_clock::now();
     while (int(out.size()) < count && next != eos) {
@@ -99,21 +103,29 @@ static void generate(Engine& engine, const EngineOptions& opt, const std::vector
             continue;
         }
         int32_t draft[8];
-        const int proposed = drafter.propose(limit-1, draft);
+        const int proposed = oracle ? limit-1 : drafter.propose(limit-1, draft);
+        if (oracle)
+            for (int i = 0; i < proposed; ++i) draft[i] = cont[out.size() + i];
         std::vector<int> window{next};
         window.insert(window.end(), draft, draft+proposed);
         const auto v0 = std::chrono::steady_clock::now();
         auto result = engine.verify(window, pos);
         const double verify_ms = std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - v0).count();
-        int keep = accepted_inputs(window, result.next);
-        for (int i = 0; i < keep; ++i)
+        int keep = oracle ? int(window.size()) : accepted_inputs(window, result.next);
+        for (int i = 0; i < keep && !oracle; ++i)
             if (result.next[i] == eos) { keep = i+1; break; }
         engine.commit(keep);
-        std::printf("spec_window pos %d T %zu accepted %d emitted %d ms %.1f\n", pos, window.size(), keep-1, keep,
-                    verify_ms);
-        for (int i = 0; i < keep; ++i) { out.push_back(result.next[i]); drafter.append(result.next[i]); }
+        const auto& tm = engine.last_timing();
+        std::printf("spec_window pos %d T %zu accepted %d emitted %d ms %.1f engram_ms %.2f cpu_experts_ms %.2f "
+                    "hits %d of %d\n", pos, window.size(), keep-1, keep, verify_ms, tm.engram_ms, tm.cpu_experts_ms,
+                    tm.expert_hits, tm.expert_total);
+        for (int i = 0; i < keep; ++i) {
+            const int t = oracle ? cont[out.size()] : result.next[i];
+            if (oracle && result.next[i] != t) ++differ;
+            out.push_back(t); drafter.append(t);
+        }
         accepted += keep-1; ++rounds;
-        next = result.next[keep-1]; pos += keep;
+        next = out.back(); pos += keep;
     }
     const double seconds = std::chrono::duration<double>(std::chrono::steady_clock::now()-begin).count();
     const int decoded = std::max(0, int(out.size())-1);
@@ -124,6 +136,7 @@ static void generate(Engine& engine, const EngineOptions& opt, const std::vector
     // the lines the speed scripts read (m3_context.sh); speculation: wall time per emitted token
     const double ms = suffix ? seconds * 1000.0 : step_ms;
     std::printf("decode_ms_per_token %.1f over %d steps\n", decoded > 0 ? ms / decoded : 0.0, decoded);
+    if (oracle) std::printf("oracle_rows_differing %d of %d\n", differ, decoded);
     if (!suffix)
         std::printf("vram_expert_slots %d hit_rate %.4f\n", engine.vram_expert_slots(),
                     routed ? (double) hits / routed : 0.0);
@@ -171,7 +184,7 @@ int main(int argc, char** argv) {
         else { std::fprintf(stderr, "unknown argument %s\n", a.c_str()); return 2; }
     }
     if (pack.empty() || (ids_s.empty() && force_path.empty())) {
-        std::fprintf(stderr, "usage: ds41_generate --pack DIR --ids a,b,c [--gen N] [--threads T] [--dump F] [--force-ids F] [--spec none|suffix] [--spec-max 1..8] [--eos-id ID]\n");
+        std::fprintf(stderr, "usage: ds41_generate --pack DIR --ids a,b,c [--gen N] [--threads T] [--dump F] [--force-ids F] [--spec none|suffix|oracle] [--spec-max 1..8] [--eos-id ID]\n");
         return 2;
     }
     std::vector<int> prompt = parse_ids(ids_s), forced;
@@ -191,19 +204,21 @@ int main(int argc, char** argv) {
         for (const auto* ids : {&prompt, &forced, &cont})
             for (int t : *ids)
                 if (t < 0 || t >= kVocab) throw std::invalid_argument("token id " + std::to_string(t) + " is outside the vocabulary");
-        if (gen < 0 || spec_max < 1 || spec_max > 8 || (spec != "none" && spec != "suffix"))
-            throw std::invalid_argument("use --gen >= 0, --spec none|suffix, --spec-max 1..8");
-        if (spec == "suffix" && (!force_path.empty() || !dump_path.empty()))
-            throw std::invalid_argument("--spec suffix cannot be combined with --force-ids or --dump");
-        if (!cont_path.empty() && ((int) cont.size() < gen || spec != "none" || !force_path.empty() || !dump_path.empty()))
-            throw std::invalid_argument("--continue-ids needs at least --gen tokens, without --spec, --force-ids, --dump");
+        if (gen < 0 || spec_max < 1 || spec_max > 8 || (spec != "none" && spec != "suffix" && spec != "oracle"))
+            throw std::invalid_argument("use --gen >= 0, --spec none|suffix|oracle, --spec-max 1..8");
+        if (spec != "none" && (!force_path.empty() || !dump_path.empty()))
+            throw std::invalid_argument("--spec cannot be combined with --force-ids or --dump");
+        if (spec == "oracle" && (int) cont.size() < gen + 8)
+            throw std::invalid_argument("--spec oracle needs --continue-ids with at least --gen + 8 tokens");
+        if (!cont_path.empty() && ((int) cont.size() < gen || spec == "suffix" || !force_path.empty() || !dump_path.empty()))
+            throw std::invalid_argument("--continue-ids needs at least --gen tokens, without --spec suffix, --force-ids, --dump");
         if (spec_max > kVerifyMaxTokens) {
             std::fprintf(stderr, "spec: cap T at %d until CPU rows 5..8 are validated\n", kVerifyMaxTokens);
             spec_max = kVerifyMaxTokens;
         }
         Engine engine(pack, opt);
         if (force_path.empty() && dump_path.empty()) {
-            generate(engine, opt, prompt, gen, batched, spec == "suffix", spec_max, eos, cont);
+            generate(engine, opt, prompt, gen, batched, spec != "none", spec_max, eos, cont, spec == "oracle");
             return 0;
         }
         if (batched) {   // prefill the prompt (or the forced sequence) in one call, then decode with step()
