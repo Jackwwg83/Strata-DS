@@ -77,6 +77,11 @@ public:
     /// buffer has room (res, ram, blobs: the layer's rows); then the copy. The buffer of this parity must be free.
     void plan(int layer, const __nv_bfloat16* x, const __nv_bfloat16* w, const float* bias, const int32_t* res,
               const kernels::Exl3Expert* ram, const ExpertBlob* blobs, cudaStream_t main);
+    /// plan() for m rows of x ([m][dim], a verify window, 1 <= m <= 4): min(guesses, kMaxGuesses / m) guesses per row,
+    /// merged in rank order (every row's best, then every row's second, ...), each expert once, then the same copy
+    /// plan. ids() then holds up to kMaxGuesses entries. m = 1 is plan().
+    void plan_rows(int layer, const __nv_bfloat16* x, int m, const __nv_bfloat16* w, const float* bias,
+                   const int32_t* res, const kernels::Exl3Expert* ram, const ExpertBlob* blobs, cudaStream_t main);
     /// `main` waits for the guesses of `layer` (ids() and descs()); x may be written after this.
     void ready(int layer, cudaStream_t main);
     /// `main` waits for the copy of `layer` (before the GPU computes the layer's experts).
@@ -93,7 +98,7 @@ private:
     int guesses_, n_experts_, dim_;
     size_t buffer_bytes_;
     uint8_t* buffer_ = nullptr;                 ///< [2][buffer_bytes]
-    float* logits_ = nullptr;                   ///< [n_experts]
+    float* logits_ = nullptr;                   ///< [4][n_experts] (plan_rows: one row per window token)
     int32_t* ids_ = nullptr;                    ///< [2][kMaxGuesses]
     int32_t* ranked_ = nullptr;                 ///< [2][kMaxGuesses]
     kernels::Exl3Expert* descs_ = nullptr;      ///< [2][kMaxGuesses]

@@ -117,8 +117,9 @@ static void generate(Engine& engine, const EngineOptions& opt, const std::vector
         engine.commit(keep);
         const auto& tm = engine.last_timing();
         std::printf("spec_window pos %d T %zu accepted %d emitted %d ms %.1f engram_ms %.2f cpu_experts_ms %.2f "
-                    "hits %d of %d\n", pos, window.size(), keep-1, keep, verify_ms, tm.engram_ms, tm.cpu_experts_ms,
-                    tm.expert_hits, tm.expert_total);
+                    "hits %d of %d wait_ms %.2f admit_ms %.2f ssd %d ram %d\n", pos, window.size(), keep-1, keep,
+                    verify_ms, tm.engram_ms, tm.cpu_experts_ms, tm.expert_hits, tm.expert_total, tm.worker_wait_ms,
+                    tm.admit_ms, tm.ssd_experts, tm.ram_experts);
         for (int i = 0; i < keep; ++i) {
             const int t = oracle ? cont[out.size()] : result.next[i];
             if (oracle && result.next[i] != t) ++differ;

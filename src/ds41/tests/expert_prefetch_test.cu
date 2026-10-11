@@ -196,6 +196,53 @@ int main() {
                                                                      "descriptors point at it");
     }
     }
+    // plan_rows (a verify window of two rows): min(G, 16 / 2) = 8 guesses per row, merged in rank order (row 0's
+    // best, row 1's best, row 0's second, ...), each expert once; then plan()'s filter (VRAM, RAM tier) and copies.
+    // The reference merges the rankings plan() gives each row on its own.
+    {
+        std::vector<__nv_bfloat16> x12(2 * D);
+        std::copy(x.begin(), x.end(), x12.begin());
+        for (int d = 0; d < D; ++d) x12[D + d] = __float2bfloat16(nd(rng));
+        __nv_bfloat16* dx12;
+        cudaMalloc(&dx12, 2 * D * 2);
+        cudaMemcpy(dx12, x12.data(), 2 * D * 2, cudaMemcpyHostToDevice);
+        sd::ExpertPrefetch rows(G, 64u << 20, N, D, false), one(G, 64u << 20, N, D, false);
+        rows.plan_rows(4, dx12, 2, dw, db, dres, dram, dblobs, st);
+        rows.ready(4, st);
+        rows.join(4, st);
+        one.plan(2, dx12, dw, db, dres, dram, dblobs, st);
+        one.ready(2, st);
+        one.join(2, st);
+        one.plan(3, dx12 + D, dw, db, dres, dram, dblobs, st);
+        one.ready(3, st);
+        one.join(3, st);
+        v.check(cudaStreamSynchronize(st) == cudaSuccess, "plan_rows ran");
+        int32_t r0[G], r1[G];
+        cudaMemcpy(r0, one.ranked(2), sizeof r0, cudaMemcpyDeviceToHost);
+        cudaMemcpy(r1, one.ranked(3), sizeof r1, cudaMemcpyDeviceToHost);
+        constexpr int K = sd::ExpertPrefetch::kMaxGuesses, g = K / 2;
+        std::vector<int> want_ranked, want_ids;
+        for (int k = 0; k < g; ++k)
+            for (const int* o : {r0, r1}) {
+                const int e = o[k];
+                if (std::find(want_ranked.begin(), want_ranked.end(), e) != want_ranked.end()) continue;
+                want_ranked.push_back(e);
+                if (res[e] < 0 && e != order[1]) want_ids.push_back(e);   // not in VRAM, in the RAM tier
+            }
+        int32_t got_ranked[K], got_ids[K];
+        cudaMemcpy(got_ranked, rows.ranked(4), sizeof got_ranked, cudaMemcpyDeviceToHost);
+        cudaMemcpy(got_ids, rows.ids(4), sizeof got_ids, cudaMemcpyDeviceToHost);
+        bool ranked_ok = true, ids_ok = true;
+        for (int k = 0; k < K; ++k) {
+            ranked_ok &= got_ranked[k] == (k < (int) want_ranked.size() ? want_ranked[k] : -1);
+            ids_ok &= got_ids[k] == (k < (int) want_ids.size() ? want_ids[k] : -1);
+        }
+        v.check(std::equal(r0, r0 + G, order.begin()), "plan() of row 0 ranks as the host reference");
+        v.check(want_ranked.size() > (size_t) g, "the two rows guess different experts (the merge is exercised)");
+        v.check(ranked_ok, "plan_rows: both rows' guesses merged in rank order, each expert once");
+        v.check(ids_ok, "plan_rows: the merged guesses outside VRAM that the RAM tier holds are copied");
+        cudaFree(dx12);
+    }
     // publish: routes = ranks 0 (VRAM), 2 (prefetched), 1 (RAM descriptor missing: CPU), and three RAM experts that
     // were not guessed; quota 1: one of those three is zero-copy, two go to the CPU
     {
