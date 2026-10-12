@@ -1,6 +1,7 @@
 // src/ds41/tests/rows_exact_test.cu - the verify window's multi-row kernels against their one-row forms, bit for bit:
 //   ops::bf16_linear_rows (the output head) against ops::bf16_linear per row, and wo_a_grouped_fp8_rows against
-//   wo_a_grouped_fp8 per row, for m = 1..4. Speculative output must equal plain greedy output token for token, so
+//   wo_a_grouped_fp8 per row, for m = 1..8 (verify windows,
+//   DSpark's block of 5). Speculative output must equal plain greedy output token for token, so
 //   a row of a window must compute exactly what the step computes for that token.
 #include "bench_util.hpp"
 
@@ -18,7 +19,7 @@ using bf16 = __nv_bfloat16;
 int main() {
     require_gpu();
     Verdict v;
-    constexpr int M = 4;
+    constexpr int M = 8;
     // the head's shape and a small odd one (n not a multiple of the 8 rows per block, k not of 32 lanes)
     for (const auto [k, n] : {std::pair<int64_t, int64_t>{sd::kDim, sd::kVocab}, {1000, 37}}) {
         Dev<bf16> x(rand_bf16((size_t) M * k, 1.0f, 3)), w(rand_bf16((size_t) n * k, 0.05f, 4));

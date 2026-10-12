@@ -108,7 +108,11 @@ void wo_a_grouped_fp8_rows(const bf16* o, int m, const uint8_t* w, const uint8_t
         case 2: wo_a_fp8_rows_k<2><<<kRows / 8, 256, 0, stream>>>(o, w, scale, y); break;
         case 3: wo_a_fp8_rows_k<3><<<kRows / 8, 256, 0, stream>>>(o, w, scale, y); break;
         case 4: wo_a_fp8_rows_k<4><<<kRows / 8, 256, 0, stream>>>(o, w, scale, y); break;
-        default: throw std::invalid_argument("wo_a_grouped_fp8_rows: m outside 1..4");
+        case 5: wo_a_fp8_rows_k<5><<<kRows / 8, 256, 0, stream>>>(o, w, scale, y); break;
+        case 6: wo_a_fp8_rows_k<6><<<kRows / 8, 256, 0, stream>>>(o, w, scale, y); break;
+        case 7: wo_a_fp8_rows_k<7><<<kRows / 8, 256, 0, stream>>>(o, w, scale, y); break;
+        case 8: wo_a_fp8_rows_k<8><<<kRows / 8, 256, 0, stream>>>(o, w, scale, y); break;
+        default: throw std::invalid_argument("wo_a_grouped_fp8_rows: m outside 1..8");
     }
     check(cudaGetLastError(), "wo_a_grouped_fp8_rows");
 }

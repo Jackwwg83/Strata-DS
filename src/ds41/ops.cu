@@ -597,7 +597,11 @@ void bf16_linear_rows(const bf16* x, int m, const bf16* w, int64_t k, int64_t n,
         case 2: bf16_gemv_rows_k<2><<<grid(n, 8), 256, 0, stream>>>(x, w, k, n, yf); break;
         case 3: bf16_gemv_rows_k<3><<<grid(n, 8), 256, 0, stream>>>(x, w, k, n, yf); break;
         case 4: bf16_gemv_rows_k<4><<<grid(n, 8), 256, 0, stream>>>(x, w, k, n, yf); break;
-        default: std::fprintf(stderr, "bf16_linear_rows: m %d outside 1..4\n", m); std::abort();
+        case 5: bf16_gemv_rows_k<5><<<grid(n, 8), 256, 0, stream>>>(x, w, k, n, yf); break;
+        case 6: bf16_gemv_rows_k<6><<<grid(n, 8), 256, 0, stream>>>(x, w, k, n, yf); break;
+        case 7: bf16_gemv_rows_k<7><<<grid(n, 8), 256, 0, stream>>>(x, w, k, n, yf); break;
+        case 8: bf16_gemv_rows_k<8><<<grid(n, 8), 256, 0, stream>>>(x, w, k, n, yf); break;
+        default: std::fprintf(stderr, "bf16_linear_rows: m %d outside 1..8\n", m); std::abort();
     }
     LAUNCH_CHECK("bf16_linear_rows");
 }
