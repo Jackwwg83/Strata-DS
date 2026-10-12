@@ -412,11 +412,18 @@ struct Engine::Impl {
     // basis of a prefetch). Recall of all routed experts and of the misses (not in VRAM), with 6, 9 and 12 guesses.
     static constexpr int kPredK = 12;
     bool pred_stats = [] { const char* v = std::getenv("DS41_PREDICT_STATS"); return v && v[0] == '1'; }();
+    // DS41_PREDICT_AHEAD=A (1..4, default 1): the stats predict layer l+A from layer l's expert input
+    int pred_ahead = [] {
+        const char* v = std::getenv("DS41_PREDICT_AHEAD");
+        const int a = v ? std::atoi(v) : 1;
+        if (a < 1 || a > 4) throw std::invalid_argument("DS41_PREDICT_AHEAD must be in [1, 4]");
+        return a;
+    }();
     std::vector<int32_t> pred_ids = std::vector<int32_t>(kLayers * kPredK, -1);
     int64_t pred_all[3] = {}, pred_miss[3] = {}, pred_n_all = 0, pred_n_miss = 0;
     void predict_tally() {
         static constexpr int ks[3] = {6, 9, 12};
-        for (int l = 1; l < kLayers; ++l)
+        for (int l = pred_ahead; l < kLayers; ++l)
             for (int i = 0; i < kTopK; ++i) {
                 const int32_t e = routes_pinned[l * kTopK + i];
                 const bool miss = !vram || vram->res_host()[(size_t) l * kExperts + e] < 0;
@@ -429,7 +436,7 @@ struct Engine::Impl {
                     pred_miss[k] += found && miss;
                 }
             }
-        if (pred_n_all && pred_n_all % (kTopK * (kLayers - 1) * 64) == 0)
+        if (pred_n_all && pred_n_all % (kTopK * (kLayers - pred_ahead) * 64) == 0)
             std::fprintf(stderr, "ds41 predict: recall all %.3f %.3f %.3f, misses %.3f %.3f %.3f (6 / 9 / 12 guesses, "
                                  "%lld uses)\n", pred_all[0] / (double) pred_n_all, pred_all[1] / (double) pred_n_all,
                          pred_all[2] / (double) pred_n_all, pred_miss[0] / (double) std::max<int64_t>(1, pred_n_miss),
@@ -908,8 +915,9 @@ struct Engine::Impl {
             wait += published - ready;
             if (l == 0) first_wait = published - ready;
             if (lookahead && m == 1) lookahead->post(l, d->x());   // predict layer l+1 while this layer computes
-            if (lookahead && m == 1 && pred_stats && l + 1 < kLayers)   // DS41_PREDICT_STATS: layer l+1's top 12
-                lookahead->predict_now(l + 1, (const uint16_t*) d->x(), kPredK, pred_ids.data() + (l + 1) * kPredK);
+            if (lookahead && m == 1 && pred_stats && l + pred_ahead < kLayers)   // DS41_PREDICT_STATS: layer l+A's top 12
+                lookahead->predict_now(l + pred_ahead, (const uint16_t*) d->x(), kPredK,
+                                       pred_ids.data() + (l + pred_ahead) * kPredK);
             c10::Half wh[kMaxUses];
             for (int i = 0; i < uses; ++i) {
                 const __half hv = __float2half_rn(d->w()[i]);
