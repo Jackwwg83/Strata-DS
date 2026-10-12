@@ -242,7 +242,7 @@ int main() {
         check(h.free_slots() == before + 1, tag + "release of an expert without a slot changes nothing");
     }
 
-    // one admit of several experts, each read in several parts (4 KiB parts here, 1 MiB in use): the parts go to the
+    // one admit of several experts, each read in several parts (4 KiB parts here, 2 MiB in use): the parts go to the
     // reader threads, and every slot must hold its expert's bytes; twice, so the readers are reused
     for (const uint64_t gap : {(uint64_t) 256, (uint64_t) 4096}) {
         const std::string tag = "parts, gap " + std::to_string(gap) + ": ";
@@ -257,6 +257,7 @@ int main() {
         for (int i = 0; i < 24; ++i) budget += pack.expert(ranked[i].first, ranked[i].second).bytes;
         HostExperts h(pack, ranked, res, budget, {}, 2);
         h.enable_adapt(3);
+        const size_t part_bytes = detail::admit_part_bytes();
         detail::admit_part_bytes() = 4096;
         std::vector<std::pair<int, int>> big;   // 3-unit experts outside the tier, of one layer
         for (int l = 0; l < ds41test::L && big.size() < 3; ++l) {
@@ -285,7 +286,7 @@ int main() {
             check(same, tag + "round " + std::to_string(round) + ": one admit read three experts in parts, bytes equal");
             for (auto& [l, e] : big) h.release(l, e);   // free their slots for the next round
         }
-        detail::admit_part_bytes() = 1u << 20;
+        detail::admit_part_bytes() = part_bytes;
     }
 
     // prefetch: reads started before admit() asks (the router lookahead's guesses for the next layer). admit() takes an
@@ -305,7 +306,8 @@ int main() {
         for (int i = 0; i < 24; ++i) budget += pack.expert(ranked[i].first, ranked[i].second).bytes;
         HostExperts h(pack, ranked, res, budget, {}, 2);
         h.enable_adapt(3);
-        detail::admit_part_bytes() = 4096;   // the prefetch reads go in parts too (1 MiB in use)
+        const size_t part_bytes = detail::admit_part_bytes();
+        detail::admit_part_bytes() = 4096;   // the prefetch reads go in parts too (2 MiB in use)
         const int free0 = h.free_slots();
         auto outside = [&](int l) {   // experts of layer l in no tier
             std::vector<int32_t> v;
@@ -371,7 +373,7 @@ int main() {
         h.end_step(r5.data(), 6);
         check(bytes_ok(5, g[0]) && h.slot_of(5, g[1]) == -1 && h.free_slots() == free0,
               tag + "the wrong guess, dropped or read in full, does not enter the tier");
-        detail::admit_part_bytes() = 1u << 20;
+        detail::admit_part_bytes() = part_bytes;
     }
 
     // pinning that fails while the arena is large (memory short at start): the tier drops its lowest-ranked slots, a

@@ -56,9 +56,11 @@ inline std::atomic<size_t>& register_limit() {
     static std::atomic<size_t> b{0};
     return b;
 }
-/// tests: the size of admit()'s read parts (a multiple of 4 KiB; 1 MiB in use)
+/// the size of admit()'s and prefetch()'s read parts (a multiple of 4 KiB; tests set it). 2 MiB: laptop SSD (YMTC
+/// PC411), O_DIRECT, one 7.9 MB expert on 8 readers 1.95 ms with 1 MiB parts, 1.68 ms with 2 MiB, 1.82 ms with 4 MiB;
+/// two experts 4.13 / 2.98 / 3.24 ms
 inline std::atomic<size_t>& admit_part_bytes() {
-    static std::atomic<size_t> b{1u << 20};
+    static std::atomic<size_t> b{2u << 20};
     return b;
 }
 }  // namespace detail

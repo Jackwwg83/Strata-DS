@@ -510,8 +510,8 @@ int HostExperts::admit(int layer, const int32_t* ids, int n, bool* ok) {
 
 void HostExperts::read_into(int layer, const int32_t* ids, int n, const std::vector<int>& pick,
                             std::atomic<bool>* failed, ThreadPool* pool) {
-    // the reads: 1 MiB parts of every picked expert on the pool's threads (admit(): 8), so several reads are in flight (the laptop's
-    // SSD reads about 6 GB/s with parallel O_DIRECT readers)
+    // the reads: admit_part_bytes() parts of every picked expert on the pool's threads (admit(): 8), so several
+    // reads are in flight (the laptop's SSD reads 4.7-5.3 GB/s with parallel O_DIRECT readers)
     struct Part { int i; size_t at, len; };
     std::vector<Part> parts;
     const size_t kPart = detail::admit_part_bytes().load();
