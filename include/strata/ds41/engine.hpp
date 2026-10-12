@@ -59,6 +59,10 @@ struct EngineOptions {
     /// decode together, at most kVerifyMaxTokens (the CPU expert kernel's rows). 0: none. Each slot holds about
     /// 90 MB of VRAM at 32K context, and the slots share a staging area of 4 x 6 experts.
     int batch_slots = 0;
+    /// DSpark, DeepSeek's MTP drafter (Engine::draft): its routed experts (6.8 GB, pack.py --mtp-experts) are read
+    /// into RAM before the RAM tier sizes itself, and step, verify and prefill keep its input (the attention input of
+    /// layers 37-39). Off: none of that.
+    bool dspark = false;
     int prefill_threads = 16;       ///< expert stream readers (pread from the pack)
     int prefill_host_buffers = 64;  ///< pinned staging buffers of the expert stream (how far reads run ahead)
 };
@@ -99,6 +103,18 @@ public:
     VerifyResult verify(const std::vector<int>& window, int pos, bool logits = false);
     /// Keep the first n_keep inputs (1..T). Discard every later input and its state.
     void commit(int n_keep);
+
+    /// DSpark's drafts (EngineOptions::dspark): the 5 tokens after `token`, the token at position() that is not fed
+    /// yet, and for each the confidence head's probability that it is accepted when the drafts before it are. n = 0
+    /// (no drafts) before the first token or near max_seq. Drafts only choose what a verify window checks.
+    struct Draft {
+        int n = 0;
+        std::array<int, 5> tokens{};
+        std::array<float, 5> accept{};
+        double ms = 0, cpu_experts_ms = 0;   ///< the whole call; the CPU's routed experts inside it
+    };
+    Draft draft(int token);
+    bool has_dspark() const;
 
     /// Feed tokens at positions pos, pos + 1, ... (pos = the tokens fed so far) in batched chunks: every layer on the
     /// GPU, all routed experts on the GPU (VRAM tier slots, the rest streamed through a ring). Returns the greedy

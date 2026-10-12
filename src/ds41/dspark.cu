@@ -1,0 +1,381 @@
+// Included by engine.cu after Impl (as verify.cu). DSpark, DeepSeek's MTP drafter (model.py DSparkBlock,
+// Transformer.forward_spec): three blocks over a block of 5 rows (the token after the committed ones, then 4 noise
+// tokens) draw the next 5 tokens in one pass. Its attention reads a ring of the last 128 committed positions' main_kv,
+// projected from the attention input of backbone layers 37-39 (main_hiddens, captured by step, verify and prefill).
+// Its routed experts (3 of 128 per stage) stay in RAM and the decode worker computes them; the rest runs on the GPU.
+// Drafts only choose what a verify window checks: nothing here changes the output.
+namespace dsk = strata::ds41::dspark;
+
+struct Engine::Impl::Dspark {
+    static constexpr int B = dsk::kBlock;
+    static constexpr int kHid = dsk::kTargets * kDim;   // 15360: the three target layers' means, concatenated
+    static constexpr int kMaxPend = kWindow;             // pending main_hiddens rows (a prefill pass leaves 128)
+    static constexpr int kPrm = 16;                      // params: [0..4] tokens, [5..9] positions, [10] start_pos
+    std::vector<std::shared_ptr<void>> mem;
+    template <class T> T* alloc(size_t n) {
+        T* p = dalloc<T>(std::max<size_t>(1, n));
+        mem.emplace_back(p, [](void* q) { cudaFree(q); });
+        return p;
+    }
+    Layer S[dsk::kStages];
+    Fp8 main_proj{};
+    const bf16 *main_norm = nullptr, *norm = nullptr, *m_embed = nullptr, *m_head = nullptr, *conf_w = nullptr;
+    // main_hiddens: the step's row and the verify window's rows (captured inside their graphs), and the pending rows
+    // whose main_kv the next draft writes into the rings first (mh rows 0..pend_n-1, positions pend_pos0 on)
+    bf16 *step_mh = nullptr, *verify_mh = nullptr, *mh = nullptr;
+    int pend_n = 0, pend_pos0 = 0;
+    // ring update scratch: 8 rows at a time (the FP8 GEMV's rows)
+    bf16 *mx = nullptr, *mkv = nullptr;
+    // the block's rows
+    bf16 *h, *h2, *xa, *xf, *qr, *q, *kvv, *o, *oa, *attn_out, *g, *u, *sh_h, *sh_out, *ffn_out, *xfin, *xn, *memb;
+    float *act, *mix, *apre, *apost, *acomb, *fpre, *fpost, *fcomb, *routed, *logits, *conf, *weights;
+    uint16_t* half = nullptr;
+    int32_t *ids = nullptr, *sel = nullptr, *idx = nullptr, *out = nullptr;
+    int *prm = nullptr, *prm_host = nullptr;   // [kPrm + kMaxPend]: then the pending rows' positions
+    int32_t* out_host = nullptr;
+    float* conf_host = nullptr;
+    std::unique_ptr<ExpertDoorbell> db;
+    int64_t moe[dsk::kStages] = {-1, -1, -1};
+    std::map<int, cudaGraphExec_t> graphs;   // by pending rows (0..kVerifyMaxTokens)
+    bool warmed = false;
+    ~Dspark() {
+        for (auto& [k, e] : graphs) cudaGraphExecDestroy(e);
+        for (int64_t hnd : moe)
+            if (hnd >= 0) exl3_moe_cpu_free_layer(hnd);
+        if (prm_host) cudaFreeHost(prm_host);
+        if (out_host) cudaFreeHost(out_host);
+        if (conf_host) cudaFreeHost(conf_host);
+    }
+};
+
+/// DSpark's weights, buffers and CPU expert layers. Its experts are already in RAM (load_mtp_experts, before the RAM
+/// tier sized itself); the buffers are allocated before the VRAM tier takes the free memory.
+void Engine::Impl::dspark_init() {
+    if (pack.mtp_stages() != dsk::kStages || pack.mtp_experts() != dsk::kExperts)
+        throw std::runtime_error("ds41 dspark: the pack has no DSpark experts (tools/ds41/pack.py --mtp-experts)");
+    ds = std::make_shared<Dspark>();
+    auto& d = *ds;
+    for (int s = 0; s < dsk::kStages; ++s) {
+        auto& y = d.S[s];
+        const std::string p = "mtp." + std::to_string(s) + ".";
+        y.wq_a = fp8(p + "attn.wq_a");
+        y.wq_b = fp8(p + "attn.wq_b");
+        y.wkv = fp8(p + "attn.wkv");
+        y.wo_b = fp8(p + "attn.wo_b");
+        y.wo_a8 = fp8(p + "attn.wo_a");
+        y.q_norm = bf(p + "attn.q_norm.weight");
+        y.kv_norm = bf(p + "attn.kv_norm.weight");
+        y.sink = f32(p + "attn.attn_sink");
+        y.attn_norm = bf(p + "attn_norm.weight");
+        y.ffn_norm = bf(p + "ffn_norm.weight");
+        y.hc_attn_fn = f32(p + "hc_attn_fn");
+        y.hc_attn_base = f32(p + "hc_attn_base");
+        y.hc_attn_scale = f32(p + "hc_attn_scale");
+        y.hc_ffn_fn = f32(p + "hc_ffn_fn");
+        y.hc_ffn_base = f32(p + "hc_ffn_base");
+        y.hc_ffn_scale = f32(p + "hc_ffn_scale");
+        y.gate_w = bf(p + "ffn.gate.weight");
+        y.gate_bias = f32(p + "ffn.gate.bias");
+        y.sh_w1 = fp8(p + "ffn.shared_experts.w1");
+        y.sh_w2 = fp8(p + "ffn.shared_experts.w2");
+        y.sh_w3 = fp8(p + "ffn.shared_experts.w3");
+        y.window = d.alloc<bf16>((size_t) kWindow * kHeadDim);
+        std::vector<MoeCpuMatrixDesc> gate(dsk::kExperts), up(dsk::kExperts), down(dsk::kExperts);
+        const uint8_t* base = pack.mtp_expert_base();
+        for (int e = 0; e < dsk::kExperts; ++e) {
+            const auto& x = pack.mtp_expert(s, e);
+            auto desc = [&](int c0, int k_tiles, int n_tiles) {
+                MoeCpuMatrixDesc m;
+                m.trellis = (const uint16_t*) (base + x.offset + x.comp_off[c0]);
+                m.suh = (const at::Half*) (base + x.offset + x.comp_off[c0 + 1]);
+                m.svh = (const at::Half*) (base + x.offset + x.comp_off[c0 + 2]);
+                m.k_tiles = k_tiles;
+                m.n_tiles = n_tiles;
+                m.tile_w = (int) (x.comp_bytes[c0] / ((uint64_t) k_tiles * n_tiles * 2));
+                return m;
+            };
+            gate[e] = desc(0, kDim / 16, kMoeInter / 16);
+            up[e] = desc(4, kDim / 16, kMoeInter / 16);
+            down[e] = desc(8, kMoeInter / 16, kDim / 16);
+        }
+        d.moe[s] = exl3_moe_cpu_make_layer_raw(gate.data(), up.data(), down.data(), dsk::kExperts, 0, kSwigluLimit, 0);
+    }
+    d.main_proj = fp8("mtp.0.main_proj");
+    if (d.main_proj.k != Dspark::kHid || d.main_proj.n != kDim) throw std::runtime_error("ds41 dspark: main_proj shape");
+    d.main_norm = bf("mtp.0.main_norm.weight");
+    d.norm = bf("mtp.2.norm.weight");
+    d.m_embed = bf("mtp.2.markov_head.embed.weight");
+    d.m_head = bf("mtp.2.markov_head.head.weight");
+    d.conf_w = bf("mtp.2.confidence_head.proj.weight");
+    const int B = Dspark::B, M = kVerifyMaxTokens;
+    d.step_mh = d.alloc<bf16>(Dspark::kHid);
+    d.verify_mh = d.alloc<bf16>((size_t) M * Dspark::kHid);
+    d.mh = d.alloc<bf16>((size_t) Dspark::kMaxPend * Dspark::kHid);
+    d.mx = d.alloc<bf16>(8 * kDim);
+    d.mkv = d.alloc<bf16>(8 * kHeadDim);
+    d.h = d.alloc<bf16>(B * kHc * kDim); d.h2 = d.alloc<bf16>(B * kHc * kDim);
+    d.xa = d.alloc<bf16>(B * kDim); d.xf = d.alloc<bf16>(B * kDim);
+    d.qr = d.alloc<bf16>(B * kQLora); d.q = d.alloc<bf16>((size_t) B * kHeads * kHeadDim);
+    d.kvv = d.alloc<bf16>(B * kHeadDim); d.o = d.alloc<bf16>((size_t) B * kHeads * kHeadDim);
+    d.oa = d.alloc<bf16>(B * kOGroups * kOLora); d.attn_out = d.alloc<bf16>(B * kDim);
+    d.g = d.alloc<bf16>(B * kMoeInter); d.u = d.alloc<bf16>(B * kMoeInter); d.sh_h = d.alloc<bf16>(B * kMoeInter);
+    d.sh_out = d.alloc<bf16>(B * kDim); d.ffn_out = d.alloc<bf16>(B * kDim);
+    d.xfin = d.alloc<bf16>(B * kDim); d.xn = d.alloc<bf16>(B * kDim); d.memb = d.alloc<bf16>(B * dsk::kMarkovRank);
+    d.act = d.alloc<float>((size_t) 8 * Dspark::kHid);
+    d.mix = d.alloc<float>(B * kHc);
+    d.apre = d.alloc<float>(B * kHc); d.apost = d.alloc<float>(B * kHc); d.acomb = d.alloc<float>(B * kHc * kHc);
+    d.fpre = d.alloc<float>(B * kHc); d.fpost = d.alloc<float>(B * kHc); d.fcomb = d.alloc<float>(B * kHc * kHc);
+    d.routed = d.alloc<float>(B * kDim);
+    d.logits = d.alloc<float>((size_t) B * kVocab);
+    d.conf = d.alloc<float>(B);
+    d.weights = d.alloc<float>(B * dsk::kTopK);
+    d.half = d.alloc<uint16_t>(B * kDim);
+    d.ids = d.alloc<int32_t>(B * dsk::kTopK);
+    d.sel = d.alloc<int32_t>(B * dsk::kTopK);
+    d.idx = d.alloc<int32_t>(B * (kWindow + B));
+    d.out = d.alloc<int32_t>(B);
+    d.prm = d.alloc<int>(Dspark::kPrm + Dspark::kMaxPend);
+    ck(cudaHostAlloc((void**) &d.prm_host, (Dspark::kPrm + Dspark::kMaxPend) * sizeof(int), cudaHostAllocDefault),
+       "dspark params");
+    ck(cudaHostAlloc((void**) &d.out_host, B * sizeof(int32_t), cudaHostAllocDefault), "dspark drafts");
+    ck(cudaHostAlloc((void**) &d.conf_host, B * sizeof(float), cudaHostAllocDefault), "dspark confidence");
+    d.db = std::make_unique<ExpertDoorbell>(B, dsk::kTopK, kDim);
+}
+
+/// After a step or a commit: rows of `src` (main_hiddens of positions pos0, pos0 + 1, ...) become the pending rows. A
+/// later draft writes their main_kv into the rings first. Rows still pending from before are dropped: their ring slots
+/// keep older rows, which costs draft quality only.
+void Engine::Impl::dspark_pend(const bf16* src, int n, int pos0) {
+    auto& d = *ds;
+    ck(cudaMemcpyAsync(d.mh, src, (size_t) n * Dspark::kHid * sizeof(bf16), cudaMemcpyDeviceToDevice, st), "dspark pend");
+    d.pend_n = n;
+    d.pend_pos0 = pos0;
+}
+
+/// The rings' rows of mh rows 0..n-1, whose positions are prm[kPrm + i] (DSparkAttention, the main_x part):
+/// main_x = main_norm(main_proj(main_hiddens)); per stage main_kv = act_quant(rope(kv_norm(wkv(main_x)))) in slot
+/// pos % 128. Eight rows at a time (the FP8 GEMV's rows).
+void Engine::Impl::dspark_ring(int n, cudaStream_t s) {
+    auto& d = *ds;
+    for (int c0 = 0; c0 < n; c0 += 8) {
+        const int mc = std::min(8, n - c0);
+        fp8_quantize_activation_f32((const uint16_t*) (d.mh + (size_t) c0 * Dspark::kHid), mc, Dspark::kHid, d.act, s);
+        fp8_block_gemv_q(d.act, mc, Dspark::kHid, d.main_proj.w, d.main_proj.s, d.main_proj.n, (uint16_t*) d.mx, s);
+        ops::rmsnorm(d.mx, d.main_norm, d.mx, kDim, kNormEps, mc, s);
+        fp8_quantize_activation_f32((const uint16_t*) d.mx, mc, kDim, d.act, s);
+        for (int st_i = 0; st_i < dsk::kStages; ++st_i) {
+            auto& y = d.S[st_i];
+            fp8_block_gemv_q(d.act, mc, kDim, y.wkv.w, y.wkv.s, y.wkv.n, (uint16_t*) d.mkv, s);
+            ops::rmsnorm(d.mkv, y.kv_norm, d.mkv, kHeadDim, kNormEps, mc, s);
+            for (int r = 0; r < mc; ++r) {
+                const int* p = d.prm + Dspark::kPrm + c0 + r;
+                bf16* kv = d.mkv + (size_t) r * kHeadDim;
+                ops::rope_device(kv, 1, kHeadDim, rope_plain, p, 0, false, s);
+                ops::act_quant_inplace(kv, kHeadDim, s);
+                ops::row_copy_device(y.window, kv, kHeadDim * sizeof(bf16), p, 1, kWindow, s);
+            }
+        }
+    }
+}
+
+/// One draft pass on st: the pending rows into the rings, then the three blocks over the block's 5 rows (the routed
+/// experts on the CPU through ds->db), the head with the Markov bias draft by draft, and the confidence head.
+void Engine::Impl::enqueue_draft(int n_pend) {
+    auto& d = *ds;
+    const int B = Dspark::B;
+    ck(cudaMemcpyAsync(d.prm, d.prm_host, (Dspark::kPrm + std::max(n_pend, 0)) * sizeof(int), cudaMemcpyHostToDevice, st),
+       "dspark params");
+    if (n_pend > 0) dspark_ring(n_pend, st);
+    auto lin = [&](const bf16* x, const Fp8& w, bf16* y) {
+        fp8_quantize_activation_f32((const uint16_t*) x, B, w.k, d.act, st);
+        fp8_block_gemv_q(d.act, B, w.k, w.w, w.s, w.n, (uint16_t*) y, st);
+    };
+    dsk::block_index(d.prm + 10, d.idx, st);
+    for (int r = 0; r < B; ++r) {
+        ops::embed_device(embed, d.prm + r, d.h + (size_t) r * kHc * kDim, st);   // x.repeat(hc_mult): 4 copies
+        ck(cudaMemcpyAsync(d.mix + r * kHc, one_hot_dev, kHc * sizeof(float), cudaMemcpyDeviceToDevice, st), "dspark mix");
+    }
+    for (int s = 0; s < dsk::kStages; ++s) {
+        auto& y = d.S[s];
+        kernels::hc_mixes_pre(d.h, B, y.hc_attn_fn, y.hc_attn_scale, y.hc_attn_base, d.mix, d.xa, d.apre, d.apost,
+                              d.acomb, st);
+        ops::rmsnorm(d.xa, y.attn_norm, d.xa, kDim, kNormEps, B, st);
+        lin(d.xa, y.wkv, d.kvv);
+        ops::rmsnorm(d.kvv, y.kv_norm, d.kvv, kHeadDim, kNormEps, B, st);
+        lin(d.xa, y.wq_a, d.qr);
+        ops::rmsnorm(d.qr, y.q_norm, d.qr, kQLora, kNormEps, B, st);
+        lin(d.qr, y.wq_b, d.q);
+        for (int r = 0; r < B; ++r) {   // block row r sits at position start_pos + 1 + r (plain rope: no compression)
+            const int* p = d.prm + 5 + r;
+            ops::rope_device(d.q + (size_t) r * kHeads * kHeadDim, kHeads, kHeadDim, rope_plain, p, 0, false, st);
+            ops::rope_device(d.kvv + (size_t) r * kHeadDim, 1, kHeadDim, rope_plain, p, 0, false, st);
+            ops::act_quant_inplace(d.kvv + (size_t) r * kHeadDim, kHeadDim, st);
+        }
+        // every block row attends to the ring's written slots and to all 5 block rows (no mask inside the block)
+        kernels::sparse_attn_decode(d.q, y.window, d.kvv, d.idx, B, kWindow + B, y.sink,
+                                    (float) std::pow(kHeadDim, -0.5), d.o, st);
+        for (int r = 0; r < B; ++r)
+            ops::rope_device(d.o + (size_t) r * kHeads * kHeadDim, kHeads, kHeadDim, rope_plain, d.prm + 5 + r, 0, true, st);
+        wo_a_grouped_fp8_rows(d.o, B, y.wo_a8.w, y.wo_a8.s, d.oa, st);
+        lin(d.oa, y.wo_b, d.attn_out);
+        ops::hc_post(d.attn_out, d.h, d.apost, d.acomb, d.h2, B, st);
+        kernels::hc_mixes_pre(d.h2, B, y.hc_ffn_fn, y.hc_ffn_scale, y.hc_ffn_base, d.apre, d.xf, d.fpre, d.fpost,
+                              d.fcomb, st);
+        ops::rmsnorm(d.xf, y.ffn_norm, d.xf, kDim, kNormEps, B, st);
+        dsk::router_small(d.xf, B, y.gate_w, y.gate_bias, dsk::kExperts, dsk::kTopK, d.ids, d.weights, st);
+        ops::to_half_fp8q(d.xf, d.half, B * kDim, st);
+        d.db->publish(d.half, d.ids, d.weights, B, nullptr, d.sel, (uint32_t) (s + 1), st);   // every expert: CPU
+        lin(d.xf, y.sh_w1, d.g);
+        lin(d.xf, y.sh_w3, d.u);
+        ops::swiglu(d.g, d.u, kSwigluLimit, d.sh_h, B * kMoeInter, st);
+        lin(d.sh_h, y.sh_w2, d.sh_out);
+        ck(cudaMemsetAsync(d.routed, 0, B * kDim * sizeof(float), st), "dspark routed");
+        d.db->wait_add(d.routed, B, (uint32_t) (s + 1), st);
+        ops::add_f32_bf16(d.routed, d.sh_out, d.ffn_out, B * kDim, st);
+        ops::hc_post(d.ffn_out, d.h2, d.fpost, d.fcomb, d.h, B, st);
+        ck(cudaMemcpyAsync(d.mix, d.fpre, B * kHc * sizeof(float), cudaMemcpyDeviceToDevice, st), "dspark ffn_pre");
+    }
+    // forward_head: the collapse (its pre-norm rows feed the confidence head), norm, the backbone's head
+    ops::hc_pre(d.h, d.mix, d.xfin, B, st);
+    ops::rmsnorm(d.xfin, d.norm, d.xn, kDim, kNormEps, B, st);
+    ops::bf16_linear_rows(d.xn, B, head, kDim, kVocab, d.logits, st);
+    for (int i = 0; i < B; ++i) {   // draft i: the Markov bias of the token before it, then the greedy pick
+        dsk::markov_bias(i == 0 ? d.prm : d.out + i - 1, d.m_embed, d.m_head, kVocab, d.logits + (size_t) i * kVocab,
+                         d.memb + i * dsk::kMarkovRank, st);
+        ops::argmax_logits(d.logits + (size_t) i * kVocab, d.out + i, st);
+    }
+    dsk::confidence_rows(d.xfin, d.memb, d.conf_w, B, d.conf, st);
+    ck(cudaMemcpyAsync(d.out_host, d.out, B * sizeof(int32_t), cudaMemcpyDeviceToHost, st), "dspark drafts");
+    ck(cudaMemcpyAsync(d.conf_host, d.conf, B * sizeof(float), cudaMemcpyDeviceToHost, st), "dspark confidence");
+}
+
+/// The decode worker's DSpark job: per stage, when the GPU publishes it, the block's routed experts from RAM.
+void Engine::Impl::run_dspark_job(ExpertDoorbell* d, int m) {
+    try {
+        exl3_moe_cpu_pool_prime(cpu_threads);
+    } catch (...) {
+    }
+    for (int s = 0; s < dsk::kStages; ++s) {
+        if (!d->wait_published((uint32_t) (s + 1), job_cancel)) return;
+        c10::Half wh[Dspark::B * dsk::kTopK];
+        for (int i = 0; i < m * dsk::kTopK; ++i) {
+            const __half hv = __float2half_rn(d->w()[i]);
+            wh[i] = c10::Half(__half_as_ushort(hv), c10::Half::from_bits());
+        }
+        const double t0 = now_ms();
+        try {
+            if (fault("dspark")) throw std::runtime_error("ds41 test fault: DSpark experts");
+            exl3_moe_cpu_forward_raw(ds->moe[s], (const at::Half*) d->x(), d->ids(), wh, d->y(), m, dsk::kTopK,
+                                     cpu_threads);
+        } catch (...) {
+            std::fill_n(d->y(), (size_t) m * kDim, 0.0f);
+            std::lock_guard<std::mutex> lk(mu);
+            if (!worker_error) worker_error = std::current_exception();
+        }
+        worker_us += (int64_t) ((now_ms() - t0) * 1000.0);
+        d->mark_done((uint32_t) (s + 1));
+    }
+}
+
+Engine::Draft Engine::Impl::draft(int token) {
+    usable();
+    if (!ds) throw std::logic_error("ds41 dspark: the engine was created without EngineOptions::dspark");
+    if (verify_pending) throw std::logic_error("commit the pending verify window first");
+    check_token(token);
+    auto& d = *ds;
+    const int pos = (int) history.size();   // token's position; the committed tokens end at pos - 1 (start_pos)
+    Draft r;
+    if (pos < 1 || pos + Dspark::B > max_seq) return r;   // no committed token yet, or no room for the drafts
+    const double begin = now_ms();
+    int* p = d.prm_host;
+    p[0] = token;
+    for (int i = 1; i < Dspark::B; ++i) p[i] = dsk::kNoiseToken;
+    for (int i = 0; i < Dspark::B; ++i) p[5 + i] = pos + i;
+    p[10] = pos - 1;
+    for (int i = 0; i < d.pend_n; ++i) p[Dspark::kPrm + i] = d.pend_pos0 + i;
+    int n_pend = d.pend_n;
+    if (n_pend > kVerifyMaxTokens) {   // a prefill's rows: written eagerly, the graphs cover a window's rows
+        ck(cudaMemcpyAsync(d.prm, d.prm_host, (Dspark::kPrm + n_pend) * sizeof(int), cudaMemcpyHostToDevice, st),
+           "dspark params");
+        dspark_ring(n_pend, st);
+        n_pend = 0;
+    }
+    d.pend_n = 0;
+    cudaGraphExec_t exec = nullptr;
+    if (use_graph && d.warmed) {
+        auto it = d.graphs.find(n_pend);
+        if (it == d.graphs.end()) {
+            cudaGraph_t gr = nullptr;
+            ck(cudaStreamBeginCapture(st, cudaStreamCaptureModeRelaxed), "dspark capture");
+            try {
+                enqueue_draft(n_pend);
+                ck(cudaStreamEndCapture(st, &gr), "dspark end capture");
+                ck(cudaGraphInstantiate(&exec, gr, 0), "dspark instantiate");
+            } catch (...) {
+                if (!gr) cudaStreamEndCapture(st, &gr);
+                if (gr) cudaGraphDestroy(gr);
+                throw;
+            }
+            cudaGraphDestroy(gr);
+            it = d.graphs.emplace(n_pend, exec).first;
+        }
+        exec = it->second;
+    }
+    d.db->reset();
+    worker_us = 0;
+    {
+        std::lock_guard<std::mutex> lk(mu);
+        job_db = d.db.get();
+        job_m = Dspark::B;
+        job_dspark = true;
+        job_cancel = false;
+        ++go;
+    }
+    cv.notify_all();
+    const uint64_t job = go;
+    auto job_end = [&] {
+        std::unique_lock<std::mutex> lk(mu);
+        cv.wait(lk, [&] { return jobs_done >= job; });
+    };
+    try {
+        if (exec) ck(cudaGraphLaunch(exec, st), "dspark launch");
+        else enqueue_draft(n_pend);
+        ck(cudaStreamSynchronize(st), "dspark draft");
+    } catch (...) {
+        job_cancel = true;
+        job_end();
+        d.db->mark_done(dsk::kStages);
+        cudaStreamSynchronize(st);
+        broken = true;   // the rings may hold half-written rows and the stream state is unknown
+        throw;
+    }
+    job_end();
+    {
+        std::lock_guard<std::mutex> lk(mu);
+        if (worker_error) {
+            std::exception_ptr e = worker_error;
+            worker_error = nullptr;
+            std::rethrow_exception(e);
+        }
+    }
+    d.warmed = true;
+    r.n = Dspark::B;
+    for (int i = 0; i < Dspark::B; ++i) {
+        r.tokens[i] = d.out_host[i];
+        r.accept[i] = 1.0f / (1.0f + std::exp(-d.conf_host[i]));
+    }
+    r.cpu_experts_ms = worker_us.load() / 1000.0;
+    r.ms = now_ms() - begin;
+    return r;
+}
+
+bf16* Engine::Impl::ds_step_mh() { return ds->step_mh; }
+bf16* Engine::Impl::ds_verify_mh() { return ds->verify_mh; }
+bf16* Engine::Impl::ds_pend_rows() { return ds->mh; }
+void Engine::Impl::ds_set_pending(int n, int pos0) {
+    ds->pend_n = n;
+    ds->pend_pos0 = pos0;
+}
+
+Engine::Draft Engine::draft(int token) { return impl_->draft(token); }
+bool Engine::has_dspark() const { return impl_->ds != nullptr; }

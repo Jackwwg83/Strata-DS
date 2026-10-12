@@ -187,6 +187,7 @@ void Engine::Impl::enqueue_verify(int m) {
                               kNormEps, m, st);
             ++eng_i;
         }
+        if (ds) dspark_capture(l, v.h, m, ds_verify_mh(), st);
         kernels::hc_mixes_pre(v.h, m, y.hc_attn_fn, y.hc_attn_scale, y.hc_attn_base, v.mix,
                              v.xa, v.apre, v.apost, v.acomb, st);
         ops::rmsnorm(v.xa, y.attn_norm, v.xa, kDim, kNormEps, m, st);
@@ -397,6 +398,7 @@ VerifyResult Engine::Impl::verify(const std::vector<int>& window, int pos, bool 
         std::lock_guard<std::mutex> lk(mu);
         job_db = v.db.get();
         job_m = m;
+        job_dspark = false;
         job_cancel = false;
         ++go;
     }
@@ -489,6 +491,7 @@ void Engine::Impl::commit_verify(int keep) {
     ck(cudaStreamSynchronize(st), "verify commit");
     for (int t = 0; t < keep; ++t) history.push_back(pack.engram_hash().token_map[v.tokens[t]]);
     lg.assign(v.logits_host+(keep-1)*kVocab, v.logits_host+keep*kVocab);
+    if (ds) dspark_pend(ds_verify_mh(), keep, v.pos);   // the kept rows' main_hiddens feed the next draft
     if (vram || (host && host->reserve() > 0)) {
         int32_t row[kLayers*kTopK];
         for (int t = 0; t < keep; ++t) {

@@ -10,6 +10,7 @@
 
 #include "strata/ds41/config.hpp"
 #include "strata/ds41/doorbell.hpp"
+#include "strata/ds41/dspark_ops.hpp"
 #include "strata/ds41/engram_rows.hpp"
 #include "strata/ds41/expert_prefetch.hpp"
 #include "strata/ds41/expert_stream.hpp"
@@ -173,6 +174,7 @@ struct Engine::Impl {
     // the released job: a step (db, 1 row) or a verify window (its doorbell, m rows); job_cancel ends its waits
     ExpertDoorbell* job_db = nullptr;
     int job_m = 1;
+    bool job_dspark = false;           // the job is a DSpark draft (run_dspark_job), not the backbone's layers
     std::atomic<bool> job_cancel{false};
     std::atomic<int64_t> worker_us{0}; // CPU expert time of the current step
     // the worker's critical-path timing of the current step (Timing::worker_*): stored by the worker before it marks
@@ -306,6 +308,26 @@ struct Engine::Impl {
     void enqueue_verify(int m);
     VerifyResult verify(const std::vector<int>& window, int pos, bool logits, Timing& tm);
     void commit_verify(int n_keep);
+
+    // DSpark (src/ds41/dspark.cu): null without EngineOptions::dspark
+    struct Dspark;
+    std::shared_ptr<Dspark> ds;
+    void dspark_init();
+    void dspark_pend(const bf16* src, int n, int pos0);
+    void dspark_ring(int n, cudaStream_t s);
+    void enqueue_draft(int n_pend);
+    void run_dspark_job(ExpertDoorbell* d, int m);
+    Draft draft(int token);
+    bf16* ds_step_mh();                  // the step's main_hiddens row
+    bf16* ds_verify_mh();                // the verify window's rows
+    bf16* ds_pend_rows();                // the pending rows (a prefill pass captures into them)
+    void ds_set_pending(int n, int pos0);
+    /// main_hiddens (model.py Transformer.forward): the mean of the hc copies of h, the attention input of target layer
+    /// l, into row r of `dst` (15360 wide: layers 37, 38, 39)
+    void dspark_capture(int l, const bf16* h_rows, int m, bf16* dst, cudaStream_t s) {
+        if (ds && l >= dspark::kFirstTarget && l < dspark::kFirstTarget + dspark::kTargets)
+            dspark::hc_mean_rows(h_rows, m, dst + (l - dspark::kFirstTarget) * kDim, dspark::kTargets * kDim, s);
+    }
 
     // shared attention state for the current token (SharedAttentionRuntime)
     const bf16* cur_comp = nullptr;
@@ -472,6 +494,12 @@ struct Engine::Impl {
         if (opt.adapt_every == 0 && !std::getenv("DS41_RAM_ADAPT")) ram_adapt = 0;
         pack.upload_dense();
         pack.map_experts();
+        if (opt.dspark) {   // before the RAM tier's automatic budget reads the available memory
+            const double t0 = now_ms();
+            const uint64_t b = pack.load_mtp_experts();
+            std::fprintf(stderr, "ds41: DSpark experts in RAM (%.2f GiB) in %.1f s\n", b / (double) (1ull << 30),
+                         (now_ms() - t0) / 1000.0);
+        }
         embed = bf("embed.weight");
         head = bf("head.weight");
         final_norm = bf("norm.weight");
@@ -695,6 +723,7 @@ struct Engine::Impl {
             }
         }
         alloc_slots();   // the batch slots' state and staging, before the VRAM tier sizes itself
+        if (opt.dspark) dspark_init();   // its buffers too
         // the VRAM expert tier last: an automatic slot count takes what the rest left free
         if (!opt.expert_profile.empty() && opt.vram_expert_slots != 0) {
             VramExperts::Adapt ad;
@@ -826,6 +855,7 @@ struct Engine::Impl {
         for (;;) {
             ExpertDoorbell* d = nullptr;
             int m = 1;
+            bool dspark_job = false;
             {
                 std::unique_lock<std::mutex> lk(mu);
                 cv.wait(lk, [&] { return stop.load() || go != seen; });
@@ -833,8 +863,10 @@ struct Engine::Impl {
                 seen = go;
                 d = job_db;
                 m = job_m;
+                dspark_job = job_dspark;
             }
-            run_job(d, m);
+            if (dspark_job) run_dspark_job(d, m);
+            else run_job(d, m);
             {
                 std::lock_guard<std::mutex> lk(mu);
                 jobs_done = seen;
@@ -1902,8 +1934,10 @@ struct Engine::Impl {
         }
         bool later_pushed = later_jobs.empty();
         int eng_i = 0;
+        const int ds_n = std::min(S, kWindow);   // DSpark's ring takes the pass's last 128 positions
         for (int l = 0; l < kLayers; ++l) {
             auto& y = L[l];
+            if (ds) dspark_capture(l, pf.h + (size_t) (S - ds_n) * kHc * kDim, ds_n, ds_pend_rows(), 0);
             for (int b0 = 0; b0 < S; b0 += B) {
                 const int T = std::min(B, S - b0);
                 bf16* h = pf.h + (size_t) b0 * kHc * kDim;
@@ -1977,6 +2011,7 @@ struct Engine::Impl {
         }
         pfp.mark(PfProfile::kHead);
         pfp.report();
+        if (ds) ds_set_pending(ds_n, p0 + S - ds_n);   // captured in place above; the next draft writes the rings
         if (S >= kStreamAll) estream->drain();   // every job of the pass was consumed
     }
 
@@ -2081,6 +2116,7 @@ struct Engine::Impl {
         for (int l = 0; l < kLayers; ++l) {
             auto& y = L[l];
             if (is_engram_layer(l) && eng_i < n_eng) engram(l, eng_i++);
+            if (ds) dspark_capture(l, h, 1, ds_step_mh(), st);
             const bool dbg_layer = dbg && (l == 1 || l == 2);
             if (dbg_layer) dbg_write(h, kHc * kDim);                    // block input (after engram)
             // attention sub-block: h -> h2
@@ -2128,6 +2164,7 @@ struct Engine::Impl {
         usable();
         history.clear();
         verify_pending = verify_failed = false;
+        if (ds) ds_set_pending(0, 0);
     }
 
     void alloc_snapshots() {
@@ -2186,6 +2223,7 @@ struct Engine::Impl {
         verify_pending = verify_failed = false;
         snapshot_copy(sn, false);
         history.resize(sn.pos);
+        if (ds) ds_set_pending(0, 0);   // DSpark's rings are not in the snapshot: stale rows cost draft quality only
         return sn.pos;
     }
 
@@ -2230,6 +2268,7 @@ struct Engine::Impl {
             std::lock_guard<std::mutex> lk(mu);
             job_db = db.get();
             job_m = 1;
+            job_dspark = false;
             job_cancel = false;
             ++go;
         }
@@ -2277,6 +2316,7 @@ struct Engine::Impl {
         }
         const int best = *hp_next;
         lg.assign(lg_pinned, lg_pinned + kVocab);
+        if (ds) dspark_pend(ds_step_mh(), 1, pos);
         if (pred_stats && lookahead) predict_tally();
         if (vram) vram->count(routes_pinned, kTopK);
         if (host && host->reserve() > 0) host->end_step(routes_pinned, kTopK);   // publish this step's reads, evict
@@ -2321,6 +2361,7 @@ struct Engine::Impl {
 
 #include "verify.cu"
 #include "batch.cu"
+#include "dspark.cu"
 
 Engine::Engine(const std::string& pack_dir, const EngineOptions& opt) : impl_(new Impl(pack_dir, opt)) {
     impl_->init();
