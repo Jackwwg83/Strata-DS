@@ -14,6 +14,7 @@ add_library(strata_ds41_engine STATIC
   src/ds41/lookahead.cpp
   src/ds41/expert_stream.cpp
   src/ds41/wo_a_fp8.cu
+  src/ds41/dspark_ops.cu
   src/platform/direct_file.cpp
   src/ds41/engine.cu
   third_party/exllamav3_moe/moe_mul1.cpp)
@@ -116,6 +117,10 @@ if(STRATA_BUILD_TESTS)
   target_link_libraries(rmsnorm_exact_test PRIVATE strata_ds41_engine)
   add_test(NAME rmsnorm_exact_test COMMAND rmsnorm_exact_test)
   set_tests_properties(rmsnorm_exact_test PROPERTIES SKIP_RETURN_CODE 77 TIMEOUT 300)
+  add_executable(dspark_ops_test src/ds41/tests/dspark_ops_test.cu)
+  target_link_libraries(dspark_ops_test PRIVATE strata_ds41_engine)
+  add_test(NAME dspark_ops_test COMMAND dspark_ops_test)
+  set_tests_properties(dspark_ops_test PROPERTIES SKIP_RETURN_CODE 77 TIMEOUT 300)
   add_executable(rows_exact_test src/ds41/tests/rows_exact_test.cu)
   target_link_libraries(rows_exact_test PRIVATE strata_ds41_engine)
   add_test(NAME rows_exact_test COMMAND rows_exact_test)
