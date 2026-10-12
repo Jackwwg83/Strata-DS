@@ -66,32 +66,51 @@ static void print_prefill(const Engine& engine, size_t n) {
 /// --step-log: one line per decode step (where the step's time went), for the decode profile
 static std::FILE* step_log = nullptr;
 
-/// DSpark's verify length: the k (0..k_max) with the most expected committed tokens per ms. Round times are EMAs per
-/// k; a k not measured yet is scaled from the measured ones by a prior (a window costs 1 + 0.7 per extra row).
+/// DSpark's policy (DeepSeek's scheduler and upstream's DraftPolicy: expected tokens per measured millisecond).
+/// Before a round: draft only while drafting rounds commit more tokens per ms than plain steps (EMAs); after a losing
+/// round, plain steps for a backoff (4, doubling to 64 while drafting keeps losing), then one drafting round again.
+/// The first 16 tokens are plain steps.
+/// After a draft (its time is spent): the k drafts with the most E(k) / verify(k), E(k) = 1 + S1 + .. + Sk, Si the
+/// product of the first i confidence probabilities. Verify times are EMAs per k; a k not measured yet is the plain
+/// step's time times 1 + 0.45 k (measured on the laptop: each verify row adds ~45% of a step).
 struct DraftScheduler {
     static constexpr int kMax = 8;
-    double ms[kMax] = {}, n[kMax] = {};
-    static double prior(int k) { return 1.0 + 0.7 * k; }
-    double cost(int k) const {
-        if (n[k] > 0) return ms[k];
-        double r = 0, w = 0;
-        for (int j = 0; j < kMax; ++j)
-            if (n[j] > 0) { r += ms[j] / prior(j); w += 1; }
-        return (w > 0 ? r / w : 1.0) * prior(k);
+    double vms[kMax] = {}, vn[kMax] = {};
+    double step_ms = 0, spec_rate = 0;   // EMAs: a plain step's time, a drafting round's tokens per ms
+    // the first 16 tokens are plain steps: they measure the step and keep drafting out of the cold start, when the
+    // tiers are empty and every extra verify row reads its experts from the SSD (a 4-row window took 2.7 s)
+    int backoff = 4, plain_left = 16;
+    double verify_cost(int k) const {
+        if (vn[k] > 0) return vms[k];
+        const double base = step_ms > 0 ? step_ms : 50.0;
+        return base * (1.0 + 0.45 * k);
+    }
+    bool want_draft() {
+        if (plain_left > 0) { --plain_left; return false; }
+        return true;
     }
     int choose(const Engine::Draft& d, int k_max) const {
         int best = 0;
-        double e = 1, s = 1, best_rate = 1 / cost(0);
+        double e = 1, s = 1, best_rate = 1 / verify_cost(0);
         for (int k = 1; k <= std::min(k_max, d.n); ++k) {
             s *= d.accept[k - 1];
             e += s;
-            if (e / cost(k) > best_rate) { best_rate = e / cost(k); best = k; }
+            if (e / verify_cost(k) > best_rate) { best_rate = e / verify_cost(k); best = k; }
         }
         return best;
     }
-    void observe(int k, double round_ms) {
-        ms[k] = n[k] > 0 ? 0.8 * ms[k] + 0.2 * round_ms : round_ms;
-        n[k] += 1;
+    void observe_step(double ms) { step_ms = step_ms > 0 ? 0.8 * step_ms + 0.2 * ms : ms; }
+    void observe_round(int k, double verify_ms, double round_ms, int tokens) {
+        vms[k] = vn[k] > 0 ? 0.8 * vms[k] + 0.2 * verify_ms : verify_ms;
+        vn[k] += 1;
+        const double rate = tokens / round_ms;
+        spec_rate = spec_rate > 0 ? 0.7 * spec_rate + 0.3 * rate : rate;
+        if (step_ms > 0 && spec_rate < 1.0 / step_ms) {   // drafting loses: plain steps for a while
+            plain_left = backoff;
+            backoff = std::min(backoff * 2, 64);
+        } else {
+            backoff = 4;
+        }
     }
 };
 
@@ -117,14 +136,17 @@ static void generate(Engine& engine, const EngineOptions& opt, const std::vector
     int64_t hits = 0, routed = 0, skipped = 0;
     DraftScheduler sched;
     double draft_ms = 0, draft_cpu_ms = 0;
+    int spec_rounds = 0;   // DSpark: rounds that drafted (the others were plain steps)
+    int64_t draft_hits = 0, draft_uses = 0;
     int64_t pos_tried[5] = {}, pos_ok[5] = {};   // DSpark: drafts verified and accepted, by draft position
     double pos_conf[5] = {};                     // the confidence head's probabilities of the verified drafts
     const auto begin = std::chrono::steady_clock::now();
     while (int(out.size()) < count && next != eos) {
         const int limit = std::min({max_t, count-int(out.size()), opt.max_seq-pos});
         if (limit < 1) throw std::runtime_error("generation exceeds max_seq");
-        if (!suffix) {
+        if (!suffix || (dspark && draft_k < 0 && !sched.want_draft())) {
             next = engine.step(next, pos++);
+            if (dspark) sched.observe_step(engine.last_timing().total_ms);
             const auto& tm = engine.last_timing();
             if (step_log)
                 std::fprintf(step_log, "%d %.3f %.3f %.3f %.3f %d %d %d %d %d %d %d %d %d %.3f %.3f %.3f %.3f %.3f %.3f %.3f\n",
@@ -148,7 +170,10 @@ static void generate(Engine& engine, const EngineOptions& opt, const std::vector
             dd = engine.draft(next);
             draft_ms += dd.ms;
             draft_cpu_ms += dd.cpu_experts_ms;
+            draft_hits += dd.vram_hits;
+            draft_uses += dd.uses;
             proposed = draft_k >= 0 ? std::min({draft_k, dd.n, limit-1}) : sched.choose(dd, std::min(limit-1, dd.n));
+            ++spec_rounds;
             for (int i = 0; i < proposed; ++i) draft[i] = dd.tokens[i];
         } else {
             proposed = oracle ? limit-1 : drafter.propose(limit-1, draft);
@@ -166,7 +191,10 @@ static void generate(Engine& engine, const EngineOptions& opt, const std::vector
         engine.commit(keep);
         const auto& tm = engine.last_timing();
         if (dspark) {
-            sched.observe(proposed, std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - r0).count());
+            sched.observe_round(proposed, verify_ms,
+                                std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - r0).count(),
+                                keep);
+            if (proposed == 0) sched.observe_step(verify_ms);   // a one-row window costs about a step
             for (int i = 0; i < proposed; ++i) {
                 ++pos_tried[i];
                 pos_conf[i] += dd.accept[i];
@@ -202,12 +230,15 @@ static void generate(Engine& engine, const EngineOptions& opt, const std::vector
     std::printf("decode_ms_per_token %.1f over %d steps\n", decoded > 0 ? ms / decoded : 0.0, decoded);
     if (oracle) std::printf("oracle_rows_differing %d of %d\n", differ, decoded);
     if (dspark) {
-        std::printf("dspark draft_ms %.2f cpu_ms %.2f per round; by draft position: accepted/verified (mean confidence)",
-                    rounds ? draft_ms / rounds : 0.0, rounds ? draft_cpu_ms / rounds : 0.0);
+        std::printf("dspark draft_ms %.2f cpu_ms %.2f vram_hit %.3f per round; by draft position: accepted/verified "
+                    "(mean confidence)", spec_rounds ? draft_ms / spec_rounds : 0.0,
+                    spec_rounds ? draft_cpu_ms / spec_rounds : 0.0,
+                    draft_uses ? (double) draft_hits / draft_uses : 0.0);
         for (int i = 0; i < 5; ++i)
             std::printf(" %lld/%lld (%.2f)", (long long) pos_ok[i], (long long) pos_tried[i],
                         pos_tried[i] ? pos_conf[i] / pos_tried[i] : 0.0);
-        std::printf("\nmean_accepted_per_window %.3f\n", rounds ? (double) accepted / rounds : 0.0);
+        std::printf("\nmean_accepted_per_window %.3f drafting_rounds %d of %d\n",
+                    spec_rounds ? (double) accepted / spec_rounds : 0.0, spec_rounds, rounds);
     }
     std::printf("tail_skipped %lld of %lld routed uses\n", (long long) skipped, (long long) routed);
     if (!suffix)
