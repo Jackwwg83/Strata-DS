@@ -710,11 +710,14 @@ struct Engine::Impl {
             std::fprintf(stderr, "ds41: zero-copy staging %d slots x %zu bytes (pack max %zu)\n",
                          kTopK, zc_stage->stride(), largest);
             // the prefetch buffers before the VRAM tier takes the free memory (DS41_PREFETCH_MB per layer parity).
-            // With the adaptive RAM tier 4 guesses by default: on the laptop (50 GiB tier, fixed continuations, 2
-            // rounds) code 52.2 -> 49.6 ms per token, agent 58.2 -> 53.6, zh_chat 52.3 -> 50.3 (3 guesses: 49.4,
-            // 54.3, 50.4; 6: code 51.0)
+            // With the adaptive RAM tier 2 guesses by default. The copies and the GPU's work on them balance the CPU's
+            // share of the misses (upstream's measured PCIe share: link / (link + 1.85 x pool rate), here 28.7 GB/s and
+            // ~0.28 ms per CPU expert: ~38% of the misses, ~25 per token, what 2 guesses copy). Laptop, 256 tokens, with
+            // the route tail skip, ms per token 4 / 2 / 0 guesses: code 42.2 / 41.9 / 44.3, 4K prompt 50.6 / 49.4 / 51.5
+            // (4 runs each; 0 guesses had 7-9 ms slower runs). Before the tail skip 4 guesses were best (code 52.2 ->
+            // 49.6 against none).
             const char* pf_env = std::getenv("DS41_PREFETCH");
-            const int guesses = pf_env ? std::atoi(pf_env) : (ram_adapt ? 4 : 0);
+            const int guesses = pf_env ? std::atoi(pf_env) : (ram_adapt ? 2 : 0);
             if (guesses > 0) {
                 const char* mb_env = std::getenv("DS41_PREFETCH_MB");
                 const size_t mb = mb_env ? (size_t) std::atoi(mb_env) : 96;
