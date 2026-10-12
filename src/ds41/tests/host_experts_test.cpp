@@ -305,6 +305,7 @@ int main() {
         for (int i = 0; i < 24; ++i) budget += pack.expert(ranked[i].first, ranked[i].second).bytes;
         HostExperts h(pack, ranked, res, budget, {}, 2);
         h.enable_adapt(3);
+        detail::admit_part_bytes() = 4096;   // the prefetch reads go in parts too (1 MiB in use)
         const int free0 = h.free_slots();
         auto outside = [&](int l) {   // experts of layer l in no tier
             std::vector<int32_t> v;
@@ -324,10 +325,11 @@ int main() {
         const auto out = outside(layer);
         check(out.size() >= 4, tag + "four experts of layer 3 outside the tier");
         const int32_t ids[3] = {out[0], out[1], out[2]};
-        check(h.prefetch(layer, ids, 2) == 0, tag + "nothing starts before open_prefetch()");
+        const int32_t nxt = outside(layer + 1)[0];   // a guess for the next layer, which no admit() asks for
+        check(h.prefetch(layer, ids, 1) == 0, tag + "nothing starts before open_prefetch()");
         h.open_prefetch();
-        check(h.prefetch(layer, ids, 2) == 2, tag + "two reads start");
-        check(h.prefetch(layer, ids, 2) == 0, tag + "an expert on its way is not read twice");
+        check(h.prefetch(layer, ids, 1) == 1 && h.prefetch(layer + 1, &nxt, 1) == 1, tag + "two reads start");
+        check(h.prefetch(layer, ids, 1) == 0, tag + "an expert on its way is not read twice");
         const int32_t in_tier = ranked[0].second;
         check(h.prefetch(ranked[0].first, &in_tier, 1) == 0, tag + "an expert in the tier is not read");
         bool ok[2] = {};
@@ -335,13 +337,13 @@ int main() {
               tag + "admit() takes the prefetched expert");
         check(h.admit(layer, &ids[2], 1, ok + 1) == 1 && ok[1] && h.prefetch_used_total() == 1,
               tag + "admit() reads an expert nobody prefetched");
-        check(h.slot_of(layer, ids[0]) == -1 && h.slot_of(layer, ids[1]) == -1,
+        check(h.slot_of(layer, ids[0]) == -1 && h.slot_of(layer + 1, nxt) == -1,
               tag + "the RAM table does not change during the step");
         std::vector<int32_t> routes((size_t) ds41test::L * 6, -1);
         routes[(size_t) layer * 6 + 0] = ids[0];
         routes[(size_t) layer * 6 + 1] = ids[2];
         h.end_step(routes.data(), 6);
-        check(bytes_ok(layer, ids[0]) && bytes_ok(layer, ids[1]) && bytes_ok(layer, ids[2]),
+        check(bytes_ok(layer, ids[0]) && bytes_ok(layer + 1, nxt) && bytes_ok(layer, ids[2]),
               tag + "all three are published with their bytes, the unused prefetch too");
         check(h.prefetched_total() == 2 && h.admitted_total() == 3, tag + "the totals");
         check(h.free_slots() == free0, tag + "end_step keeps the reserve free");
@@ -357,6 +359,19 @@ int main() {
         routes[(size_t) layer * 6 + 2] = late;
         h.end_step(routes.data(), 6);
         check(bytes_ok(layer, late) && h.free_slots() == free0, tag + "its bytes, and the failed read's slot is free again");
+        // two guesses for layer 5, admit() asks for one: the other was wrong, and its parts not yet read are dropped
+        h.open_prefetch();
+        const auto out5 = outside(5);
+        const int32_t g[2] = {out5[0], out5[1]};
+        check(h.prefetch(5, g, 2) == 2, tag + "two guesses for layer 5");
+        bool ok3 = false;
+        check(h.admit(5, &g[0], 1, &ok3) == 1 && ok3, tag + "admit() takes one");
+        std::vector<int32_t> r5((size_t) ds41test::L * 6, -1);
+        r5[(size_t) 5 * 6] = g[0];
+        h.end_step(r5.data(), 6);
+        check(bytes_ok(5, g[0]) && (h.slot_of(5, g[1]) == -1 || bytes_ok(5, g[1])) && h.free_slots() == free0,
+              tag + "the wrong guess, dropped or read in full, leaves the tier consistent");
+        detail::admit_part_bytes() = 1u << 20;
     }
 
     // pinning that fails while the arena is large (memory short at start): the tier drops its lowest-ranked slots, a

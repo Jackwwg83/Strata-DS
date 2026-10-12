@@ -230,13 +230,13 @@ HostExperts::HostExperts(const Pack& pack, const std::vector<std::pair<int, int>
 }
 
 HostExperts::~HostExperts() {
-    if (pf_thread_.joinable()) {
+    if (!pf_threads_.empty()) {
         {
             std::lock_guard<std::mutex> lk(admit_mu_);
             pf_stop_ = true;
         }
         pf_cv_.notify_all();
-        pf_thread_.join();
+        for (auto& t : pf_threads_) t.join();
     }
     if (dfd_ >= 0) close(dfd_);
     cudaFree(experts_dev_);
@@ -369,6 +369,7 @@ void HostExperts::free_slot(int slot) {
 
 namespace {
 constexpr size_t kReaders = 8;   // admit()'s reader threads, the caller included
+constexpr int kPrefetchReaders = 4;
 }  // namespace
 
 void HostExperts::enable_adapt(int reserve) {
@@ -382,9 +383,8 @@ void HostExperts::enable_adapt(int reserve) {
     dfd_ = open((pack_.dir() + "/experts.bin").c_str(), O_RDONLY | O_DIRECT);
     // persistent readers: new threads for every admit made a 7 MB read 17% slower (laptop SSD, 0.26 -> 0.216 ms/MB)
     readers_ = std::make_unique<ThreadPool>(kReaders);
-    // prefetch: one thread takes the queued reads, each on 4 readers (itself included), beside admit()'s 8
-    pf_readers_ = std::make_unique<ThreadPool>(4);
-    pf_thread_ = std::thread([this] { prefetch_loop(); });
+    // prefetch: 4 threads read the queued parts (one each in flight), beside admit()'s 8 readers
+    for (int i = 0; i < kPrefetchReaders; ++i) pf_threads_.emplace_back([this] { prefetch_loop(); });
     free_.assign(slots_, 0);
     age_.assign(slots_, 0);
     std::map<size_t, std::vector<int>> by_capacity;
@@ -428,40 +428,84 @@ int HostExperts::pick_free(uint64_t bytes) const {
 int HostExperts::admit(int layer, const int32_t* ids, int n, bool* ok) {
     for (int i = 0; i < n; ++i) ok[i] = false;
     if (!reserve_ || n <= 0) return 0;
-    std::vector<int> pick(n, -1);
-    int taken = 0;
+    std::vector<int> pick(n, -1), claim(n, -1);   // claim: the prefetch flight of ids[i]
     {
-        std::unique_lock<std::mutex> lk(admit_mu_);
-        for (int i = 0; i < n; ++i) {   // prefetched: wait for the read, then take it
-            if (ids[i] < 0) continue;
-            size_t f = 0;
-            while (f < flights_.size() && !(flights_[f].layer == layer && flights_[f].expert == ids[i])) ++f;
-            if (f == flights_.size() || flights_[f].claimed) continue;
-            flights_[f].claimed = true;
-            pf_cv_.wait(lk, [&] { return flights_[f].state != Flight::queued; });
-            if (flights_[f].state != Flight::read) continue;   // failed: its slot is free again; read it below
-            ok[i] = true;
-            ++taken;
-            ++prefetch_used_total_;
-            admitted_.push_back({flights_[f].slot, {layer, ids[i]}});
-            point(layer, ids[i], slot_ptr(flights_[f].slot));
-        }
+        std::lock_guard<std::mutex> lk(admit_mu_);
         for (int i = 0; i < n; ++i) {
-            if (ids[i] < 0 || ok[i]) continue;
+            if (ids[i] < 0) continue;
+            for (size_t f = 0; f < flights_.size() && claim[i] < 0; ++f) {
+                const Prefetch& x = flights_[f];
+                if (x.layer == layer && x.expert == ids[i] && !x.claimed && x.state != Flight::failed) claim[i] = (int) f;
+            }
+            if (claim[i] >= 0) flights_[claim[i]].claimed = true;
+        }
+        // the claimed parts go first; the unclaimed guesses of this layer and earlier ones were wrong: their parts
+        // not yet read are dropped, which leaves the SSD to these reads
+        std::deque<PrefetchPart> first, later;
+        for (const PrefetchPart& p : pf_parts_) {
+            Prefetch& f = flights_[p.flight];
+            if (f.claimed) first.push_back(p);
+            else if (f.layer > layer) later.push_back(p);
+            else {
+                f.bad = true;
+                if (--f.parts_left == 0) finish_flight(f);
+            }
+        }
+        first.insert(first.end(), later.begin(), later.end());
+        pf_parts_.swap(first);
+        for (int i = 0; i < n; ++i) {
+            if (ids[i] < 0 || claim[i] >= 0) continue;
             pick[i] = pick_free(pack_.expert(layer, ids[i]).bytes);
             if (pick[i] >= 0) free_[pick[i]] = 0;
         }
+        ++admitting_;   // the prefetch readers read only claimed parts until these reads are done
     }
-    int read = 0;
-    try {
-        read = read_picked(layer, ids, n, pick, ok);
-    } catch (...) {   // the picked slots that did not get their expert are free again; no pointer moved for them
-        std::lock_guard<std::mutex> lk(admit_mu_);
-        for (int i = 0; i < n; ++i)
-            if (pick[i] >= 0 && !ok[i]) free_[pick[i]] = 1;
-        throw;
+    pf_cv_.notify_all();
+    struct Admitting {
+        HostExperts* h;
+        ~Admitting() {
+            {
+                std::lock_guard<std::mutex> lk(h->admit_mu_);
+                --h->admitting_;
+            }
+            h->pf_cv_.notify_all();
+        }
+    } admitting{this};
+    auto read = [&](const std::vector<int>& slots) {
+        try {
+            return read_picked(layer, ids, n, slots, ok);
+        } catch (...) {   // the picked slots that did not get their expert are free again; no pointer moved for them
+            std::lock_guard<std::mutex> lk(admit_mu_);
+            for (int i = 0; i < n; ++i)
+                if (slots[i] >= 0 && !ok[i]) free_[slots[i]] = 1;
+            throw;
+        }
+    };
+    int got = read(pick);
+    // then the claimed reads: take the ones read; a failed one is read here
+    std::vector<int> again(n, -1);
+    bool any_again = false;
+    {
+        std::unique_lock<std::mutex> lk(admit_mu_);
+        for (int i = 0; i < n; ++i) {
+            if (claim[i] < 0) continue;
+            const size_t f = (size_t) claim[i];   // an index: prefetch() may grow flights_ meanwhile
+            pf_cv_.wait(lk, [&] { return flights_[f].state != Flight::queued; });
+            if (flights_[f].state == Flight::read) {
+                flights_[f].taken = true;
+                ok[i] = true;
+                ++got;
+                ++prefetch_used_total_;
+                admitted_.push_back({flights_[f].slot, {layer, ids[i]}});
+                point(layer, ids[i], slot_ptr(flights_[f].slot));
+            } else if ((again[i] = pick_free(pack_.expert(layer, ids[i]).bytes)) >= 0) {
+                free_[again[i]] = 0;
+                any_again = true;
+            }
+        }
     }
-    return taken + read;
+    if (any_again) got += read(again);
+    return got;
 }
 
 void HostExperts::read_into(int layer, const int32_t* ids, int n, const std::vector<int>& pick,
@@ -485,26 +529,29 @@ void HostExperts::read_into(int layer, const int32_t* ids, int n, const std::vec
         if (detail::admit_fault().exchange(false)) throw std::runtime_error("ds41 RAM tier: test fault in admit");
         for (size_t k; (k = next++) < parts.size();) {
             const Part& p = parts[k];
-            const ExpertSlot& x = pack_.expert(layer, ids[p.i]);
-            uint8_t* dst = slot_ptr(pick[p.i]);
-            if (p.len == 0) {
-                std::memcpy(dst, pack_.expert_base() + x.offset, x.bytes);
-                continue;
-            }
-            // O_DIRECT needs 4 KiB multiples: the last part reads up to the next boundary (the slot holds it)
-            const size_t want = (p.len + 4095) / 4096 * 4096;
-            size_t got = 0;
-            while (got < p.len) {
-                const ssize_t r = pread(dfd_, dst + p.at + got, want - got, (off_t) (x.offset + p.at + got));
-                if (r <= 0) break;
-                got += (size_t) r;
-            }
-            if (got < p.len) failed[p.i] = true;
+            if (!read_part(layer, ids[p.i], slot_ptr(pick[p.i]), p.at, p.len)) failed[p.i] = true;
         }
     };
     const size_t threads = std::min<size_t>(parts.size(), pool ? pool->size() : kReaders);
     if (pool) pool->run(threads, read_parts);
     else run_parallel(threads, read_parts);
+}
+
+bool HostExperts::read_part(int layer, int expert, uint8_t* dst, size_t at, size_t len) {
+    const ExpertSlot& x = pack_.expert(layer, expert);
+    if (len == 0) {
+        std::memcpy(dst, pack_.expert_base() + x.offset, x.bytes);
+        return true;
+    }
+    // O_DIRECT needs 4 KiB multiples: the last part reads up to the next boundary (the slot holds it)
+    const size_t want = (len + 4095) / 4096 * 4096;
+    size_t got = 0;
+    while (got < len) {
+        const ssize_t r = pread(dfd_, dst + at + got, want - got, (off_t) (x.offset + at + got));
+        if (r <= 0) break;
+        got += (size_t) r;
+    }
+    return got >= len;
 }
 
 int HostExperts::read_picked(int layer, const int32_t* ids, int n, const std::vector<int>& pick, bool* ok) {
@@ -538,7 +585,7 @@ int HostExperts::prefetch(int layer, const int32_t* ids, int n) {
     int started = 0;
     {
         std::lock_guard<std::mutex> lk(admit_mu_);
-        if (!pf_open_ || !pf_thread_.joinable()) return 0;
+        if (!pf_open_ || pf_threads_.empty()) return 0;
         for (int i = 0; i < n; ++i) {
             const int32_t e = ids[i];
             if (e < 0 || in_memory(layer, e)) continue;
@@ -549,7 +596,19 @@ int HostExperts::prefetch(int layer, const int32_t* ids, int n) {
             const int s = pick_free(pack_.expert(layer, e).bytes);
             if (s < 0) continue;
             free_[s] = 0;
-            flights_.push_back({layer, e, s, Flight::queued, false});
+            const size_t k = flights_.size();
+            flights_.push_back({layer, e, s, Flight::queued, false, false, 0, false});
+            const ExpertSlot& x = pack_.expert(layer, e);
+            const size_t kPart = detail::admit_part_bytes().load();
+            if (dfd_ < 0 || x.offset % 4096 != 0) {   // copied from the mapped pack (an unaligned expert: tests)
+                pf_parts_.push_back({k, 0, 0});
+                flights_[k].parts_left = 1;
+            } else {
+                for (size_t at = 0; at < x.bytes; at += kPart) {
+                    pf_parts_.push_back({k, at, std::min(kPart, (size_t) x.bytes - at)});
+                    ++flights_[k].parts_left;
+                }
+            }
             ++started;
         }
     }
@@ -563,26 +622,27 @@ int HostExperts::prefetch(int layer, const int32_t* ids, int n) {
 void HostExperts::prefetch_loop() {
     std::unique_lock<std::mutex> lk(admit_mu_);
     for (;;) {
-        pf_cv_.wait(lk, [&] { return pf_stop_ || next_flight_ < flights_.size(); });
+        pf_cv_.wait(lk, [&] {
+            return pf_stop_ || (!pf_parts_.empty() && (admitting_ == 0 || flights_[pf_parts_.front().flight].claimed));
+        });
         if (pf_stop_) return;
-        const size_t k = next_flight_++;
-        const int layer = flights_[k].layer, slot = flights_[k].slot;
-        const int32_t id = flights_[k].expert;
+        const PrefetchPart p = pf_parts_.front();
+        pf_parts_.pop_front();
+        const int layer = flights_[p.flight].layer, expert = flights_[p.flight].expert, slot = flights_[p.flight].slot;
         lk.unlock();
-        std::atomic<bool> failed{false};
-        bool threw = false;
-        try {
-            read_into(layer, &id, 1, std::vector<int>{slot}, &failed, pf_readers_.get());
-        } catch (...) {   // e.g. a reader could not start: admit() reads the expert itself
-            threw = true;
-        }
+        const bool ok = !detail::admit_fault().exchange(false) && read_part(layer, expert, slot_ptr(slot), p.at, p.len);
         lk.lock();
-        // flights_ keeps k: only settle_prefetches() clears it, after every read is done
-        Prefetch& f = flights_[k];
-        f.state = threw || failed ? Flight::failed : Flight::read;
-        if (f.state == Flight::failed) free_[slot] = 1;
-        pf_cv_.notify_all();
+        // flights_ keeps the flight: only settle_prefetches() clears it, after every read is done
+        Prefetch& f = flights_[p.flight];
+        f.bad |= !ok;
+        if (--f.parts_left == 0) finish_flight(f);
     }
+}
+
+void HostExperts::finish_flight(Prefetch& f) {
+    f.state = f.bad ? Flight::failed : Flight::read;
+    if (f.bad) free_[f.slot] = 1;   // a claimed one: admit() reads the expert itself
+    pf_cv_.notify_all();
 }
 
 void HostExperts::settle_prefetches(std::unique_lock<std::mutex>& lk) {
@@ -592,12 +652,11 @@ void HostExperts::settle_prefetches(std::unique_lock<std::mutex>& lk) {
         return true;
     });
     for (const auto& f : flights_)
-        if (f.state == Flight::read && !f.claimed) {   // a guess no admit() asked for: it stays, as an admitted one
+        if (f.state == Flight::read && !f.taken) {   // a guess no admit() took: it stays, as an admitted one
             admitted_.push_back({f.slot, {f.layer, f.expert}});
             point(f.layer, f.expert, slot_ptr(f.slot));
         }
     flights_.clear();
-    next_flight_ = 0;
 }
 
 int HostExperts::end_step(const int32_t* routes, int topk) {

@@ -32,6 +32,7 @@
 #include <condition_variable>
 #include <cstddef>
 #include <cstdint>
+#include <deque>
 #include <memory>
 #include <mutex>
 #include <string>
@@ -172,6 +173,9 @@ private:
     /// reader throws.
     void read_into(int layer, const int32_t* ids, int n, const std::vector<int>& pick, std::atomic<bool>* failed,
                    ThreadPool* pool);
+    /// bytes [at, at + len) of (layer, expert) into dst + at (len 0: the whole expert, copied from the mapped pack).
+    /// False when the file gave fewer bytes.
+    bool read_part(int layer, int expert, uint8_t* dst, size_t at, size_t len);
     void prefetch_loop();
     /// the smallest capacity's free, unlocked slot that holds `bytes`, or -1 (under admit_mu_)
     int pick_free(uint64_t bytes) const;
@@ -214,15 +218,22 @@ private:
     std::mutex admit_mu_;
     std::vector<std::pair<int, std::pair<int, int>>> admitted_;   ///< (slot, (layer, expert)) read this step
     int64_t admitted_total_ = 0, evicted_total_ = 0;
-    // prefetch: reads on their way (under admit_mu_), read by one thread with its own readers
+    // prefetch: reads on their way (under admit_mu_). The reads go in parts to kPrefetchReaders threads, which wait
+    // while admit() reads (except for the parts it claimed): the step's own reads are on its critical path, the
+    // guesses fill the SSD's idle time.
     enum class Flight : uint8_t { queued, read, failed };
-    struct Prefetch { int layer, expert, slot; Flight state; bool claimed; };
+    /// claimed: an admit() waits for it (its parts go first, also while admit() reads); taken: admit() pointed the
+    /// CPU kernel at it
+    struct Prefetch { int layer, expert, slot; Flight state; bool claimed, taken; int parts_left; bool bad; };
+    struct PrefetchPart { size_t flight, at, len; };   ///< len 0: copy the whole expert from the mapped pack
+    /// a flight's last part is done: read, or failed and its slot free again (under admit_mu_)
+    void finish_flight(Prefetch& f);
     std::vector<Prefetch> flights_;
-    size_t next_flight_ = 0;                        ///< the first flight the prefetch thread has not taken
+    std::deque<PrefetchPart> pf_parts_;
+    int admitting_ = 0;                             ///< admit() calls reading now
     bool pf_open_ = false, pf_stop_ = false;
-    std::condition_variable pf_cv_;                 ///< a flight queued, a read done, or stop
-    std::unique_ptr<ThreadPool> pf_readers_;
-    std::thread pf_thread_;
+    std::condition_variable pf_cv_;                 ///< a part queued, a read done, an admit() read done, or stop
+    std::vector<std::thread> pf_threads_;
     std::atomic<int64_t> prefetched_total_{0}, prefetch_used_total_{0};
 };
 
