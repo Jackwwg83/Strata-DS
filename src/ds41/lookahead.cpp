@@ -66,9 +66,10 @@ void cpu_router_topk(const uint16_t* x, const uint16_t* w, const float* bias, in
 }
 
 RouterLookahead::RouterLookahead(std::vector<std::vector<uint16_t>> router_w, std::vector<std::vector<float>> bias,
-                                 int n_experts, int dim, int k, std::function<bool(int, int)> warm)
+                                 int n_experts, int dim, int k, std::function<bool(int, int)> warm,
+                                 std::function<void(int, const int32_t*, int)> fetch)
     : w_(std::move(router_w)), bias_(std::move(bias)), n_experts_(n_experts), dim_(dim), k_(k),
-      warm_(std::move(warm)), x_(dim), warmed_(w_.size()) {
+      warm_(std::move(warm)), fetch_(std::move(fetch)), x_(dim), warmed_(w_.size()) {
     th_ = std::thread([this] { run(); });
 }
 
@@ -112,6 +113,7 @@ void RouterLookahead::run() {
             std::lock_guard<std::mutex> lock(residency_mutex());
             if (warm_(next, ids[i])) warmed.push_back(ids[i]);
         }
+        if (fetch_ && !warmed.empty()) fetch_(next, warmed.data(), (int) warmed.size());
         predicted_ += k_;
         warmed_n_ += (int64_t) warmed.size();
         std::lock_guard<std::mutex> lk(mu_);

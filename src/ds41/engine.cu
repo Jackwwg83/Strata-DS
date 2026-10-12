@@ -802,10 +802,15 @@ struct Engine::Impl {
         // the router lookahead: every expert outside the VRAM and RAM tiers is read from the file (upstream turns it
         // on with a RAM budget; here the file tier exists whenever the experts do not all fit in RAM)
         if (const char* f = std::getenv("DS41_FETCH_NOW")) fetch_now = f[0] != '0';
-        // With the adaptive RAM tier a miss is read with O_DIRECT, past the file cache: pages warmed there would only
-        // take SSD time from those reads. DS41_LOOKAHEAD=1 keeps the lookahead on.
+        // With the adaptive RAM tier a miss is read with O_DIRECT, past the file cache, so warmed pages would not
+        // help: the predicted experts are read into free RAM slots instead (HostExperts::prefetch), and admit()
+        // takes them. Laptop, 6 guesses: 59% (agent) and 67% (code) of the SSD reads were predicted.
+        // DS41_LOOKAHEAD=0: off. DS41_LOOKAHEAD_K: guesses per token (default 6).
         const char* la_env = std::getenv("DS41_LOOKAHEAD");
-        if (la_env ? la_env[0] != '0' : !(host && host->reserve() > 0)) {
+        const char* lk_env = std::getenv("DS41_LOOKAHEAD_K");
+        const int la_k = lk_env ? std::atoi(lk_env) : kTopK;
+        if (la_k < 1 || la_k > kExperts) throw std::invalid_argument("DS41_LOOKAHEAD_K must be in [1, 384]");
+        if (la_env ? la_env[0] != '0' : true) {
             std::vector<std::vector<uint16_t>> rw(kLayers, std::vector<uint16_t>((size_t) kExperts * kDim));
             std::vector<std::vector<float>> rb(kLayers, std::vector<float>(kExperts));
             for (int l = 0; l < kLayers; ++l) {
@@ -814,8 +819,14 @@ struct Engine::Impl {
             }
             // The VRAM and RAM tables change only between steps; a prediction racing that change warms one expert
             // more or less, never changes what is computed.
-            lookahead = std::make_unique<RouterLookahead>(std::move(rw), std::move(rb), kExperts, kDim, kTopK,
-                                                          [this](int l, int e) { return warm_file_expert(l, e); });
+            const bool adaptive = host && host->reserve() > 0;
+            std::function<void(int, const int32_t*, int)> fetch;
+            if (adaptive) fetch = [this](int l, const int32_t* ids, int n) { host->prefetch(l, ids, n); };
+            lookahead = std::make_unique<RouterLookahead>(std::move(rw), std::move(rb), kExperts, kDim, la_k,
+                                                          [this, adaptive](int l, int e) {
+                                                              return warm_file_expert(l, e, !adaptive);
+                                                          },
+                                                          std::move(fetch));
         }
         worker = std::thread([this] { worker_loop(); });
         if (const char* p = std::getenv("DS41_DEBUG")) dbg = std::fopen(p, "wb");
@@ -890,6 +901,7 @@ struct Engine::Impl {
         const int uses = m * kTopK;
         const double wake = now_ms();
         double ready = wake, wait = 0, first_wait = 0, admit = 0;   // ready: since when the worker waits for the GPU
+        if (host && host->reserve() > 0) host->open_prefetch();   // the lookahead may read guesses into RAM slots
         for (int l = 0; l < kLayers; ++l) {
             if (!d->wait_published(l + 1, job_cancel)) return;
             const double published = now_ms();
@@ -988,10 +1000,12 @@ struct Engine::Impl {
         }
     }
 
-    /// Lookahead callback: ask the OS for the pages of (layer, expert) when it is in neither the VRAM nor the RAM tier.
-    bool warm_file_expert(int l, int e) {
+    /// Lookahead callback: (layer, expert) is in neither the VRAM nor the RAM tier. pages: ask the OS for its pages
+    /// (without the adaptive RAM tier; with it, the lookahead's fetch reads the expert into a RAM slot).
+    bool warm_file_expert(int l, int e, bool pages = true) {
         if (vram && vram->res_host()[(size_t) l * kExperts + e] >= 0) return false;
         if (host && host->slot_of(l, e) >= 0) return false;
+        if (!pages) return true;
         const ExpertSlot& x = pack.expert(l, e);
         const uintptr_t a = (uintptr_t) (pack.expert_base() + x.offset) & ~(uintptr_t) 4095;
         madvise((void*) a, (uintptr_t) (pack.expert_base() + x.offset + x.bytes) - a, MADV_WILLNEED);

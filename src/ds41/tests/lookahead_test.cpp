@@ -1,7 +1,9 @@
 // src/ds41/tests/lookahead_test.cpp - the router lookahead: cpu_router_topk picks the experts a double-precision
 // reference picks (except where two scores tie within 1e-4 at the k-th place), and RouterLookahead warms the next
-// layer's predicted experts and counts the ones the layer then used.
+// layer's predicted experts, hands the accepted ones to its fetch callback outside the residency lock, and counts
+// the ones the layer then used.
 #include "strata/ds41/lookahead.hpp"
+#include "strata/ds41/residency.hpp"
 
 #include <algorithm>
 #include <atomic>
@@ -129,6 +131,36 @@ int main() {
     const auto st = la.take_stats();
     check(st.predicted == k && st.warmed == even && st.useful == even, "stats: predicted, warmed, useful");
     la.post(2, x.data());   // the last layer: nothing to predict
+
+    // 3. the fetch callback: once per prediction, the experts warm() accepted, in order, with the residency lock free
+    //    (HostExperts::prefetch takes its own lock, which end_step holds while it takes the residency lock)
+    {
+        std::vector<int32_t> got;
+        int calls = 0, layer = -1;
+        bool unlocked = false;
+        RouterLookahead lf(ws, bs, n, dim, k, [](int, int e) { return e % 2 == 0; },
+                           [&](int l, const int32_t* ids, int m) {
+                               const bool free = residency_mutex().try_lock();
+                               if (free) residency_mutex().unlock();
+                               std::lock_guard<std::mutex> lk(mu);
+                               ++calls;
+                               layer = l;
+                               unlocked = free;
+                               got.assign(ids, ids + m);
+                           });
+        lf.post(0, x.data());
+        for (int i = 0; i < 200; ++i) {
+            { std::lock_guard<std::mutex> lk(mu); if (calls) break; }
+            std::this_thread::sleep_for(std::chrono::milliseconds(10));
+        }
+        std::lock_guard<std::mutex> lk(mu);
+        std::vector<int32_t> want;
+        for (int i = 0; i < k; ++i)
+            if (pred[i] % 2 == 0) want.push_back(pred[i]);
+        if (want.empty()) check(calls == 0, "fetch: not called when warm() accepted nothing");
+        else check(calls == 1 && layer == 1 && got == want, "fetch: once, layer 1, the accepted ids in order");
+        if (calls) check(unlocked, "fetch: called without the residency lock");
+    }
     std::printf("RESULT %s\n", failures ? "fail" : "pass");
     return failures ? 1 : 0;
 }
