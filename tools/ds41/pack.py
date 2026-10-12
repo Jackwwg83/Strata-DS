@@ -18,6 +18,8 @@ once, the engine never re-derives it):
                  Inside a slot: w1, w3, w2, each as trellis, suh, svh, mul1; each component 256 B aligned.
   experts.txt    one line per expert: layer expert offset bytes w1_bits w3_bits w2_bits, then 12 entries
                  component:offset:bytes (offset inside the slot). Bitrates may differ per expert (SAGE).
+  mtp_experts.bin, mtp_experts.txt   DSpark's routed experts (--mtp-experts, added to a finished pack), laid out as
+                 experts.bin; the layer field is the DSpark stage (0..2)
   engram.txt     one line per Engram layer: layer rows dim weight_offset scale_offset path (tables are not copied)
   engram_hash.txt, engram_tokenmap.bin   the n-gram hash tables, computed here with DeepSeek's own engram.py
                  (the compressed token map needs the tokenizer's normalizer; the engine needs only integers)
@@ -51,13 +53,14 @@ def align(x, a):
 
 
 class Source:
-    """Safetensors headers of a checkpoint, and pread access to tensor bytes."""
+    """Safetensors headers of a checkpoint, and pread access to tensor bytes. files: these shards (relative to src)
+    instead of the ones model.safetensors.index.json names."""
 
-    def __init__(self, src):
+    def __init__(self, src, files=None):
         self.src = src
-        idx = json.load(open(os.path.join(src, "model.safetensors.index.json")))["weight_map"]
+        idx = json.load(open(os.path.join(src, "model.safetensors.index.json")))["weight_map"] if files is None else {}
         self.entries, self.fds = {}, {}
-        for fname in sorted(set(idx.values())):
+        for fname in sorted(set(idx.values()) if files is None else files):
             path = os.path.join(src, fname)
             with open(path, "rb") as f:
                 n = struct.unpack("<Q", f.read(8))[0]
@@ -121,27 +124,28 @@ def write_dense(srcs, out, wo_a_fp8=True):
     return len(names), off
 
 
-def expert_layout(srcs, L, e):
+def expert_layout(srcs, L, e, prefix="layers"):
     comps, off, bits = [], 0, {}
     for w in PROJ:
         for p in PARTS:
-            name = f"layers.{L}.ffn.experts.{e}.{w}.{p}"
+            name = f"{prefix}.{L}.ffn.experts.{e}.{w}.{p}"
             nb = srcs.entries[name][4]
             comps.append((f"{w}.{p}", name, off, nb))
             off = align(off + nb, COMPONENT_ALIGN)
-        bits[w] = bits_of(srcs.entries[f"layers.{L}.ffn.experts.{e}.{w}.trellis"][2])
+        bits[w] = bits_of(srcs.entries[f"{prefix}.{L}.ffn.experts.{e}.{w}.trellis"][2])
     return comps, align(off, EXPERT_ALIGN), bits
 
 
-def write_experts(srcs, out, n_layers, n_experts):
+def write_experts(srcs, out, n_layers, n_experts, prefix="layers", name="experts"):
+    """name.bin and name.txt; prefix: layers (the backbone) or mtp (DSpark's stages, one per line's layer field)"""
     pos = 0
     t0 = time.time()
-    with open(os.path.join(out, "experts.bin"), "wb") as fb, open(os.path.join(out, "experts.txt"), "w") as ft:
+    with open(os.path.join(out, name + ".bin"), "wb") as fb, open(os.path.join(out, name + ".txt"), "w") as ft:
         ft.write("# ds41 experts index v1: layer expert offset bytes w1_bits w3_bits w2_bits "
                  "then component:offset:bytes x12 (offset inside the slot)\n")
         for L in range(n_layers):
             for e in range(n_experts):
-                comps, slot, bits = expert_layout(srcs, L, e)
+                comps, slot, bits = expert_layout(srcs, L, e, prefix)
                 buf = bytearray(slot)
                 for _, name, coff, nb in comps:
                     buf[coff:coff + nb] = srcs.read(name)
@@ -300,6 +304,30 @@ def copy_engram_hash(src, out):
             f.write(data)
 
 
+def add_mtp_experts(src, out, n_stages=3, n_experts=128):
+    """DSpark's routed experts into a finished pack: mtp_experts.bin and mtp_experts.txt, in the layout of experts.bin
+    (the layer field is the DSpark stage). They come from exllamav3/requant_mtp_part*.safetensors (SAGE: 4 bpw EXL3);
+    DSpark's other tensors are already in dense.bin. Nothing else in the pack changes. Returns the experts written."""
+    info = os.path.join(out, "pack_info.txt")
+    if not os.path.exists(info):
+        raise SystemExit("--mtp-experts needs a finished pack")
+    lines = [l for l in open(info).read().splitlines() if l.strip()]
+    if "finished 1" not in lines:
+        raise SystemExit("--mtp-experts needs a finished pack")
+    d = os.path.join(src, "exllamav3")
+    files = sorted(os.path.join("exllamav3", f) for f in os.listdir(d)
+                   if f.startswith("requant_mtp_part") and f.endswith(".safetensors"))
+    if not files:
+        raise SystemExit(f"no requant_mtp_part*.safetensors in {d}")
+    nbytes = write_experts(Source(src, files), out, n_stages, n_experts, prefix="mtp", name="mtp_experts")
+    keep = [l for l in lines if l.split()[0] not in ("finished", "mtp_stages", "mtp_experts", "mtp_expert_bytes")]
+    with open(info + ".tmp", "w") as f:
+        f.write("\n".join(keep + [f"mtp_stages {n_stages}", f"mtp_experts {n_experts}", f"mtp_expert_bytes {nbytes}",
+                                   "finished 1"]) + "\n")
+    os.replace(info + ".tmp", info)
+    return n_stages * n_experts
+
+
 def build_pack(src, out, n_layers=40, n_experts=384, wo_a_fp8=True, dense_only=False, engram_from=None):
     """dense_only: rewrite dense.bin and index.txt of a finished pack; experts.bin and the rest stay."""
     if engram_from is not None and not wo_a_fp8:
@@ -346,7 +374,12 @@ def main():
     ap.add_argument("--wo-a-bf16", action="store_true", help="dequantize attn.wo_a to BF16 (packs before 2026-10-06)")
     ap.add_argument("--dense-only", action="store_true", help="rewrite only dense.bin and index.txt of a finished pack")
     ap.add_argument("--engram-from", help="copy verified SAGE Engram files from DIR without torch", metavar="DIR")
+    ap.add_argument("--mtp-experts", action="store_true",
+                    help="add DSpark's routed experts (mtp_experts.bin) to a finished pack; nothing else changes")
     a = ap.parse_args()
+    if a.mtp_experts:
+        add_mtp_experts(a.src, a.out)
+        return
     build_pack(a.src, a.out, a.layers, a.experts, wo_a_fp8=not a.wo_a_bf16, dense_only=a.dense_only,
                engram_from=a.engram_from)
 
