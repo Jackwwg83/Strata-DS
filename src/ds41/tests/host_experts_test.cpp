@@ -288,6 +288,77 @@ int main() {
         detail::admit_part_bytes() = 1u << 20;
     }
 
+    // prefetch: reads started before admit() asks (the router lookahead's guesses for the next layer). admit() takes an
+    // expert read that way without reading it again; one that no admit() asked for enters the tier at end_step(); a
+    // failed read gives its slot back and admit() reads the expert itself. Between end_step() and open_prefetch()
+    // prefetch() starts nothing (the slots change between steps).
+    {
+        const std::string tag = "prefetch: ";
+        const std::string dir = "ds41_fake_pack_prefetch";
+        ds41test::write_fake_pack(dir, true, 4096);
+        Pack pack(dir);
+        pack.map_experts();
+        std::vector<std::pair<int, int>> ranked;
+        for (int i = 0; i < 40; ++i) ranked.push_back({i % ds41test::L, (i * 7) % ds41test::E});
+        const std::vector<int32_t> res((size_t) ds41test::L * ds41test::E, -1);
+        uint64_t budget = 0;
+        for (int i = 0; i < 24; ++i) budget += pack.expert(ranked[i].first, ranked[i].second).bytes;
+        HostExperts h(pack, ranked, res, budget, {}, 2);
+        h.enable_adapt(3);
+        const int free0 = h.free_slots();
+        auto outside = [&](int l) {   // experts of layer l in no tier
+            std::vector<int32_t> v;
+            for (int e = 0; e < ds41test::E; ++e) {
+                bool ranked_pair = false;
+                for (auto& p : ranked) ranked_pair |= p == std::make_pair(l, e);
+                if (!ranked_pair) v.push_back(e);
+            }
+            return v;
+        };
+        auto bytes_ok = [&](int l, int e) {
+            const int s = h.slot_of(l, e);
+            const ExpertSlot& x = pack.expert(l, e);
+            return s >= 0 && std::memcmp(h.slot_ptr(s), pack.expert_base() + x.offset, x.bytes) == 0;
+        };
+        const int layer = 3;
+        const auto out = outside(layer);
+        check(out.size() >= 4, tag + "four experts of layer 3 outside the tier");
+        const int32_t ids[3] = {out[0], out[1], out[2]};
+        check(h.prefetch(layer, ids, 2) == 0, tag + "nothing starts before open_prefetch()");
+        h.open_prefetch();
+        check(h.prefetch(layer, ids, 2) == 2, tag + "two reads start");
+        check(h.prefetch(layer, ids, 2) == 0, tag + "an expert on its way is not read twice");
+        const int32_t in_tier = ranked[0].second;
+        check(h.prefetch(ranked[0].first, &in_tier, 1) == 0, tag + "an expert in the tier is not read");
+        bool ok[2] = {};
+        check(h.admit(layer, &ids[0], 1, ok) == 1 && ok[0] && h.prefetch_used_total() == 1,
+              tag + "admit() takes the prefetched expert");
+        check(h.admit(layer, &ids[2], 1, ok + 1) == 1 && ok[1] && h.prefetch_used_total() == 1,
+              tag + "admit() reads an expert nobody prefetched");
+        check(h.slot_of(layer, ids[0]) == -1 && h.slot_of(layer, ids[1]) == -1,
+              tag + "the RAM table does not change during the step");
+        std::vector<int32_t> routes((size_t) ds41test::L * 6, -1);
+        routes[(size_t) layer * 6 + 0] = ids[0];
+        routes[(size_t) layer * 6 + 1] = ids[2];
+        h.end_step(routes.data(), 6);
+        check(bytes_ok(layer, ids[0]) && bytes_ok(layer, ids[1]) && bytes_ok(layer, ids[2]),
+              tag + "all three are published with their bytes, the unused prefetch too");
+        check(h.prefetched_total() == 2 && h.admitted_total() == 3, tag + "the totals");
+        check(h.free_slots() == free0, tag + "end_step keeps the reserve free");
+        const int32_t late = out[3];
+        check(h.prefetch(layer, &late, 1) == 0, tag + "after end_step() nothing starts until open_prefetch()");
+        h.open_prefetch();
+        detail::admit_fault() = true;   // the prefetch read takes the fault: admit() waits for it, then reads itself
+        check(h.prefetch(layer, &late, 1) == 1, tag + "a read starts");
+        bool ok2 = false;
+        check(h.admit(layer, &late, 1, &ok2) == 1 && ok2 && h.prefetch_used_total() == 1,
+              tag + "a failed prefetch: admit() reads the expert itself");
+        detail::admit_fault() = false;
+        routes[(size_t) layer * 6 + 2] = late;
+        h.end_step(routes.data(), 6);
+        check(bytes_ok(layer, late) && h.free_slots() == free0, tag + "its bytes, and the failed read's slot is free again");
+    }
+
     // pinning that fails while the arena is large (memory short at start): the tier drops its lowest-ranked slots, a
     // step at a time, until the GPU can map it, instead of staying unpinned (paged out, CPU only)
     {

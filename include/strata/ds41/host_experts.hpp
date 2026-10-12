@@ -29,11 +29,13 @@
 #include "strata/ds41/pack.hpp"
 
 #include <atomic>
+#include <condition_variable>
 #include <cstddef>
 #include <cstdint>
 #include <memory>
 #include <mutex>
 #include <string>
+#include <thread>
 #include <utility>
 #include <vector>
 
@@ -138,6 +140,15 @@ public:
     /// expert i or its read failed: the CPU kernel then still reads it from the file. The RAM table and the device
     /// descriptors do not change until end_step(). Returns the number read.
     int admit(int layer, const int32_t* ids, int n, bool* ok);
+    /// During a step, from any thread (the router lookahead's guesses for the next layer): start reading ids[0..n) of
+    /// `layer` that are in no tier and not already on their way into free slots, in the background. admit() takes
+    /// such an expert when its read is done instead of reading it again; one that no admit() asked for enters the
+    /// tier at end_step(). Starts nothing between end_step() and open_prefetch(). Returns the number of reads started.
+    int prefetch(int layer, const int32_t* ids, int n);
+    /// The step's prefetch() calls may start reads (the CPU worker, when a step begins)
+    void open_prefetch();
+    int64_t prefetched_total() const { return prefetched_total_; }
+    int64_t prefetch_used_total() const { return prefetch_used_total_; }
     /// Between steps: publish the experts admitted during the step, record the step's routes ([n_layers][topk],
     /// negative ids ignored) as uses, then free the least recently used slots until each capacity has `reserve` free
     /// slots. A locked slot is never freed. Returns the number of experts that left.
@@ -157,6 +168,15 @@ private:
     void free_slot(int slot);      ///< its expert (if any) leaves for the file; the slot joins the free ones
     /// admit()'s reads into the picked slots (pick[i] < 0: none); records and points the ones read
     int read_picked(int layer, const int32_t* ids, int n, const std::vector<int>& pick, bool* ok);
+    /// the reads of read_picked() on `pool`: failed[i] is set for each picked expert not read in full. Throws what a
+    /// reader throws.
+    void read_into(int layer, const int32_t* ids, int n, const std::vector<int>& pick, std::atomic<bool>* failed,
+                   ThreadPool* pool);
+    void prefetch_loop();
+    /// the smallest capacity's free, unlocked slot that holds `bytes`, or -1 (under admit_mu_)
+    int pick_free(uint64_t bytes) const;
+    /// wait for every prefetch read; the unused ones join admitted_ (under admit_mu_)
+    void settle_prefetches(std::unique_lock<std::mutex>& lk);
     void publish_descriptor(int layer, int expert, int slot);
     void reserve_pending(int n);
 
@@ -194,6 +214,16 @@ private:
     std::mutex admit_mu_;
     std::vector<std::pair<int, std::pair<int, int>>> admitted_;   ///< (slot, (layer, expert)) read this step
     int64_t admitted_total_ = 0, evicted_total_ = 0;
+    // prefetch: reads on their way (under admit_mu_), read by one thread with its own readers
+    enum class Flight : uint8_t { queued, read, failed };
+    struct Prefetch { int layer, expert, slot; Flight state; bool claimed; };
+    std::vector<Prefetch> flights_;
+    size_t next_flight_ = 0;                        ///< the first flight the prefetch thread has not taken
+    bool pf_open_ = false, pf_stop_ = false;
+    std::condition_variable pf_cv_;                 ///< a flight queued, a read done, or stop
+    std::unique_ptr<ThreadPool> pf_readers_;
+    std::thread pf_thread_;
+    std::atomic<int64_t> prefetched_total_{0}, prefetch_used_total_{0};
 };
 
 }  // namespace strata::ds41
