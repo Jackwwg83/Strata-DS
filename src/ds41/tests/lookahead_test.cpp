@@ -1,6 +1,6 @@
 // src/ds41/tests/lookahead_test.cpp - the router lookahead: cpu_router_topk picks the experts a double-precision
 // reference picks (except where two scores tie within 1e-4 at the k-th place), and RouterLookahead warms the next
-// layer's predicted experts, hands the accepted ones to its fetch callback outside the residency lock, and counts
+// layer's (or, ahead 2, the one after's) predicted experts, hands the accepted ones to its fetch callback outside the residency lock, and counts
 // the ones the layer then used.
 #include "strata/ds41/lookahead.hpp"
 #include "strata/ds41/residency.hpp"
@@ -160,6 +160,31 @@ int main() {
         if (want.empty()) check(calls == 0, "fetch: not called when warm() accepted nothing");
         else check(calls == 1 && layer == 1 && got == want, "fetch: once, layer 1, the accepted ids in order");
         if (calls) check(unlocked, "fetch: called without the residency lock");
+    }
+    // 4. ahead 2: layer l's input predicts layer l+2 (a longer lead for the reads, at a lower recall)
+    {
+        std::vector<int32_t> got;
+        int calls = 0, layer = -1;
+        RouterLookahead l2(ws, bs, n, dim, k, [](int, int) { return true; },
+                           [&](int l, const int32_t* ids, int m) {
+                               std::lock_guard<std::mutex> lk(mu);
+                               ++calls;
+                               layer = l;
+                               got.assign(ids, ids + m);
+                           },
+                           2);
+        int32_t want[k];
+        cpu_router_topk(x.data(), ws[2].data(), bs[2].data(), n, dim, k, want);
+        l2.post(1, x.data());   // layer 3 does not exist: nothing
+        l2.post(0, x.data());
+        for (int i = 0; i < 200; ++i) {
+            { std::lock_guard<std::mutex> lk(mu); if (calls) break; }
+            std::this_thread::sleep_for(std::chrono::milliseconds(10));
+        }
+        std::this_thread::sleep_for(std::chrono::milliseconds(20));
+        std::lock_guard<std::mutex> lk(mu);
+        check(calls == 1 && layer == 2 && got == std::vector<int32_t>(want, want + k),
+              "ahead 2: layer 0's input predicts layer 2, once (layer 1 has no layer 3)");
     }
     std::printf("RESULT %s\n", failures ? "fail" : "pass");
     return failures ? 1 : 0;

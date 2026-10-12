@@ -811,13 +811,24 @@ struct Engine::Impl {
         if (const char* f = std::getenv("DS41_FETCH_NOW")) fetch_now = f[0] != '0';
         // With the adaptive RAM tier a miss is read with O_DIRECT, past the file cache, so warmed pages would not
         // help: the predicted experts are read into free RAM slots instead (HostExperts::prefetch), and admit()
-        // takes them. Laptop, 6 guesses: 59% (agent) and 67% (code) of the SSD reads were predicted.
-        // DS41_LOOKAHEAD=0: off. DS41_LOOKAHEAD_K: guesses per token (default 6).
+        // takes them. It pays only when the tiers hold few experts. Laptop (RTX 5090 Laptop, 60 GB), 256 tokens, 2
+        // rounds, ms/token off / 3 / 6 guesses: 16 GiB RAM tier (the tiers hold 25% of the experts) agent 65.8 /
+        // 63.0 / 69.0, code 63.0 / 59.6 / 73.3; automatic tier (54%) agent 42.8 / 43.7 / 45.2, code 41.6 / 42.0 /
+        // 45.1 (6 guesses read too many wrong experts). So with the adaptive tier it is on, with 3 guesses, when the
+        // VRAM and RAM tiers hold less than half of the experts. DS41_LOOKAHEAD=0 / 1: off / on;
+        // DS41_LOOKAHEAD_K: guesses per token; DS41_LOOKAHEAD_AHEAD=A (1..3): layer l's input predicts layer l+A
+        // (laptop, agent, recall of the experts outside VRAM with 6 guesses: A = 1 59%, 2 53%, 3 43%).
+        const bool adaptive = host && host->reserve() > 0;
+        const int64_t resident = (int64_t) (vram ? vram->slots() : 0) + (host ? host->slots() : 0);
+        const bool few = resident * 2 < (int64_t) kLayers * kExperts;
         const char* la_env = std::getenv("DS41_LOOKAHEAD");
         const char* lk_env = std::getenv("DS41_LOOKAHEAD_K");
-        const int la_k = lk_env ? std::atoi(lk_env) : kTopK;
+        const int la_k = lk_env ? std::atoi(lk_env) : adaptive ? 3 : kTopK;
         if (la_k < 1 || la_k > kExperts) throw std::invalid_argument("DS41_LOOKAHEAD_K must be in [1, 384]");
-        if (la_env ? la_env[0] != '0' : true) {
+        const char* la_ahead_env = std::getenv("DS41_LOOKAHEAD_AHEAD");
+        const int la_ahead = la_ahead_env ? std::atoi(la_ahead_env) : 1;
+        if (la_ahead < 1 || la_ahead > 3) throw std::invalid_argument("DS41_LOOKAHEAD_AHEAD must be in [1, 3]");
+        if (la_env ? la_env[0] != '0' : !adaptive || few) {
             std::vector<std::vector<uint16_t>> rw(kLayers, std::vector<uint16_t>((size_t) kExperts * kDim));
             std::vector<std::vector<float>> rb(kLayers, std::vector<float>(kExperts));
             for (int l = 0; l < kLayers; ++l) {
@@ -826,14 +837,13 @@ struct Engine::Impl {
             }
             // The VRAM and RAM tables change only between steps; a prediction racing that change warms one expert
             // more or less, never changes what is computed.
-            const bool adaptive = host && host->reserve() > 0;
             std::function<void(int, const int32_t*, int)> fetch;
             if (adaptive) fetch = [this](int l, const int32_t* ids, int n) { host->prefetch(l, ids, n); };
             lookahead = std::make_unique<RouterLookahead>(std::move(rw), std::move(rb), kExperts, kDim, la_k,
                                                           [this, adaptive](int l, int e) {
                                                               return warm_file_expert(l, e, !adaptive);
                                                           },
-                                                          std::move(fetch));
+                                                          std::move(fetch), la_ahead);
         }
         worker = std::thread([this] { worker_loop(); });
         if (const char* p = std::getenv("DS41_DEBUG")) dbg = std::fopen(p, "wb");

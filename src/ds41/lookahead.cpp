@@ -67,8 +67,8 @@ void cpu_router_topk(const uint16_t* x, const uint16_t* w, const float* bias, in
 
 RouterLookahead::RouterLookahead(std::vector<std::vector<uint16_t>> router_w, std::vector<std::vector<float>> bias,
                                  int n_experts, int dim, int k, std::function<bool(int, int)> warm,
-                                 std::function<void(int, const int32_t*, int)> fetch)
-    : w_(std::move(router_w)), bias_(std::move(bias)), n_experts_(n_experts), dim_(dim), k_(k),
+                                 std::function<void(int, const int32_t*, int)> fetch, int ahead)
+    : w_(std::move(router_w)), bias_(std::move(bias)), n_experts_(n_experts), dim_(dim), k_(k), ahead_(ahead),
       warm_(std::move(warm)), fetch_(std::move(fetch)), x_(dim), warmed_(w_.size()) {
     th_ = std::thread([this] { run(); });
 }
@@ -83,7 +83,7 @@ RouterLookahead::~RouterLookahead() {
 }
 
 void RouterLookahead::post(int layer, const uint16_t* x) {
-    if (layer + 1 >= (int) w_.size()) return;
+    if (layer + ahead_ >= (int) w_.size()) return;
     {
         std::lock_guard<std::mutex> lk(mu_);
         std::memcpy(x_.data(), x, (size_t) dim_ * 2);
@@ -106,7 +106,7 @@ void RouterLookahead::run() {
             layer = layer_;
             x = x_;
         }
-        const int next = layer + 1;
+        const int next = layer + ahead_;
         cpu_router_topk(x.data(), w_[next].data(), bias_[next].data(), n_experts_, dim_, k_, ids.data());
         std::vector<int32_t> warmed;
         for (int i = 0; i < k_; ++i) {

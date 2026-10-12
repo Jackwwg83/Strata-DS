@@ -29,15 +29,16 @@ public:
     /// each predicted expert of the next layer; it decides whether the expert needs warming (file tier) and does it,
     /// returning true when it asked the OS for pages.
     /// `fetch(layer, ids, n)`, when given, then gets the experts warm() accepted, in prediction order, once per
-    /// prediction and without the residency lock (warm() runs under it).
+    /// prediction and without the residency lock (warm() runs under it). `ahead`: layer l's input predicts layer
+    /// l + ahead (1: the next layer).
     RouterLookahead(std::vector<std::vector<uint16_t>> router_w, std::vector<std::vector<float>> bias, int n_experts,
                     int dim, int k, std::function<bool(int, int)> warm,
-                    std::function<void(int, const int32_t*, int)> fetch = nullptr);
+                    std::function<void(int, const int32_t*, int)> fetch = nullptr, int ahead = 1);
     ~RouterLookahead();
     RouterLookahead(const RouterLookahead&) = delete;
     RouterLookahead& operator=(const RouterLookahead&) = delete;
 
-    /// Layer `layer`'s expert input x (fp16 bits) is ready: predict layer + 1 in the background. Never blocks for
+    /// Layer `layer`'s expert input x (fp16 bits) is ready: predict layer + ahead in the background. Never blocks for
     /// long; a request that arrives while the previous one still runs replaces it.
     void post(int layer, const uint16_t* x);
     /// The experts layer `layer` really routed to the CPU's file tier: counts how many had been warmed.
@@ -54,7 +55,7 @@ private:
 
     std::vector<std::vector<uint16_t>> w_;
     std::vector<std::vector<float>> bias_;
-    int n_experts_, dim_, k_;
+    int n_experts_, dim_, k_, ahead_;
     std::function<bool(int, int)> warm_;
     std::function<void(int, const int32_t*, int)> fetch_;
     std::mutex mu_;
