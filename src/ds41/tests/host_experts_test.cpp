@@ -336,6 +336,56 @@ int main() {
     }
     check(b <= avail_kb * 1024, "the budget is below MemAvailable");
     std::printf("auto budget %.1f GiB (MemAvailable %.1f GiB)\n", b / 1073741824.0, avail_kb / 1048576.0);
+    {
+        // DSpark's experts (pack.py --mtp-experts): mtp_experts.txt in the layout of experts.txt, the layer field the
+        // stage; load_mtp_experts reads every slot into RAM
+        const std::string dir = "ds41_fake_pack_mtp";
+        ds41test::write_fake_pack(dir);
+        {
+            Pack plain(dir);
+            check(plain.mtp_stages() == 0 && plain.mtp_experts() == 0, "a pack without mtp_experts.txt has no DSpark experts");
+        }
+        const int S = 3, E = 128;
+        const uint64_t slot = 8192;
+        {
+            std::ofstream f(dir + "/mtp_experts.txt");
+            f << "# header\n";
+            const char* comp[12] = {"w1.trellis", "w1.suh", "w1.svh", "w1.mul1", "w3.trellis", "w3.suh",
+                                    "w3.svh",     "w3.mul1", "w2.trellis", "w2.suh", "w2.svh", "w2.mul1"};
+            for (int st = 0; st < S; ++st)
+                for (int e = 0; e < E; ++e) {
+                    f << st << " " << e << " " << ((uint64_t) st * E + e) * slot << " " << slot << " 4 4 4";
+                    for (int c = 0; c < 12; ++c) f << " " << comp[c] << ":" << c * 512 << ":" << 512;
+                    f << "\n";
+                }
+            std::vector<uint8_t> b((size_t) S * E * slot);
+            for (size_t i = 0; i < b.size(); ++i) b[i] = (uint8_t) (i * 2654435761u >> 13);
+            std::ofstream(dir + "/mtp_experts.bin", std::ios::binary).write((const char*) b.data(), (std::streamsize) b.size());
+            std::ofstream(dir + "/pack_info.txt") << "layers " << ds41test::L << "\nexperts " << ds41test::E
+                                                  << "\nmtp_stages 3\nmtp_experts 128\nfinished 1\n";
+        }
+        Pack pack(dir);
+        check(pack.mtp_stages() == S && pack.mtp_experts() == E, "pack_info.txt names 3 stages of 128 DSpark experts");
+        check(pack.mtp_expert(2, 127).offset == (uint64_t) (2 * E + 127) * slot && pack.mtp_expert(1, 5).bits[0] == 4,
+              "mtp_expert reads mtp_experts.txt");
+        check(pack.load_mtp_experts() == (uint64_t) S * E * slot, "load_mtp_experts reads the whole file");
+        bool same = true;
+        for (int st = 0; st < S; ++st)
+            for (int e = 0; e < E; e += 17) {
+                const auto& x = pack.mtp_expert(st, e);
+                for (uint64_t i = 0; i < x.bytes; i += 509)
+                    same &= pack.mtp_expert_base()[x.offset + i] == (uint8_t) ((x.offset + i) * 2654435761u >> 13);
+            }
+        check(same, "the loaded experts hold the file's bytes");
+        std::remove((dir + "/mtp_experts.txt").c_str());
+        bool threw = false;
+        try {
+            Pack missing(dir);
+        } catch (const std::exception&) {
+            threw = true;
+        }
+        check(threw, "pack_info.txt names DSpark experts that mtp_experts.txt does not list: refused");
+    }
     std::printf("RESULT %s\n", failures ? "fail" : "pass");
     return failures ? 1 : 0;
 }
