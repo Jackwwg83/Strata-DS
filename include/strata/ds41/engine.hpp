@@ -112,6 +112,7 @@ public:
         std::array<int, 5> tokens{};
         std::array<float, 5> accept{};
         double ms = 0, cpu_experts_ms = 0;   ///< the whole call; the CPU's routed experts inside it
+        int vram_hits = 0, uses = 0;          ///< routed uses computed from DSpark's VRAM set, of all
     };
     Draft draft(int token);
     bool has_dspark() const;

@@ -313,6 +313,9 @@ struct Engine::Impl {
     struct Dspark;
     std::shared_ptr<Dspark> ds;
     void dspark_init();
+    void dspark_vram_update();
+    /// DSpark's VRAM set by default (DS41_DSPARK_VRAM_MB): see dspark.cu
+    static constexpr size_t kDsparkVramMb = 0;   // laptop, agent, 3 drafts: 0 / 768 / 1536 / 3072 MB took 47.4 / 49.8 / 53.2 / 56.3 ms per token
     void dspark_pend(const bf16* src, int n, int pos0);
     void dspark_ring(int n, cudaStream_t s);
     void enqueue_draft(int n_pend);

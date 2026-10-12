@@ -34,14 +34,43 @@ struct Engine::Impl::Dspark {
     int *prm = nullptr, *prm_host = nullptr;   // [kPrm + kMaxPend]: then the pending rows' positions
     int32_t* out_host = nullptr;
     float* conf_host = nullptr;
+    // DS41_DSPARK_PROFILE=<file>: every draft's routes ([stage][B][3], ids_host) are counted and written there as
+    // "stage expert uses" lines when the engine ends (the profile of DSpark's VRAM set)
+    int32_t* ids_host = nullptr;
+    std::string profile_path;
+    std::vector<int64_t> uses = std::vector<int64_t>(dsk::kStages * dsk::kExperts, 0);
     std::unique_ptr<ExpertDoorbell> db;
     int64_t moe[dsk::kStages] = {-1, -1, -1};
+    // the VRAM set (DS41_DSPARK_VRAM_MB): DSpark's hottest experts in VRAM slots, computed by K10 on the GPU, the
+    // others by the CPU. Scores decay per draft; before a draft the hottest expert outside VRAM replaces the coldest
+    // inside (copied from the RAM copy, registered for DMA)
+    int vslots = 0;
+    size_t vslot_bytes = 0;
+    uint8_t* varena = nullptr;
+    kernels::Exl3Expert* vdesc = nullptr;       // [vslots] device
+    int32_t* vres = nullptr;                    // [stage][expert] device: the slot, or -1
+    std::vector<int32_t> vres_host;
+    std::vector<int> vowner;                    // [slot]: stage * kExperts + expert, or -1
+    std::vector<float> score = std::vector<float>(dsk::kStages * dsk::kExperts, 0.0f);
+    void* vws = nullptr;                        // K10 workspace
+    const void* registered = nullptr;
+    int last_hits = 0, last_uses = 0;
     std::map<int, cudaGraphExec_t> graphs;   // by pending rows (0..kVerifyMaxTokens)
     bool warmed = false;
     ~Dspark() {
         for (auto& [k, e] : graphs) cudaGraphExecDestroy(e);
         for (int64_t hnd : moe)
             if (hnd >= 0) exl3_moe_cpu_free_layer(hnd);
+        if (!profile_path.empty())
+            if (std::FILE* f = std::fopen(profile_path.c_str(), "w")) {
+                std::fprintf(f, "# ds41 DSpark routes: stage expert uses\n");
+                for (int s = 0; s < dsk::kStages; ++s)
+                    for (int e = 0; e < dsk::kExperts; ++e)
+                        std::fprintf(f, "%d %d %lld\n", s, e, (long long) uses[s * dsk::kExperts + e]);
+                std::fclose(f);
+            }
+        if (registered) cudaHostUnregister(const_cast<void*>(registered));
+        if (ids_host) cudaFreeHost(ids_host);
         if (prm_host) cudaFreeHost(prm_host);
         if (out_host) cudaFreeHost(out_host);
         if (conf_host) cudaFreeHost(conf_host);
@@ -130,7 +159,7 @@ void Engine::Impl::dspark_init() {
     d.conf = d.alloc<float>(B);
     d.weights = d.alloc<float>(B * dsk::kTopK);
     d.half = d.alloc<uint16_t>(B * kDim);
-    d.ids = d.alloc<int32_t>(B * dsk::kTopK);
+    d.ids = d.alloc<int32_t>(dsk::kStages * B * dsk::kTopK);   // per stage: the profile reads all three
     d.sel = d.alloc<int32_t>(B * dsk::kTopK);
     d.idx = d.alloc<int32_t>(B * (kWindow + B));
     d.out = d.alloc<int32_t>(B);
@@ -139,17 +168,113 @@ void Engine::Impl::dspark_init() {
        "dspark params");
     ck(cudaHostAlloc((void**) &d.out_host, B * sizeof(int32_t), cudaHostAllocDefault), "dspark drafts");
     ck(cudaHostAlloc((void**) &d.conf_host, B * sizeof(float), cudaHostAllocDefault), "dspark confidence");
+    ck(cudaHostAlloc((void**) &d.ids_host, dsk::kStages * B * dsk::kTopK * sizeof(int32_t), cudaHostAllocDefault),
+       "dspark routes");
+    if (const char* f = std::getenv("DS41_DSPARK_PROFILE")) d.profile_path = f;
     d.db = std::make_unique<ExpertDoorbell>(B, dsk::kTopK, kDim);
+    {
+        const char* v = std::getenv("DS41_DSPARK_VRAM_MB");
+        const size_t mb = v ? (size_t) std::max(0, std::atoi(v)) : kDsparkVramMb;
+        for (int s = 0; s < dsk::kStages; ++s)
+            for (int e = 0; e < dsk::kExperts; ++e)
+                d.vslot_bytes = std::max<size_t>(d.vslot_bytes, pack.mtp_expert(s, e).bytes);
+        d.vslot_bytes = (d.vslot_bytes + 255) & ~(size_t) 255;
+        d.vslots = (int) std::min<size_t>((mb << 20) / d.vslot_bytes, dsk::kStages * dsk::kExperts);
+    }
+    d.vres_host.assign(dsk::kStages * dsk::kExperts, -1);
+    if (d.vslots > 0) {
+        d.varena = d.alloc<uint8_t>((size_t) d.vslots * d.vslot_bytes);
+        d.vdesc = d.alloc<kernels::Exl3Expert>(d.vslots);
+        d.vres = d.alloc<int32_t>(dsk::kStages * dsk::kExperts);
+        ck(cudaMemcpy(d.vres, d.vres_host.data(), d.vres_host.size() * sizeof(int32_t), cudaMemcpyHostToDevice),
+           "dspark vram table");
+        d.vws = d.alloc<uint8_t>(VramExperts::kWorkspaceBytes);
+        d.vowner.assign(d.vslots, -1);
+        const uint64_t bytes = pack.load_mtp_experts();   // already loaded: its size
+        if (cudaHostRegister((void*) pack.mtp_expert_base(), bytes, cudaHostRegisterPortable) == cudaSuccess)
+            d.registered = pack.mtp_expert_base();
+        else
+            cudaGetLastError();   // pageable copies still work, slower
+        std::fprintf(stderr, "ds41: DSpark VRAM set %d experts (%.2f GiB)%s\n", d.vslots,
+                     d.vslots * (double) d.vslot_bytes / (1ull << 30), d.registered ? "" : ", RAM copy not registered");
+    }
 }
 
-/// After a step or a commit: rows of `src` (main_hiddens of positions pos0, pos0 + 1, ...) become the pending rows. A
-/// later draft writes their main_kv into the rings first. Rows still pending from before are dropped: their ring slots
-/// keep older rows, which costs draft quality only.
+/// Before a draft (the device is idle): the scores decay and take the last draft's routes; then the hottest experts
+/// outside VRAM fill free slots (8 per draft) or replace the coldest resident when clearly hotter (2 per draft).
+void Engine::Impl::dspark_vram_update() {
+    auto& d = *ds;
+    const int n = dsk::kStages * dsk::kExperts;
+    if (d.vslots == 0) return;
+    int free_n = 0;
+    for (int o : d.vowner) free_n += o < 0;
+    int budget = free_n > 0 ? 8 : 2;
+    bool changed = false;
+    std::vector<int> slots_changed;
+    while (budget-- > 0) {
+        int hot = -1;
+        for (int i = 0; i < n; ++i)
+            if (d.vres_host[i] < 0 && d.score[i] > 0 && (hot < 0 || d.score[i] > d.score[hot])) hot = i;
+        if (hot < 0) break;
+        int slot = -1;
+        for (int k = 0; k < d.vslots && slot < 0; ++k)
+            if (d.vowner[k] < 0) slot = k;
+        if (slot < 0) {
+            for (int k = 0; k < d.vslots; ++k)
+                if (slot < 0 || d.score[d.vowner[k]] < d.score[d.vowner[slot]]) slot = k;
+            if (d.score[hot] <= 1.25f * d.score[d.vowner[slot]] + 0.5f) break;
+            d.vres_host[d.vowner[slot]] = -1;
+        }
+        const int st_i = hot / dsk::kExperts, e = hot % dsk::kExperts;
+        const auto& x = pack.mtp_expert(st_i, e);
+        uint8_t* dst = d.varena + (size_t) slot * d.vslot_bytes;
+        ck(cudaMemcpy(dst, pack.mtp_expert_base() + x.offset, x.bytes, cudaMemcpyHostToDevice), "dspark vram copy");
+        d.vowner[slot] = hot;
+        d.vres_host[hot] = slot;
+        auto proj = [&](int c0, int k, int nn) {
+            kernels::Exl3Proj p;
+            p.trellis = (const uint16_t*) (dst + x.comp_off[c0]);
+            p.suh = (const __half*) (dst + x.comp_off[c0 + 1]);
+            p.svh = (const __half*) (dst + x.comp_off[c0 + 2]);
+            p.k = k;
+            p.n = nn;
+            p.tile_w = (int) (x.comp_bytes[c0] / ((uint64_t) (k / 16) * (nn / 16) * 2));
+            return p;
+        };
+        kernels::Exl3Expert desc;
+        desc.w1 = proj(0, kDim, kMoeInter);
+        desc.w3 = proj(4, kDim, kMoeInter);
+        desc.w2 = proj(8, kMoeInter, kDim);
+        ck(cudaMemcpy(d.vdesc + slot, &desc, sizeof desc, cudaMemcpyHostToDevice), "dspark vram descriptor");
+        changed = true;
+    }
+    if (changed)
+        ck(cudaMemcpy(d.vres, d.vres_host.data(), n * sizeof(int32_t), cudaMemcpyHostToDevice), "dspark vram table");
+}
+
+/// After a step or a commit: rows of `src` (main_hiddens of positions pos0, pos0 + 1, ...) join the pending rows when
+/// they follow them (plain steps between drafts), else replace them. A later draft writes their main_kv into the rings
+/// first; 128 pending rows are written at once, here. Replaced rows leave older rows in their ring slots, which costs
+/// draft quality only.
 void Engine::Impl::dspark_pend(const bf16* src, int n, int pos0) {
     auto& d = *ds;
-    ck(cudaMemcpyAsync(d.mh, src, (size_t) n * Dspark::kHid * sizeof(bf16), cudaMemcpyDeviceToDevice, st), "dspark pend");
-    d.pend_n = n;
-    d.pend_pos0 = pos0;
+    const bool follows = d.pend_n > 0 && d.pend_pos0 + d.pend_n == pos0;
+    if (follows && d.pend_n + n > Dspark::kMaxPend) {   // full: write the rings now (the device is idle)
+        for (int i = 0; i < d.pend_n; ++i) d.prm_host[Dspark::kPrm + i] = d.pend_pos0 + i;
+        ck(cudaMemcpyAsync(d.prm, d.prm_host, (Dspark::kPrm + d.pend_n) * sizeof(int), cudaMemcpyHostToDevice, st),
+           "dspark params");
+        dspark_ring(d.pend_n, st);
+        ck(cudaStreamSynchronize(st), "dspark ring");
+        d.pend_pos0 += d.pend_n;
+        d.pend_n = 0;
+    }
+    if (!follows || d.pend_n == 0) {
+        d.pend_n = 0;
+        d.pend_pos0 = pos0;
+    }
+    ck(cudaMemcpyAsync(d.mh + (size_t) d.pend_n * Dspark::kHid, src, (size_t) n * Dspark::kHid * sizeof(bf16),
+                       cudaMemcpyDeviceToDevice, st), "dspark pend");
+    d.pend_n += n;
 }
 
 /// The rings' rows of mh rows 0..n-1, whose positions are prm[kPrm + i] (DSparkAttention, the main_x part):
@@ -222,14 +347,20 @@ void Engine::Impl::enqueue_draft(int n_pend) {
         kernels::hc_mixes_pre(d.h2, B, y.hc_ffn_fn, y.hc_ffn_scale, y.hc_ffn_base, d.apre, d.xf, d.fpre, d.fpost,
                               d.fcomb, st);
         ops::rmsnorm(d.xf, y.ffn_norm, d.xf, kDim, kNormEps, B, st);
-        dsk::router_small(d.xf, B, y.gate_w, y.gate_bias, dsk::kExperts, dsk::kTopK, d.ids, d.weights, st);
+        int32_t* ids = d.ids + s * B * dsk::kTopK;
+        dsk::router_small(d.xf, B, y.gate_w, y.gate_bias, dsk::kExperts, dsk::kTopK, ids, d.weights, st);
         ops::to_half_fp8q(d.xf, d.half, B * kDim, st);
-        d.db->publish(d.half, d.ids, d.weights, B, nullptr, d.sel, (uint32_t) (s + 1), st);   // every expert: CPU
+        // VRAM-set experts: K10 on the GPU (descriptor mode); the rest: the CPU
+        d.db->publish(d.half, ids, d.weights, B, d.vslots ? d.vres + s * dsk::kExperts : nullptr, d.sel,
+                      (uint32_t) (s + 1), st, d.vslots ? d.vdesc : nullptr);
         lin(d.xf, y.sh_w1, d.g);
         lin(d.xf, y.sh_w3, d.u);
         ops::swiglu(d.g, d.u, kSwigluLimit, d.sh_h, B * kMoeInter, st);
         lin(d.sh_h, y.sh_w2, d.sh_out);
         ck(cudaMemsetAsync(d.routed, 0, B * kDim * sizeof(float), st), "dspark routed");
+        if (d.vslots)
+            kernels::exl3_moe_decode((const __half*) d.half, B, d.sel, d.weights, dsk::kTopK, d.db->gpu_experts(),
+                                     d.routed, d.vws, VramExperts::kWorkspaceBytes, st);
         d.db->wait_add(d.routed, B, (uint32_t) (s + 1), st);
         ops::add_f32_bf16(d.routed, d.sh_out, d.ffn_out, B * kDim, st);
         ops::hc_post(d.ffn_out, d.h2, d.fpost, d.fcomb, d.h, B, st);
@@ -247,6 +378,8 @@ void Engine::Impl::enqueue_draft(int n_pend) {
     dsk::confidence_rows(d.xfin, d.memb, d.conf_w, B, d.conf, st);
     ck(cudaMemcpyAsync(d.out_host, d.out, B * sizeof(int32_t), cudaMemcpyDeviceToHost, st), "dspark drafts");
     ck(cudaMemcpyAsync(d.conf_host, d.conf, B * sizeof(float), cudaMemcpyDeviceToHost, st), "dspark confidence");
+    ck(cudaMemcpyAsync(d.ids_host, d.ids, dsk::kStages * B * dsk::kTopK * sizeof(int32_t), cudaMemcpyDeviceToHost, st),
+       "dspark routes");
 }
 
 /// The decode worker's DSpark job: per stage, when the GPU publishes it, the block's routed experts from RAM.
@@ -301,6 +434,7 @@ Engine::Draft Engine::Impl::draft(int token) {
         n_pend = 0;
     }
     d.pend_n = 0;
+    dspark_vram_update();
     cudaGraphExec_t exec = nullptr;
     if (use_graph && d.warmed) {
         auto it = d.graphs.find(n_pend);
@@ -359,12 +493,25 @@ Engine::Draft Engine::Impl::draft(int token) {
         }
     }
     d.warmed = true;
+    for (float& sc : d.score) sc *= 0.95f;
+    d.last_hits = d.last_uses = 0;
+    for (int i = 0; i < dsk::kStages * Dspark::B * dsk::kTopK; ++i) {
+        const int e = d.ids_host[i];
+        if (e < 0 || e >= dsk::kExperts) continue;
+        const int k = (i / (Dspark::B * dsk::kTopK)) * dsk::kExperts + e;
+        ++d.uses[k];
+        d.score[k] += 1.0f;
+        ++d.last_uses;
+        d.last_hits += d.vres_host[k] >= 0;
+    }
     r.n = Dspark::B;
     for (int i = 0; i < Dspark::B; ++i) {
         r.tokens[i] = d.out_host[i];
         r.accept[i] = 1.0f / (1.0f + std::exp(-d.conf_host[i]));
     }
     r.cpu_experts_ms = worker_us.load() / 1000.0;
+    r.vram_hits = d.last_hits;
+    r.uses = d.last_uses;
     r.ms = now_ms() - begin;
     return r;
 }
