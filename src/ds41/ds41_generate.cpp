@@ -13,6 +13,10 @@
 // the prompt instead of the engine's own predictions: every run of a speed A/B then routes the same experts.
 // --spec oracle --continue-ids FILE measures the verify window: every window is --spec-max tokens, its drafts are the
 // file's next tokens and every row is committed (the cost at full acceptance; the file is a greedy run's output).
+// --spec dspark drafts with DSpark (DeepSeek's MTP drafter; the pack needs pack.py --mtp-experts). Per round it
+// verifies the k drafts with the most expected tokens per millisecond: E(k) = 1 + S1 + .. + Sk, Si the product of the
+// confidence head's first i probabilities, over the measured time of rounds with k drafts (DeepSeek's scheduler, and
+// upstream's DraftPolicy). --draft-k K verifies K drafts every round instead (raw acceptance).
 #include "strata/ds41/config.hpp"
 #include "strata/ds41/engine.hpp"
 #include "strata/ds41/suffix_drafter.hpp"
@@ -62,9 +66,38 @@ static void print_prefill(const Engine& engine, size_t n) {
 /// --step-log: one line per decode step (where the step's time went), for the decode profile
 static std::FILE* step_log = nullptr;
 
+/// DSpark's verify length: the k (0..k_max) with the most expected committed tokens per ms. Round times are EMAs per
+/// k; a k not measured yet is scaled from the measured ones by a prior (a window costs 1 + 0.7 per extra row).
+struct DraftScheduler {
+    static constexpr int kMax = 8;
+    double ms[kMax] = {}, n[kMax] = {};
+    static double prior(int k) { return 1.0 + 0.7 * k; }
+    double cost(int k) const {
+        if (n[k] > 0) return ms[k];
+        double r = 0, w = 0;
+        for (int j = 0; j < kMax; ++j)
+            if (n[j] > 0) { r += ms[j] / prior(j); w += 1; }
+        return (w > 0 ? r / w : 1.0) * prior(k);
+    }
+    int choose(const Engine::Draft& d, int k_max) const {
+        int best = 0;
+        double e = 1, s = 1, best_rate = 1 / cost(0);
+        for (int k = 1; k <= std::min(k_max, d.n); ++k) {
+            s *= d.accept[k - 1];
+            e += s;
+            if (e / cost(k) > best_rate) { best_rate = e / cost(k); best = k; }
+        }
+        return best;
+    }
+    void observe(int k, double round_ms) {
+        ms[k] = n[k] > 0 ? 0.8 * ms[k] + 0.2 * round_ms : round_ms;
+        n[k] += 1;
+    }
+};
+
 static void generate(Engine& engine, const EngineOptions& opt, const std::vector<int>& prompt,
                      int count, bool batched, bool suffix, int max_t, int eos, const std::vector<int>& cont = {},
-                     bool oracle = false) {
+                     bool oracle = false, bool dspark = false, int draft_k = -1) {
     if (prompt.empty()) throw std::invalid_argument("generation needs a nonempty prompt");
     int next = -1;
     if (batched) {
@@ -82,6 +115,10 @@ static void generate(Engine& engine, const EngineOptions& opt, const std::vector
     double step_ms = 0;            // plain decode: the engine's step times, as the forced path reports them
     int differ = 0;                // oracle: rows whose prediction differs from the file
     int64_t hits = 0, routed = 0, skipped = 0;
+    DraftScheduler sched;
+    double draft_ms = 0, draft_cpu_ms = 0;
+    int64_t pos_tried[5] = {}, pos_ok[5] = {};   // DSpark: drafts verified and accepted, by draft position
+    double pos_conf[5] = {};                     // the confidence head's probabilities of the verified drafts
     const auto begin = std::chrono::steady_clock::now();
     while (int(out.size()) < count && next != eos) {
         const int limit = std::min({max_t, count-int(out.size()), opt.max_seq-pos});
@@ -104,7 +141,18 @@ static void generate(Engine& engine, const EngineOptions& opt, const std::vector
             continue;
         }
         int32_t draft[8];
-        const int proposed = oracle ? limit-1 : drafter.propose(limit-1, draft);
+        const auto r0 = std::chrono::steady_clock::now();
+        Engine::Draft dd;
+        int proposed = 0;
+        if (dspark) {
+            dd = engine.draft(next);
+            draft_ms += dd.ms;
+            draft_cpu_ms += dd.cpu_experts_ms;
+            proposed = draft_k >= 0 ? std::min({draft_k, dd.n, limit-1}) : sched.choose(dd, std::min(limit-1, dd.n));
+            for (int i = 0; i < proposed; ++i) draft[i] = dd.tokens[i];
+        } else {
+            proposed = oracle ? limit-1 : drafter.propose(limit-1, draft);
+        }
         if (oracle)
             for (int i = 0; i < proposed; ++i) draft[i] = cont[out.size() + i];
         std::vector<int> window{next};
@@ -117,10 +165,22 @@ static void generate(Engine& engine, const EngineOptions& opt, const std::vector
             if (result.next[i] == eos) { keep = i+1; break; }
         engine.commit(keep);
         const auto& tm = engine.last_timing();
+        if (dspark) {
+            sched.observe(proposed, std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - r0).count());
+            for (int i = 0; i < proposed; ++i) {
+                ++pos_tried[i];
+                pos_conf[i] += dd.accept[i];
+                if (i < keep - 1) ++pos_ok[i];
+            }
+        }
         std::printf("spec_window pos %d T %zu accepted %d emitted %d ms %.1f engram_ms %.2f cpu_experts_ms %.2f "
-                    "hits %d of %d wait_ms %.2f admit_ms %.2f ssd %d ram %d\n", pos, window.size(), keep-1, keep,
+                    "hits %d of %d wait_ms %.2f admit_ms %.2f ssd %d ram %d", pos, window.size(), keep-1, keep,
                     verify_ms, tm.engram_ms, tm.cpu_experts_ms, tm.expert_hits, tm.expert_total, tm.worker_wait_ms,
                     tm.admit_ms, tm.ssd_experts, tm.ram_experts);
+        if (dspark)
+            std::printf(" draft_ms %.2f draft_cpu_ms %.2f conf %.2f %.2f %.2f %.2f %.2f", dd.ms, dd.cpu_experts_ms,
+                        dd.accept[0], dd.accept[1], dd.accept[2], dd.accept[3], dd.accept[4]);
+        std::printf("\n");
         skipped += tm.skipped;
         routed += tm.expert_total;
         for (int i = 0; i < keep; ++i) {
@@ -141,6 +201,14 @@ static void generate(Engine& engine, const EngineOptions& opt, const std::vector
     const double ms = suffix ? seconds * 1000.0 : step_ms;
     std::printf("decode_ms_per_token %.1f over %d steps\n", decoded > 0 ? ms / decoded : 0.0, decoded);
     if (oracle) std::printf("oracle_rows_differing %d of %d\n", differ, decoded);
+    if (dspark) {
+        std::printf("dspark draft_ms %.2f cpu_ms %.2f per round; by draft position: accepted/verified (mean confidence)",
+                    rounds ? draft_ms / rounds : 0.0, rounds ? draft_cpu_ms / rounds : 0.0);
+        for (int i = 0; i < 5; ++i)
+            std::printf(" %lld/%lld (%.2f)", (long long) pos_ok[i], (long long) pos_tried[i],
+                        pos_tried[i] ? pos_conf[i] / pos_tried[i] : 0.0);
+        std::printf("\nmean_accepted_per_window %.3f\n", rounds ? (double) accepted / rounds : 0.0);
+    }
     std::printf("tail_skipped %lld of %lld routed uses\n", (long long) skipped, (long long) routed);
     if (!suffix)
         std::printf("vram_expert_slots %d hit_rate %.4f\n", engine.vram_expert_slots(),
@@ -149,7 +217,7 @@ static void generate(Engine& engine, const EngineOptions& opt, const std::vector
 
 int main(int argc, char** argv) {
     std::string pack, ids_s, dump_path, force_path, cont_path, spec = "none";
-    int spec_max = kVerifyMaxTokens, eos = -1;
+    int spec_max = kVerifyMaxTokens, eos = -1, draft_k = -1;
     int gen = 32;
     bool batched = false;
     EngineOptions opt;
@@ -162,6 +230,7 @@ int main(int argc, char** argv) {
         else if (a == "--spec") spec = next();
         else if (a == "--spec-max") spec_max = std::stoi(next());
         else if (a == "--eos-id") eos = std::stoi(next());
+        else if (a == "--draft-k") draft_k = std::stoi(next());
         else if (a == "--threads") opt.cpu_threads = std::stoi(next());
         else if (a == "--max-seq") opt.max_seq = std::stoi(next());
         else if (a == "--expert-profile") opt.expert_profile = next();
@@ -189,7 +258,7 @@ int main(int argc, char** argv) {
         else { std::fprintf(stderr, "unknown argument %s\n", a.c_str()); return 2; }
     }
     if (pack.empty() || (ids_s.empty() && force_path.empty())) {
-        std::fprintf(stderr, "usage: ds41_generate --pack DIR --ids a,b,c [--gen N] [--threads T] [--dump F] [--force-ids F] [--spec none|suffix|oracle] [--spec-max 1..8] [--eos-id ID]\n");
+        std::fprintf(stderr, "usage: ds41_generate --pack DIR --ids a,b,c [--gen N] [--threads T] [--dump F] [--force-ids F] [--spec none|suffix|oracle|dspark] [--spec-max 1..8] [--draft-k 0..5] [--eos-id ID]\n");
         return 2;
     }
     std::vector<int> prompt = parse_ids(ids_s), forced;
@@ -209,21 +278,25 @@ int main(int argc, char** argv) {
         for (const auto* ids : {&prompt, &forced, &cont})
             for (int t : *ids)
                 if (t < 0 || t >= kVocab) throw std::invalid_argument("token id " + std::to_string(t) + " is outside the vocabulary");
-        if (gen < 0 || spec_max < 1 || spec_max > 8 || (spec != "none" && spec != "suffix" && spec != "oracle"))
-            throw std::invalid_argument("use --gen >= 0, --spec none|suffix|oracle, --spec-max 1..8");
+        if (gen < 0 || spec_max < 1 || spec_max > 8 ||
+            (spec != "none" && spec != "suffix" && spec != "oracle" && spec != "dspark"))
+            throw std::invalid_argument("use --gen >= 0, --spec none|suffix|oracle|dspark, --spec-max 1..8");
+        if (draft_k > 5 || (draft_k >= 0 && spec != "dspark")) throw std::invalid_argument("--draft-k 0..5 needs --spec dspark");
+        if (spec == "dspark") opt.dspark = true;
         if (spec != "none" && (!force_path.empty() || !dump_path.empty()))
             throw std::invalid_argument("--spec cannot be combined with --force-ids or --dump");
         if (spec == "oracle" && (int) cont.size() < gen + 8)
             throw std::invalid_argument("--spec oracle needs --continue-ids with at least --gen + 8 tokens");
-        if (!cont_path.empty() && ((int) cont.size() < gen || spec == "suffix" || !force_path.empty() || !dump_path.empty()))
-            throw std::invalid_argument("--continue-ids needs at least --gen tokens, without --spec suffix, --force-ids, --dump");
+        if (!cont_path.empty() && ((int) cont.size() < gen || spec == "suffix" || spec == "dspark" || !force_path.empty() || !dump_path.empty()))
+            throw std::invalid_argument("--continue-ids needs at least --gen tokens, without --spec suffix or dspark, --force-ids, --dump");
         if (spec_max > kVerifyMaxTokens) {
             std::fprintf(stderr, "spec: cap T at %d until CPU rows 5..8 are validated\n", kVerifyMaxTokens);
             spec_max = kVerifyMaxTokens;
         }
         Engine engine(pack, opt);
         if (force_path.empty() && dump_path.empty()) {
-            generate(engine, opt, prompt, gen, batched, spec != "none", spec_max, eos, cont, spec == "oracle");
+            generate(engine, opt, prompt, gen, batched, spec != "none", spec_max, eos, cont, spec == "oracle",
+                     spec == "dspark", draft_k);
             return 0;
         }
         if (batched) {   // prefill the prompt (or the forced sequence) in one call, then decode with step()
