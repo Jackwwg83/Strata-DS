@@ -214,6 +214,9 @@ struct Engine::Impl {
     /// computed; the others keep their weights. DS41_ROUTE_TAIL_SKIP=R sets the rank, 0 turns it off; off by default
     /// when the VRAM tier holds 90% of the experts or more (upstream #1884), and for batch slots. Changes the output.
     int tail_rank = 0;
+    /// DS41_SSD_TAIL_SKIP=S (off by default; not upstream's: its models fit in RAM): the tail skip also leaves out an
+    /// expert in neither VRAM nor the RAM tier (read from the SSD) that every token routes at rank S or lower
+    int ssd_rank = [] { const char* e = std::getenv("DS41_SSD_TAIL_SKIP"); return e ? std::max(0, std::atoi(e)) : 0; }();
     static constexpr int kDefaultTailRank = 4;   // ranks 4 and 5 of 0..5: the last two of six (upstream: the last 3 of 10)
     int32_t* routes_dev = nullptr;     // [40][6]
     float* weights_dev = nullptr;      // [40][6]
@@ -1254,7 +1257,7 @@ struct Engine::Impl {
                     zc_quota ? zc_quota.get() + l : nullptr,
                     ram ? zc_stage.get() : nullptr, ram && zc_blobs ? zc_blobs.get() + (size_t) l * kExperts : nullptr,
                     pf && l > 0 ? prefetch->ids(l) : nullptr, pf && l > 0 ? prefetch->descs(l) : nullptr,
-                    pf ? prefetch->guesses() : 0, tail_rank);
+                    pf ? prefetch->guesses() : 0, tail_rank, ssd_rank);
         // layer l + 1's guesses from this layer's expert input, and their copy, beside the rest of this layer
         if (pf && l + 1 < kLayers)
             prefetch->plan(l + 1, xf, L[l + 1].gate_w, L[l + 1].gate_bias,

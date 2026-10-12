@@ -209,5 +209,41 @@ int main() {
                 "tail skip counts: 2 skipped, 1 VRAM hit, 9 CPU uses");
         cudaStreamDestroy(s);
     }
+    // 5. the SSD tail skip (ssd_rank 3, no VRAM tier): experts with an even id are in the RAM tier.
+    //    token 0: 1 2 4 5 7 8      token 1: 11 13 14 16 5 19
+    //    5 (best rank 3, odd), 7 (rank 4, odd) and 19 (rank 5, odd) come from the SSD and are routed low: skipped, 5 in
+    //    both tokens. 8 (rank 5) is in RAM: kept. 1, 11, 13 are odd but ranked 0..2: kept.
+    {
+        const int m = 2;
+        ExpertDoorbell db(m, kTopK, kDim);
+        std::vector<int32_t> ids = {1, 2, 4, 5, 7, 8, 11, 13, 14, 16, 5, 19};
+        std::vector<strata::ds41::kernels::Exl3Expert> ram(kExperts);
+        for (int i = 0; i < kExperts; i += 2) ram[i].w1.trellis = reinterpret_cast<const uint16_t*>(uintptr_t(4096));
+        Dev<strata::ds41::kernels::Exl3Expert> dram(ram);
+        Dev<uint16_t> dx(std::vector<uint16_t>(m * kDim, 0));
+        Dev<int32_t> did(ids), sel(m * kTopK);
+        Dev<float> dw(std::vector<float>(m * kTopK, 0.5f)), dout(std::vector<float>(m * kDim, 0.0f));
+        cudaStream_t s;
+        ck(cudaStreamCreateWithFlags(&s, cudaStreamNonBlocking), "stream");
+        std::vector<int32_t> mids;
+        ExpertDoorbell::Counts counts{};
+        std::atomic<bool> stop{false};
+        std::thread th([&] {
+            if (!db.wait_published(1, stop)) return;
+            mids.assign(db.ids(), db.ids() + m * kTopK);
+            counts = db.counts();
+            std::fill_n(db.y(), m * kDim, 0.0f);
+            db.mark_done(1);
+        });
+        db.publish(dx.p, did.p, dw.p, m, nullptr, sel.p, 1, s, nullptr, dram.p, nullptr, nullptr, nullptr, nullptr,
+                   nullptr, 0, 0, 3);
+        db.wait_add(dout.p, m, 1, s);
+        ck(cudaStreamSynchronize(s), "ssd tail skip");
+        th.join();
+        const std::vector<int32_t> want = {1, 2, 4, -1, -1, 8, 11, 13, 14, 16, -1, -1};
+        v.check(mids == want, "ssd tail skip: low-ranked experts outside RAM are left out; those in RAM or ranked high stay");
+        v.check(counts.skipped == 4 && counts.cpu == 8, "ssd tail skip counts: 4 skipped, 8 CPU uses");
+        cudaStreamDestroy(s);
+    }
     return v.finish();
 }

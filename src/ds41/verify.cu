@@ -289,7 +289,7 @@ void Engine::Impl::enqueue_verify(int m) {
         v.db->publish(v.half, ids, w, m, tier ? vram->res_dev()+size_t(l)*kExperts : nullptr, v.selected,
                       l+1, st, tier ? vram->experts_dev() : nullptr, ram, zc_quota ? zc_quota.get()+l : nullptr,
                       nullptr, nullptr, pf && l > 0 ? prefetch->ids(l) : nullptr,
-                      pf && l > 0 ? prefetch->descs(l) : nullptr, pf ? ExpertPrefetch::kMaxGuesses : 0, tail_rank);
+                      pf && l > 0 ? prefetch->descs(l) : nullptr, pf ? ExpertPrefetch::kMaxGuesses : 0, tail_rank, ssd_rank);
         if (pf && l+1 < kLayers)
             prefetch->plan_rows(l+1, v.xf, m, L[l+1].gate_w, L[l+1].gate_bias,
                                 tier ? vram->res_dev()+size_t(l+1)*kExperts : nullptr,
