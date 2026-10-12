@@ -651,11 +651,10 @@ void HostExperts::settle_prefetches(std::unique_lock<std::mutex>& lk) {
             if (f.state == Flight::queued) return false;
         return true;
     });
+    // a guess no admit() took leaves: kept, it would enter as recently used and push out experts the steps use
+    // (laptop, 16 GiB tier, code: SSD experts per token 14.0 -> 18.3 when the wrong guesses stayed)
     for (const auto& f : flights_)
-        if (f.state == Flight::read && !f.taken) {   // a guess no admit() took: it stays, as an admitted one
-            admitted_.push_back({f.slot, {f.layer, f.expert}});
-            point(f.layer, f.expert, slot_ptr(f.slot));
-        }
+        if (f.state == Flight::read && !f.taken) free_[f.slot] = 1;
     flights_.clear();
 }
 

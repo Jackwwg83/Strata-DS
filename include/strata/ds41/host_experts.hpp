@@ -143,8 +143,8 @@ public:
     int admit(int layer, const int32_t* ids, int n, bool* ok);
     /// During a step, from any thread (the router lookahead's guesses for the next layer): start reading ids[0..n) of
     /// `layer` that are in no tier and not already on their way into free slots, in the background. admit() takes
-    /// such an expert when its read is done instead of reading it again; one that no admit() asked for enters the
-    /// tier at end_step(). Starts nothing between end_step() and open_prefetch(). Returns the number of reads started.
+    /// such an expert when its read is done instead of reading it again; at end_step() the slot of one that no admit()
+    /// took is free again. Starts nothing between end_step() and open_prefetch(). Returns the number of reads started.
     int prefetch(int layer, const int32_t* ids, int n);
     /// The step's prefetch() calls may start reads (the CPU worker, when a step begins)
     void open_prefetch();
@@ -179,7 +179,7 @@ private:
     void prefetch_loop();
     /// the smallest capacity's free, unlocked slot that holds `bytes`, or -1 (under admit_mu_)
     int pick_free(uint64_t bytes) const;
-    /// wait for every prefetch read; the unused ones join admitted_ (under admit_mu_)
+    /// wait for every prefetch read; the slots of the unused ones are free again (under admit_mu_)
     void settle_prefetches(std::unique_lock<std::mutex>& lk);
     void publish_descriptor(int layer, int expert, int slot);
     void reserve_pending(int n);

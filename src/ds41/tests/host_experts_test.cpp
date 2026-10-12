@@ -289,7 +289,7 @@ int main() {
     }
 
     // prefetch: reads started before admit() asks (the router lookahead's guesses for the next layer). admit() takes an
-    // expert read that way without reading it again; one that no admit() asked for enters the tier at end_step(); a
+    // expert read that way without reading it again; one that no admit() took leaves at end_step() (its slot free); a
     // failed read gives its slot back and admit() reads the expert itself. Between end_step() and open_prefetch()
     // prefetch() starts nothing (the slots change between steps).
     {
@@ -343,9 +343,9 @@ int main() {
         routes[(size_t) layer * 6 + 0] = ids[0];
         routes[(size_t) layer * 6 + 1] = ids[2];
         h.end_step(routes.data(), 6);
-        check(bytes_ok(layer, ids[0]) && bytes_ok(layer + 1, nxt) && bytes_ok(layer, ids[2]),
-              tag + "all three are published with their bytes, the unused prefetch too");
-        check(h.prefetched_total() == 2 && h.admitted_total() == 3, tag + "the totals");
+        check(bytes_ok(layer, ids[0]) && bytes_ok(layer, ids[2]), tag + "both admitted experts are published with their bytes");
+        check(h.slot_of(layer + 1, nxt) == -1, tag + "the unused guess does not enter the tier");
+        check(h.prefetched_total() == 2 && h.admitted_total() == 2, tag + "the totals");
         check(h.free_slots() == free0, tag + "end_step keeps the reserve free");
         const int32_t late = out[3];
         check(h.prefetch(layer, &late, 1) == 0, tag + "after end_step() nothing starts until open_prefetch()");
@@ -369,8 +369,8 @@ int main() {
         std::vector<int32_t> r5((size_t) ds41test::L * 6, -1);
         r5[(size_t) 5 * 6] = g[0];
         h.end_step(r5.data(), 6);
-        check(bytes_ok(5, g[0]) && (h.slot_of(5, g[1]) == -1 || bytes_ok(5, g[1])) && h.free_slots() == free0,
-              tag + "the wrong guess, dropped or read in full, leaves the tier consistent");
+        check(bytes_ok(5, g[0]) && h.slot_of(5, g[1]) == -1 && h.free_slots() == free0,
+              tag + "the wrong guess, dropped or read in full, does not enter the tier");
         detail::admit_part_bytes() = 1u << 20;
     }
 
