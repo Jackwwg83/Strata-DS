@@ -245,5 +245,18 @@ int main() {
         v.check(counts.skipped == 4 && counts.cpu == 8, "ssd tail skip counts: 4 skipped, 8 CPU uses");
         cudaStreamDestroy(s);
     }
+    // 6. the default skip ranks: tail 4 and SSD 3 with a VRAM tier under 90% of the experts; both off at 90% or
+    //    without a VRAM tier; the env values win, and DS41_ROUTE_TAIL_SKIP=0 also turns the SSD default off.
+    {
+        using strata::ds41::skip_ranks;
+        auto is = [](strata::ds41::SkipRanks r, int t, int s) { return r.tail == t && r.ssd == s; };
+        v.check(is(skip_ranks(nullptr, nullptr, true, 0.11), 4, 3), "skip ranks: defaults tail 4, SSD 3");
+        v.check(is(skip_ranks(nullptr, nullptr, true, 0.90), 0, 0), "skip ranks: off at 90% cached");
+        v.check(is(skip_ranks(nullptr, nullptr, false, 0.0), 0, 0), "skip ranks: off without a VRAM tier");
+        v.check(is(skip_ranks("0", nullptr, true, 0.11), 0, 0), "skip ranks: tail 0 also turns the SSD default off");
+        v.check(is(skip_ranks(nullptr, "0", true, 0.11), 4, 0), "skip ranks: SSD 0 keeps the tail skip");
+        v.check(is(skip_ranks("5", "2", false, 0.0), 5, 2), "skip ranks: env values win");
+        v.check(is(skip_ranks("6", "-1", true, 0.11), 0, 0), "skip ranks: out of range is off");
+    }
     return v.finish();
 }

@@ -214,10 +214,9 @@ struct Engine::Impl {
     /// computed; the others keep their weights. DS41_ROUTE_TAIL_SKIP=R sets the rank, 0 turns it off; off by default
     /// when the VRAM tier holds 90% of the experts or more (upstream #1884), and for batch slots. Changes the output.
     int tail_rank = 0;
-    /// DS41_SSD_TAIL_SKIP=S (off by default; not upstream's: its models fit in RAM): the tail skip also leaves out an
-    /// expert in neither VRAM nor the RAM tier (read from the SSD) that every token routes at rank S or lower
-    int ssd_rank = [] { const char* e = std::getenv("DS41_SSD_TAIL_SKIP"); return e ? std::max(0, std::atoi(e)) : 0; }();
-    static constexpr int kDefaultTailRank = 4;   // ranks 4 and 5 of 0..5: the last two of six (upstream: the last 3 of 10)
+    /// DS41_SSD_TAIL_SKIP=S (not upstream's: its models fit in RAM): the tail skip also leaves out an expert in neither
+    /// VRAM nor the RAM tier (read from the SSD) that every token routes at rank S or lower. Defaults: skip_ranks().
+    int ssd_rank = 0;
     int32_t* routes_dev = nullptr;     // [40][6]
     float* weights_dev = nullptr;      // [40][6]
     uint8_t* cand_dev = nullptr;       // [max_seq] candidate mask of the candidate layer
@@ -754,12 +753,18 @@ struct Engine::Impl {
         {
             const char* e = std::getenv("DS41_ROUTE_TAIL_SKIP");
             const double cached = vram ? (double) vram->slots() / (double) (kLayers * kExperts) : 0.0;
-            tail_rank = e ? std::atoi(e) : (vram && cached < 0.90 ? kDefaultTailRank : 0);
-            if (tail_rank < 0 || tail_rank >= kTopK) tail_rank = 0;
+            const char* es = std::getenv("DS41_SSD_TAIL_SKIP");
+            const SkipRanks sr = skip_ranks(e, es, vram != nullptr, cached);
+            tail_rank = sr.tail;
+            ssd_rank = sr.ssd;
             if (tail_rank)
                 std::fprintf(stderr, "ds41: route tail skip ON%s: an expert outside VRAM that every token routes at rank "
                                      "%d or lower (of %d) is left out; DS41_ROUTE_TAIL_SKIP=0 turns it off\n",
                              e ? "" : " (default)", tail_rank + 1, kTopK);
+            if (ssd_rank)
+                std::fprintf(stderr, "ds41: SSD tail skip ON%s: an expert read from the SSD that every token routes at "
+                                     "rank %d or lower is left out; DS41_SSD_TAIL_SKIP=0 turns it off\n",
+                             es ? "" : " (default)", ssd_rank + 1);
         }
         // the RAM tier after it: the hottest experts the VRAM tier does not hold (upstream's resident budget)
         if (!opt.expert_profile.empty() && opt.ram_budget_gib != 0) {

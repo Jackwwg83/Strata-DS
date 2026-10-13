@@ -88,4 +88,11 @@ private:
     float *h_y_ = nullptr, *d_y_ = nullptr;
 };
 
+/// The tail_rank and ssd_rank of publish (0 = off, valid 1..5). route_env / ssd_env: DS41_ROUTE_TAIL_SKIP /
+/// DS41_SSD_TAIL_SKIP or null. Defaults, with a VRAM tier under 90% of the experts (upstream #1884): tail 4 (ranks 5
+/// and 6 of 6) and SSD 3 (ranks 4..6 of experts read from the SSD; laptop, 2 rounds: code 42.1 -> 39.2 ms/token,
+/// 4K 50.3 -> 46.6, short prompts neutral; NLL code +0.006). The SSD default follows the tail skip: tail 0 turns it off.
+struct SkipRanks { int tail, ssd; };
+SkipRanks skip_ranks(const char* route_env, const char* ssd_env, bool has_vram, double cached_share);
+
 }  // namespace strata::ds41

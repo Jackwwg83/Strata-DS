@@ -1,6 +1,7 @@
 // src/ds41/doorbell.cu - see include/strata/ds41/doorbell.hpp.
 #include "strata/ds41/doorbell.hpp"
 
+#include <cstdlib>
 #include <cstring>
 #include <stdexcept>
 #include <string>
@@ -206,5 +207,14 @@ bool ExpertDoorbell::wait_published(uint32_t round, const std::atomic<bool>& sto
 }
 
 void ExpertDoorbell::mark_done(uint32_t round) { __atomic_store_n(h_done_, round, __ATOMIC_RELEASE); }
+
+SkipRanks skip_ranks(const char* route_env, const char* ssd_env, bool has_vram, double cached_share) {
+    auto valid = [](int r) { return r > 0 && r < 6 ? r : 0; };
+    const bool on = has_vram && cached_share < 0.90;
+    SkipRanks r;
+    r.tail = valid(route_env ? std::atoi(route_env) : (on ? 4 : 0));
+    r.ssd = valid(ssd_env ? std::atoi(ssd_env) : (r.tail ? 3 : 0));
+    return r;
+}
 
 }  // namespace strata::ds41
