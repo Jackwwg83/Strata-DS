@@ -5,6 +5,8 @@
 #include "strata/ds41/residency.hpp"
 #include "strata/ds41/host_experts.hpp"
 
+#include <sys/mman.h>
+
 #include <algorithm>
 #include <cstdio>
 #include <cstring>
@@ -18,6 +20,17 @@ namespace {
 
 void ck(cudaError_t e, const char* what) {
     if (e != cudaSuccess) throw std::runtime_error(std::string("ds41 vram experts: ") + what + ": " + cudaGetErrorString(e));
+}
+
+/// After copies from the mapped pack: every page of experts.bin leaves this process (the copied experts' pages and the
+/// neighbours the page faults mapped with them), so the OS reclaims them first; a later read faults them in again.
+/// Mapped, the 11.8 GiB of a laptop's VRAM fill made the kernel page the RAM tier (unlocked while it fills) out to
+/// zram instead: fill 20 -> 40 s in half the starts (60 GB laptop, 2 rounds x 3 prompts: mean 31.9 -> 20.9 s).
+void unmap_pack_pages(const Pack& pack) {
+    uint64_t end = 0;
+    for (int l = 0; l < pack.n_layers(); ++l)
+        for (int e = 0; e < pack.n_experts(); ++e) end = std::max(end, pack.expert(l, e).offset + pack.expert(l, e).bytes);
+    if (pack.expert_base() && end) madvise((void*) pack.expert_base(), end, MADV_DONTNEED);
 }
 
 }  // namespace
@@ -130,6 +143,7 @@ VramExperts::VramExperts(const Pack& pack, const std::string& profile_path, int6
                     desc_host_[s] = describe(l, e, s);
                     publish_residency(res_host_[(size_t) l * E + e], s);
                 }
+                unmap_pack_pages(pack);
                 ck(cudaMalloc(&experts_dev_, desc_host_.size() * sizeof(desc_host_[0])), "expert descriptors");
                 ck(cudaMemcpy(experts_dev_, desc_host_.data(), desc_host_.size() * sizeof(desc_host_[0]),
                               cudaMemcpyHostToDevice),
@@ -331,6 +345,10 @@ int VramExperts::between_steps() {
         const size_t vcap = off_[res_host_[(size_t) l * E + out] + 1] - off_[res_host_[(size_t) l * E + out]];
         if (pack_.expert(l, in).bytes > vcap) return false;
         const int32_t ram = host_ ? host_->slot_of(l, in) : -1;
+        // With the adaptive RAM tier, `in` comes from its RAM slot only. An expert the tier did not admit (a skipped SSD
+        // expert, say) was copied from the mapped pack: page faults to the SSD during decode, 1.5 GiB of file pages in
+        // 255 steps of a 128K prompt. Laptop, 2 rounds x 3 prompts: no-stall decode 33.7 -> 32.9 ms/token.
+        if (ram < 0 && host_ && host_->reserve() > 0) return false;
         return ram < 0 || pack_.expert(l, out).bytes <= host_->slot_capacity(ram);
     };
     const auto swaps = plan_expert_swaps(usage_, res_host_, L, E, adapt_.max_swaps, fits);
@@ -387,6 +405,7 @@ void VramExperts::restore() {
         // The descriptors still describe (l, e) at slot s.
         publish_residency(res_host_[(size_t) l * E + e], s);
     }
+    unmap_pack_pages(pack_);
     lent_ = 0;
     lent_owner_.clear();
     upload_res();

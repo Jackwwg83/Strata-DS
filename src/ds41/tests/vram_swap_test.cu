@@ -1,6 +1,7 @@
 // src/ds41/tests/vram_swap_test.cu - adaptive swaps with a RAM tier: after every switch between two steps, every
 // expert is in VRAM or in host memory (its RAM slot or the swap buffer), never only in the file; when the swaps have
-// landed, every VRAM slot and every RAM slot holds its expert's bytes.
+// landed, every VRAM slot and every RAM slot holds its expert's bytes. With the adaptive RAM tier, only experts in
+// the RAM tier swap in.
 // Runs on a fake pack (full 40 x 384 geometry, experts of 4, 8 and 12 KiB as SAGE's sizes differ).
 #include "strata/ds41/host_experts.hpp"
 #include "strata/ds41/vram_experts.hpp"
@@ -16,6 +17,66 @@
 
 using namespace ds41test;
 namespace sd = strata::ds41;
+
+namespace {
+
+/// With the adaptive RAM tier, a swap takes `in` from its RAM slot only: an expert in neither tier (the tier did not
+/// admit it, for example a skipped SSD expert) stays out of VRAM. Copying it from the mapped pack page-faulted it in
+/// from the SSD during decode (laptop, 128K prompt: 1.5 GiB of experts.bin pages in 255 steps).
+void adaptive_ram_tier(Verdict& v) {
+    const std::string dir = "/tmp/ds41_fake_pack_swap_adapt", prof = "/tmp/ds41_fake_profile_swap_adapt.bin";
+    write_fake_pack(dir);   // experts of one size: every swap fits
+    std::vector<std::pair<int, int>> ranked;   // expert-major: VRAM holds experts 0..4 of every layer
+    for (int e = 0; e < E; ++e)
+        for (int l = 0; l < L; ++l) ranked.push_back({l, e});
+    write_profile(prof, ranked);
+    sd::Pack pack(dir);
+    pack.map_experts();
+    sd::VramExperts::Adapt ad;
+    ad.every = 1;
+    ad.max_swaps = 96;
+    sd::VramExperts vram(pack, prof, 200, 0, ad);
+    uint64_t total = 0;
+    for (int l = 0; l < L; ++l)
+        for (int e = 0; e < E; ++e) total += pack.expert(l, e).bytes;
+    sd::HostExperts host(pack, ranked, vram.res_host(), total / 2, {}, 2);   // about experts 5..191 of every layer
+    vram.set_host(&host);
+    host.enable_adapt(4);
+    std::vector<char> neither((size_t) L * E, 0);
+    int n_neither = 0;
+    for (int l = 0; l < L; ++l)
+        for (int e = 0; e < E; ++e)
+            if (vram.res_host()[(size_t) l * E + e] < 0 && !host.in_memory(l, e)) {
+                neither[(size_t) l * E + e] = 1;
+                ++n_neither;
+            }
+    v.check(n_neither > 0, "adaptive: some experts are in neither tier (" + std::to_string(n_neither) + ")");
+    const std::vector<int32_t> start = vram.res_host();
+    bool kept_out = true;
+    for (int step = 0; step < 60; ++step) {
+        std::vector<int32_t> routes((size_t) L * sd::kTopK);
+        for (int l = 0; l < L; ++l)   // layer 0 and the last 4 only: one batch of swaps covers them
+            for (int k = 0; k < sd::kTopK; ++k)
+                routes[(size_t) l * sd::kTopK + k] = l == 0 || l >= L - 4 ? (step / 10 * 6 + k + l * 5) % E : -1;
+        vram.count(routes.data(), sd::kTopK);
+        vram.between_steps();
+        for (size_t i = 0; i < neither.size(); ++i) kept_out &= !(neither[i] && vram.res_host()[i] >= 0);
+    }
+    vram.lend(0);
+    vram.restore();
+    int entered = 0;   // experts that swapped in
+    for (size_t i = 0; i < neither.size(); ++i) {
+        kept_out &= !(neither[i] && vram.res_host()[i] >= 0);
+        entered += start[i] < 0 && vram.res_host()[i] >= 0;
+    }
+    // layer 0's routes use experts of the RAM tier, the last layers' ones (from expert 180 up) partly experts in neither
+    v.check(entered > 0, "adaptive: experts from the RAM tier still swap in (" + std::to_string(entered) + ")");
+    v.check(kept_out, "adaptive: no expert in neither tier enters VRAM");
+    v.metric("adapt_neither", n_neither);
+    v.metric("adapt_entered", entered);
+}
+
+}  // namespace
 
 int main() {
     Verdict v;
@@ -84,5 +145,6 @@ int main() {
         }
     v.check(vram_ok, "every VRAM slot holds its expert's bytes");
     v.check(ram_ok, "every RAM slot holds its expert's bytes, and no expert is in both tiers");
+    adaptive_ram_tier(v);
     return v.finish();
 }
