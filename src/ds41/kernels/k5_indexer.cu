@@ -36,6 +36,27 @@ __device__ __forceinline__ int64_t live_length(const int* pos, int ratio, int64_
     return t;
 }
 
+// Graph selection: the single-CTA radix below this many keys, the partitioned radix from here.
+// RTX 5090 Laptop, scores included: 4096 keys 26 us single vs 32 us partitioned; 262144 keys 890 vs 165 us.
+constexpr int64_t kDeviceParallelFrom = 8192;
+
+// Length of a partitioned selection. pos == nullptr: the host length n, always run. Otherwise n is the capacity;
+// the live length replaces it, and the selection runs only where the single-CTA kernel yields to it.
+struct Live {
+    const int* pos = nullptr;
+    int ratio = 1;
+    int k = 0;
+};
+__device__ __forceinline__ bool partitioned(Live live, int64_t& n) {
+    if (!live.pos) return true;
+    n = live_length(live.pos, live.ratio, n);
+    return n >= kDeviceParallelFrom && live.k > 0 && live.k < n;
+}
+__host__ __device__ __forceinline__ int64_t partitions_of(int64_t n) { return (n - 1) / kRadixItems + 1; }
+__host__ __device__ __forceinline__ int histogram_ctas(int64_t n) {
+    return int(partitions_of(n) < 256 ? partitions_of(n) : 256);
+}
+
 __global__ void small_scores(const bf16* q, const bf16* keys, int64_t n, const bf16* w,
                              const uint8_t* cand, float* scores, const int* pos = nullptr, int ratio = 1) {
     if (pos) {
@@ -144,6 +165,12 @@ struct Values {
             if (j == (positions - 1) / block_size) return CUDART_INF_F;
             float value = -CUDART_INF_F;
             const int64_t begin = j * block_size;
+            // the decode block (8): two 16-byte loads instead of eight dependent ones; only the last block is partial
+            if (block_size == 8 && (reinterpret_cast<uintptr_t>(scores) & 15) == 0) {
+                const float4 a = *reinterpret_cast<const float4*>(scores + begin);
+                const float4 b = *reinterpret_cast<const float4*>(scores + begin + 4);
+                return fmaxf(value, fmaxf(fmaxf(fmaxf(a.x, a.y), fmaxf(a.z, a.w)), fmaxf(fmaxf(b.x, b.y), fmaxf(b.z, b.w))));
+            }
             for (int d = 0; d < block_size && begin + d < positions; ++d)
                 value = fmaxf(value, scores[begin + d]);
             return value;
@@ -174,11 +201,13 @@ __global__ void all_candidates(const float* scores, int64_t n, int block_size, u
 template <bool Candidate>
 __global__ void select_without_scratch(Values<Candidate> values, int64_t n,
                                        int k, int32_t offset, int32_t* out,
-                                       uint8_t* cand, const int* pos = nullptr, int ratio = 1) {
+                                       uint8_t* cand, const int* pos = nullptr, int ratio = 1,
+                                       bool yield = false) {
     if (pos) {
         values.positions = live_length(pos, ratio, values.positions);
         if (values.positions == 0) return;
         n = Candidate ? (values.positions - 1) / values.block_size + 1 : values.positions;
+        if (yield && n >= kDeviceParallelFrom && k > 0 && k < n) return;   // the partitioned selection runs
         k = int(n < k ? n : k);
         if (k <= 0) {
             if constexpr (Candidate) {
@@ -327,13 +356,17 @@ __device__ __forceinline__ void store_count(float* scores, int64_t index, Count 
 // eight local counts to Count before accumulating into its 64-bit total.
 // The scorer, two radix bytes, global count layout, and launch count are unchanged.
 template<bool First>
-__global__ void parallel_histogram(float* scores, int64_t n) {
+__global__ void parallel_histogram(float* scores, int64_t n, Live live) {
+    if (!partitioned(live, n)) return;
+    // each CTA owns metadata slots [8+1024*b, 8+1024*(b+1)): exactly histogram_ctas(n) CTAs take part
+    const int ctas = live.pos ? histogram_ctas(n) : int(gridDim.x);
+    if (int(blockIdx.x) >= ctas) return;
     __shared__ uint32_t warp_bins[kThreads / 32][256];
     constexpr int batches_per_round = kRadixItems / kThreads;
     static_assert(batches_per_round * 32 == 512, "warp-local count bound");
     const int tid = threadIdx.x, lane = tid & 31, warp = tid >> 5;
     const uint32_t prefix = First ? 0u : load_word(scores, 0);
-    const int64_t stride = int64_t(gridDim.x) * kThreads;
+    const int64_t stride = int64_t(ctas) * kThreads;
     Count total = 0;
     for (int64_t begin = int64_t(blockIdx.x) * kThreads; begin < n;
          begin += stride * batches_per_round) {
@@ -365,7 +398,9 @@ __global__ void parallel_histogram(float* scores, int64_t n) {
 }
 
 template<bool First>
-__global__ void choose_parallel_byte(float* scores, int parts, int k) {
+__global__ void choose_parallel_byte(float* scores, int parts, int k, int64_t n, Live live) {
+    if (!partitioned(live, n)) return;
+    if (live.pos) parts = histogram_ctas(n);
     __shared__ Count bins[256];
     Count sum = 0;
     for (int p = 0; p < parts; ++p)
@@ -418,7 +453,8 @@ __device__ __forceinline__ Pair scan_pair(Pair own, Pair* warps, Pair& total) {
     return prefix;
 }
 
-__global__ void count_partitions(float* scores, int64_t n) {
+__global__ void count_partitions(float* scores, int64_t n, Live live) {
+    if (!partitioned(live, n)) return;
     __shared__ Pair warps[8];
     const uint32_t cutoff = load_word(scores, 0);
     const int64_t partitions = (n - 1) / kRadixItems + 1;
@@ -443,7 +479,9 @@ __global__ void count_partitions(float* scores, int64_t n) {
     }
 }
 
-__global__ void prefix_partitions(float* scores, int64_t parts) {
+__global__ void prefix_partitions(float* scores, int64_t parts, int64_t n, Live live) {
+    if (!partitioned(live, n)) return;
+    if (live.pos) parts = partitions_of(n);
     __shared__ Pair warps[8];
     Pair carry{0, 0};
     for (int64_t base = 0; base < parts; base += kThreads) {
@@ -463,7 +501,8 @@ __global__ void prefix_partitions(float* scores, int64_t parts) {
     }
 }
 
-__global__ void emit_partitions(const float* scores, int64_t n, int32_t offset, int32_t* out) {
+__global__ void emit_partitions(const float* scores, int64_t n, int32_t offset, int32_t* out, Live live) {
+    if (!partitioned(live, n)) return;
     __shared__ uint32_t prefix_g[32], prefix_e[32], batch_g, batch_e;
     const int tid = threadIdx.x, lane = tid & 31, warp = tid >> 5;
     const uint32_t lane_mask = (uint32_t(1) << lane) - 1;
@@ -522,24 +561,29 @@ __global__ void emit_partitions(const float* scores, int64_t n, int32_t offset, 
 
 // No selector accesses scores after this separate launch starts. Restore only
 // the written metadata span; all remaining low halves were never touched.
-__global__ void restore_scores(float* scores, int64_t words) {
+__host__ __device__ __forceinline__ int64_t metadata_words(int64_t n) {
+    const int64_t histograms = 1024 * int64_t(histogram_ctas(n)), records = 8 * partitions_of(n);
+    return kMetadataHeader + (histograms > records ? histograms : records);
+}
+__global__ void restore_scores(float* scores, int64_t n, Live live) {
+    if (!partitioned(live, n)) return;
+    const int64_t words = metadata_words(n);
     for (int64_t j = int64_t(blockIdx.x) * kThreads + threadIdx.x; j < words;
          j += int64_t(gridDim.x) * kThreads) store_low(scores, j, 0);
 }
 
+// n: the length (live.pos == nullptr) or the capacity, which sizes the grids (graph: the live length decides)
 void parallel_select(float* scores, int64_t n, int k, int32_t offset,
-                     int32_t* out, cudaStream_t stream) {
-    const int64_t parts = (n - 1) / kRadixItems + 1;
-    const int hist_parts = int(std::min<int64_t>(parts, 256));
-    parallel_histogram<true><<<hist_parts, kThreads, 0, stream>>>(scores, n);
-    choose_parallel_byte<true><<<1, kThreads, 0, stream>>>(scores, hist_parts, k);
-    parallel_histogram<false><<<hist_parts, kThreads, 0, stream>>>(scores, n);
-    choose_parallel_byte<false><<<1, kThreads, 0, stream>>>(scores, hist_parts, k);
-    count_partitions<<<hist_parts, kThreads, 0, stream>>>(scores, n);
-    prefix_partitions<<<1, kThreads, 0, stream>>>(scores, parts);
-    emit_partitions<<<hist_parts, kThreads, 0, stream>>>(scores, n, offset, out);
-    const int64_t written = kMetadataHeader + std::max<int64_t>(1024 * hist_parts, 8 * parts);
-    restore_scores<<<hist_parts, kThreads, 0, stream>>>(scores, written);
+                     int32_t* out, cudaStream_t stream, Live live = {}) {
+    const int hist_parts = histogram_ctas(n);
+    parallel_histogram<true><<<hist_parts, kThreads, 0, stream>>>(scores, n, live);
+    choose_parallel_byte<true><<<1, kThreads, 0, stream>>>(scores, hist_parts, k, n, live);
+    parallel_histogram<false><<<hist_parts, kThreads, 0, stream>>>(scores, n, live);
+    choose_parallel_byte<false><<<1, kThreads, 0, stream>>>(scores, hist_parts, k, n, live);
+    count_partitions<<<hist_parts, kThreads, 0, stream>>>(scores, n, live);
+    prefix_partitions<<<1, kThreads, 0, stream>>>(scores, partitions_of(n), n, live);
+    emit_partitions<<<hist_parts, kThreads, 0, stream>>>(scores, n, offset, out, live);
+    restore_scores<<<hist_parts, kThreads, 0, stream>>>(scores, n, live);
 }
 
 }  // namespace
@@ -594,8 +638,10 @@ void indexer_topk_device(const bf16* q, const bf16* keys, const int* pos_dev,
         q, keys, t_cap, w, cand, scores, pos_dev, ratio);
     if (t_cap > 512) tensor_scores<<<unsigned((t_cap + 63) / 64), 128, 0, stream>>>(
         q, keys, t_cap, w, cand, scores, pos_dev, ratio);
+    const bool partition = t_cap >= kDeviceParallelFrom;
     select_without_scratch<false><<<1, kThreads, 0, stream>>>(
-        {scores, t_cap, 1}, t_cap, k, offset, out_idx, nullptr, pos_dev, ratio);
+        {scores, t_cap, 1}, t_cap, k, offset, out_idx, nullptr, pos_dev, ratio, partition);
+    if (partition) parallel_select(scores, t_cap, k, offset, out_idx, stream, {pos_dev, ratio, k});
     check(cudaGetLastError(), "device indexer launch");
 }
 

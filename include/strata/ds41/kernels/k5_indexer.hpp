@@ -27,8 +27,9 @@ void candidate_blocks(const float* scores, int64_t t, int topk_blocks, int block
 /// Keep t_cap fixed for a graph. One full-context capacity needs only one capture.
 /// Optional buckets use max(1, next_power_of_two(t)); each bucket needs its own graph.
 /// Both score paths are captured when t_cap > 512. Device guards select the host-equivalent math.
-/// Selection always uses the scratch-free radix kernel, including t >= 4096 and k >= t.
-/// This avoids metadata writes outside a short live prefix. Large-context speed is not yet measured.
+/// Selection: the scratch-free single-CTA radix below 8192 live keys or when k >= t; from 8192 (t_cap >= 8192)
+/// the partitioned radix of indexer_topk, whose metadata stays in the low halves of scores [0, t).
+/// RTX 5090 Laptop, 262144 keys: 890 us single-CTA, 165 us partitioned.
 void indexer_topk_device(const __nv_bfloat16* q, const __nv_bfloat16* keys, const int* pos_dev,
                          int ratio, int64_t t_cap, const __nv_bfloat16* w, const uint8_t* cand,
                          int k, int32_t offset, float* scores, int32_t* out_idx, cudaStream_t stream);
