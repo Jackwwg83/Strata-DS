@@ -65,7 +65,8 @@ __global__ void plan_k(const float* __restrict__ logits, const float* __restrict
         ids[k++] = best;
         used = at + blob.bytes;
     }
-    for (int j = k; j < g; ++j) ids[j] = -1;
+    // every entry past the copies: verify windows search all kMaxGuesses (plan_rows_k fills that many)
+    for (int j = k; j < ExpertPrefetch::kMaxGuesses; ++j) ids[j] = -1;
     *count = k;
     if (tag) {   // DMA mode: the copy list is in mapped host memory; the tag tells the copy thread, after the jobs
         __threadfence_system();

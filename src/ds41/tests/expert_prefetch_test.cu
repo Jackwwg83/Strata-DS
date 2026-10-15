@@ -241,6 +241,17 @@ int main() {
         v.check(want_ranked.size() > (size_t) g, "the two rows guess different experts (the merge is exercised)");
         v.check(ranked_ok, "plan_rows: both rows' guesses merged in rank order, each expert once");
         v.check(ids_ok, "plan_rows: the merged guesses outside VRAM that the RAM tier holds are copied");
+        // a one-row window after a two-row one on the same parity (a prompt part of 4n + 1 tokens): verify searches
+        // all kMaxGuesses entries, so plan() must clear the entries the rows' plan left (another layer's experts,
+        // descriptors into a buffer the new copies overwrite)
+        rows.plan(6, dx12 + D, dw, db, dres, dram, dblobs, st);
+        rows.ready(6, st);
+        rows.join(6, st);
+        v.check(cudaStreamSynchronize(st) == cudaSuccess, "plan after plan_rows ran");
+        int32_t after[K];
+        cudaMemcpy(after, rows.ids(6), sizeof after, cudaMemcpyDeviceToHost);
+        v.check(std::all_of(after + G, after + K, [](int32_t e) { return e == -1; }),
+                "plan() after plan_rows: no entry past its guesses is left from the rows' plan");
         cudaFree(dx12);
     }
     // publish: routes = ranks 0 (VRAM), 2 (prefetched), 1 (RAM descriptor missing: CPU), and three RAM experts that
