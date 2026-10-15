@@ -1,6 +1,22 @@
-<h1 align="center">Strata</h1>
+<h1 align="center">Strata-DS</h1>
 
 **English** · [简体中文](README.zh-CN.md) · [日本語](README.ja.md) · [Deutsch](README.de.md) · [Français](README.fr.md) · [Español](README.es.md) · [Português](README.pt-BR.md)
+
+<p align="center"><b>DeepSeek V4.1 Flash (763B MoE) on a 64 GB gaming laptop</b><br>
+about 30 tokens/s on short prompts · 23.6 tokens/s with a 256K-token prompt · RTX 5090 Laptop 24 GB · Linux</p>
+
+<p align="center"><img src="docs/media/deepseek-laptop-context.svg" width="760" alt="DeepSeek V4.1 Flash decode and prefill speed by context length on an RTX 5090 Laptop with 64 GB of RAM"></p>
+
+This fork of [Strata](https://github.com/Niko1221/Strata) adds an engine for
+[DeepSeek V4.1 Flash](https://huggingface.co/deepseek-ai/DeepSeek-V4.1-Flash). It splits the model's 15,360 experts
+over GPU memory, RAM and the SSD, so the 763B model runs on a laptop with a 24 GB GPU and 64 GB of RAM. The recipe,
+every setting, what the settings cost in quality, and the raw data: **[docs/DEEPSEEK_LAPTOP.md](docs/DEEPSEEK_LAPTOP.md)**.
+
+---
+
+<h2 align="center">Upstream Strata (Qwen3.8-Flash-Next)</h2>
+
+Everything below is upstream Strata's README: it runs Qwen3.8-Flash-Next.
 
 <p align="center"><b>Run a 125-billion-parameter AI model on your own gaming PC</b><br>
 NVIDIA or AMD graphics card (12 GB or more) · Windows or Linux · free and open source</p>
