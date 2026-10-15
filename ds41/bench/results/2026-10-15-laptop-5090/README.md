@@ -15,10 +15,12 @@ Model: `vcruz305/DSV4.1-Flash-SAGE-EXL3-1.59bpw` at `eca94a388a70841858feed8f057
 
 ## What ran
 
-1. `ctest` (165 tests): 158 pass. The 7 failures need files this laptop does not have (`k10_exl3_moe_test`,
-   `k11_cpu_moe_test`: a 3bpw test pack; `ple_parity`, `expert_parity`, `pool_test`: Qwen model files), a larger
-   lock limit (`platform_memory_test`: mlock ulimit 8 MiB), or fail the same way before these changes
-   (`hybrid_host_table_test`, 2 checks). [ctest-summary.txt](ctest-summary.txt).
+1. `ctest` (165 tests): 148 pass, 10 skip, 7 fail ([ctest-summary.txt](ctest-summary.txt)). The 10 skipped tests
+   need the model pack (`--pack`); run by hand on the SAGE pack, all 10 and their other cases (19 runs) pass
+   ([engine-tests.txt](engine-tests.txt)). The 7 failures need files this laptop does not have
+   (`k10_exl3_moe_test`, `k11_cpu_moe_test`: a 3bpw test pack; `ple_parity`, `expert_parity`, `pool_test`: Qwen
+   model files), a larger lock limit (`platform_memory_test`: mlock ulimit 8 MiB), or fail the same way before these
+   changes (`hybrid_host_table_test`, 2 checks).
 2. Length matrix: `ds41_generate --prefill --gen 256` (greedy), a fresh process per run, upstream's length-tiered
    speed prompts ([make_len_ids.py](make_len_ids.py)) at 4K, 32K, 64K, 128K (2 prompts each) and 256K (1 prompt).
    The page cache of the pack is dropped before each run.
@@ -36,6 +38,9 @@ Model: `vcruz305/DSV4.1-Flash-SAGE-EXL3-1.59bpw` at `eca94a388a70841858feed8f057
 | [steps.tsv](steps.tsv) | every decode step of every run (`--step-log` columns, with the run's name) |
 | [api.jsonl](api.jsonl) | one line per API request: prompt tokens, time to first token, decode tokens/s (client and server), the answer's first characters |
 | [machine.json](machine.json) | the laptop, driver, CUDA, kernel, swap, model revision |
+| [engine-tests.txt](engine-tests.txt) | the pack tests run by hand (verify windows, DSpark spec, reset, failures, batch) |
+| [bench.sh](bench.sh), [api_bench.py](api_bench.py), [make_len_ids.py](make_len_ids.py) | the scripts that produced this |
+| [short-prompts.json](short-prompts.json), [api-prompts.json](api-prompts.json) | the prompts: text and token ids |
 
 `decode_ms_per_token` is the mean over all 256 steps. `no_stall_ms_per_token` leaves out the steps over 100 ms.
 A run's first 32 steps take about 54 ms each (the experts in GPU memory and the RAM tier are still cold); steps

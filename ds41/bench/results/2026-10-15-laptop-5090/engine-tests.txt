@@ -1,0 +1,21 @@
+# The engine tests ctest skips without a pack, run by hand on the SAGE pack (source 7b79a3e0), 2026-10-15.
+# name, exit code, seconds, result line
+verify_rows_parity exit 0 149 s | RESULT pass verify_rows_parity 
+verify_commit_prefix exit 0 337 s | RESULT pass verify_commit_prefix 
+verify_ring_rollback exit 0 1102 s | RESULT pass verify_ring_rollback 
+verify_compressor exit 0 345 s | RESULT pass verify_compressor 
+verify_engram exit 0 537 s | RESULT pass verify_engram 
+spec_end_to_end exit 0 54 s | RESULT pass spec_end_to_end 
+engine_reset_test exit 0 108 s | RESULT pass engine_reset reset 
+engine_timing_test exit 0 7 s | RESULT pass engine_timing plain 
+engine_failure_test exit 0 4 s | RESULT pass engine_failure tokens 
+batch_test exit 0 70 s | RESULT pass batch 
+engine_failure-engram exit 0 7 s | RESULT pass engine_failure engram 
+engine_failure-engram_read exit 0 4 s | RESULT pass engine_failure engram_read 
+engine_failure-worker exit 0 3 s | RESULT pass engine_failure worker 
+engine_failure-prefill exit 0 11 s | RESULT pass engine_failure prefill 
+engine_failure-lifecycle exit 0 13 s | RESULT pass engine_failure lifecycle 
+engine_timing-adaptive exit 0 6 s | RESULT pass engine_timing adaptive 
+engine_reset-progress exit 0 53 s | RESULT pass engine_reset progress 
+engine_reset-cancel exit 0 55 s | RESULT pass engine_reset cancel 
+engine_reset-snapshot exit 0 91 s | RESULT pass engine_reset snapshot 
