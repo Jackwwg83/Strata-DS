@@ -44,6 +44,7 @@ void Engine::commit(int keep) {
     impl_->history.insert(impl_->history.end(), impl_->pending.begin(), impl_->pending.begin()+keep);
     impl_->pending.clear();
 }
+Engine::Draft Engine::draft(int) { return {}; }   // --spec dspark is not exercised: no drafts
 int Engine::vram_expert_slots() const { return 0; }
 const std::vector<float>& Engine::last_logits() const { return impl_->logits; }
 } // namespace strata::ds41
