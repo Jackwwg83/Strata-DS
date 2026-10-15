@@ -1,0 +1,26 @@
+{
+ "exe": "/home/USER/strata-ds-dev/sync/build/ds41_serve",
+ "args": [
+  "--pack",
+  "/home/USER/strata-ds-dev/pack-sage",
+  "--max-context",
+  "32768",
+  "--expert-profile",
+  "/home/USER/strata-ds-dev/sync/ds41/data/expert-profile.bin",
+  "--threads",
+  "16"
+ ],
+ "cwd": "/home/USER/strata-ds-dev/sync",
+ "tokenizer": "/home/USER/strata-ds-dev/pack-sage",
+ "format": "deepseek_v41",
+ "model_name": "deepseek-v4.1-flash",
+ "log": "/home/USER/strata-ds-dev/lenbench/rel1/serve-engine.log",
+ "lib_dirs": [
+  "/opt/cuda/bin"
+ ],
+ "port": 8091,
+ "gpu": 0,
+ "gpus_asked": true,
+ "cuda": 13,
+ "open_browser": false
+}
