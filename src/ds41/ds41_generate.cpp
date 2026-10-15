@@ -9,6 +9,9 @@
 // prefill (M3) instead of step() token by token; generation then continues with step().
 // --force-ids feeds a fixed token sequence (from the oracle) instead of the engine's own predictions, so a
 // per-layer comparison stays aligned even after the first differing token. Tokenization stays in Python.
+// --force-list FILE runs one forced sequence per line, the engine reset before each, step() token by token (the
+// decode path, where the tail skips act); --logprobs-out FILE also writes every position's fp16 log-softmax, so two
+// engine settings can be compared by KL divergence (format: force_list()).
 // --continue-ids FILE decodes as usual (prompt, then step() per token, --step-log) but feeds the file's tokens after
 // the prompt instead of the engine's own predictions: every run of a speed A/B then routes the same experts.
 // --spec oracle --continue-ids FILE measures the verify window: every window is --spec-max tokens, its drafts are the
@@ -37,6 +40,27 @@
 using namespace strata::ds41;
 
 /// comma-separated ids, or @FILE holding them (a 32K-token prompt is longer than one command-line argument may be)
+/// IEEE binary16 of a float, rounded to nearest even
+static uint16_t to_half(float f) {
+    uint32_t x;
+    std::memcpy(&x, &f, 4);
+    const uint32_t sign = (x >> 16) & 0x8000, m = x & 0x7fffff;
+    const int exp = int((x >> 23) & 0xff);
+    if (exp == 0xff) return uint16_t(sign | 0x7c00 | (m ? 0x200 : 0));
+    const int e = exp - 127 + 15;
+    if (e >= 31) return uint16_t(sign | 0x7c00);
+    auto round = [](uint32_t kept, uint32_t rest, uint32_t half) {
+        return kept + (rest > half || (rest == half && (kept & 1)));
+    };
+    if (e <= 0) {   // subnormal half (or zero)
+        if (e < -10) return uint16_t(sign);
+        const int shift = 14 - e;
+        const uint32_t full = m | 0x800000;
+        return uint16_t(sign | round(full >> shift, full & ((1u << shift) - 1), 1u << (shift - 1)));
+    }
+    return uint16_t(sign | round((uint32_t(e) << 10) | (m >> 13), m & 0x1fff, 0x1000));   // a carry fixes the exponent
+}
+
 static std::vector<int> parse_ids(const std::string& arg) {
     std::string s = arg;
     if (!s.empty() && s[0] == '@') {
@@ -246,8 +270,63 @@ static void generate(Engine& engine, const EngineOptions& opt, const std::vector
                     routed ? (double) hits / routed : 0.0);
 }
 
+/// --force-list: one forced sequence per line (blank lines skipped), the engine reset before each. Prints each
+/// sequence's mean nll and the overall one. --logprobs-out writes int32 {0x31504c44, vocab}, then for every scored
+/// position int32 {sequence, pos, next forced id} and the fp16 log-softmax of the whole vocabulary.
+static void force_list(Engine& engine, const std::string& list_path, const std::string& lp_path) {
+    std::ifstream in(list_path);
+    if (!in) throw std::runtime_error("cannot read --force-list " + list_path);
+    std::FILE* out = lp_path.empty() ? nullptr : std::fopen(lp_path.c_str(), "wb");
+    if (!lp_path.empty() && !out) throw std::runtime_error("cannot open --logprobs-out " + lp_path);
+    auto put = [&](const void* p, size_t size, size_t n) {
+        if (std::fwrite(p, size, n, out) != n) throw std::runtime_error("cannot write --logprobs-out " + lp_path);
+    };
+    if (out) {
+        const int32_t hdr[2] = {0x31504c44, kVocab};
+        put(hdr, 4, 2);
+    }
+    std::vector<uint16_t> row(kVocab);
+    std::string line;
+    int seq = 0, steps = 0;
+    long long scored = 0;
+    double total = 0, ms = 0;
+    while (std::getline(in, line)) {
+        const std::vector<int> ids = parse_ids(line);
+        if (ids.empty()) continue;
+        for (int t : ids)
+            if (t < 0 || t >= kVocab) throw std::invalid_argument("token id " + std::to_string(t) + " is outside the vocabulary");
+        engine.reset();
+        double nll = 0;
+        for (int pos = 0; pos + 1 < (int) ids.size(); ++pos) {   // the last id is only a target
+            engine.step(ids[pos], pos);
+            ms += engine.last_timing().total_ms;
+            ++steps;
+            const auto& lg = engine.last_logits();
+            double mx = -1e300, se = 0;
+            for (float v : lg) mx = std::max(mx, (double) v);
+            for (float v : lg) se += std::exp((double) v - mx);
+            const double lse = mx + std::log(se);
+            nll += lse - lg[ids[pos + 1]];
+            if (out) {
+                const int32_t rec[3] = {seq, pos, ids[pos + 1]};
+                put(rec, 4, 3);
+                for (int v = 0; v < kVocab; ++v) row[v] = to_half(float(lg[v] - lse));
+                put(row.data(), 2, kVocab);
+            }
+        }
+        const int n = (int) ids.size() - 1;
+        std::printf("force_list sequence %d tokens %zu mean_nll %.6f\n", seq, ids.size(), n > 0 ? nll / n : 0.0);
+        total += nll;
+        scored += n;
+        ++seq;
+    }
+    if (out && std::fclose(out) != 0) throw std::runtime_error("cannot write --logprobs-out " + lp_path);
+    std::printf("generated:\nforce_list sequences %d scored %lld mean_nll %.6f\ndecode_ms_per_token %.1f over %d steps\n",
+                seq, scored, scored ? total / scored : 0.0, steps ? ms / steps : 0.0, steps);
+}
+
 int main(int argc, char** argv) {
-    std::string pack, ids_s, dump_path, force_path, cont_path, spec = "none";
+    std::string pack, ids_s, dump_path, force_path, cont_path, list_path, logprobs_path, spec = "none";
     int spec_max = kVerifyMaxTokens, eos = -1, draft_k = -1;
     int gen = 32;
     bool batched = false;
@@ -285,10 +364,12 @@ int main(int argc, char** argv) {
                                    "swaps_ms end_ms\n");
         }
         else if (a == "--force-ids") force_path = next();
+        else if (a == "--force-list") list_path = next();
+        else if (a == "--logprobs-out") logprobs_path = next();
         else if (a == "--continue-ids") cont_path = next();
         else { std::fprintf(stderr, "unknown argument %s\n", a.c_str()); return 2; }
     }
-    if (pack.empty() || (ids_s.empty() && force_path.empty())) {
+    if (pack.empty() || (ids_s.empty() && force_path.empty() && list_path.empty())) {
         std::fprintf(stderr, "usage: ds41_generate --pack DIR --ids a,b,c [--gen N] [--threads T] [--dump F] [--force-ids F] [--spec none|suffix|oracle|dspark] [--spec-max 1..8] [--draft-k 0..5] [--eos-id ID]\n");
         return 2;
     }
@@ -324,7 +405,14 @@ int main(int argc, char** argv) {
             std::fprintf(stderr, "spec: cap T at %d until CPU rows 5..8 are validated\n", kVerifyMaxTokens);
             spec_max = kVerifyMaxTokens;
         }
+        if (!logprobs_path.empty() && list_path.empty()) throw std::invalid_argument("--logprobs-out needs --force-list");
+        if (!list_path.empty() && (!force_path.empty() || !dump_path.empty() || !cont_path.empty() || spec != "none" || batched))
+            throw std::invalid_argument("--force-list runs step() alone: without --force-ids, --dump, --continue-ids, --spec, --prefill");
         Engine engine(pack, opt);
+        if (!list_path.empty()) {
+            force_list(engine, list_path, logprobs_path);
+            return 0;
+        }
         if (force_path.empty() && dump_path.empty()) {
             generate(engine, opt, prompt, gen, batched, spec != "none", spec_max, eos, cont, spec == "oracle",
                      spec == "dspark", draft_k);

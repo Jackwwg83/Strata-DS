@@ -3,6 +3,7 @@
 #include "../ds41_generate.cpp"
 #undef main
 #include <unistd.h>
+#include <cstdlib>
 
 namespace {
 int windows = 0, multi = 0, rejected = 0;
@@ -19,11 +20,15 @@ struct Engine::Impl {
 };
 Engine::Engine(const std::string&, const EngineOptions& options) : impl_(new Impl) { impl_->max_seq = options.max_seq; }
 Engine::~Engine() = default;
+// logits: 0 everywhere, 5 at the predicted id (the --logprobs-out check knows their log-softmax)
 int Engine::step(int token, int pos, StepDump*) {
     check(impl_->pending.empty() && pos == int(impl_->history.size()) && pos < impl_->max_seq);
     impl_->history.push_back(token);
+    impl_->logits.assign(kVocab, 0.0f);
+    impl_->logits[predict(pos)] = 5.0f;
     return predict(pos);
 }
+void Engine::reset() { impl_->history.clear(); impl_->pending.clear(); }
 int Engine::prefill(const std::vector<int>& tokens, int pos, std::vector<float>*) {
     int next = -1;
     for (int token : tokens) next = step(token, pos++);
@@ -104,7 +109,42 @@ int main() {
         check(capped.size() == 64);
         for (int i = 0; i < 64; ++i) check(capped[i] == predict(i));
         check(windows > 0 && multi > 0 && rejected > 0);
-        std::printf("RESULT pass generate_suffix_mock windows=%d multi=%d rejected=%d gen_bounds=1 eos=1 prefill=1\n",
+        // --force-list: one forced sequence per line, the engine reset before each (step() checks pos == history);
+        // --logprobs-out: header {magic, vocab}, then per scored position {sequence, pos, next id} and the fp16
+        // log-softmax of the whole vocabulary
+        {
+            char list[] = "/tmp/ds41_force_list_XXXXXX", lp[] = "/tmp/ds41_logprobs_XXXXXX";
+            const int fl = mkstemp(list), fo = mkstemp(lp);
+            check(fl >= 0 && fo >= 0);
+            const std::string seqs = "1,2,3,4\n\n7,8,9\n";   // a blank line is skipped
+            check(write(fl, seqs.data(), seqs.size()) == (ssize_t) seqs.size());
+            close(fl); close(fo);
+            cli({"mock", "--pack", "synthetic", "--force-list", list, "--logprobs-out", lp});
+            check(last_text.find("force_list sequences 2 scored 5") != std::string::npos);
+            std::FILE* f = std::fopen(lp, "rb");
+            check(f != nullptr);
+            int32_t hdr[2];
+            check(std::fread(hdr, 4, 2, f) == 2 && hdr[0] == 0x31504c44 && hdr[1] == kVocab);
+            const double lse = std::log(double(kVocab - 1) + std::exp(5.0));
+            const int want[5][3] = {{0, 0, 2}, {0, 1, 3}, {0, 2, 4}, {1, 0, 8}, {1, 1, 9}};
+            std::vector<uint16_t> row(kVocab);
+            auto half = [](uint16_t h) {   // IEEE binary16 -> float (normal numbers and zero)
+                const int e = (h >> 10) & 31, m = h & 1023;
+                const double v = e ? std::ldexp(1.0 + m / 1024.0, e - 15) : std::ldexp(m / 1024.0, -14);
+                return h & 0x8000 ? -v : v;
+            };
+            for (const auto& w : want) {
+                int32_t rec[3];
+                check(std::fread(rec, 4, 3, f) == 3 && rec[0] == w[0] && rec[1] == w[1] && rec[2] == w[2]);
+                check(std::fread(row.data(), 2, kVocab, f) == size_t(kVocab));
+                check(std::fabs(half(row[predict(w[1])]) - (5.0 - lse)) < 2e-3);
+                check(std::fabs(half(row[predict(w[1]) == 0 ? 1 : 0]) + lse) < 2e-2);
+            }
+            check(std::fgetc(f) == EOF);
+            std::fclose(f);
+            std::remove(list); std::remove(lp);
+        }
+        std::printf("RESULT pass generate_suffix_mock windows=%d multi=%d rejected=%d gen_bounds=1 eos=1 prefill=1 force_list=1\n",
                     windows, multi, rejected);
         return 0;
     } catch (const std::exception& e) { std::fprintf(stderr, "RESULT fail %s\n", e.what()); return 1; }
