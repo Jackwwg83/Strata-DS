@@ -3,14 +3,14 @@
 [English](README.md) · **简体中文** · [日本語](README.ja.md) · [Deutsch](README.de.md) · [Français](README.fr.md) · [Español](README.es.md) · [Português](README.pt-BR.md)
 
 <p align="center"><b>在 64 GB 内存的游戏本上运行 DeepSeek V4.1 Flash（7630 亿参数 MoE）</b><br>
-短提示词约 30 token/s · 256K 上下文 23.6 token/s · RTX 5090 笔记本 24 GB · Linux</p>
+冷启动 30-32 token/s，服务运行后 33-39 token/s · 256K 上下文 24.4 token/s · RTX 5090 笔记本 24 GB · Linux</p>
 
 <p align="center"><img src="docs/media/deepseek-laptop-context.svg" width="760" alt="DeepSeek V4.1 Flash 在 RTX 5090 笔记本、64 GB 内存上各上下文长度的生成和读入速度"></p>
 
 这个仓库是 [Strata](https://github.com/Niko1221/Strata) 的分支，加了一个
 [DeepSeek V4.1 Flash](https://huggingface.co/deepseek-ai/DeepSeek-V4.1-Flash) 引擎。它把模型的 15,360 个专家分放在
 显存、内存和 SSD 上，所以这个 7630 亿参数的模型能在 24 GB 显卡、64 GB 内存的笔记本上运行。完整配方、每项设置、
-设置对质量的影响和原始数据：**[docs/DEEPSEEK_LAPTOP.md](docs/DEEPSEEK_LAPTOP.md)**（英文）。
+设置对质量的实测影响、时间花在哪里和原始数据：**[docs/DEEPSEEK_LAPTOP.md](docs/DEEPSEEK_LAPTOP.md)**（英文）。
 
 ---
 

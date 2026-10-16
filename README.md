@@ -3,14 +3,14 @@
 **English** · [简体中文](README.zh-CN.md) · [日本語](README.ja.md) · [Deutsch](README.de.md) · [Français](README.fr.md) · [Español](README.es.md) · [Português](README.pt-BR.md)
 
 <p align="center"><b>DeepSeek V4.1 Flash (763B MoE) on a 64 GB gaming laptop</b><br>
-about 30 tokens/s on short prompts · 23.6 tokens/s with a 256K-token prompt · RTX 5090 Laptop 24 GB · Linux</p>
+30-32 tokens/s from a cold start, 33-39 on a running server · 24.4 tokens/s with a 256K-token prompt · RTX 5090 Laptop 24 GB · Linux</p>
 
 <p align="center"><img src="docs/media/deepseek-laptop-context.svg" width="760" alt="DeepSeek V4.1 Flash decode and prefill speed by context length on an RTX 5090 Laptop with 64 GB of RAM"></p>
 
 This fork of [Strata](https://github.com/Niko1221/Strata) adds an engine for
 [DeepSeek V4.1 Flash](https://huggingface.co/deepseek-ai/DeepSeek-V4.1-Flash). It splits the model's 15,360 experts
 over GPU memory, RAM and the SSD, so the 763B model runs on a laptop with a 24 GB GPU and 64 GB of RAM. The recipe,
-every setting, what the settings cost in quality, and the raw data: **[docs/DEEPSEEK_LAPTOP.md](docs/DEEPSEEK_LAPTOP.md)**.
+every setting, what the settings cost in quality (measured), where the time goes, and the raw data: **[docs/DEEPSEEK_LAPTOP.md](docs/DEEPSEEK_LAPTOP.md)**.
 
 ---
 
@@ -151,7 +151,7 @@ sizes are faster. Larger sizes are a bit smarter.
   (763B parameters with its Engram memory), as the SAGE 1.59bpw quantization. It needs an NVIDIA GPU with 24 GB or
   more, 64 GB of RAM or more (128 GB recommended) and about 462 GB of disk; `./setup.sh --setup --family deepseek`.
   It writes 17-32 tokens/s on desktop PCs (an RTX 3090 and an RTX 5090, 2026-10-07, before the laptop work, [details](docs/MODELS.md#deepseek-v41-flash-sage-159bpw))
-  and about 30 tokens/s on a 64 GB gaming laptop with an RTX 5090 Laptop GPU ([the laptop recipe](docs/DEEPSEEK_LAPTOP.md)).
+  and 30-39 tokens/s on a 64 GB gaming laptop with an RTX 5090 Laptop GPU ([the laptop recipe](docs/DEEPSEEK_LAPTOP.md)).
 - **[OrcaRouter's Uncensored IQ3_XXS](docs/MODELS.md#orcarouter-uncensored-iq3_xxs):** you set it up by hand. It is
   not in the installer's menu.
 
