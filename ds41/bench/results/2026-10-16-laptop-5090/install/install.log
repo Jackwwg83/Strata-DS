@@ -1,0 +1,24 @@
+== 00:52:40 step 1 check: nvidia-powerd active
+== 00:52:40 clone
+00:52:40 Cloning into '/home/USER/strata-ds-clean'...
+97438fec README: Strata-DS on top (DeepSeek V4.1 Flash on a 64 GB laptop), upstream below
+== 00:52:42 step 2: ./setup.sh --setup --yes --family deepseek --context 32768 --no-start
+setup exit 0
+== 03:52:39 setup done; files:
+-rwxr-xr-x 1 user user  265 Oct 16 03:52 /home/USER/strata-ds-clean/run-deepseek-sage-1.59bpw.sh
+-rw-r--r-- 1 user user  648 Oct 16 03:52 /home/USER/strata-ds-clean/strata-deepseek-sage-1.59bpw.json
+308G	/home/USER/Strata-data/models/deepseek-sage-1.59bpw
+112G	/home/USER/Strata-data/packs/deepseek-sage-1.59bpw
+== 03:52:39 sha256 of the new pack and the development pack
+dense.bin new a191f32be9ea5fd20285247b3a98df819506667425c7a9f4780c14548a5f36cf dev a191f32be9ea5fd20285247b3a98df819506667425c7a9f4780c14548a5f36cf SAME
+experts.bin new e0a06c2a6521f543e3f9c4abcd2af4e57ac694923d9eaaa51b72db7116aea322 dev e0a06c2a6521f543e3f9c4abcd2af4e57ac694923d9eaaa51b72db7116aea322 SAME
+index.txt new ac3769f5700e5e2ca38cd049d7292726ffbba520a9d44352e8eaff15139889b8 dev ac3769f5700e5e2ca38cd049d7292726ffbba520a9d44352e8eaff15139889b8 SAME
+experts.txt new 0742e170172313253bb9f2c9374b549bc86e62de9a1e136b6614327b7f42178d dev 0742e170172313253bb9f2c9374b549bc86e62de9a1e136b6614327b7f42178d SAME
+engram.txt new 6bf05e826cdaf5a979f9d2d9d0c89aeb2c29d982b01acbbbecd4dcc5fdcacd80 dev f35f9f7bf4af78ce5107d33bbd7b4ff97ba7731428bbe8c782536dcd2a40cf35 DIFFERENT
+engram_hash.txt new a55179fea918e66a331ac4cc1bdf9a0b947117dd6478f74d470de2a7e42a5c49 dev a55179fea918e66a331ac4cc1bdf9a0b947117dd6478f74d470de2a7e42a5c49 SAME
+engram_tokenmap.bin new c60a86322ec17b4142bfef3c57a8d81fb428550cdf487f88a4320cb59fe46481 dev c60a86322ec17b4142bfef3c57a8d81fb428550cdf487f88a4320cb59fe46481 SAME
+config.json new 25882944c203b1970a9187dc47334ebafbb7e95ffda888fd86c8181af9e15867 dev 25882944c203b1970a9187dc47334ebafbb7e95ffda888fd86c8181af9e15867 SAME
+tokenizer.json new c90dfa01249db1be4245780a052ede752e1361c612ac6d08e2bdada7d599476b dev c90dfa01249db1be4245780a052ede752e1361c612ac6d08e2bdada7d599476b SAME
+d88619233b4475af859b351f7fc54779cd16af79d6d41d6b95e959746b5af72b  /home/USER/strata-ds-clean/engine/ds41_serve
+d88619233b4475af859b351f7fc54779cd16af79d6d41d6b95e959746b5af72b  /home/USER/strata-ds-clean/build-ds41/ds41_serve
+== 03:54:39 F1_DONE
