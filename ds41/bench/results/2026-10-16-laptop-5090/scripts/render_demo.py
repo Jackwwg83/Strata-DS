@@ -54,7 +54,7 @@ for i, ch in enumerate(chars):
     if width + w > TW and cur:
         # English: break after the last space of the line; CJK and long words: break here
         sp = max((j for j, c in enumerate(cur) if chars[c] == " "), default=-1)
-        if sp > len(cur) // 2:
+        if ch.isascii() and ch.isalnum() and sp > len(cur) // 2:   # inside an English word: wrap at its space
             lines.append(cur[:sp + 1]); cur = cur[sp + 1:]
         else:
             lines.append(cur); cur = []
