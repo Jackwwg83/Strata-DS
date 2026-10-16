@@ -1,0 +1,56 @@
+{
+ "tasks": [
+  {
+   "task": "humaneval-base",
+   "n": 164,
+   "acc_no_skip": 0.9573170731707317,
+   "acc_default": 0.9512195121951219,
+   "diff": -0.006097560975609756,
+   "diff_ci95": [
+    -0.024390243902439025,
+    0.012195121951219513
+   ],
+   "only_no_skip_right": 2,
+   "only_default_right": 1,
+   "mcnemar_p": 1.0
+  },
+  {
+   "task": "humaneval-plus",
+   "n": 164,
+   "acc_no_skip": 0.9146341463414634,
+   "acc_default": 0.9024390243902439,
+   "diff": -0.012195121951219513,
+   "diff_ci95": [
+    -0.036585365853658534,
+    0.012195121951219513
+   ],
+   "only_no_skip_right": 3,
+   "only_default_right": 1,
+   "mcnemar_p": 0.625
+  },
+  {
+   "task": "gsm8k",
+   "n": 200,
+   "acc_no_skip": 0.975,
+   "acc_default": 0.98,
+   "diff": 0.005,
+   "diff_ci95": [
+    0.0,
+    0.015
+   ],
+   "only_no_skip_right": 0,
+   "only_default_right": 1,
+   "mcnemar_p": 1.0
+  }
+ ],
+ "niah": {
+  "noskip": {
+   "correct": 60,
+   "trials": 60
+  },
+  "default": {
+   "correct": 60,
+   "trials": 60
+  }
+ }
+}

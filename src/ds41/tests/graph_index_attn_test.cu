@@ -66,6 +66,72 @@ static void indexer(Verdict& v, Stream& st) {
     }
 }
 
+// median time of fn on stream s (median_us times the legacy stream, which a nonblocking stream does not join)
+template<class F> static double stream_us(cudaStream_t s, F fn) {
+    for (int i = 0; i < 3; ++i) fn();
+    cudaEvent_t a, b;
+    ck(cudaEventCreate(&a), "event"); ck(cudaEventCreate(&b), "event");
+    std::vector<float> t;
+    for (int i = 0; i < 25; ++i) {
+        ck(cudaEventRecord(a, s), "record"); fn(); ck(cudaEventRecord(b, s), "record");
+        ck(cudaEventSynchronize(b), "event sync");
+        float ms = 0; cudaEventElapsedTime(&ms, a, b); t.push_back(ms * 1000.0f);
+    }
+    cudaEventDestroy(a); cudaEventDestroy(b);
+    std::sort(t.begin(), t.end());
+    return t[t.size() / 2];
+}
+
+// Long contexts: the graph selection equals indexer_topk bit for bit (more than 256 radix partitions included),
+// and it is not slower than indexer_topk at 256K keys (the decode step runs it on 8 layers).
+static void indexer_long(Verdict& v, Stream& st) {
+    Dev<int> pos(1);
+    for (int cap : {16384, 262144, (1 << 20) + 8192}) {
+        size_t free_bytes = 0, total_bytes = 0;
+        ck(cudaMemGetInfo(&free_bytes, &total_bytes), "memory info");
+        if (free_bytes < size_t(cap) * 280) {   // keys 256 B + scores 8 B + mask 1 B per position, and headroom
+            std::printf("  cap=%d skipped: %zu MiB free on the GPU\n", cap, free_bytes >> 20);
+            continue;
+        }
+        Dev<__nv_bfloat16> q(rand_bf16(32 * 128, 0.2f, 4));
+        Dev<__nv_bfloat16> keys(rand_bf16(size_t(cap) * 128, 0.2f, 5));
+        Dev<__nv_bfloat16> weights(rand_bf16(32, 0.2f, 6));
+        Dev<float> score(cap), ref_score(cap);
+        Dev<int32_t> out(kIndexTopK), ref_out(kIndexTopK);
+        Dev<uint8_t> mask(cap);
+        std::vector<uint8_t> hm(cap);
+        for (int i = 0; i < cap; ++i) hm[i] = i % 3 != 0;
+        upload(mask, hm);
+        for (int ratio : {1, 2}) for (int masking : {0, 1}) {
+            const uint8_t* cm = masking ? mask.p : nullptr;
+            Graph g(st.s, [&] {
+                kk::indexer_topk_device(q.p, keys.p, pos.p, ratio, cap, weights.p, cm,
+                                         kIndexTopK, 128, score.p, out.p, st.s);
+            });
+            for (int t : {4095, 4096, 8191, 8192, 8193, cap / 2 + 1, cap - 4097, cap}) {
+                upload(pos, {t * ratio - 1});
+                fill(score, st.s); fill(ref_score, st.s); fill(out, st.s); fill(ref_out, st.s);
+                g.run(st.s);
+                kk::indexer_topk(q.p, keys.p, t, weights.p, cm, kIndexTopK, 128, ref_score.p, ref_out.p, st.s);
+                st.sync();
+                const auto label = "K5 long cap=" + std::to_string(cap) + " ratio=" + std::to_string(ratio) +
+                                   " t=" + std::to_string(t) + " mask=" + std::to_string(masking);
+                same(v, score, ref_score, label + " scores"); same(v, out, ref_out, label + " IDs");
+            }
+            if (cap == 262144 && ratio == 1 && masking == 1) {
+                upload(pos, {cap - 1});
+                const double graph_us = stream_us(st.s, [&] { g.run(st.s); });
+                const double eager_us = stream_us(st.s, [&] {
+                    kk::indexer_topk(q.p, keys.p, cap, weights.p, cm, kIndexTopK, 128, ref_score.p, ref_out.p, st.s);
+                });
+                std::printf("  t=262144: graph %.1f us, indexer_topk %.1f us\n", graph_us, eager_us);
+                v.metric("graph_us_t256k", graph_us);
+                v.check(graph_us <= 1.3 * eager_us, "K5 graph selection at 256K keys within 1.3x of indexer_topk");
+            }
+        }
+    }
+}
+
 static void attention(Verdict& v, Stream& st) {
     constexpr int cap = kWindow + kIndexTopK;
     Dev<int> t(1);
@@ -91,6 +157,6 @@ static void attention(Verdict& v, Stream& st) {
 }
 int main() {
     require_gpu(); Verdict v; Stream st;
-    indexer(v, st); attention(v, st);
+    indexer(v, st); indexer_long(v, st); attention(v, st);
     return v.finish();
 }

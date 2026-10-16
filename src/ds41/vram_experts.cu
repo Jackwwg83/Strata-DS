@@ -5,6 +5,8 @@
 #include "strata/ds41/residency.hpp"
 #include "strata/ds41/host_experts.hpp"
 
+#include <sys/mman.h>
+
 #include <algorithm>
 #include <cstdio>
 #include <cstring>
@@ -18,6 +20,17 @@ namespace {
 
 void ck(cudaError_t e, const char* what) {
     if (e != cudaSuccess) throw std::runtime_error(std::string("ds41 vram experts: ") + what + ": " + cudaGetErrorString(e));
+}
+
+/// After copies from the mapped pack: every page of experts.bin leaves this process (the copied experts' pages and the
+/// neighbours the page faults mapped with them), so the OS reclaims them first; a later read faults them in again.
+/// Mapped, the 11.8 GiB of a laptop's VRAM fill made the kernel page the RAM tier (unlocked while it fills) out to
+/// zram instead: fill 20 -> 40 s in half the starts (60 GB laptop, 2 rounds x 3 prompts: mean 31.9 -> 20.9 s).
+void unmap_pack_pages(const Pack& pack) {
+    uint64_t end = 0;
+    for (int l = 0; l < pack.n_layers(); ++l)
+        for (int e = 0; e < pack.n_experts(); ++e) end = std::max(end, pack.expert(l, e).offset + pack.expert(l, e).bytes);
+    if (pack.expert_base() && end) madvise((void*) pack.expert_base(), end, MADV_DONTNEED);
 }
 
 }  // namespace
@@ -130,6 +143,7 @@ VramExperts::VramExperts(const Pack& pack, const std::string& profile_path, int6
                     desc_host_[s] = describe(l, e, s);
                     publish_residency(res_host_[(size_t) l * E + e], s);
                 }
+                unmap_pack_pages(pack);
                 ck(cudaMalloc(&experts_dev_, desc_host_.size() * sizeof(desc_host_[0])), "expert descriptors");
                 ck(cudaMemcpy(experts_dev_, desc_host_.data(), desc_host_.size() * sizeof(desc_host_[0]),
                               cudaMemcpyHostToDevice),
@@ -154,6 +168,24 @@ void VramExperts::cleanup() noexcept {
     cudaFree(res_dev_);
     cudaFree(experts_dev_);
     cudaFree(ws_);
+}
+
+namespace {
+__global__ void scatter_descriptors_k(kernels::Exl3Expert* table, const int32_t* idx, const kernels::Exl3Expert* desc,
+                                      int n) {
+    for (int i = blockIdx.x * blockDim.x + threadIdx.x; i < n; i += gridDim.x * blockDim.x) table[idx[i]] = desc[i];
+}
+}  // namespace
+
+void VramExperts::scatter_descriptors(kernels::Exl3Expert* table, const int32_t* idx, const kernels::Exl3Expert* desc,
+                                      int n) {
+    if (n <= 0) return;
+    int32_t* d_idx = nullptr;
+    kernels::Exl3Expert* d_desc = nullptr;
+    ck(cudaHostGetDevicePointer((void**) &d_idx, (void*) idx, 0), "descriptor index alias");
+    ck(cudaHostGetDevicePointer((void**) &d_desc, (void*) desc, 0), "descriptor alias");
+    scatter_descriptors_k<<<(n + 127) / 128, 128>>>(table, d_idx, d_desc, n);
+    ck(cudaGetLastError(), "descriptor scatter");
 }
 
 kernels::Exl3Expert VramExperts::describe(int layer, int expert, int slot) const {
@@ -254,6 +286,15 @@ int VramExperts::commit_pending(bool wait) {
         copier_.join();
         if (copy_error_) throw std::runtime_error("ds41 vram experts: an adaptive expert copy failed");
         const int E = pack_.n_experts();
+        // the RAM descriptors change together below, published before the phase's next copy; on a throw the
+        // guard publishes what was collected
+        if (host_) host_->defer_descriptors();
+        struct Batch {
+            HostExperts* h;
+            ~Batch() {
+                if (h) try { h->flush_descriptors(); } catch (...) {}
+            }
+        } batch{host_};
         if (phase_ == 1) {
             // `out` leaves VRAM: the CPU reads it from the swap buffer (or the file); the slot now describes `in`
             for (const Pending& w : pending_) {
@@ -262,6 +303,7 @@ int VramExperts::commit_pending(bool wait) {
                 if (w.ram_slot >= 0) host_->point_to(w.layer, w.out, staging_ + w.staged);
                 else if (host_) host_->point_to_file(w.layer, w.out);
             }
+            if (host_) host_->flush_descriptors();
             upload_res();   // before the copy into the slots: no step reads a slot that is being overwritten
             start_phase(2);
         } else if (phase_ == 2) {
@@ -269,14 +311,20 @@ int VramExperts::commit_pending(bool wait) {
             for (const Pending& w : pending_) {
                 publish_residency(res_host_[(size_t) w.layer * E + w.in], w.vram_slot);
                 if (w.ram_slot >= 0) host_->point_to_file(w.layer, w.in);   // revokes its RAM descriptor
+                else if (host_) host_->release(w.layer, w.in);   // the adaptive RAM tier read it in meanwhile
             }
+            if (host_) host_->flush_descriptors();
             upload_res();
             committed += (int) pending_.size();
             swaps_total_ += (int) pending_.size();
             start_phase(3);
         } else {
             for (const Pending& w : pending_)
-                if (w.ram_slot >= 0) host_->assign(w.ram_slot, w.layer, w.out);   // the CPU reads `out` from RAM
+                if (w.ram_slot >= 0) {
+                    host_->assign(w.ram_slot, w.layer, w.out);   // the CPU reads `out` from RAM
+                    host_->unlock(w.ram_slot);
+                }
+            if (host_) host_->flush_descriptors();
             pending_.clear();
             phase_ = 0;
         }
@@ -297,6 +345,10 @@ int VramExperts::between_steps() {
         const size_t vcap = off_[res_host_[(size_t) l * E + out] + 1] - off_[res_host_[(size_t) l * E + out]];
         if (pack_.expert(l, in).bytes > vcap) return false;
         const int32_t ram = host_ ? host_->slot_of(l, in) : -1;
+        // With the adaptive RAM tier, `in` comes from its RAM slot only. An expert the tier did not admit (a skipped SSD
+        // expert, say) was copied from the mapped pack: page faults to the SSD during decode, 1.5 GiB of file pages in
+        // 255 steps of a 128K prompt. Laptop, 2 rounds x 3 prompts: no-stall decode 33.7 -> 32.9 ms/token.
+        if (ram < 0 && host_ && host_->reserve() > 0) return false;
         return ram < 0 || pack_.expert(l, out).bytes <= host_->slot_capacity(ram);
     };
     const auto swaps = plan_expert_swaps(usage_, res_host_, L, E, adapt_.max_swaps, fits);
@@ -307,6 +359,7 @@ int VramExperts::between_steps() {
         const size_t need = ram >= 0 ? (pack_.expert(s.layer, s.out).bytes + 255) / 256 * 256 : 0;
         if (staged + need > staging_bytes_) break;
         pending_.push_back(Pending{s.layer, s.in, s.out, res_host_[(size_t) s.layer * E + s.out], ram, staged});
+        if (ram >= 0) host_->lock(ram);   // the adaptive RAM tier keeps the slot until `out` is written there
         staged += need;
     }
     if (pending_.empty()) return committed;
@@ -352,6 +405,7 @@ void VramExperts::restore() {
         // The descriptors still describe (l, e) at slot s.
         publish_residency(res_host_[(size_t) l * E + e], s);
     }
+    unmap_pack_pages(pack_);
     lent_ = 0;
     lent_owner_.clear();
     upload_res();

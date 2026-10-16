@@ -78,6 +78,20 @@ int main() {
             check_entry(0, e);
             v.check(host.experts_dev() == stable, "table address stays stable across swaps");
         }
+        // Deferred publication (between steps): the same entries as the immediate calls once flushed, the last
+        // update of an entry wins (assign() revokes the old holder, then publishes the new one).
+        host.defer_descriptors();
+        for (int e : {7, 8}) {
+            const int old = e - 1;
+            host.point_to_file(0, old);
+            const auto& s = pack.expert(0, e);
+            std::memcpy(host.slot_ptr(slot), pack.expert_base() + s.offset, s.bytes);
+            host.assign(slot, 0, e);
+        }
+        host.flush_descriptors();
+        for (int e : {6, 7, 8}) check_entry(0, e);
+        host.flush_descriptors();   // nothing pending: no change
+        check_entry(0, 8);
         bool threw = false;
         try { host.assign(host.slot_of(1, 0), 2, 2); }
         catch (const std::invalid_argument&) { threw = true; }

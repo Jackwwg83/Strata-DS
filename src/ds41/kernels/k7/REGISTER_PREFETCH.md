@@ -81,3 +81,23 @@ non-default stream, large/tiny/zero and cancellation inputs, unrelated task
 traffic, and sequential device switching when multiple GPUs are available.
 Run it under memcheck, racecheck and synccheck when GPU access returns. Test
 harness copies/waits are deliberately outside the implementation.
+
+## Deeper ring for m <= 4 (2026-10-09, RTX 5090 Laptop, CUDA 13.3)
+
+In decode the 1.97 MB weight of each layer is cold. With two steps in flight, 192 warps keep about 74 KB of loads
+in flight, which is about 120 GB/s: the two calls per layer took 31.6 us (nsys, real model, 96-token decode).
+
+`kPrefetchDepth` now sets how many steps a lane loads ahead: 16 for m <= 2, 8 for m <= 4, and the original two-step
+loop for m > 4. Every lane still consumes its 80 steps in order, so the arithmetic is unchanged: the CPU model gives
+bitwise equality for all m, and `k7_hc_test` gives zero error.
+
+Measured on the laptop:
+
+| | before | depth ring |
+|---|---|---|
+| decode, both calls per layer (cold weight, nsys) | 31.6 us | 12.1 us |
+| per-layer GPU chain before publish | 338.7 us | 321.6 us |
+| `k7_hc_test` m=1 (warm L2) | 11.3-12.5 us | 8.4-8.9 us |
+| `k7_hc_test` m=8 | 14.7-14.8 us | 14.6 us |
+
+Tried and not kept: depth 4 for m > 4, fully unrolled (m=8: 17.3-17.9 us); depth 40 for m=1 (decode 12.4 us).

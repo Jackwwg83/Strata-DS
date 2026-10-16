@@ -31,12 +31,16 @@ struct EngineOptions {
     int cpu_threads = 8;
     std::string expert_profile;             ///< STRP profile for the VRAM expert tier; empty: no tier
     int64_t vram_expert_slots = -1;         ///< with a profile: -1 = as many as fit, 0 = none
-    size_t vram_reserve_bytes = 1536ull << 20;   ///< VRAM left free when the slot count is automatic
+    /// VRAM left free when the slot count is automatic (--vram-reserve-mib). 700 MiB, upstream's default: on the RTX
+    /// 5090 Laptop 1536 -> 700 MiB gave 97 more slots, code 50.27 -> 49.62 ms/token, agent 53.63 -> 52.97, and a
+    /// 16K-token prompt and verify windows still ran (512 MiB too)
+    size_t vram_reserve_bytes = 700ull << 20;
     int adapt_every = 4;                    ///< adaptive tier: steps between swaps (0 = static residency)
     float adapt_decay = 0.7f;
     int adapt_swaps = 96;
     /// with a profile: RAM tier size in GiB (upstream's resident budget); -1 = automatic, the available RAM less
-    /// 24 GiB (upstream setup's default N = RAM - 24 GB: N = 40 on a 64 GB PC); 0 = none. Measured on an RTX 4090
+    /// 8 GiB with the adaptive tier (the default), less 24 GiB with DS41_RAM_ADAPT=0 (upstream setup's default
+    /// N = RAM - 24 GB: N = 40 on a 64 GB PC); 0 = none. Measured on an RTX 4090
     /// with 119.9 GiB of container RAM and an 8.8 GB/s SSD (2026-10-06, 3bpw): no tier, 8K prompt 318 tok/s and
     /// decode 168-250 ms/token; 96 GiB, 582 tok/s and 103-109 ms/token (32K: 966 -> 1,031 tok/s).
     double ram_budget_gib = -1;
@@ -55,6 +59,10 @@ struct EngineOptions {
     /// decode together, at most kVerifyMaxTokens (the CPU expert kernel's rows). 0: none. Each slot holds about
     /// 90 MB of VRAM at 32K context, and the slots share a staging area of 4 x 6 experts.
     int batch_slots = 0;
+    /// DSpark, DeepSeek's MTP drafter (Engine::draft): its routed experts (6.8 GB, pack.py --mtp-experts) are read
+    /// into RAM before the RAM tier sizes itself, and step, verify and prefill keep its input (the attention input of
+    /// layers 37-39). Off: none of that.
+    bool dspark = false;
     int prefill_threads = 16;       ///< expert stream readers (pread from the pack)
     int prefill_host_buffers = 64;  ///< pinned staging buffers of the expert stream (how far reads run ahead)
 };
@@ -95,6 +103,19 @@ public:
     VerifyResult verify(const std::vector<int>& window, int pos, bool logits = false);
     /// Keep the first n_keep inputs (1..T). Discard every later input and its state.
     void commit(int n_keep);
+
+    /// DSpark's drafts (EngineOptions::dspark): the 5 tokens after `token`, the token at position() that is not fed
+    /// yet, and for each the confidence head's probability that it is accepted when the drafts before it are. n = 0
+    /// (no drafts) before the first token or near max_seq. Drafts only choose what a verify window checks.
+    struct Draft {
+        int n = 0;
+        std::array<int, 5> tokens{};
+        std::array<float, 5> accept{};
+        double ms = 0, cpu_experts_ms = 0;   ///< the whole call; the CPU's routed experts inside it
+        int vram_hits = 0, uses = 0;          ///< routed uses computed from DSpark's VRAM set, of all
+    };
+    Draft draft(int token);
+    bool has_dspark() const;
 
     /// Feed tokens at positions pos, pos + 1, ... (pos = the tokens fed so far) in batched chunks: every layer on the
     /// GPU, all routed experts on the GPU (VRAM tier slots, the rest streamed through a ring). Returns the greedy
@@ -140,20 +161,28 @@ public:
     /// FP32 logits of the last step (all 129280)
     const std::vector<float>& last_logits() const;
 
-    /// engram_ms: the engram reads at the step start. gpu_ms: the rest of the step (wall time). cpu_experts_ms: the
-    /// time the CPU thread spent computing experts, inside gpu_ms.
+    /// engram_ms: the engram reads (step(): on their own thread beside layer 0, so gpu_ms is the whole step; verify
+    /// and batch: before the window, and gpu_ms is the rest). cpu_experts_ms: the time the CPU thread spent computing
+    /// experts, inside gpu_ms.
     /// expert_hits: routed experts of the step computed from VRAM slots, of expert_total.
     struct Timing {
         double gpu_ms = 0, cpu_experts_ms = 0, engram_ms = 0, total_ms = 0;
         int expert_hits = 0, expert_total = 0;   ///< VRAM hits and all routed uses
         int cpu_experts() const { return ram_experts + file_experts; }
-        int zero_copy_experts() const { return expert_total - expert_hits - cpu_experts(); }
+        int zero_copy_experts() const { return expert_total - expert_hits - cpu_experts() - skipped; }
         int vram_swaps = 0;   ///< adaptive swaps committed before this step
         /// the CPU's experts by tier: from the RAM copy, from the mapped file, and of those, the ones with pages
         /// missing from RAM when computed (read from the SSD)
         int ram_experts = 0, file_experts = 0, ssd_experts = 0;
         int warmed = 0, warmed_useful = 0;   ///< lookahead: file-tier experts warmed, and of those, used next layer
         int prefetched = 0;   ///< misses the GPU computed from the prefetch buffer (DS41_PREFETCH), in zero_copy_experts()
+        int skipped = 0;      ///< uses left out by the route tail skip (DS41_ROUTE_TAIL_SKIP), outside VRAM hits
+        /// the decode step's critical path, seen from the CPU expert worker (step() only): step start to the worker's
+        /// wake (lead), the worker's wake to its last layer done (span); inside the span, the waits for the GPU to
+        /// publish a layer (layer 0's wait alone: first_wait) and the adaptive RAM tier's reads (admit). Outside it:
+        /// the VRAM tier's between_steps (swaps) and the work after the device sync (end).
+        double worker_lead_ms = 0, worker_span_ms = 0, worker_wait_ms = 0, worker_first_wait_ms = 0, admit_ms = 0;
+        double swaps_ms = 0, end_ms = 0;
     };
     /// VRAM expert slots in use (0: no tier)
     int vram_expert_slots() const;

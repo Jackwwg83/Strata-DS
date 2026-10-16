@@ -43,10 +43,18 @@ float bf16(uint16_t v) {
 void cpu_router_topk(const uint16_t* x, const uint16_t* w, const float* bias, int n, int dim, int k, int32_t* ids) {
     std::vector<float> xf(dim), biased(n);
     for (int i = 0; i < dim; ++i) xf[i] = f16(x[i]);
+    // 16 partial sums: independent lanes the compiler vectorizes (one running sum is a 4-cycle add chain per
+    // element, about 1.6 ms per layer on the laptop, longer than the layer the prediction must run ahead of)
+    constexpr int kLanes = 16;
     for (int e = 0; e < n; ++e) {
         const uint16_t* r = w + (size_t) e * dim;
+        float lane[kLanes] = {};
+        int i = 0;
+        for (; i + kLanes <= dim; i += kLanes)
+            for (int j = 0; j < kLanes; ++j) lane[j] += xf[i + j] * bf16(r[i + j]);
         float acc = 0.f;
-        for (int i = 0; i < dim; ++i) acc += xf[i] * bf16(r[i]);
+        for (int j = 0; j < kLanes; ++j) acc += lane[j];
+        for (; i < dim; ++i) acc += xf[i] * bf16(r[i]);
         const float sp = acc > 20.f ? acc : std::log1p(std::exp(acc));
         biased[e] = std::sqrt(sp) + bias[e];
     }
@@ -58,9 +66,10 @@ void cpu_router_topk(const uint16_t* x, const uint16_t* w, const float* bias, in
 }
 
 RouterLookahead::RouterLookahead(std::vector<std::vector<uint16_t>> router_w, std::vector<std::vector<float>> bias,
-                                 int n_experts, int dim, int k, std::function<bool(int, int)> warm)
-    : w_(std::move(router_w)), bias_(std::move(bias)), n_experts_(n_experts), dim_(dim), k_(k),
-      warm_(std::move(warm)), x_(dim), warmed_(w_.size()) {
+                                 int n_experts, int dim, int k, std::function<bool(int, int)> warm,
+                                 std::function<void(int, const int32_t*, int)> fetch, int ahead)
+    : w_(std::move(router_w)), bias_(std::move(bias)), n_experts_(n_experts), dim_(dim), k_(k), ahead_(ahead),
+      warm_(std::move(warm)), fetch_(std::move(fetch)), x_(dim), warmed_(w_.size()) {
     th_ = std::thread([this] { run(); });
 }
 
@@ -74,7 +83,7 @@ RouterLookahead::~RouterLookahead() {
 }
 
 void RouterLookahead::post(int layer, const uint16_t* x) {
-    if (layer + 1 >= (int) w_.size()) return;
+    if (layer + ahead_ >= (int) w_.size()) return;
     {
         std::lock_guard<std::mutex> lk(mu_);
         std::memcpy(x_.data(), x, (size_t) dim_ * 2);
@@ -97,13 +106,14 @@ void RouterLookahead::run() {
             layer = layer_;
             x = x_;
         }
-        const int next = layer + 1;
+        const int next = layer + ahead_;
         cpu_router_topk(x.data(), w_[next].data(), bias_[next].data(), n_experts_, dim_, k_, ids.data());
         std::vector<int32_t> warmed;
         for (int i = 0; i < k_; ++i) {
             std::lock_guard<std::mutex> lock(residency_mutex());
             if (warm_(next, ids[i])) warmed.push_back(ids[i]);
         }
+        if (fetch_ && !warmed.empty()) fetch_(next, warmed.data(), (int) warmed.size());
         predicted_ += k_;
         warmed_n_ += (int64_t) warmed.size();
         std::lock_guard<std::mutex> lk(mu_);

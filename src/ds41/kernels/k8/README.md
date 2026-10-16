@@ -92,6 +92,16 @@ all m values on a non-default stream, warms up at m=1 before larger captures,
 checks the graph has two nodes, changes inputs over 24 replays, and checks exact
 ties and near-ties. It was compile-checked only.
 
+## Integer order keys (2026-10-09)
+
+`select_top6` now compares `order_key(score + bias)` instead of the doubles: the IEEE bits as a signed integer,
+with the negative values' low 63 bits flipped, -0 folded to +0, and NaN mapped to the lowest key (a NaN never wins,
+as with the double compare). The order equals `better` on doubles, so the IDs, the selected order and the weight
+bits are unchanged. FP64 compares are slow on GPUs with few FP64 units: on the RTX 5090 Laptop, select_top6 took
+10.8 us per decode layer and now takes 4.3 us (nsys, 40 layers). `graph_validation.cu` is now the CTest target
+`k8_graph_validation`. It keeps the previous scorer and selector as a reference and requires equal IDs and equal
+weight bits for every case; it adds negative, mixed-sign, extreme and NaN biases.
+
 The selector trades more candidates/registers per lane for removal of cross-warp
 reductions and barriers. The m=1 path now has one selector warp instead of four,
 so reduced inter-warp latency hiding and longer serial candidate scans could

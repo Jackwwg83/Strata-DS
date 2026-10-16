@@ -10,11 +10,31 @@
 
 #include <algorithm>
 #include <cstring>
+#include <fstream>
+#include <string>
 
 using namespace ds41test;
 namespace sd = strata::ds41;
 
 namespace {
+
+/// kB of `path`'s mapping resident in this process (/proc/self/smaps Rss), summed over its mappings
+size_t mapped_kib(const std::string& path) {
+    std::ifstream f("/proc/self/smaps");
+    std::string line;
+    bool in = false;
+    size_t kib = 0;
+    while (std::getline(f, line)) {
+        const std::string first = line.substr(0, line.find(' '));
+        if (first.empty()) continue;
+        if (first.back() != ':') {   // a mapping's header: address range, perms, offset, device, inode, path
+            in = line.size() >= path.size() && line.compare(line.size() - path.size(), path.size(), path) == 0;
+        } else if (in && first == "Rss:") {
+            kib += std::stoul(line.substr(4));
+        }
+    }
+    return kib;
+}
 
 void mixed_sizes(Verdict& v) {
     const std::string dir = "/tmp/ds41_fake_pack_mixed", prof = "/tmp/ds41_fake_profile_mixed.bin";
@@ -82,6 +102,11 @@ int main() {
     constexpr int kSlots = 100, kLend = 30;
     sd::VramExperts vram(pack, prof, kSlots, 0, ad);
     v.check(vram.slots() == kSlots, "slot count");
+    // the copies' file pages leave this process (unmapped, the OS reclaims them first): while the RAM tier fills
+    // next, 11.8 GiB of mapped pages made the kernel page the unlocked tier out to zram (laptop: fill 20 -> 40 s)
+    const std::string file = dir + "/experts.bin";
+    v.check(mapped_kib(file) == 0, "the VRAM fill leaves no experts.bin page mapped, got " +
+                                       std::to_string(mapped_kib(file)) + " kB");
     const auto before = vram.res_host();
 
     uint8_t* lent = vram.lend(kLend);
@@ -105,6 +130,7 @@ int main() {
 
     vram.restore();
     v.check(vram.lent() == 0 && vram.res_host() == before, "restore: the table is as before");
+    v.check(mapped_kib(file) == 0, "restore leaves no experts.bin page mapped, got " + std::to_string(mapped_kib(file)) + " kB");
     bool bytes_ok = true;
     for (size_t i = 0; i < before.size(); ++i) {
         const int s = before[i];

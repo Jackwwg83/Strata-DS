@@ -4,6 +4,7 @@
 //   dense:   every non-expert tensor copied into one device arena, looked up by name
 //   experts: experts.bin mapped read-only; each expert is a 4 KiB aligned slot with 12 components
 //   engram:  the two n-gram tables stay in their original files; rows are read on demand
+//   mtp:     DSpark's routed experts (pack.py --mtp-experts), mtp_experts.bin, read into RAM on request
 #pragma once
 
 #include <cstdint>
@@ -70,6 +71,14 @@ public:
     bool has_dense(const std::string& name) const { return dense_.count(name) != 0; }
     const ExpertSlot& expert(int layer, int e) const { return experts_[(size_t) layer * n_experts_ + e]; }
     const uint8_t* expert_base() const { return experts_map_; }
+    /// DSpark's routed experts: stages x experts slots of mtp_experts.bin (0 stages: the pack has none)
+    int mtp_stages() const { return mtp_stages_; }
+    int mtp_experts() const { return mtp_experts_; }
+    const ExpertSlot& mtp_expert(int stage, int e) const { return mtp_[(size_t) stage * mtp_experts_ + e]; }
+    /// Reads mtp_experts.bin into anonymous memory (locked when the limit allows): DSpark's experts are computed by
+    /// the CPU from RAM. Returns its bytes; mtp_expert_base() then holds them.
+    uint64_t load_mtp_experts();
+    const uint8_t* mtp_expert_base() const { return mtp_base_; }
     const std::vector<EngramTable>& engram_tables() const { return engram_; }
     const EngramHash& engram_hash() const { return hash_; }
     int n_layers() const { return n_layers_; }
@@ -87,6 +96,10 @@ private:
     void* arena_ = nullptr;
     const uint8_t* experts_map_ = nullptr;
     uint64_t experts_map_bytes_ = 0;
+    int mtp_stages_ = 0, mtp_experts_ = 0;
+    std::vector<ExpertSlot> mtp_;
+    uint8_t* mtp_base_ = nullptr;
+    uint64_t mtp_bytes_ = 0;
 };
 
 size_t dtype_size(DType t);

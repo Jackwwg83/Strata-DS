@@ -61,6 +61,41 @@ bool skip(const std::string& line) { return line.empty() || line[0] == '#'; }
 const char* kComp[12] = {"w1.trellis", "w1.suh", "w1.svh", "w1.mul1", "w3.trellis", "w3.suh",
                          "w3.svh",     "w3.mul1", "w2.trellis", "w2.suh", "w2.svh", "w2.mul1"};
 
+/// experts.txt or mtp_experts.txt: every (layer, expert) of n_layers x n_experts exactly once
+std::vector<ExpertSlot> read_expert_index(const std::string& path, int n_layers, int n_experts) {
+    std::vector<ExpertSlot> slots((size_t) n_layers * n_experts);
+    std::vector<bool> seen(slots.size(), false);
+    auto f = open_text(path);
+    const std::string name = path.substr(path.rfind('/') + 1);
+    std::string line;
+    while (std::getline(f, line)) {
+        if (skip(line)) continue;
+        std::istringstream s(line);
+        int l = 0, e = 0;
+        ExpertSlot x;
+        s >> l >> e >> x.offset >> x.bytes >> x.bits[0] >> x.bits[1] >> x.bits[2];
+        for (int c = 0; c < 12; ++c) {
+            std::string item;
+            s >> item;
+            const auto a = item.find(':'), b = item.rfind(':');
+            if (a == std::string::npos || b <= a || item.substr(0, a) != kComp[c])
+                fail("bad component in " + name + ": " + item);
+            x.comp_off[c] = component_number(item.substr(a + 1, b - a - 1));
+            x.comp_bytes[c] = component_number(item.substr(b + 1));
+            if (!contains(x.bytes, x.comp_off[c], x.comp_bytes[c])) fail("component outside its slot: " + line);
+        }
+        if (!s || l < 0 || l >= n_layers || e < 0 || e >= n_experts) fail("bad " + name + " line: " + line);
+        // The tiers round slot sizes up to 4 KiB.
+        if (x.bytes > std::numeric_limits<size_t>::max() - 4095)
+            fail("slot size cannot be aligned");
+        slots[(size_t) l * n_experts + e] = x;
+        seen[(size_t) l * n_experts + e] = true;
+    }
+    for (bool b : seen)
+        if (!b) fail(name + " does not list every expert");
+    return slots;
+}
+
 }  // namespace
 
 size_t dtype_size(DType t) {
@@ -85,7 +120,12 @@ Pack::Pack(const std::string& dir) : dir_(dir) {
             if (key == "finished") finished = v == 1;
             if (key == "layers") n_layers_ = (int) v;
             if (key == "experts") n_experts_ = (int) v;
+            if (key == "mtp_stages") mtp_stages_ = (int) v;
+            if (key == "mtp_experts") mtp_experts_ = (int) v;
         }
+        if (mtp_stages_ < 0 || mtp_stages_ > 8 || mtp_experts_ < 0 || mtp_experts_ > kExperts ||
+            (mtp_stages_ == 0) != (mtp_experts_ == 0))
+            fail("bad mtp_stages / mtp_experts in pack_info.txt");
         if (!finished) fail(dir + " is not a finished pack (pack_info.txt has no 'finished 1')");
         if (n_layers_ != kLayers || n_experts_ != kExperts) fail("layer or expert count does not match config.hpp");
     }
@@ -115,37 +155,8 @@ Pack::Pack(const std::string& dir) : dir_(dir) {
             dense_[t.name] = t;
         }
     }
-    {
-        experts_.resize((size_t) n_layers_ * n_experts_);
-        std::vector<bool> seen(experts_.size(), false);
-        auto f = open_text(dir + "/experts.txt");
-        std::string line;
-        while (std::getline(f, line)) {
-            if (skip(line)) continue;
-            std::istringstream s(line);
-            int l = 0, e = 0;
-            ExpertSlot x;
-            s >> l >> e >> x.offset >> x.bytes >> x.bits[0] >> x.bits[1] >> x.bits[2];
-            for (int c = 0; c < 12; ++c) {
-                std::string item;
-                s >> item;
-                const auto a = item.find(':'), b = item.rfind(':');
-                if (a == std::string::npos || b <= a || item.substr(0, a) != kComp[c])
-                    fail("bad component in experts.txt: " + item);
-                x.comp_off[c] = component_number(item.substr(a + 1, b - a - 1));
-                x.comp_bytes[c] = component_number(item.substr(b + 1));
-                if (!contains(x.bytes, x.comp_off[c], x.comp_bytes[c])) fail("component outside its slot: " + line);
-            }
-            if (!s || l < 0 || l >= n_layers_ || e < 0 || e >= n_experts_) fail("bad experts.txt line: " + line);
-            // The tiers round slot sizes up to 4 KiB.
-            if (x.bytes > std::numeric_limits<size_t>::max() - 4095)
-                fail("slot size cannot be aligned");
-            experts_[(size_t) l * n_experts_ + e] = x;
-            seen[(size_t) l * n_experts_ + e] = true;
-        }
-        for (bool b : seen)
-            if (!b) fail("experts.txt does not list every expert");
-    }
+    experts_ = read_expert_index(dir + "/experts.txt", n_layers_, n_experts_);
+    if (mtp_stages_) mtp_ = read_expert_index(dir + "/mtp_experts.txt", mtp_stages_, mtp_experts_);
     {
         auto f = open_text(dir + "/engram.txt");
         std::string line;
@@ -236,6 +247,7 @@ Pack::Pack(const std::string& dir) : dir_(dir) {
 Pack::~Pack() {
     if (arena_) cudaFree(arena_);
     if (experts_map_) munmap(const_cast<uint8_t*>(experts_map_), experts_map_bytes_);
+    if (mtp_base_) munmap(mtp_base_, mtp_bytes_);
 }
 
 const DenseTensor& Pack::dense(const std::string& name) const {
@@ -305,6 +317,45 @@ void Pack::map_experts() {
     if (experts_map_) munmap(const_cast<uint8_t*>(experts_map_), experts_map_bytes_);
     experts_map_ = (const uint8_t*) p;
     experts_map_bytes_ = total;
+}
+
+uint64_t Pack::load_mtp_experts() {
+    if (!mtp_stages_) fail("the pack has no DSpark experts (pack.py --mtp-experts)");
+    if (mtp_base_) return mtp_bytes_;
+    const std::string path = dir_ + "/mtp_experts.bin";
+    const int fd = open(path.c_str(), O_RDONLY);
+    if (fd < 0) fail("cannot open " + path);
+    struct stat st {};
+    if (fstat(fd, &st) != 0 || st.st_size <= 0) {
+        close(fd);
+        fail("cannot size mtp_experts.bin");
+    }
+    const uint64_t total = (uint64_t) st.st_size;
+    for (const auto& x : mtp_)
+        if (!contains(total, x.offset, x.bytes)) {
+            close(fd);
+            fail("expert past end of mtp_experts.bin");
+        }
+    void* p = mmap(nullptr, total, PROT_READ | PROT_WRITE, MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
+    if (p == MAP_FAILED) {
+        close(fd);
+        fail("cannot allocate RAM for mtp_experts.bin");
+    }
+    for (uint64_t got = 0; got < total;) {
+        const ssize_t r = pread(fd, (char*) p + got, std::min<uint64_t>(total - got, 1ull << 30), (off_t) got);
+        if (r <= 0) {
+            close(fd);
+            munmap(p, total);
+            fail("short read of mtp_experts.bin");
+        }
+        got += (uint64_t) r;
+    }
+    posix_fadvise(fd, 0, 0, POSIX_FADV_DONTNEED);   // the copy in RAM is the one used: no second one in the file cache
+    close(fd);
+    mlock(p, total);   // best effort, as the RAM tier: kept out of swap when RLIMIT_MEMLOCK allows
+    mtp_base_ = (uint8_t*) p;
+    mtp_bytes_ = total;
+    return total;
 }
 
 }  // namespace strata::ds41

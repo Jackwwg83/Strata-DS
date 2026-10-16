@@ -41,13 +41,26 @@ struct Engine::Impl::VerifyWorkspace {
     uint8_t *candidates, *eng, *eng_host;
     size_t eng_bytes;
     std::unique_ptr<ExpertDoorbell> db;
+    // the window's engram rows, read by the engine's reader thread beside the first layers (post_engram): per table
+    // the rows of all tokens, M * kEngRows weights then M * kEngRows scales (TB bytes), in mapped pinned memory;
+    // the GPU copies a table once its flag rises, on st_eng, and computes its wkv GEMV there (veng_kv)
+    static constexpr size_t TB = size_t(M) * kEngRows * (256 + 8);
+    std::vector<std::unique_ptr<EngramRows>> veng_rows;
+    std::vector<std::vector<int64_t>> veng_ids;
+    uint8_t *veng = nullptr, *veng_host = nullptr;
+    const uint8_t* veng_host_dev = nullptr;
+    bf16* veng_kv = nullptr;
+    float* act_eng = nullptr;
+    float *act_kv = nullptr, *act_sh = nullptr;   // the FP8 activation scratch of the kv branch and the shared expert
+    EngJob job;
     std::map<std::array<int64_t, 4>, cudaGraphExec_t> graphs;
     std::vector<int> tokens;
     int pos = 0, m = 0;
     bool warmed = false;
+    bool eager = false;   // the window being enqueued runs eagerly (the first one), not as a graph
     VerifyWorkspace(Impl& e) {
         const int S = e.max_seq;
-        params = alloc<int>(M * 4); params_host = pin<int>(M * 4);
+        params = alloc<int>(M * 4 + 1); params_host = pin<int>(M * 4 + 1);   // [M * 4]: the engram epoch
         next = alloc<int>(M); next_host = pin<int>(M);
         h = alloc<bf16>(M*kHc*kDim); h2 = alloc<bf16>(M*kHc*kDim);
         xa = alloc<bf16>(M*kDim); xf = alloc<bf16>(M*kDim);
@@ -68,6 +81,29 @@ struct Engine::Impl::VerifyWorkspace {
         eng_bytes = size_t(e.n_eng)*kEngRows*(256+8);
         eng = alloc<uint8_t>(M*eng_bytes); eng_host = pin<uint8_t>(M*eng_bytes);
         db = std::make_unique<ExpertDoorbell>(M, kTopK, kDim);
+        act_kv = alloc<float>(M * 8192);
+        act_sh = alloc<float>(M * 8192);
+        if (e.n_eng) {
+            veng = alloc<uint8_t>(e.n_eng * TB);
+            ck(cudaHostAlloc((void**)&veng_host, e.n_eng * TB, cudaHostAllocMapped), "verify engram pinned");
+            pinned.emplace_back(veng_host, [](void* q) { cudaFreeHost(q); });
+            ck(cudaHostGetDevicePointer((void**)&veng_host_dev, veng_host, 0), "verify engram alias");
+            veng_kv = alloc<bf16>(size_t(e.n_eng) * M * (kHc + 1) * kDim);
+            act_eng = alloc<float>(M * 8192);
+            const auto& hs = e.pack.engram_hash();
+            job.rows = 0;   // set per window: m * cols
+            for (int li = 0; li < e.n_eng; ++li) {
+                const auto& t = e.pack.engram_tables()[li];
+                veng_rows.push_back(std::make_unique<EngramRows>(
+                    std::vector<EngramRows::Table>{{t.path, t.weight_offset, t.scale_offset}},
+                    M * ((hs.max_ngram - 1) * hs.n_heads), 256, 8, 128));
+                veng_ids.emplace_back(size_t(M) * kEngRows, 0);
+                job.reader.push_back(veng_rows.back().get());
+                job.ids.push_back(veng_ids.back().data());
+                job.w.push_back(veng_host + li * TB);
+                job.s.push_back(veng_host + li * TB + size_t(M) * kEngRows * 256);
+            }
+        }
         for (int l = 0; l < kLayers; ++l) {
             auto& s = state[l];
             s.ring = alloc<bf16>(kWindow*kHeadDim); s.rows = alloc<bf16>(M*kHeadDim);
@@ -90,12 +126,38 @@ void Engine::Impl::enqueue_verify(int m) {
     auto copy = [&](void* dst, const void* src, size_t bytes) {
         ck(cudaMemcpyAsync(dst, src, bytes, cudaMemcpyDeviceToDevice, st), "verify copy");
     };
-    auto linear = [&](const bf16* x, const Fp8& w, bf16* out) {
-        fp8_quantize_activation_f32((const uint16_t*)x, m, w.k, v.act, st);
-        fp8_block_gemv_q(v.act, m, w.k, w.w, w.s, w.n, (uint16_t*)out, st);
+    auto linear_on = [&](const bf16* x, const Fp8& w, bf16* out, float* act, cudaStream_t s) {
+        fp8_quantize_activation_f32((const uint16_t*)x, m, w.k, act, s);
+        fp8_block_gemv_q(act, m, w.k, w.w, w.s, w.n, (uint16_t*)out, s);
     };
-    ck(cudaMemcpyAsync(v.params, v.params_host, m*4*sizeof(int), cudaMemcpyHostToDevice, st), "verify params");
-    if (n_eng) ck(cudaMemcpyAsync(v.eng, v.eng_host, m*v.eng_bytes, cudaMemcpyHostToDevice, st), "verify engram");
+    auto linear = [&](const bf16* x, const Fp8& w, bf16* out) { linear_on(x, w, out, v.act, st); };
+    ck(cudaMemcpyAsync(v.params, v.params_host, (VerifyWorkspace::M*4+1)*sizeof(int), cudaMemcpyHostToDevice, st),
+       "verify params");
+    if (n_eng) {
+        // per table on st_eng, as the step's engram_kv: wait for the rows, copy, dequantize (token by token, rows of
+        // cols ids), the wkv GEMV of all m rows; the engram layer waits for eng_join[li]
+        const int cols = (pack.engram_hash().max_ngram-1)*pack.engram_hash().n_heads;
+        ck(cudaEventRecord(eng_fork, st), "verify engram fork");
+        ck(cudaStreamWaitEvent(st_eng, eng_fork, 0), "verify engram fork wait");
+        for (int li = 0; li < n_eng; ++li) {
+            const auto& y = L[pack.engram_tables()[li].layer];
+            wait_engram_k<<<1, 1, 0, st_eng>>>(eng_flag_dev + li*kEngFlagStride, v.params + VerifyWorkspace::M*4 - 4);
+            ck(cudaGetLastError(), "verify engram wait");
+            const int n16 = int(VerifyWorkspace::TB / 16);
+            engram_rows_k<<<(n16+255)/256, 256, 0, st_eng>>>((const uint4*)(v.veng_host_dev + li*VerifyWorkspace::TB),
+                                                            (uint4*)(v.veng + li*VerifyWorkspace::TB), n16);
+            ck(cudaGetLastError(), "verify engram rows");
+            const uint8_t* tw = v.veng + li*VerifyWorkspace::TB;
+            const uint8_t* ts = tw + size_t(VerifyWorkspace::M)*kEngRows*256;
+            for (int t = 0; t < m; ++t)
+                ops::engram_dequant(tw + size_t(t)*cols*256, ts + size_t(t)*cols*8, cols, v.eng_vals+t*y.eng_wkv.k,
+                                    st_eng);
+            fp8_quantize_activation_f32((const uint16_t*)v.eng_vals, m, y.eng_wkv.k, v.act_eng, st_eng);
+            fp8_block_gemv_q(v.act_eng, m, y.eng_wkv.k, y.eng_wkv.w, y.eng_wkv.s, y.eng_wkv.n,
+                             (uint16_t*)(v.veng_kv + size_t(li)*VerifyWorkspace::M*(kHc+1)*kDim), st_eng);
+            ck(cudaEventRecord(eng_join[li], st_eng), "verify engram join");
+        }
+    }
     for (int t = 0; t < m; ++t) {
         ops::window_index_device(v.params+t*4+1, v.indices+t*(kWindow+kIndexTopK), st);
         ops::embed_device(embed, v.params+t*4, v.h+t*kHc*kDim, st);
@@ -119,24 +181,26 @@ void Engine::Impl::enqueue_verify(int m) {
                 copy(s.score, y.score_state, 2*kHeadDim*sizeof(float));
             }
         }
-        if (is_engram_layer(l)) {
-            const int cols = (pack.engram_hash().max_ngram-1)*pack.engram_hash().n_heads;
-            for (int t = 0; t < m; ++t) {
-                const auto* w = v.eng+t*v.eng_bytes+size_t(eng_i)*kEngRows*(256+8);
-                ops::engram_dequant(w, w+kEngRows*256, cols, v.eng_vals+t*y.eng_wkv.k, st);
-            }
-            linear(v.eng_vals, y.eng_wkv, v.eng_kv);
-            ops::engram_apply(v.h, v.eng_kv, y.eng_qw, y.eng_kw, kNormEps, m, st);
+        if (is_engram_layer(l) && eng_i < n_eng) {
+            ck(cudaStreamWaitEvent(st, eng_join[eng_i], 0), "verify engram join wait");
+            ops::engram_apply(v.h, v.veng_kv + size_t(eng_i)*VerifyWorkspace::M*(kHc+1)*kDim, y.eng_qw, y.eng_kw,
+                              kNormEps, m, st);
             ++eng_i;
         }
+        if (ds) dspark_capture(l, v.h, m, ds_verify_mh(), st);
         kernels::hc_mixes_pre(v.h, m, y.hc_attn_fn, y.hc_attn_scale, y.hc_attn_base, v.mix,
                              v.xa, v.apre, v.apost, v.acomb, st);
         ops::rmsnorm(v.xa, y.attn_norm, v.xa, kDim, kNormEps, m, st);
+        // kv branch on st_kv beside the q branch, as the step's attention (it reads xa only)
+        ck(cudaEventRecord(kv_fork, st), "verify kv fork");
+        ck(cudaStreamWaitEvent(st_kv, kv_fork, 0), "verify kv fork wait");
+        linear_on(v.xa, y.wkv, v.kvv, v.act_kv, st_kv);
+        ops::rmsnorm(v.kvv, y.kv_norm, v.kvv, kHeadDim, kNormEps, m, st_kv);
+        ck(cudaEventRecord(kv_join, st_kv), "verify kv join");
         linear(v.xa, y.wq_a, v.qr);
         ops::rmsnorm(v.qr, y.q_norm, v.qr, kQLora, kNormEps, m, st);
         linear(v.qr, y.wq_b, v.q);
-        linear(v.xa, y.wkv, v.kvv);
-        ops::rmsnorm(v.kvv, y.kv_norm, v.kvv, kHeadDim, kNormEps, m, st);
+        ck(cudaStreamWaitEvent(st, kv_join, 0), "verify kv join wait");
         for (int t = 0; t < m; ++t) {
             const int* p = v.params+4*t;
             const bf16* x = v.xa+t*kDim;
@@ -202,9 +266,10 @@ void Engine::Impl::enqueue_verify(int m) {
                 kernels::sparse_attn_decode(qt, s.ring, nullptr, idx, 1, kWindow, y.sink,
                                             float(std::pow(kHeadDim,-0.5)), ot, st);
             ops::rope_device(ot, kHeads, kHeadDim, rope, p+1, 0, true, st);
-            if (y.wo_a8.w) wo_a_grouped_fp8(ot, y.wo_a8.w, y.wo_a8.s, v.oa+t*kOGroups*kOLora, st);
-            else ops::wo_a_grouped(ot, y.wo_a, v.oa+t*kOGroups*kOLora, st);
+            if (!y.wo_a8.w) ops::wo_a_grouped(ot, y.wo_a, v.oa+t*kOGroups*kOLora, st);
         }
+        // every row at once, the weight read once (each row as wo_a_grouped_fp8 computes it)
+        if (y.wo_a8.w) wo_a_grouped_fp8_rows(v.o, m, y.wo_a8.w, y.wo_a8.s, v.oa, st);
         linear(v.oa, y.wo_b, v.attn_out);
         ops::hc_post(v.attn_out, v.h, v.apost, v.acomb, v.h2, m, st);
         kernels::hc_mixes_pre(v.h2, m, y.hc_ffn_fn, y.hc_ffn_scale, y.hc_ffn_base, v.apre,
@@ -216,26 +281,43 @@ void Engine::Impl::enqueue_verify(int m) {
         ops::to_half_fp8q(v.xf, v.half, m*kDim, st);
         const bool tier = vram && vram->slots() > 0;
         const auto* ram = host && host->experts_dev() ? host->experts_dev()+size_t(l)*kExperts : nullptr;
+        // prefetch, as the step: layer l's guesses (all rows' union) were planned and copied during layer l - 1
+        // not in the eager first window: its thousands of launches fill the launch queue while the GPU waits for the
+        // CPU, and the host thread then holds the driver while the DMA copy thread needs it for the copies the GPU
+        // waits for (a hang at layer 5, laptop); a graph is one launch
+        const bool pf = prefetch && ram && zc_blobs && !v.eager;
         v.db->publish(v.half, ids, w, m, tier ? vram->res_dev()+size_t(l)*kExperts : nullptr, v.selected,
-                      l+1, st, tier ? vram->experts_dev() : nullptr, ram, zc_quota ? zc_quota.get()+l : nullptr);
+                      l+1, st, tier ? vram->experts_dev() : nullptr, ram, zc_quota ? zc_quota.get()+l : nullptr,
+                      nullptr, nullptr, pf && l > 0 ? prefetch->ids(l) : nullptr,
+                      pf && l > 0 ? prefetch->descs(l) : nullptr, pf ? ExpertPrefetch::kMaxGuesses : 0, tail_rank, ssd_rank);
+        if (pf && l+1 < kLayers)
+            prefetch->plan_rows(l+1, v.xf, m, L[l+1].gate_w, L[l+1].gate_bias,
+                                tier ? vram->res_dev()+size_t(l+1)*kExperts : nullptr,
+                                host->experts_dev()+size_t(l+1)*kExperts, zc_blobs.get()+size_t(l+1)*kExperts, st);
+        // the shared expert reads xf only: on st_sh beside the routed experts until the outputs add up
+        ck(cudaEventRecord(sh_fork, st), "verify shared fork");
+        ck(cudaStreamWaitEvent(st_sh, sh_fork, 0), "verify shared fork wait");
+        linear_on(v.xf, y.sh_w1, v.g, v.act_sh, st_sh);
+        linear_on(v.xf, y.sh_w3, v.u, v.act_sh, st_sh);
+        ops::swiglu(v.g, v.u, kSwigluLimit, v.sh_h, m*kMoeInter, st_sh);
+        linear_on(v.sh_h, y.sh_w2, v.sh_out, v.act_sh, st_sh);
+        ck(cudaEventRecord(sh_done, st_sh), "verify shared done");
         ck(cudaMemsetAsync(v.routed, 0, m*kDim*sizeof(float), st), "verify routed");
+        if (pf && l > 0) prefetch->join(l, st);   // the GPU computes the prefetched experts below
         if (tier || ram)
             kernels::exl3_moe_decode((const __half*)v.half, m, v.selected, w, kTopK, v.db->gpu_experts(), v.routed,
                                     vram ? vram->workspace() : zc_workspace.get(), VramExperts::kWorkspaceBytes, st);
-        linear(v.xf, y.sh_w1, v.g); linear(v.xf, y.sh_w3, v.u);
-        ops::swiglu(v.g, v.u, kSwigluLimit, v.sh_h, m*kMoeInter, st);
-        linear(v.sh_h, y.sh_w2, v.sh_out);
         v.db->wait_add(v.routed, m, l+1, st);
+        if (pf && l+1 < kLayers) prefetch->ready(l+1, st);   // the next layer overwrites v.xf, which the guesses read
+        ck(cudaStreamWaitEvent(st, sh_done, 0), "verify shared join");
         ops::add_f32_bf16(v.routed, v.sh_out, v.ffn_out, m*kDim, st);
         ops::hc_post(v.ffn_out, v.h2, v.fpost, v.fcomb, v.h, m, st);
         copy(v.mix, v.fpre, m*kHc*sizeof(float));
     }
     ops::hc_pre(v.h, v.mix, v.final_x, m, st);
     ops::rmsnorm(v.final_x, final_norm, v.final_x, kDim, kNormEps, m, st);
-    for (int t = 0; t < m; ++t) {
-        ops::bf16_linear(v.final_x+t*kDim, nullptr, head, kDim, kVocab, nullptr, v.logits+t*kVocab, st);
-        ops::argmax_logits(v.logits+t*kVocab, v.next+t, st);
-    }
+    ops::bf16_linear_rows(v.final_x, m, head, kDim, kVocab, v.logits, st);   // the head read once (1.3 GB)
+    for (int t = 0; t < m; ++t) ops::argmax_logits(v.logits+t*kVocab, v.next+t, st);
     ck(cudaMemcpyAsync(v.next_host, v.next, m*sizeof(int), cudaMemcpyDeviceToHost, st), "verify next");
     ck(cudaMemcpyAsync(v.logits_host, v.logits, size_t(m)*kVocab*sizeof(float), cudaMemcpyDeviceToHost, st), "verify logits");
     ck(cudaMemcpyAsync(v.routes_host, v.routes, kLayers*VerifyWorkspace::M*kTopK*sizeof(int32_t), cudaMemcpyDeviceToHost, st), "verify routes");
@@ -254,21 +336,27 @@ VerifyResult Engine::Impl::verify(const std::vector<int>& window, int pos, bool 
     v.tokens = window; v.pos = pos; v.m = m;
     tm = Timing{};
     const double begin = now_ms();
-    // Stage hashes from each tentative prefix. Restore formal history even if an I/O read fails.
+    // Stage hashes from each tentative prefix; the rows of all tokens are read beside the first layers.
+    const int cols = n_eng ? (pack.engram_hash().max_ngram-1)*pack.engram_hash().n_heads : 0;
     try {
         for (int t = 0; t < m; ++t) {
             history.push_back(pack.engram_hash().token_map[window[t]]);
             int li = 0;
             for (int l = 0; l < kLayers; ++l)
-                if (is_engram_layer(l)) engram_ids(l, li++, pos+t);
-            engram_read_all();
-            if (n_eng) std::memcpy(v.eng_host+t*v.eng_bytes, eng_host, v.eng_bytes);
+                if (is_engram_layer(l)) {
+                    engram_ids(l, li, pos+t);
+                    std::copy_n(eng_ids[li].data(), cols, v.veng_ids[li].data()+size_t(t)*cols);
+                    ++li;
+                }
             const int params[] = {window[t], pos+t, pos+t+1, (pos+t+1)/2};
             std::copy_n(params, 4, v.params_host+4*t);
         }
     } catch (...) { history.resize(pos); throw; }
     history.resize(pos);
-    tm.engram_ms = now_ms()-begin;
+    if (n_eng) {
+        v.job.rows = m*cols;
+        v.params_host[VerifyWorkspace::M*4] = int(post_engram(v.job));
+    }
     if (vram) tm.vram_swaps = vram->between_steps();
     parity = pos&1;
     tcap1 = cap_of(pos+m, max_seq+1);
@@ -282,6 +370,7 @@ VerifyResult Engine::Impl::verify(const std::vector<int>& window, int pos, bool 
         reused = it != v.graphs.end();
         if (it == v.graphs.end()) {
             cudaGraph_t graph = nullptr;
+            v.eager = false;
             ck(cudaStreamBeginCapture(st, cudaStreamCaptureModeRelaxed), "verify capture");
             try {
                 enqueue_verify(m);
@@ -298,62 +387,68 @@ VerifyResult Engine::Impl::verify(const std::vector<int>& window, int pos, bool 
         executable = it->second;
     }
     v.db->reset();
-    std::atomic<bool> cancel{false};
-    std::exception_ptr worker_error;
-    // The original decode worker is idle. Use a separate doorbell and leave its protocol unchanged.
-    std::thread cpu([&] {
-        for (int l = 0; l < kLayers; ++l) {
-            if (!v.db->wait_published(l+1, cancel)) return;
-            const auto counts = v.db->counts();
-            tm.expert_hits += counts.vram;
-            if (!worker_error) {
-                try {
-                    c10::Half weights[kVerifyMaxTokens*kTopK];
-                    int misses = 0;
-                    for (int i = 0; i < m*kTopK; ++i) {
-                        weights[i] = c10::Half(__half_as_ushort(__float2half_rn(v.db->w()[i])), c10::Half::from_bits());
-                        const int e = v.db->ids()[i];
-                        if (e < 0) continue;
-                        ++misses;
-                        if (host && host->slot_of(l, e) >= 0) ++tm.ram_experts;
-                        else {
-                            ++tm.file_experts;
-                            if (file_pages_missing(l, e)) {
-                                ++tm.ssd_experts;
-                                if (fetch_now) warm_file_expert(l, e);
-                            }
-                        }
-                    }
-                    const double start = now_ms();
-                    if (misses)
-                        // moe_mul1 groups rows by expert before its weight passes. m never exceeds four.
-                        exl3_moe_cpu_forward_raw(L[l].moe_handle, (const at::Half*)v.db->x(), v.db->ids(), weights,
-                                                v.db->y(), m, kTopK, cpu_threads);
-                    else std::fill_n(v.db->y(), m*kDim, 0.0f);
-                    tm.cpu_experts_ms += now_ms()-start;
-                } catch (...) { worker_error = std::current_exception(); }
-            }
-            // Finish the protocol on failure. The caller rejects the entire window after the stream drains.
-            if (worker_error) std::fill_n(v.db->y(), m*kDim, 0.0f);
-            v.db->mark_done(l+1);
-        }
-    });
+    if (prefetch) prefetch->begin_step();   // the device is idle: a new window's layers are copied again
+    // the decode worker computes the window's CPU experts: the job is the window's doorbell and its m rows
+    worker_us = 0;
+    worker_misses = 0;
+    worker_ram = worker_file = worker_ssd = 0;
+    worker_prefetched = 0;
+    worker_skipped = 0;
+    {
+        std::lock_guard<std::mutex> lk(mu);
+        job_db = v.db.get();
+        job_m = m;
+        job_dspark = false;
+        job_cancel = false;
+        ++go;
+    }
+    cv.notify_all();
+    const uint64_t job = go;
+    auto job_end = [&] {
+        std::unique_lock<std::mutex> lk(mu);
+        cv.wait(lk, [&] { return jobs_done >= job; });
+    };
     verify_pending = true;
     verify_failed = true;
     try {
         if (executable) ck(cudaGraphLaunch(executable, st), "verify launch");
-        else enqueue_verify(m);
+        else {
+            v.eager = true;
+            enqueue_verify(m);
+            v.eager = false;
+        }
         ck(cudaStreamSynchronize(st), "verify completion");
     } catch (...) {
-        cancel = true;
-        cpu.join();
+        job_cancel = true;
+        job_end();
         // Release any enqueued wait before workspace destruction. Never commit this failed window.
         v.db->mark_done(kLayers);
         cudaStreamSynchronize(st);
         throw;
     }
-    cpu.join();
-    if (worker_error) std::rethrow_exception(worker_error);
+    job_end();
+    if (n_eng) finish_engram(tm);
+    {
+        std::lock_guard<std::mutex> lk(mu);
+        if (worker_error) {
+            std::exception_ptr e = worker_error;
+            worker_error = nullptr;
+            std::rethrow_exception(e);
+        }
+    }
+    tm.expert_total = m*kLayers*kTopK;
+    tm.expert_hits = tm.expert_total - worker_misses.load();
+    tm.ram_experts = worker_ram.load();
+    tm.file_experts = worker_file.load();
+    tm.ssd_experts = worker_ssd.load();
+    tm.prefetched = worker_prefetched.load();
+    tm.skipped = worker_skipped.load();
+    tm.cpu_experts_ms = worker_us.load() / 1000.0;
+    tm.worker_lead_ms = worker_wake_at.load() - begin;
+    tm.worker_span_ms = worker_end_at.load() - worker_wake_at.load();
+    tm.worker_wait_ms = worker_wait.load();
+    tm.worker_first_wait_ms = worker_first_wait.load();
+    tm.admit_ms = worker_admit.load();
     v.warmed = true;
     VerifyResult result;
     result.graph_reused = reused;
@@ -363,9 +458,8 @@ VerifyResult Engine::Impl::verify(const std::vector<int>& window, int pos, bool 
         for (int t = 0; t < m; ++t)
             result.logits[t].assign(v.logits_host+t*kVocab, v.logits_host+(t+1)*kVocab);
     }
-    tm.expert_total = m*kLayers*kTopK;
     tm.total_ms = now_ms()-begin;
-    tm.gpu_ms = tm.total_ms-tm.engram_ms;
+    tm.gpu_ms = tm.total_ms;   // the engram rows are read beside the first layers
     verify_failed = false;
     return result;
 }
@@ -397,12 +491,14 @@ void Engine::Impl::commit_verify(int keep) {
     ck(cudaStreamSynchronize(st), "verify commit");
     for (int t = 0; t < keep; ++t) history.push_back(pack.engram_hash().token_map[v.tokens[t]]);
     lg.assign(v.logits_host+(keep-1)*kVocab, v.logits_host+keep*kVocab);
-    if (vram) {
+    if (ds) dspark_pend(ds_verify_mh(), keep, v.pos);   // the kept rows' main_hiddens feed the next draft
+    if (vram || (host && host->reserve() > 0)) {
         int32_t row[kLayers*kTopK];
         for (int t = 0; t < keep; ++t) {
             for (int l = 0; l < kLayers; ++l)
                 std::copy_n(v.routes_host+(l*VerifyWorkspace::M+t)*kTopK, kTopK, row+l*kTopK);
-            vram->count(row, kTopK);
+            if (vram) vram->count(row, kTopK);
+            if (host && host->reserve() > 0) host->end_step(row, kTopK);   // publish the window's reads, record uses
         }
     }
     // Step reconstructs its index list and candidate mask. No tentative row uses its scratch.

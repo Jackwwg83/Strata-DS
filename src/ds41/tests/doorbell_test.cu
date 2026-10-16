@@ -172,5 +172,91 @@ int main() {
         cudaStreamDestroy(s);
         for (int r = 0; r < kRounds; ++r) { delete dx[r]; delete dids[r]; delete dw[r]; delete dout[r]; }
     }
+    // 4. upstream's route tail skip (tail_rank 4: ranks 4 and 5 of 0..5). Experts with id % 3 == 0 are resident.
+    //    token 0: 1 2 4 5 7 8      token 1: 11 13 14 16 5 18
+    //    7 (rank 4) and 8 (rank 5) are missed and every token routes them low: skipped. 5 is rank 4 in token 1 but rank 3
+    //    in token 0: kept for both. 18 (rank 5) is resident: a VRAM hit, never skipped.
+    {
+        const int m = 2;
+        ExpertDoorbell db(m, kTopK, kDim);
+        std::vector<int32_t> ids = {1, 2, 4, 5, 7, 8, 11, 13, 14, 16, 5, 18};
+        std::vector<int32_t> res(kExperts, -1);
+        for (int i = 0; i < kExperts; i += 3) res[i] = 100 + i;
+        Dev<uint16_t> dx(std::vector<uint16_t>(m * kDim, 0));
+        Dev<int32_t> did(ids), dres(res), sel(m * kTopK);
+        Dev<float> dw(std::vector<float>(m * kTopK, 0.5f)), dout(std::vector<float>(m * kDim, 0.0f));
+        cudaStream_t s;
+        ck(cudaStreamCreateWithFlags(&s, cudaStreamNonBlocking), "stream");
+        std::vector<int32_t> mids;
+        ExpertDoorbell::Counts counts{};
+        std::atomic<bool> stop{false};
+        std::thread th([&] {
+            if (!db.wait_published(1, stop)) return;
+            mids.assign(db.ids(), db.ids() + m * kTopK);
+            counts = db.counts();
+            std::fill_n(db.y(), m * kDim, 0.0f);
+            db.mark_done(1);
+        });
+        db.publish(dx.p, did.p, dw.p, m, dres.p, sel.p, 1, s, nullptr, nullptr, nullptr, nullptr, nullptr, nullptr,
+                   nullptr, 0, 4);
+        db.wait_add(dout.p, m, 1, s);
+        ck(cudaStreamSynchronize(s), "tail skip");
+        th.join();
+        const std::vector<int32_t> want = {1, 2, 4, 5, -1, -1, 11, 13, 14, 16, 5, -1};
+        v.check(mids == want, "tail skip: the low-ranked misses go to neither the CPU nor the GPU; a shared expert ranked "
+                              "higher by another token and a resident one stay");
+        v.check(counts.skipped == 2 && counts.vram == 1 && counts.cpu == 9,
+                "tail skip counts: 2 skipped, 1 VRAM hit, 9 CPU uses");
+        cudaStreamDestroy(s);
+    }
+    // 5. the SSD tail skip (ssd_rank 3, no VRAM tier): experts with an even id are in the RAM tier.
+    //    token 0: 1 2 4 5 7 8      token 1: 11 13 14 16 5 19
+    //    5 (best rank 3, odd), 7 (rank 4, odd) and 19 (rank 5, odd) come from the SSD and are routed low: skipped, 5 in
+    //    both tokens. 8 (rank 5) is in RAM: kept. 1, 11, 13 are odd but ranked 0..2: kept.
+    {
+        const int m = 2;
+        ExpertDoorbell db(m, kTopK, kDim);
+        std::vector<int32_t> ids = {1, 2, 4, 5, 7, 8, 11, 13, 14, 16, 5, 19};
+        std::vector<strata::ds41::kernels::Exl3Expert> ram(kExperts);
+        for (int i = 0; i < kExperts; i += 2) ram[i].w1.trellis = reinterpret_cast<const uint16_t*>(uintptr_t(4096));
+        Dev<strata::ds41::kernels::Exl3Expert> dram(ram);
+        Dev<uint16_t> dx(std::vector<uint16_t>(m * kDim, 0));
+        Dev<int32_t> did(ids), sel(m * kTopK);
+        Dev<float> dw(std::vector<float>(m * kTopK, 0.5f)), dout(std::vector<float>(m * kDim, 0.0f));
+        cudaStream_t s;
+        ck(cudaStreamCreateWithFlags(&s, cudaStreamNonBlocking), "stream");
+        std::vector<int32_t> mids;
+        ExpertDoorbell::Counts counts{};
+        std::atomic<bool> stop{false};
+        std::thread th([&] {
+            if (!db.wait_published(1, stop)) return;
+            mids.assign(db.ids(), db.ids() + m * kTopK);
+            counts = db.counts();
+            std::fill_n(db.y(), m * kDim, 0.0f);
+            db.mark_done(1);
+        });
+        db.publish(dx.p, did.p, dw.p, m, nullptr, sel.p, 1, s, nullptr, dram.p, nullptr, nullptr, nullptr, nullptr,
+                   nullptr, 0, 0, 3);
+        db.wait_add(dout.p, m, 1, s);
+        ck(cudaStreamSynchronize(s), "ssd tail skip");
+        th.join();
+        const std::vector<int32_t> want = {1, 2, 4, -1, -1, 8, 11, 13, 14, 16, -1, -1};
+        v.check(mids == want, "ssd tail skip: low-ranked experts outside RAM are left out; those in RAM or ranked high stay");
+        v.check(counts.skipped == 4 && counts.cpu == 8, "ssd tail skip counts: 4 skipped, 8 CPU uses");
+        cudaStreamDestroy(s);
+    }
+    // 6. the default skip ranks: tail 4 and SSD 3 with a VRAM tier under 90% of the experts; both off at 90% or
+    //    without a VRAM tier; the env values win, and DS41_ROUTE_TAIL_SKIP=0 also turns the SSD default off.
+    {
+        using strata::ds41::skip_ranks;
+        auto is = [](strata::ds41::SkipRanks r, int t, int s) { return r.tail == t && r.ssd == s; };
+        v.check(is(skip_ranks(nullptr, nullptr, true, 0.11), 4, 3), "skip ranks: defaults tail 4, SSD 3");
+        v.check(is(skip_ranks(nullptr, nullptr, true, 0.90), 0, 0), "skip ranks: off at 90% cached");
+        v.check(is(skip_ranks(nullptr, nullptr, false, 0.0), 0, 0), "skip ranks: off without a VRAM tier");
+        v.check(is(skip_ranks("0", nullptr, true, 0.11), 0, 0), "skip ranks: tail 0 also turns the SSD default off");
+        v.check(is(skip_ranks(nullptr, "0", true, 0.11), 4, 0), "skip ranks: SSD 0 keeps the tail skip");
+        v.check(is(skip_ranks("5", "2", false, 0.0), 5, 2), "skip ranks: env values win");
+        v.check(is(skip_ranks("6", "-1", true, 0.11), 0, 0), "skip ranks: out of range is off");
+    }
     return v.finish();
 }

@@ -51,6 +51,39 @@ __global__ void wo_a_fp8_k(const bf16* o, const uint8_t* w, const uint8_t* scale
     if (lane == 0) y[row] = __float2bfloat16_rn(acc);
 }
 
+// wo_a_fp8_k for M rows: the same lanes and order per row, each weight byte and scale loaded once for all rows
+template <int M>
+__global__ void wo_a_fp8_rows_k(const bf16* o, const uint8_t* w, const uint8_t* scale, bf16* y) {
+    const int row = blockIdx.x * (blockDim.x / 32) + (threadIdx.x >> 5);
+    const int lane = threadIdx.x & 31;
+    if (row >= kRows) return;
+    const bf16* x = o + (row / kOLora) * kIn;
+    const uint8_t* wr = w + (int64_t) row * kIn;
+    const uint8_t* sr = scale + (row / kBlock) * (kIn / kBlock);
+    float acc[M];
+#pragma unroll
+    for (int t = 0; t < M; ++t) acc[t] = 0.0f;
+    for (int i = lane; i < kIn; i += kUnroll * 32) {
+        uint8_t wv[kUnroll], sv[kUnroll];
+#pragma unroll
+        for (int u = 0; u < kUnroll; ++u) {
+            wv[u] = wr[i + 32 * u];
+            sv[u] = sr[i / kBlock + u];
+        }
+#pragma unroll
+        for (int u = 0; u < kUnroll; ++u) {
+            const float d = deq(wv[u], sv[u]);
+#pragma unroll
+            for (int t = 0; t < M; ++t) acc[t] += __bfloat162float(x[t * kHeads * kHeadDim + i + 32 * u]) * d;
+        }
+    }
+#pragma unroll
+    for (int t = 0; t < M; ++t) {
+        for (int off = 16; off > 0; off >>= 1) acc[t] += __shfl_down_sync(0xffffffffu, acc[t], off);
+        if (lane == 0) y[t * kRows + row] = __float2bfloat16_rn(acc[t]);
+    }
+}
+
 __global__ void dequant_k(const uint8_t* w, const uint8_t* scale, bf16* out) {
     const int64_t i = (int64_t) blockIdx.x * blockDim.x + threadIdx.x;
     if (i >= (int64_t) kRows * kIn) return;
@@ -67,6 +100,21 @@ void check(cudaError_t e, const char* what) {
 void wo_a_grouped_fp8(const bf16* o, const uint8_t* w, const uint8_t* scale, bf16* y, cudaStream_t stream) {
     wo_a_fp8_k<<<kRows / 8, 256, 0, stream>>>(o, w, scale, y);
     check(cudaGetLastError(), "wo_a_grouped_fp8");
+}
+
+void wo_a_grouped_fp8_rows(const bf16* o, int m, const uint8_t* w, const uint8_t* scale, bf16* y, cudaStream_t stream) {
+    switch (m) {
+        case 1: wo_a_fp8_rows_k<1><<<kRows / 8, 256, 0, stream>>>(o, w, scale, y); break;
+        case 2: wo_a_fp8_rows_k<2><<<kRows / 8, 256, 0, stream>>>(o, w, scale, y); break;
+        case 3: wo_a_fp8_rows_k<3><<<kRows / 8, 256, 0, stream>>>(o, w, scale, y); break;
+        case 4: wo_a_fp8_rows_k<4><<<kRows / 8, 256, 0, stream>>>(o, w, scale, y); break;
+        case 5: wo_a_fp8_rows_k<5><<<kRows / 8, 256, 0, stream>>>(o, w, scale, y); break;
+        case 6: wo_a_fp8_rows_k<6><<<kRows / 8, 256, 0, stream>>>(o, w, scale, y); break;
+        case 7: wo_a_fp8_rows_k<7><<<kRows / 8, 256, 0, stream>>>(o, w, scale, y); break;
+        case 8: wo_a_fp8_rows_k<8><<<kRows / 8, 256, 0, stream>>>(o, w, scale, y); break;
+        default: throw std::invalid_argument("wo_a_grouped_fp8_rows: m outside 1..8");
+    }
+    check(cudaGetLastError(), "wo_a_grouped_fp8_rows");
 }
 
 void dequant_wo_a(const uint8_t* w, const uint8_t* scale, bf16* out, cudaStream_t stream) {

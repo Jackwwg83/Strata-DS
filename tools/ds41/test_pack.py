@@ -154,6 +154,71 @@ class PackTest(unittest.TestCase):
             self.assertTrue(os.path.exists(os.path.join(self.out, f)))
 
 
+class MtpExpertsTest(unittest.TestCase):
+    """DSpark's routed experts (mtp.*) from exllamav3/requant_mtp_part*.safetensors into mtp_experts.bin."""
+
+    def setUp(self):
+        self.tmp = tempfile.TemporaryDirectory()
+        self.src = os.path.join(self.tmp.name, "src")
+        self.out = os.path.join(self.tmp.name, "pack")
+        os.makedirs(os.path.join(self.src, "exllamav3"))
+        write_checkpoint(self.src)
+        P.build_pack(self.src, self.out, n_layers=2, n_experts=3)
+        self.truth = {}
+        parts = [{}, {}]
+        for S in range(2):
+            for e in range(3):
+                for w, (tr, su, sv) in SHAPES[3].items():
+                    base = f"mtp.{S}.ffn.experts.{e}.{w}."
+                    for k, (part, t) in enumerate((("trellis", torch.randint(-32768, 32767, tr, dtype=torch.int16)),
+                                                   ("suh", torch.randn(su).half()), ("svh", torch.randn(sv).half()),
+                                                   ("mul1", torch.tensor(-2082680531, dtype=torch.int32)))):
+                        parts[(S + e + k) % 2][base + part] = t
+                        self.truth[base + part] = t
+            # requantized attention lives in the same files and is not an expert
+            parts[S][f"mtp.{S}.attn.wkv.trellis"] = torch.zeros(320, 32, 48, dtype=torch.int16)
+        parts[0]["__align_pad__.requant_mtp_part00.0"] = torch.zeros(60, dtype=torch.uint8)
+        for k in range(2):
+            save_file(parts[k], os.path.join(self.src, "exllamav3", f"requant_mtp_part0{k}.safetensors"))
+
+    def tearDown(self):
+        self.tmp.cleanup()
+
+    def test_every_mtp_expert_component_round_trips(self):
+        n = P.add_mtp_experts(self.src, self.out, n_stages=2, n_experts=3)
+        self.assertEqual(n, 6)
+        rows = P.read_experts_txt(os.path.join(self.out, "mtp_experts.txt"))
+        self.assertEqual(sorted(rows), [(S, e) for S in range(2) for e in range(3)])
+        blob = np.fromfile(os.path.join(self.out, "mtp_experts.bin"), dtype=np.uint8)
+        for (S, e), r in rows.items():
+            self.assertEqual(r["offset"] % P.EXPERT_ALIGN, 0)
+            self.assertEqual(r["bits"], {"w1": 3, "w3": 3, "w2": 3})
+            for comp, (coff, cnb) in r["components"].items():
+                w, part = comp.split(".")
+                want = self.truth[f"mtp.{S}.ffn.experts.{e}.{w}.{part}"].contiguous().reshape(-1).view(torch.uint8)
+                a = r["offset"] + coff
+                np.testing.assert_array_equal(blob[a:a + cnb], want.numpy().reshape(-1), err_msg=f"{S}.{e}.{comp}")
+
+    def test_the_pack_stays_finished_and_records_the_mtp_experts(self):
+        experts = os.path.join(self.out, "experts.bin")
+        before = os.stat(experts).st_mtime_ns
+        P.add_mtp_experts(self.src, self.out, n_stages=2, n_experts=3)
+        self.assertEqual(os.stat(experts).st_mtime_ns, before)
+        info = open(os.path.join(self.out, "pack_info.txt")).read().splitlines()
+        self.assertEqual(info[-1], "finished 1")
+        self.assertIn("mtp_stages 2", info)
+        self.assertIn("mtp_experts 3", info)
+        self.assertIn(f"mtp_expert_bytes {os.path.getsize(os.path.join(self.out, 'mtp_experts.bin'))}", info)
+        P.add_mtp_experts(self.src, self.out, n_stages=2, n_experts=3)   # again: replaces, does not repeat
+        info = open(os.path.join(self.out, "pack_info.txt")).read().splitlines()
+        self.assertEqual(sum(l.startswith("mtp_stages") for l in info), 1)
+
+    def test_needs_a_finished_pack(self):
+        os.remove(os.path.join(self.out, "pack_info.txt"))
+        with self.assertRaises(SystemExit):
+            P.add_mtp_experts(self.src, self.out, n_stages=2, n_experts=3)
+
+
 class EngramLocationTest(unittest.TestCase):
     """Engram tables in engrams/*.safetensors (the 3bpw pack) or in a shard of the index (SAGE 1.59bpw)."""
 

@@ -1,0 +1,7 @@
+{"test": "gpu_copies", "bytes": 268435456, "h2d_GBps": 28.9, "d2h_GBps": 28.6, "gpu_mem_GBps": 780.7}
+{"test": "gpu_copies", "bytes": 7340032, "h2d_GBps": 28.5, "d2h_GBps": 28.3, "gpu_mem_GBps": 2094.8}
+{"test": "ram", "threads": 16, "gib": 8, "read_gbps": 59.88, "copy_gbps_rw": 37.82, "sink": 0}
+{"test": "ram", "threads": 32, "gib": 8, "read_gbps": 59.24, "copy_gbps_rw": 37.27, "sink": 0}
+{"test": "ssd", "threads": 1, "expert_bytes": 7340032, "GBps": 3.21, "experts_per_s": 437.0, "ms_per_expert_at_this_depth": 2.29}
+{"test": "ssd", "threads": 4, "expert_bytes": 7340032, "GBps": 5.35, "experts_per_s": 728.4, "ms_per_expert_at_this_depth": 5.49}
+{"test": "ssd", "threads": 8, "expert_bytes": 7340032, "GBps": 5.35, "experts_per_s": 729.2, "ms_per_expert_at_this_depth": 10.97}

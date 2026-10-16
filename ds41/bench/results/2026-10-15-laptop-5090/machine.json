@@ -1,0 +1,18 @@
+{
+ "date_utc": "2026-10-15T05:14:51Z",
+ "machine": "MECHREVO CANGLONG Series",
+ "cpu_model": "AMD Ryzen 9 9955HX3D 16-Core Processor",
+ "cpu_logical": 32,
+ "mem_total_gib": 60.5,
+ "swap": "/swap/swapfile 60.5G   0;/dev/zram0     60.5G 100;",
+ "swappiness": "150",
+ "gpu": "NVIDIA GeForce RTX 5090 Laptop GPU, 24463 MiB, 610.57.04, [N/A], 5, 16",
+ "nvidia_powerd (Dynamic Boost)": "active",
+ "cuda": "Cuda compilation tools, release 13.3, V13.3.73",
+ "kernel": "7.1.9-arch1-2",
+ "os": "Omarchy",
+ "ssd": "nvme0n1 YMTC PC411-2048GB-B  1.9T",
+ "source_commit": "adad2779 for ds41_generate (length matrix, short prompts); ds41_serve (API) also had 7b79a3e0 (prefetch entries in verify windows), which changes no step() path",
+ "model": "vcruz305/DSV4.1-Flash-SAGE-EXL3-1.59bpw @ eca94a388a70841858feed8f057a9862e897aba4",
+ "gpu_fields": "name, memory, driver, power limit (N/A on this laptop), PCIe gen max, PCIe width max"
+}

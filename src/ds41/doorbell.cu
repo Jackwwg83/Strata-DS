@@ -1,6 +1,7 @@
 // src/ds41/doorbell.cu - see include/strata/ds41/doorbell.hpp.
 #include "strata/ds41/doorbell.hpp"
 
+#include <cstdlib>
 #include <cstring>
 #include <stdexcept>
 #include <string>
@@ -35,26 +36,52 @@ __global__ void publish_k(const uint4* __restrict__ x, int n_x16, const int32_t*
                           const int* quota, kernels::Exl3Expert* call, ExpertDoorbell::Counts* counts,
                           const ExpertBlob* blobs, uint8_t* staging, size_t stride,
                           ExpertCopy* jobs, int* copy_count, const int32_t* pf_ids,
-                          const kernels::Exl3Expert* pf_desc, int pf_n) {
+                          const kernels::Exl3Expert* pf_desc, int pf_n, int tail_rank, int ssd_rank) {
     for (int i = threadIdx.x; i < n_x16; i += blockDim.x) mx[i] = x[i];
-    // At most 48 route uses in decode/verify. One lane makes the prefix rule explicit.
-    if (threadIdx.x == 0) {
+    // At most 48 route uses in decode/verify. Warp 0 takes one route use per lane, whole tokens per pass (5 tokens
+    // of 6 uses), so the dependent loads (ids, res, descriptors) of all uses overlap; one lane for all of them took
+    // 4.8-6.0 us, one lane each 3.0-3.2 us (RTX 5090 Laptop). The zero-copy prefix rule (the first q eligible misses
+    // of a token, in route order) and the copy job order come from ballots in route order.
+    if (threadIdx.x < 32) {
+        const int lane = threadIdx.x;
         ExpertDoorbell::Counts c{};
         const bool descriptors = vram != nullptr || ram != nullptr;
         const int q = quota ? max(0, min(*quota, topk)) : 0;
-        for (int t = 0; t < m; ++t) {
-            int used = 0;
-            for (int j = 0; j < topk; ++j) {
-                const int i = t * topk + j;
-                const int32_t id = ids[i];
-                const int32_t slot = (res && id >= 0) ? res[id] : -1;
-                const bool hit = slot >= 0;
-                int pf = -1;   // a miss the prefetch already copied: the GPU computes it from the buffer
-                if (!hit && id >= 0 && pf_ids)
-                    for (int k = 0; k < pf_n && pf < 0; ++k)
-                        if (pf_ids[k] == id) pf = k;
-                const bool zc = !hit && pf < 0 && id >= 0 && ram && used < q && ram[id].w1.trellis;
-                mids[i] = (id < 0 || hit || zc || pf >= 0) ? -1 : id;
+        const int per_pass = 32 / topk;
+        const int t_of = lane / topk, j_of = lane % topk;
+        for (int t0 = 0; t0 < m; t0 += per_pass) {
+            const int t = t0 + t_of;
+            const bool live = t_of < per_pass && t < m;
+            const int i = t * topk + j_of;
+            const int32_t id = live ? ids[i] : -1;
+            const int32_t slot = (live && res && id >= 0) ? res[id] : -1;
+            const bool hit = slot >= 0;
+            // upstream's route tail skip: the best rank any token of the call gives this expert (lanes of the same id)
+            // ssd_rank: the same for experts in neither VRAM nor the RAM tier (their weights come from the SSD)
+            bool skip = false;
+            if ((tail_rank > 0 || ssd_rank > 0) && m <= per_pass) {   // every use in this one pass
+                const unsigned same = __match_any_sync(0xffffffffu, (live && id >= 0) ? id : -1 - lane);
+                int best = live ? j_of : 99;
+                for (int s = 0; s < 32; ++s) {
+                    const int r = __shfl_sync(0xffffffffu, best, s);
+                    if ((same >> s) & 1u) best = min(best, r);
+                }
+                const bool in_ram = live && id >= 0 && ram && ram[id].w1.trellis;
+                skip = live && id >= 0 && !hit &&
+                       ((tail_rank > 0 && best >= tail_rank) || (ssd_rank > 0 && !in_ram && best >= ssd_rank));
+            }
+            int pf = -1;   // a miss the prefetch already copied: the GPU computes it from the buffer
+            if (live && !hit && !skip && id >= 0 && pf_ids)
+                for (int k = 0; k < pf_n && pf < 0; ++k)
+                    if (pf_ids[k] == id) pf = k;
+            const bool eligible = live && !hit && !skip && pf < 0 && id >= 0 && ram && ram[id].w1.trellis;
+            const unsigned below = (1u << lane) - 1;
+            const unsigned token_lanes = ((1u << topk) - 1) << (t_of * topk);
+            const unsigned eligible_lanes = __ballot_sync(0xffffffffu, eligible);   // every lane votes
+            const bool zc = eligible && __popc(eligible_lanes & below & token_lanes) < q;
+            const unsigned zc_lanes = __ballot_sync(0xffffffffu, zc);
+            if (live) {
+                mids[i] = (id < 0 || hit || zc || pf >= 0 || skip) ? -1 : id;
                 mw[i] = w[i];
                 if (gpu_sel) gpu_sel[i] = descriptors ? ((hit || zc || pf >= 0) ? i : -1) : slot;
                 if (descriptors) {
@@ -63,20 +90,23 @@ __global__ void publish_k(const uint4* __restrict__ x, int n_x16, const int32_t*
                         const ExpertBlob blob = blobs[id];
                         const auto* src = reinterpret_cast<const uint8_t*>(call[i].w1.trellis) - blob.first_trellis;
                         auto* dst = staging + size_t(i) * stride;
-                        jobs[c.zero_copy] = {src, dst, blob.bytes};
+                        jobs[c.zero_copy + __popc(zc_lanes & below)] = {src, dst, blob.bytes};
                         rebase(call[i].w1, src, dst);
                         rebase(call[i].w3, src, dst);
                         rebase(call[i].w2, src, dst);
                     }
                 }
-                if (hit) ++c.vram;
-                else if (pf >= 0) ++c.prefetched;
-                else if (zc) { ++used; ++c.zero_copy; }
-                else if (id >= 0) ++c.cpu;
             }
+            c.vram += __popc(__ballot_sync(0xffffffffu, hit));
+            c.prefetched += __popc(__ballot_sync(0xffffffffu, !hit && pf >= 0));
+            c.zero_copy += __popc(zc_lanes);
+            c.cpu += __popc(__ballot_sync(0xffffffffu, live && !hit && !skip && pf < 0 && !zc && id >= 0));
+            c.skipped += __popc(__ballot_sync(0xffffffffu, skip));
         }
-        *counts = c;
-        if (copy_count) *copy_count = c.zero_copy;
+        if (lane == 0) {
+            *counts = c;
+            if (copy_count) *copy_count = c.zero_copy;
+        }
     }
     __threadfence_system();   // Every thread publishes its writes before seq.
     __syncthreads();
@@ -103,7 +133,7 @@ __global__ void wait_add_k(const volatile uint32_t* done, uint32_t round, const 
 }  // namespace
 
 ExpertDoorbell::ExpertDoorbell(int max_m, int topk, int dim) : max_m_(max_m), topk_(topk), dim_(dim) {
-    if (max_m < 1 || topk < 1 || dim < 8 || dim % 8 != 0) throw std::invalid_argument("ExpertDoorbell: bad shape");
+    if (max_m < 1 || topk < 1 || topk > 31 || dim < 8 || dim % 8 != 0) throw std::invalid_argument("ExpertDoorbell: bad shape");
     const size_t sel = (size_t) max_m * topk, rows = (size_t) max_m * dim;
     const size_t o_seq = 0, o_done = kAlign, o_x = 2 * kAlign;
     const size_t o_ids = o_x + up(rows * 2), o_w = o_ids + up(sel * 4), o_y = o_w + up(sel * 4);
@@ -144,7 +174,7 @@ void ExpertDoorbell::publish(const uint16_t* x, const int32_t* ids, const float*
                              int32_t* gpu_sel, uint32_t round, cudaStream_t stream,
                              const kernels::Exl3Expert* vram, const kernels::Exl3Expert* ram, const int* quota,
                              ExpertStaging* stage, const ExpertBlob* blobs, const int32_t* pf_ids,
-                             const kernels::Exl3Expert* pf_desc, int pf_n) {
+                             const kernels::Exl3Expert* pf_desc, int pf_n, int tail_rank, int ssd_rank) {
     if (m < 1 || m > max_m_) throw std::invalid_argument("ExpertDoorbell::publish: bad m");
     if (res && ram && !vram) throw std::invalid_argument("ExpertDoorbell::publish: missing VRAM descriptors");
     if (stage && (!blobs || stage->capacity() < m * topk_))
@@ -153,7 +183,7 @@ void ExpertDoorbell::publish(const uint16_t* x, const int32_t* ids, const float*
                                      d_ids_, d_w_, d_seq_, round, vram, ram, quota, gpu_experts_, d_counts_,
                                      blobs, stage ? stage->data() : nullptr, stage ? stage->stride() : 0,
                                      stage ? stage->jobs() : nullptr, stage ? stage->count() : nullptr, pf_ids,
-                                     pf_desc, pf_n);
+                                     pf_desc, pf_n, tail_rank, ssd_rank);
     ck(cudaGetLastError(), "publish");
 }
 
@@ -177,5 +207,14 @@ bool ExpertDoorbell::wait_published(uint32_t round, const std::atomic<bool>& sto
 }
 
 void ExpertDoorbell::mark_done(uint32_t round) { __atomic_store_n(h_done_, round, __ATOMIC_RELEASE); }
+
+SkipRanks skip_ranks(const char* route_env, const char* ssd_env, bool has_vram, double cached_share) {
+    auto valid = [](int r) { return r > 0 && r < 6 ? r : 0; };
+    const bool on = has_vram && cached_share < 0.90;
+    SkipRanks r;
+    r.tail = valid(route_env ? std::atoi(route_env) : (on ? 4 : 0));
+    r.ssd = valid(ssd_env ? std::atoi(ssd_env) : (r.tail ? 3 : 0));
+    return r;
+}
 
 }  // namespace strata::ds41

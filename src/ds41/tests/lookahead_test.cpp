@@ -1,7 +1,9 @@
 // src/ds41/tests/lookahead_test.cpp - the router lookahead: cpu_router_topk picks the experts a double-precision
 // reference picks (except where two scores tie within 1e-4 at the k-th place), and RouterLookahead warms the next
-// layer's predicted experts and counts the ones the layer then used.
+// layer's (or, ahead 2, the one after's) predicted experts, hands the accepted ones to its fetch callback outside the residency lock, and counts
+// the ones the layer then used.
 #include "strata/ds41/lookahead.hpp"
+#include "strata/ds41/residency.hpp"
 
 #include <algorithm>
 #include <atomic>
@@ -59,6 +61,20 @@ int main() {
     std::vector<float> bias(n);
     for (auto& v : bias) v = nd(g) * 0.05f;
 
+    // 0. speed: the prediction must finish within a layer (about 1.4 ms per layer on the laptop with the adaptive
+    // RAM tier); a single running sum took about 1.6 ms. Loose bound, printed for the record.
+    {
+        std::vector<uint16_t> x(dim);
+        for (auto& v : x) v = to_f16(nd(g));
+        int32_t ids[k];
+        const auto t0 = std::chrono::steady_clock::now();
+        const int reps = 20;
+        for (int r = 0; r < reps; ++r) cpu_router_topk(x.data(), w.data(), bias.data(), n, dim, k, ids);
+        const double ms = std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - t0).count() / reps;
+        std::printf("cpu_router_topk %.3f ms per call (384 x 5120)\n", ms);
+        check(ms < 1.0, "the router prediction runs in under 1 ms, took " + std::to_string(ms) + " ms");
+    }
+
     // 1. selection against a double-precision reference
     int exact = 0, near_tie = 0;
     const int trials = 50;
@@ -115,6 +131,61 @@ int main() {
     const auto st = la.take_stats();
     check(st.predicted == k && st.warmed == even && st.useful == even, "stats: predicted, warmed, useful");
     la.post(2, x.data());   // the last layer: nothing to predict
+
+    // 3. the fetch callback: once per prediction, the experts warm() accepted, in order, with the residency lock free
+    //    (HostExperts::prefetch takes its own lock, which end_step holds while it takes the residency lock)
+    {
+        std::vector<int32_t> got;
+        int calls = 0, layer = -1;
+        bool unlocked = false;
+        RouterLookahead lf(ws, bs, n, dim, k, [](int, int e) { return e % 2 == 0; },
+                           [&](int l, const int32_t* ids, int m) {
+                               const bool free = residency_mutex().try_lock();
+                               if (free) residency_mutex().unlock();
+                               std::lock_guard<std::mutex> lk(mu);
+                               ++calls;
+                               layer = l;
+                               unlocked = free;
+                               got.assign(ids, ids + m);
+                           });
+        lf.post(0, x.data());
+        for (int i = 0; i < 200; ++i) {
+            { std::lock_guard<std::mutex> lk(mu); if (calls) break; }
+            std::this_thread::sleep_for(std::chrono::milliseconds(10));
+        }
+        std::lock_guard<std::mutex> lk(mu);
+        std::vector<int32_t> want;
+        for (int i = 0; i < k; ++i)
+            if (pred[i] % 2 == 0) want.push_back(pred[i]);
+        if (want.empty()) check(calls == 0, "fetch: not called when warm() accepted nothing");
+        else check(calls == 1 && layer == 1 && got == want, "fetch: once, layer 1, the accepted ids in order");
+        if (calls) check(unlocked, "fetch: called without the residency lock");
+    }
+    // 4. ahead 2: layer l's input predicts layer l+2 (a longer lead for the reads, at a lower recall)
+    {
+        std::vector<int32_t> got;
+        int calls = 0, layer = -1;
+        RouterLookahead l2(ws, bs, n, dim, k, [](int, int) { return true; },
+                           [&](int l, const int32_t* ids, int m) {
+                               std::lock_guard<std::mutex> lk(mu);
+                               ++calls;
+                               layer = l;
+                               got.assign(ids, ids + m);
+                           },
+                           2);
+        int32_t want[k];
+        cpu_router_topk(x.data(), ws[2].data(), bs[2].data(), n, dim, k, want);
+        l2.post(1, x.data());   // layer 3 does not exist: nothing
+        l2.post(0, x.data());
+        for (int i = 0; i < 200; ++i) {
+            { std::lock_guard<std::mutex> lk(mu); if (calls) break; }
+            std::this_thread::sleep_for(std::chrono::milliseconds(10));
+        }
+        std::this_thread::sleep_for(std::chrono::milliseconds(20));
+        std::lock_guard<std::mutex> lk(mu);
+        check(calls == 1 && layer == 2 && got == std::vector<int32_t>(want, want + k),
+              "ahead 2: layer 0's input predicts layer 2, once (layer 1 has no layer 3)");
+    }
     std::printf("RESULT %s\n", failures ? "fail" : "pass");
     return failures ? 1 : 0;
 }

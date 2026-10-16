@@ -17,5 +17,12 @@ void hc_init();
 ///   pre  [m][4], post [m][4], comb [m][16] f32 = the new coefficients from x  (ops::hc_mixes, Sinkhorn 20 steps)
 void hc_mixes_pre(const __nv_bfloat16* x, int m, const float* fn, const float* scale, const float* base,
                   const float* pre_in, __nv_bfloat16* y, float* pre, float* post, float* comb, cudaStream_t stream);
+/// hc_mixes_pre for one token with the coefficients off the stream: the partial sums and y on `stream`; pre, post
+/// and comb on `side` (forked with `fork` after the partial sums), complete at `done`. Wait for `done` before reading
+/// pre, post or comb, and before the next hc_mixes_pre call (the partial sums' scratch is shared). The same
+/// arithmetic as hc_mixes_pre.
+void hc_mixes_pre_split(const __nv_bfloat16* x, const float* fn, const float* scale, const float* base,
+                        const float* pre_in, __nv_bfloat16* y, float* pre, float* post, float* comb,
+                        cudaStream_t stream, cudaStream_t side, cudaEvent_t fork, cudaEvent_t done);
 
 }  // namespace strata::ds41::kernels

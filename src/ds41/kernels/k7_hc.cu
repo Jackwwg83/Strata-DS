@@ -177,26 +177,24 @@ __device__ __forceinline__ void finish_coefficients(
 // Launch ordering on the supplied stream publishes ALL partials before this
 // stage. There is no cross-CTA spin, fence, atomic, or in-kernel global barrier.
 // The feature tiles also distribute collapse across 20 CTAs per token.
-__global__ void hc_finish(const __nv_bfloat16* __restrict__ x,
-                          const float* __restrict__ scale, const float* __restrict__ base,
-                          const float* __restrict__ pre_in, __nv_bfloat16* __restrict__ y,
-                          float* __restrict__ pre, float* __restrict__ post,
-                          float* __restrict__ comb, const Workspace* workspace) {
-    __shared__ float mixes[kHcMix];
-    __shared__ float reciprocal_rms;
-    const int tid = threadIdx.x;
-    const int token = blockIdx.y;
-    const int d = blockIdx.x * kThreads + tid;
-
-    // Match ops::hc_pre's j=0..3 FP32 accumulation and single BF16 rounding.
+// Match ops::hc_pre's j=0..3 FP32 accumulation and single BF16 rounding.
+__device__ __forceinline__ void collapse_feature(const __nv_bfloat16* __restrict__ x, const float* __restrict__ pre_in,
+                                                 __nv_bfloat16* __restrict__ y, int token, int d) {
     float collapsed = 0.0f;
 #pragma unroll
     for (int j = 0; j < kHc; ++j)
         collapsed += pre_in[token * kHc + j] *
                      __bfloat162float(x[token * kStreamSize + j * kDim + d]);
     y[token * kDim + d] = __float2bfloat16_rn(collapsed);
-    if (blockIdx.x != 0) return;  // Uniform for the CTA, before any barrier.
+}
 
+// The partial sums to the token's coefficients: one CTA of kThreads per token.
+__device__ __forceinline__ void finish_token(const float* __restrict__ scale, const float* __restrict__ base,
+                                             float* __restrict__ pre, float* __restrict__ post,
+                                             float* __restrict__ comb, const Workspace* workspace, int token) {
+    __shared__ float mixes[kHcMix];
+    __shared__ float reciprocal_rms;
+    const int tid = threadIdx.x;
     if (tid < kReductionRows) {
         // Start at +0 and sum warp totals in exactly ops::block_sum order.
         float sum = 0.0f;
@@ -216,6 +214,29 @@ __global__ void hc_finish(const __nv_bfloat16* __restrict__ x,
     if (tid < 32)
         finish_coefficients(mixes, reciprocal_rms, scale, base, pre + token * kHc,
                             post + token * kHc, comb + token * kHc * kHc);
+}
+
+__global__ void hc_finish(const __nv_bfloat16* __restrict__ x,
+                          const float* __restrict__ scale, const float* __restrict__ base,
+                          const float* __restrict__ pre_in, __nv_bfloat16* __restrict__ y,
+                          float* __restrict__ pre, float* __restrict__ post,
+                          float* __restrict__ comb, const Workspace* workspace) {
+    const int token = blockIdx.y;
+    collapse_feature(x, pre_in, y, token, blockIdx.x * kThreads + threadIdx.x);
+    if (blockIdx.x != 0) return;  // Uniform for the CTA, before any barrier.
+    finish_token(scale, base, pre, post, comb, workspace, token);
+}
+
+// hc_mixes_pre_split: the two halves of hc_finish as their own kernels
+__global__ void hc_collapse(const __nv_bfloat16* __restrict__ x, const float* __restrict__ pre_in,
+                            __nv_bfloat16* __restrict__ y) {
+    collapse_feature(x, pre_in, y, blockIdx.y, blockIdx.x * kThreads + threadIdx.x);
+}
+
+__global__ void hc_coefficients(const float* __restrict__ scale, const float* __restrict__ base,
+                                float* __restrict__ pre, float* __restrict__ post, float* __restrict__ comb,
+                                const Workspace* workspace) {
+    finish_token(scale, base, pre, post, comb, workspace, blockIdx.y);
 }
 
 }  // namespace
@@ -250,6 +271,21 @@ void hc_mixes_pre(const __nv_bfloat16* x, int m, const float* fn, const float* s
     hc_finish<<<dim3(kDim / kThreads, m), kThreads, 0, stream>>>(
         x, scale, base, pre_in, y, pre, post, comb, workspace);
     check_cuda(cudaGetLastError(), "launch reduction and collapse");
+}
+
+void hc_mixes_pre_split(const __nv_bfloat16* x, const float* fn, const float* scale, const float* base,
+                        const float* pre_in, __nv_bfloat16* y, float* pre, float* post, float* comb,
+                        cudaStream_t stream, cudaStream_t side, cudaEvent_t fork, cudaEvent_t done) {
+    Workspace* workspace = workspace_for_device();
+    hc_partials<1><<<dim3(kDotWarps, kHcMix), kProducerThreads, 0, stream>>>(x, fn, workspace);
+    check_cuda(cudaGetLastError(), "launch partial mixes");
+    check_cuda(cudaEventRecord(fork, stream), "coefficient fork");
+    check_cuda(cudaStreamWaitEvent(side, fork, 0), "coefficient fork wait");
+    hc_coefficients<<<dim3(1, 1), kThreads, 0, side>>>(scale, base, pre, post, comb, workspace);
+    check_cuda(cudaGetLastError(), "launch coefficients");
+    check_cuda(cudaEventRecord(done, side), "coefficients done");
+    hc_collapse<<<dim3(kDim / kThreads, 1), kThreads, 0, stream>>>(x, pre_in, y);
+    check_cuda(cudaGetLastError(), "launch collapse");
 }
 
 }  // namespace strata::ds41::kernels

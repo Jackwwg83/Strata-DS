@@ -17,6 +17,10 @@ namespace strata::ds41 {
 /// y [8 * 1024] = per group g: wo_a[g] [1024][4096] x o[g * 4096 ...]; o [64 * 512], y BF16.
 void wo_a_grouped_fp8(const __nv_bfloat16* o, const uint8_t* w, const uint8_t* scale, __nv_bfloat16* y,
                       cudaStream_t stream = 0);
+/// wo_a_grouped_fp8 for m rows (1..8): o [m][64 * 512], y [m][8 * 1024], the weight read once; every row equals
+/// wo_a_grouped_fp8 on that row bit for bit (the verify window)
+void wo_a_grouped_fp8_rows(const __nv_bfloat16* o, int m, const uint8_t* w, const uint8_t* scale, __nv_bfloat16* y,
+                           cudaStream_t stream = 0);
 /// out [8 * 1024][4096] BF16 = w * scale, rounded to BF16
 void dequant_wo_a(const uint8_t* w, const uint8_t* scale, __nv_bfloat16* out, cudaStream_t stream = 0);
 

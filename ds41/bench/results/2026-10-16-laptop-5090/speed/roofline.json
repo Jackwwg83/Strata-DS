@@ -1,0 +1,119 @@
+{
+ "L262144-rx": {
+  "pattern": "L262144-r*",
+  "steps": 1115,
+  "mean_step_ms": 38.24019192825112,
+  "parts": [
+   {
+    "part": "GPU memory: dense weights + VRAM experts",
+    "GB_per_token": 10.155,
+    "GBps": 780.7,
+    "lower_bound_ms": 13.01,
+    "measured_ms": 15.43,
+    "note": "measured: the worker's wait for the GPU (wait_ms)"
+   },
+   {
+    "part": "RAM: experts the CPU computes",
+    "GB_per_token": 0.282,
+    "GBps": 59.88,
+    "lower_bound_ms": 4.71,
+    "measured_ms": 11.88,
+    "note": "measured: cpu_experts_ms"
+   },
+   {
+    "part": "SSD: experts read per token",
+    "GB_per_token": 0.035,
+    "GBps": 5.35,
+    "lower_bound_ms": 6.6,
+    "measured_ms": 8.9,
+    "note": "measured: admit_ms (8 threads bandwidth)"
+   },
+   {
+    "part": "PCIe: prefetched experts copied to the GPU",
+    "GB_per_token": 0.197,
+    "GBps": 28.9,
+    "lower_bound_ms": 6.83,
+    "measured_ms": null,
+    "note": "overlaps the GPU's work"
+   }
+  ]
+ },
+ "agent-rx": {
+  "pattern": "agent-r*",
+  "steps": 1113,
+  "mean_step_ms": 30.741387241689125,
+  "parts": [
+   {
+    "part": "GPU memory: dense weights + VRAM experts",
+    "GB_per_token": 10.33,
+    "GBps": 780.7,
+    "lower_bound_ms": 13.23,
+    "measured_ms": 14.13,
+    "note": "measured: the worker's wait for the GPU (wait_ms)"
+   },
+   {
+    "part": "RAM: experts the CPU computes",
+    "GB_per_token": 0.213,
+    "GBps": 59.88,
+    "lower_bound_ms": 3.56,
+    "measured_ms": 7.72,
+    "note": "measured: cpu_experts_ms"
+   },
+   {
+    "part": "SSD: experts read per token",
+    "GB_per_token": 0.032,
+    "GBps": 5.35,
+    "lower_bound_ms": 6.04,
+    "measured_ms": 6.87,
+    "note": "measured: admit_ms (8 threads bandwidth)"
+   },
+   {
+    "part": "PCIe: prefetched experts copied to the GPU",
+    "GB_per_token": 0.112,
+    "GBps": 28.9,
+    "lower_bound_ms": 3.87,
+    "measured_ms": null,
+    "note": "overlaps the GPU's work"
+   }
+  ]
+ },
+ "code-rx": {
+  "pattern": "code-r*",
+  "steps": 1115,
+  "mean_step_ms": 29.32189147982063,
+  "parts": [
+   {
+    "part": "GPU memory: dense weights + VRAM experts",
+    "GB_per_token": 10.366,
+    "GBps": 780.7,
+    "lower_bound_ms": 13.28,
+    "measured_ms": 14.73,
+    "note": "measured: the worker's wait for the GPU (wait_ms)"
+   },
+   {
+    "part": "RAM: experts the CPU computes",
+    "GB_per_token": 0.192,
+    "GBps": 59.88,
+    "lower_bound_ms": 3.21,
+    "measured_ms": 7.48,
+    "note": "measured: cpu_experts_ms"
+   },
+   {
+    "part": "SSD: experts read per token",
+    "GB_per_token": 0.023,
+    "GBps": 5.35,
+    "lower_bound_ms": 4.24,
+    "measured_ms": 5.07,
+    "note": "measured: admit_ms (8 threads bandwidth)"
+   },
+   {
+    "part": "PCIe: prefetched experts copied to the GPU",
+    "GB_per_token": 0.118,
+    "GBps": 28.9,
+    "lower_bound_ms": 4.07,
+    "measured_ms": null,
+    "note": "overlaps the GPU's work"
+   }
+  ]
+ }
+}

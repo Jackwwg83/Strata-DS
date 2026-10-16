@@ -348,6 +348,7 @@ std::vector<int> Engine::Impl::step_slots(const std::vector<int>& rows, const st
                             }
                         }
                     }
+                    if (misses) admit_rows(l, v.db->ids(), m * kTopK);   // the adaptive RAM tier keeps them
                     const double start = now_ms();
                     if (misses)
                         exl3_moe_cpu_forward_raw(L[l].moe_handle, (const at::Half*) v.db->x(), v.db->ids(), weights,
@@ -381,12 +382,13 @@ std::vector<int> Engine::Impl::step_slots(const std::vector<int>& rows, const st
         std::rethrow_exception(cpu_error);
     }
     batch_warmed = true;
-    if (vram) {
+    if (vram || (host && host->reserve() > 0)) {
         int32_t row[kLayers * kTopK];
         for (int t = 0; t < m; ++t) {
             for (int l = 0; l < kLayers; ++l)
                 std::copy_n(v.routes_host + (l * VerifyWorkspace::M + t) * kTopK, kTopK, row + l * kTopK);
-            vram->count(row, kTopK);
+            if (vram) vram->count(row, kTopK);
+            if (host && host->reserve() > 0) host->end_step(row, kTopK);   // publish the step's reads, record uses
         }
     }
     std::vector<int> next(v.next_host, v.next_host + m);

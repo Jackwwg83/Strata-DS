@@ -1,6 +1,22 @@
-<h1 align="center">Strata</h1>
+<h1 align="center">Strata-DS</h1>
 
 **English** · [简体中文](README.zh-CN.md) · [日本語](README.ja.md) · [Deutsch](README.de.md) · [Français](README.fr.md) · [Español](README.es.md) · [Português](README.pt-BR.md)
+
+<p align="center"><b>DeepSeek V4.1 Flash (763B MoE) on a 64 GB gaming laptop</b><br>
+30-32 tokens/s from a cold start, 33-39 on a running server · 24.4 tokens/s with a 256K-token prompt · RTX 5090 Laptop 24 GB · Linux</p>
+
+<p align="center"><img src="docs/media/deepseek-laptop-context.svg" width="760" alt="DeepSeek V4.1 Flash decode and prefill speed by context length on an RTX 5090 Laptop with 64 GB of RAM"></p>
+
+This fork of [Strata](https://github.com/Niko1221/Strata) adds an engine for
+[DeepSeek V4.1 Flash](https://huggingface.co/deepseek-ai/DeepSeek-V4.1-Flash). It splits the model's 15,360 experts
+over GPU memory, RAM and the SSD, so the 763B model runs on a laptop with a 24 GB GPU and 64 GB of RAM. The recipe,
+every setting, what the settings cost in quality (measured), where the time goes, and the raw data: **[docs/DEEPSEEK_LAPTOP.md](docs/DEEPSEEK_LAPTOP.md)**.
+
+---
+
+<h2 align="center">Upstream Strata (Qwen3.8-Flash-Next)</h2>
+
+Everything below is upstream Strata's README: it runs Qwen3.8-Flash-Next.
 
 <p align="center"><b>Run a 125-billion-parameter AI model on your own gaming PC</b><br>
 NVIDIA or AMD graphics card (12 GB or more) · Windows or Linux · free and open source</p>
@@ -132,9 +148,10 @@ sizes are faster. Larger sizes are a bit smarter.
 - **[Unsloth UD-Q4_K_XL](docs/MODELS.md#unsloth-ud-q4_k_xl-experimental)** (experimental): the closest to the full
   model. But Strata reads most of it from the SSD while it answers, so it writes only 7-8.5 tokens/s on a 64 GB PC.
 - **[DeepSeek V4.1 Flash](docs/MODELS.md#deepseek-v41-flash-sage-159bpw)** (Linux + NVIDIA only): a much larger model
-  (763B parameters with its Engram memory), as the SAGE 1.59bpw quantization. It needs a 128 GB PC, an NVIDIA GPU
-  with 24 GB or more and about 462 GB of disk; `./setup.sh --setup --family deepseek`. It writes 17-32 tokens/s
-  depending on the GPU (measured on an RTX 3090 and an RTX 5090, [details](docs/MODELS.md#deepseek-v41-flash-sage-159bpw)).
+  (763B parameters with its Engram memory), as the SAGE 1.59bpw quantization. It needs an NVIDIA GPU with 24 GB or
+  more, 64 GB of RAM or more (128 GB recommended) and about 462 GB of disk; `./setup.sh --setup --family deepseek`.
+  It writes 17-32 tokens/s on desktop PCs (an RTX 3090 and an RTX 5090, 2026-10-07, before the laptop work, [details](docs/MODELS.md#deepseek-v41-flash-sage-159bpw))
+  and 30-39 tokens/s on a 64 GB gaming laptop with an RTX 5090 Laptop GPU ([the laptop recipe](docs/DEEPSEEK_LAPTOP.md)).
 - **[OrcaRouter's Uncensored IQ3_XXS](docs/MODELS.md#orcarouter-uncensored-iq3_xxs):** you set it up by hand. It is
   not in the installer's menu.
 

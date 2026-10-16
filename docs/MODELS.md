@@ -159,7 +159,8 @@ The source is `vcruz305/DSV4.1-Flash-SAGE-EXL3-1.59bpw`, pinned to
 
 - Linux and one NVIDIA GPU only. At least 16 GB VRAM and compute capability 8.6 or higher.
 - A 128 GB PC is recommended. Below 120 GiB usable RAM, setup warns that this is not tested and may be slow.
-  An explicit `--family deepseek --yes` accepts the risk.
+  An explicit `--family deepseek --yes` accepts the risk. A 64 GB laptop with a 24 GB GPU was measured since:
+  [DEEPSEEK_LAPTOP.md](DEEPSEEK_LAPTOP.md).
 - About 462 GB disk space: 341.8 GB of source files plus about 120 GB of pack files.
   Keep all source shards. Shards 16 and 17 hold about 196 GB of Engram tables that the engine reads in place.
 - Context choices: 8K, 32K, 64K, 128K and 256K. Default: 32K. No RoPE extension.
@@ -172,6 +173,7 @@ Measured on Linux with 119.9-120.6 GiB of usable RAM (a 128 GB PC), SAGE 1.59bpw
 | --- | --- | ---: | --- |
 | RTX 5090 32 GB (5.0 x16) | Threadripper PRO 7965WX | 26-32 tokens/s | four chats; the rented disk's slow random reads cost 6-13 ms per token in Engram reads, which a local NVMe SSD should mostly save |
 | RTX 3090 24 GB (4.0 x16) | EPYC 7D12 | 16-17 tokens/s | a coding chat; the copies of experts over PCIe 4.0 are the limit |
+| RTX 5090 Laptop 24 GB, 64 GB RAM (2026-10-16) | Ryzen 9 9955HX3D | 30-32 tokens/s from a cold start, 33-39 through the API; 24.4 at 256K | the [laptop recipe](DEEPSEEK_LAPTOP.md) |
 
 A 2000-token prompt took 13.4 s on the RTX 3090 PC (its disk reads ~56,000 random 4 KiB blocks per s at depth 64;
 Engram rows are such reads); a short new part of a chat is read in under a second. The model loads in about one

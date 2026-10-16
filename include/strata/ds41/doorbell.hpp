@@ -48,11 +48,16 @@ public:
                  uint32_t round, cudaStream_t stream,
                  const kernels::Exl3Expert* vram = nullptr, const kernels::Exl3Expert* ram = nullptr,
                  const int* quota = nullptr, ExpertStaging* stage = nullptr, const ExpertBlob* blobs = nullptr,
-                 const int32_t* pf_ids = nullptr, const kernels::Exl3Expert* pf_desc = nullptr, int pf_n = 0);
+                 const int32_t* pf_ids = nullptr, const kernels::Exl3Expert* pf_desc = nullptr, int pf_n = 0,
+                 int tail_rank = 0, int ssd_rank = 0);
     /// Per-call descriptors. Consume on the publish stream before the next publish.
     const kernels::Exl3Expert* gpu_experts() const { return gpu_experts_; }
-    /// prefetched: misses the GPU computes from the prefetch buffer (pf_ids / pf_desc of publish), outside the quota
-    struct Counts { int vram, zero_copy, cpu, prefetched; };
+    /// prefetched: misses the GPU computes from the prefetch buffer (pf_ids / pf_desc of publish), outside the quota.
+    /// skipped: with tail_rank R > 0 (upstream's STRATA_ROUTE_TAIL_SKIP), the uses of an expert outside VRAM that every
+    /// token of the call routes at rank R or lower (ids in router order, 0 = best): neither the GPU nor the CPU computes
+    /// them, they add nothing, the other experts keep their weights. Only for calls of up to 5 tokens (one pass).
+    /// ssd_rank S > 0 skips the same way an expert in neither VRAM nor `ram` (read from the SSD) routed at rank S or lower.
+    struct Counts { int vram, zero_copy, cpu, prefetched, skipped; };
     /// Read after wait_published, before mark_done. Counts refer to this call.
     Counts counts() const { return *h_counts_; }
     /// Wait until the CPU raised done to `round`, then out[i] += its rows [m][dim] (FP32).
@@ -82,5 +87,12 @@ private:
     float *h_w_ = nullptr, *d_w_ = nullptr;
     float *h_y_ = nullptr, *d_y_ = nullptr;
 };
+
+/// The tail_rank and ssd_rank of publish (0 = off, valid 1..5). route_env / ssd_env: DS41_ROUTE_TAIL_SKIP /
+/// DS41_SSD_TAIL_SKIP or null. Defaults, with a VRAM tier under 90% of the experts (upstream #1884): tail 4 (ranks 5
+/// and 6 of 6) and SSD 3 (ranks 4..6 of experts read from the SSD; laptop, 2 rounds: code 42.1 -> 39.2 ms/token,
+/// 4K 50.3 -> 46.6, short prompts neutral; NLL code +0.006). The SSD default follows the tail skip: tail 0 turns it off.
+struct SkipRanks { int tail, ssd; };
+SkipRanks skip_ranks(const char* route_env, const char* ssd_env, bool has_vram, double cached_share);
 
 }  // namespace strata::ds41
