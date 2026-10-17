@@ -66,3 +66,13 @@ add_executable(k18_exl3_linear_test src/ds41/tests/k18_exl3_linear_test.cu)
 target_link_libraries(k18_exl3_linear_test PRIVATE ds41_k18_exl3_linear strata_ds41_engine)
 add_test(NAME k18_exl3_linear_test COMMAND k18_exl3_linear_test)
 set_tests_properties(k18_exl3_linear_test PROPERTIES SKIP_RETURN_CODE 77 TIMEOUT 900)
+
+# K19: routed experts from EXL3 weights with sudoingX's streaming exl3_smoe kernels (third_party/exl3_smoe), the GB10
+# path for EXL3 packs; the test checks it against a K18 reference and K10, and times both
+add_library(ds41_k19_exl3_smoe STATIC src/ds41/kernels/k19_exl3_smoe.cu)
+target_link_libraries(ds41_k19_exl3_smoe PUBLIC strata_ds41_engine)
+target_link_libraries(strata_ds41_engine PUBLIC ds41_k19_exl3_smoe)
+add_executable(k19_exl3_smoe_test src/ds41/tests/k19_exl3_smoe_test.cu)
+target_link_libraries(k19_exl3_smoe_test PRIVATE ds41_k19_exl3_smoe ds41_k18_exl3_linear ds41_k10_exl3_moe strata_ds41_engine)
+add_test(NAME k19_exl3_smoe_test COMMAND k19_exl3_smoe_test)
+set_tests_properties(k19_exl3_smoe_test PROPERTIES SKIP_RETURN_CODE 77 TIMEOUT 900)
