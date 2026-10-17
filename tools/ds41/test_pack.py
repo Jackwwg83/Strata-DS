@@ -247,6 +247,16 @@ class Mxfp4PackTest(unittest.TestCase):
                 np.testing.assert_array_equal(blob[a:a + cnb], want.numpy().reshape(-1), err_msg=f"{S}.{e}.{comp}")
         self.assertIn("finished 1", open(os.path.join(self.out, "pack_info.txt")).read())
 
+    def test_dense_only_keeps_the_mtp_experts(self):
+        # a dense-only rewrite (e.g. other dense tensors) keeps DSpark's experts and their pack_info lines
+        P.add_mtp_experts(self.src, self.out, n_stages=2, n_experts=2)
+        P.build_pack(self.src, self.out, n_layers=2, n_experts=2, dense_only=True)
+        info = open(os.path.join(self.out, "pack_info.txt")).read().splitlines()
+        self.assertIn("mtp_stages 2", info)
+        self.assertIn("mtp_experts 2", info)
+        self.assertTrue(any(l.startswith("mtp_expert_bytes ") for l in info))
+        self.assertEqual(info[-1], "finished 1")
+
     def test_the_index_decides_which_tensors_exist(self):
         # a merged checkpoint (official dense + another repo's experts) points its index at shards that also hold
         # tensors it does not name: those are not part of the checkpoint

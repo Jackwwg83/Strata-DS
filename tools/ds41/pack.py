@@ -384,7 +384,9 @@ def build_pack(src, out, n_layers=40, n_experts=384, wo_a_fp8=True, dense_only=F
             f.write(f"source {os.path.abspath(src)}\nlayers {old['layers']}\nexperts {old['experts']}\n"
                     f"dense_tensors {n_dense}\ndense_bytes {dense_bytes}\nexpert_bytes {old['expert_bytes']}\n"
                     f"engram_layers {old['engram_layers']}\nexpert_format {old.get('expert_format', 'exl3').strip()}\n"
-                    "finished 1\n")
+                    + "".join(f"{k} {old[k].strip()}\n" for k in ("mtp_stages", "mtp_experts", "mtp_expert_bytes")
+                              if k in old)   # DSpark's experts stay
+                    + "finished 1\n")
         return
     fmt = expert_format(srcs)
     expert_bytes = write_experts(srcs, out, n_layers, n_experts, fmt=fmt)
