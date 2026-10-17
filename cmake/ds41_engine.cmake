@@ -11,6 +11,7 @@ add_library(strata_ds41_engine STATIC
   src/ds41/vram_experts.cu
   src/ds41/engram_rows.cpp
   src/ds41/host_experts.cpp
+  src/ds41/mxfp4_cpu.cpp
   src/ds41/lookahead.cpp
   src/ds41/expert_stream.cpp
   src/ds41/wo_a_fp8.cu
@@ -25,6 +26,7 @@ target_include_directories(strata_ds41_engine PUBLIC
 target_compile_features(strata_ds41_engine PUBLIC cxx_std_17)
 # moe_mul1 picks AVX2 / AVX-512 per function with target attributes and dispatches at run time
 set_source_files_properties(third_party/exllamav3_moe/moe_mul1.cpp PROPERTIES COMPILE_OPTIONS "-O3")
+set_source_files_properties(src/ds41/mxfp4_cpu.cpp PROPERTIES COMPILE_OPTIONS "-O3")
 find_package(Threads REQUIRED)
 target_link_libraries(strata_ds41_engine PUBLIC strata_ds41 CUDA::cudart CUDA::cublas Threads::Threads)
 
@@ -124,6 +126,10 @@ if(STRATA_BUILD_TESTS)
   if(_ds41_x86)
     add_test(NAME moe_set_expert_test COMMAND moe_set_expert_test)
   endif()
+  add_executable(mxfp4_cpu_test src/ds41/tests/mxfp4_cpu_test.cpp)
+  target_link_libraries(mxfp4_cpu_test PRIVATE strata_ds41_engine)
+  add_test(NAME mxfp4_cpu_test COMMAND mxfp4_cpu_test)
+  set_tests_properties(mxfp4_cpu_test PROPERTIES TIMEOUT 900)
   add_executable(pack_format_test src/ds41/tests/pack_format_test.cpp)
   target_link_libraries(pack_format_test PRIVATE strata_ds41_engine)
   add_test(NAME pack_format_test COMMAND pack_format_test)
