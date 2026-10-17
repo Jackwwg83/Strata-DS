@@ -43,7 +43,11 @@ inline void write_fake_pack(const std::string& dir, bool mixed = false, uint64_t
     {
         std::ofstream f(dir + "/index.txt");
         f << "embed.weight bf16 2 " << strata::ds41::kVocab << " " << strata::ds41::kDim << " 0 " << (uint64_t) strata::ds41::kVocab * strata::ds41::kDim * 2 << "\n";
-        f << "head.weight bf16 2 " << strata::ds41::kVocab << " " << strata::ds41::kDim << " 0 " << (uint64_t) strata::ds41::kVocab * strata::ds41::kDim * 2 << "\n";
+        if (exl3_dense)
+            f << "head.trellis i16 3 " << strata::ds41::kDim / 16 << " " << strata::ds41::kVocab / 16 << " 96 0 "
+              << (uint64_t) strata::ds41::kDim / 16 * (strata::ds41::kVocab / 16) * 96 * 2 << "\n";
+        else
+            f << "head.weight bf16 2 " << strata::ds41::kVocab << " " << strata::ds41::kDim << " 0 " << (uint64_t) strata::ds41::kVocab * strata::ds41::kDim * 2 << "\n";
         if (exl3_dense) {
             const int64_t qb = strata::ds41::kHeads * strata::ds41::kHeadDim, g = qb / strata::ds41::kOGroups;
             f << "layers.0.attn.wq_b.trellis i16 3 " << strata::ds41::kQLora / 16 << " " << qb / 16 << " 80 0 "

@@ -58,6 +58,7 @@ int main() {
         ds41test::write_fake_pack(d, false, 256, false, true);
         Pack p(d);
         CHECK(p.has_dense("layers.0.attn.wq_b.trellis") && !p.has_dense("layers.0.attn.wq_b.weight"));
+        CHECK(p.has_dense("head.trellis") && !p.has_dense("head.weight"));
         std::ifstream in(d + "/index.txt");
         std::stringstream out;
         std::string line;
