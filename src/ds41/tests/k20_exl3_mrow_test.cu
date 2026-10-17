@@ -85,6 +85,26 @@ int main() {
                     s.name, w.bytes() / 1e6, t20, w.bytes() / t20 / 1e3, t20_4, t18, w.bytes() / t18 / 1e3);
         v.metric(std::string("k20_gbs_") + (s.name[0] == 's' ? "shared" : s.name), w.bytes() / t20 / 1e3);
     }
+    {   // FP32 output (the head's logits): the same sums, before the bf16 rounding
+        Proj w(5120, 129280, 6, 0x4ead);
+        kk::Exl3Mrow mrow({{w.p, 0, 0}});
+        for (int m : {1, 5, 16}) {
+            Dev<__nv_bfloat16> x(rand_bf16((size_t) m * 5120, 1.0f, 41 + m)), yb((size_t) m * 129280);
+            Dev<float> yf((size_t) m * 129280);
+            mrow.run(x.p, 5120, yb.p, 129280, m, 0);
+            mrow.run_f32(x.p, 5120, yf.p, 129280, m, 0);
+            const auto b = yb.down();
+            const auto f = yf.down();
+            bool same = true;
+            for (size_t i = 0; i < f.size(); ++i)
+                same &= bf16_bits(f[i]) == bf16_bits(__bfloat162float(b[i]));
+            v.check(same, "head m=" + std::to_string(m) + ": FP32 output rounds to the bf16 output");
+        }
+        Dev<__nv_bfloat16> x(rand_bf16((size_t) 5120, 1.0f, 7));
+        Dev<float> yf((size_t) 129280);
+        const double t = median_us([&] { mrow.run_f32(x.p, 5120, yf.p, 129280, 1, 0); });
+        std::printf("speed head K6 %.1f MB: K20 m=1 FP32 out %.1f us (%.1f GB/s)\n", w.bytes() / 1e6, t, w.bytes() / t / 1e3);
+    }
     {   // wo_a: eight 4096 -> 1024 slices in one launch, each reading its own column block of x
         std::vector<Proj*> slices;
         std::vector<kk::MrowLinear> group;

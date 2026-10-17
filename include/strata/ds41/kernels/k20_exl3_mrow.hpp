@@ -28,6 +28,8 @@ public:
     Exl3Mrow(const Exl3Mrow&) = delete;
     Exl3Mrow& operator=(const Exl3Mrow&) = delete;
     void run(const __nv_bfloat16* x, int ldx, __nv_bfloat16* y, int ldy, int m, cudaStream_t stream) const;
+    /// the same, y in FP32 (logits): the sums before the bf16 rounding
+    void run_f32(const __nv_bfloat16* x, int ldx, float* y, int ldy, int m, cudaStream_t stream) const;
     static constexpr int kMaxRows = 16;
 
 private:

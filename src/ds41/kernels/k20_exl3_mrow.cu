@@ -62,9 +62,21 @@ __host__ __device__ constexpr int smem_bytes(int K, int rows, int ks_max) {
 __device__ __forceinline__ void consumer_sync() { asm volatile("bar.sync 1, %0;\n" :: "n"(CONSUMER_THREADS) : "memory"); }
 
 // M16: 9..16 rows (both 8-row halves of the m16 fragment); otherwise 1..8 rows, the upper half of A is zero registers
-template <int K, bool M16>
+/// four outputs of a row: bf16 (rounded) or FP32 (logits)
+__device__ __forceinline__ void store4(__nv_bfloat16* p, float a, float b, float c, float d) {
+    const __nv_bfloat162 o01 = __floats2bfloat162_rn(a, b), o23 = __floats2bfloat162_rn(c, d);
+    uint2 ov;
+    ov.x = *reinterpret_cast<const uint32_t*>(&o01);
+    ov.y = *reinterpret_cast<const uint32_t*>(&o23);
+    *reinterpret_cast<uint2*>(p) = ov;
+}
+__device__ __forceinline__ void store4(float* p, float a, float b, float c, float d) {
+    *reinterpret_cast<float4*>(p) = make_float4(a, b, c, d);
+}
+
+template <int K, bool M16, typename OutT>
 __global__ void __launch_bounds__(THREADS, 1) mrow_kernel(const __nv_bfloat16* __restrict__ x, int x_stride,
-                                                          __nv_bfloat16* __restrict__ out, int out_stride, int m,
+                                                          OutT* __restrict__ out, int out_stride, int m,
                                                           float* __restrict__ ws, int* __restrict__ ctr,
                                                           const __grid_constant__ Group g) {
     constexpr int RX = M16 ? 16 : 8;
@@ -213,11 +225,7 @@ __global__ void __launch_bounds__(THREADS, 1) mrow_kernel(const __nv_bfloat16* _
         const float y0 = v[0] * RSQRT128 * s01.x, y1 = v[1] * RSQRT128 * s01.y;
         const float y2 = v[2] * RSQRT128 * s23.x, y3 = v[3] * RSQRT128 * s23.y;
         if (P.n_slices == 1) {
-            const __nv_bfloat162 o01 = __floats2bfloat162_rn(y0, y1), o23 = __floats2bfloat162_rn(y2, y3);
-            uint2 ov;
-            ov.x = *reinterpret_cast<const uint32_t*>(&o01);
-            ov.y = *reinterpret_cast<const uint32_t*>(&o23);
-            *reinterpret_cast<uint2*>(out + (size_t) r * out_stride + P.out_col + oc) = ov;
+            store4(out + (size_t) r * out_stride + P.out_col + oc, y0, y1, y2, y3);
         } else {
             *reinterpret_cast<float4*>(ws + P.ws_off + ((size_t) sl * m + r) * P.n + oc) = make_float4(y0, y1, y2, y3);
         }
@@ -240,11 +248,7 @@ __global__ void __launch_bounds__(THREADS, 1) mrow_kernel(const __nv_bfloat16* _
             const float4 t = __ldcg(reinterpret_cast<const float4*>(ws + P.ws_off + ((size_t) q * m + r) * P.n + oc));
             acc.x += t.x; acc.y += t.y; acc.z += t.z; acc.w += t.w;
         }
-        const __nv_bfloat162 o01 = __floats2bfloat162_rn(acc.x, acc.y), o23 = __floats2bfloat162_rn(acc.z, acc.w);
-        uint2 ov;
-        ov.x = *reinterpret_cast<const uint32_t*>(&o01);
-        ov.y = *reinterpret_cast<const uint32_t*>(&o23);
-        *reinterpret_cast<uint2*>(out + (size_t) r * out_stride + P.out_col + oc) = ov;
+        store4(out + (size_t) r * out_stride + P.out_col + oc, acc.x, acc.y, acc.z, acc.w);
     }
     if (threadIdx.x == 0) ctr[P.ctr_off + nb] = 0;
 }
@@ -265,16 +269,33 @@ void ck(cudaError_t e, const char* where) {
     if (e != cudaSuccess) throw std::runtime_error(std::string("K20: ") + where + ": " + cudaGetErrorString(e));
 }
 
-template <int K, bool M16>
-void launch(const Group& g, const __nv_bfloat16* x, int xs, __nv_bfloat16* y, int ys, int m, float* ws, int* ctr,
+template <int K, bool M16, typename OutT>
+void launch(const Group& g, const __nv_bfloat16* x, int xs, OutT* y, int ys, int m, float* ws, int* ctr,
             cudaStream_t stream) {
     const int smem = smem_bytes(K, M16 ? 16 : 8, g.ks_max);
     static int smem_set = 48 * 1024;   // dynamic shared memory past 48 KB needs the opt-in, once per size
     if (smem > smem_set) {
-        ck(cudaFuncSetAttribute(mrow_kernel<K, M16>, cudaFuncAttributeMaxDynamicSharedMemorySize, smem), "smem");
+        ck(cudaFuncSetAttribute(mrow_kernel<K, M16, OutT>, cudaFuncAttributeMaxDynamicSharedMemorySize, smem), "smem");
         smem_set = smem;
     }
-    mrow_kernel<K, M16><<<g.n_items, THREADS, smem, stream>>>(x, xs, y, ys, m, ws, ctr, g);
+    mrow_kernel<K, M16, OutT><<<g.n_items, THREADS, smem, stream>>>(x, xs, y, ys, m, ws, ctr, g);
+}
+
+template <typename OutT>
+void run_any(const Group& g, int K, const __nv_bfloat16* x, int ldx, OutT* y, int ldy, int m, float* ws, int* ctr,
+             cudaStream_t stream) {
+    if (m < 1 || m > MAX_M || !x || !y || ldx % 4 || ldy % 4 || reinterpret_cast<uintptr_t>(x) % 8 ||
+        reinterpret_cast<uintptr_t>(y) % (sizeof(OutT) == 4 ? 16 : 8))
+        throw std::invalid_argument("K20: 1..16 rows, aligned rows with strides that are multiples of 4");
+    const bool m16 = m > 8;
+    switch (K) {
+        case 2: m16 ? launch<2, true>(g, x, ldx, y, ldy, m, ws, ctr, stream) : launch<2, false>(g, x, ldx, y, ldy, m, ws, ctr, stream); break;
+        case 3: m16 ? launch<3, true>(g, x, ldx, y, ldy, m, ws, ctr, stream) : launch<3, false>(g, x, ldx, y, ldy, m, ws, ctr, stream); break;
+        case 4: m16 ? launch<4, true>(g, x, ldx, y, ldy, m, ws, ctr, stream) : launch<4, false>(g, x, ldx, y, ldy, m, ws, ctr, stream); break;
+        case 5: m16 ? launch<5, true>(g, x, ldx, y, ldy, m, ws, ctr, stream) : launch<5, false>(g, x, ldx, y, ldy, m, ws, ctr, stream); break;
+        case 6: m16 ? launch<6, true>(g, x, ldx, y, ldy, m, ws, ctr, stream) : launch<6, false>(g, x, ldx, y, ldy, m, ws, ctr, stream); break;
+    }
+    ck(cudaPeekAtLastError(), "launch");
 }
 
 }  // namespace
@@ -337,19 +358,11 @@ Exl3Mrow::~Exl3Mrow() {
 }
 
 void Exl3Mrow::run(const __nv_bfloat16* x, int ldx, __nv_bfloat16* y, int ldy, int m, cudaStream_t stream) const {
-    if (m < 1 || m > MAX_M || !x || !y || ldx % 4 || ldy % 4 || reinterpret_cast<uintptr_t>(x) % 8 ||
-        reinterpret_cast<uintptr_t>(y) % 8)
-        throw std::invalid_argument("K20: 1..16 rows, 8-byte aligned rows with strides that are multiples of 4");
-    const Impl& h = *impl_;
-    const bool m16 = m > 8;
-    switch (h.K) {
-        case 2: m16 ? launch<2, true>(h.g, x, ldx, y, ldy, m, h.ws, h.ctr, stream) : launch<2, false>(h.g, x, ldx, y, ldy, m, h.ws, h.ctr, stream); break;
-        case 3: m16 ? launch<3, true>(h.g, x, ldx, y, ldy, m, h.ws, h.ctr, stream) : launch<3, false>(h.g, x, ldx, y, ldy, m, h.ws, h.ctr, stream); break;
-        case 4: m16 ? launch<4, true>(h.g, x, ldx, y, ldy, m, h.ws, h.ctr, stream) : launch<4, false>(h.g, x, ldx, y, ldy, m, h.ws, h.ctr, stream); break;
-        case 5: m16 ? launch<5, true>(h.g, x, ldx, y, ldy, m, h.ws, h.ctr, stream) : launch<5, false>(h.g, x, ldx, y, ldy, m, h.ws, h.ctr, stream); break;
-        case 6: m16 ? launch<6, true>(h.g, x, ldx, y, ldy, m, h.ws, h.ctr, stream) : launch<6, false>(h.g, x, ldx, y, ldy, m, h.ws, h.ctr, stream); break;
-    }
-    ck(cudaPeekAtLastError(), "launch");
+    run_any(impl_->g, impl_->K, x, ldx, y, ldy, m, impl_->ws, impl_->ctr, stream);
+}
+
+void Exl3Mrow::run_f32(const __nv_bfloat16* x, int ldx, float* y, int ldy, int m, cudaStream_t stream) const {
+    run_any(impl_->g, impl_->K, x, ldx, y, ldy, m, impl_->ws, impl_->ctr, stream);
 }
 
 }  // namespace strata::ds41::kernels
