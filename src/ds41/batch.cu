@@ -224,7 +224,7 @@ void Engine::Impl::enqueue_slots(int m) {
     ops::hc_pre(v.h, v.mix, v.final_x, m, st);
     ops::rmsnorm(v.final_x, final_norm, v.final_x, kDim, kNormEps, m, st);
     for (int t = 0; t < m; ++t) {
-        ops::bf16_linear(v.final_x + t * kDim, nullptr, head, kDim, kVocab, nullptr, v.logits + t * kVocab, st);
+        head_logits(v.final_x + t * kDim, 1, v.logits + t * kVocab, st);
         ops::argmax_logits(v.logits + t * kVocab, v.next + t, st);
     }
     ck(cudaMemcpyAsync(v.next_host, v.next, m * sizeof(int), cudaMemcpyDeviceToHost, st), "batch next");

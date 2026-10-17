@@ -162,6 +162,7 @@ struct Engine::Impl {
     };
     std::vector<Layer> L;
     const bf16 *embed, *head, *final_norm;
+    const kernels::Exl3Mrow* head3 = nullptr;   // an EXL3 head (head null): K20 with FP32 logits, 16 rows a launch
 
     // rope tables on the device: [max_seq][64] floats
     float* rope_plain = nullptr;
@@ -511,7 +512,7 @@ struct Engine::Impl {
     void* x3_ws = nullptr;                        // K18's prefill workspace (EXL3 dense), allocated at the first prompt
     size_t x3_ws_bytes = 0;
     /// an EXL3 tensor set of the pack (trellis [k/16][n/16][16K], suh [k], svh [n])
-    kernels::Exl3Proj exl3(const std::string& name) {
+    kernels::Exl3Proj exl3(const std::string& name, bool prefill = true) {
         const auto& t = pack.dense(name + ".trellis");
         const auto& su = pack.dense(name + ".suh");
         const auto& sv = pack.dense(name + ".svh");
@@ -524,7 +525,7 @@ struct Engine::Impl {
         p.k = (int) t.shape[0] * 16;
         p.n = (int) t.shape[1] * 16;
         p.tile_w = (int) t.shape[2];
-        x3_ws_bytes = std::max(x3_ws_bytes, kernels::exl3_linear_workspace_bytes(kX3PrefillRows, p.k, p.n));
+        if (prefill) x3_ws_bytes = std::max(x3_ws_bytes, kernels::exl3_linear_workspace_bytes(kX3PrefillRows, p.k, p.n));
         return p;
     }
     Fp8 fp8(const std::string& name) {
@@ -583,7 +584,14 @@ struct Engine::Impl {
                          (now_ms() - t0) / 1000.0);
         }
         embed = bf("embed.weight");
-        head = bf("head.weight");
+        if (pack.has_dense("head.trellis")) {   // EXL3 head: K20 in every path (prompts too, 16 rows a launch)
+            x3_groups.push_back(std::make_unique<kernels::Exl3Mrow>(
+                std::vector<kernels::MrowLinear>{{exl3("head", false), 0, 0}}));
+            head3 = x3_groups.back().get();
+            head = nullptr;
+        } else {
+            head = bf("head.weight");
+        }
         final_norm = bf("norm.weight");
         L.resize(kLayers);
         for (int l = 0; l < kLayers; ++l) {
@@ -1749,6 +1757,17 @@ struct Engine::Impl {
     bool resident(int l, int e) const { return vram && vram->res_host()[(size_t) l * kExperts + e] >= 0; }
 
     /// model.py linear() for T rows (K2)
+    /// FP32 logits of m rows of the final hidden state: the EXL3 head (K20) or the BF16 head
+    void head_logits(const bf16* x, int m, float* logits, cudaStream_t s) {
+        if (head3) {
+            for (int r = 0; r < m; r += kernels::Exl3Mrow::kMaxRows)
+                head3->run_f32(x + (size_t) r * kDim, kDim, logits + (size_t) r * kVocab, kVocab,
+                               std::min(kernels::Exl3Mrow::kMaxRows, m - r), s);
+            return;
+        }
+        if (m == 1) ops::bf16_linear(x, nullptr, head, kDim, kVocab, nullptr, logits, s);
+        else ops::bf16_linear_rows(x, m, head, kDim, kVocab, logits, s);
+    }
     void fp8_rows(const bf16* x, int T, const Fp8& w, bf16* y) {
         if (w.x3) {
             exl3_rows(x, (int) w.k, T, w.e, y, (int) w.n);
@@ -2162,11 +2181,12 @@ struct Engine::Impl {
             if (nll)
                 for (int r0 = 0; r0 < T; r0 += kNllRows) {
                     const int nb = std::min(kNllRows, T - r0);
-                    prefill::bf16_gemm(pf.final_x + (size_t) r0 * kDim, head, nb, kDim, kVocab, nullptr, pf.nll_logits);
+                    if (head3) head_logits(pf.final_x + (size_t) r0 * kDim, nb, pf.nll_logits, 0);
+                    else prefill::bf16_gemm(pf.final_x + (size_t) r0 * kDim, head, nb, kDim, kVocab, nullptr, pf.nll_logits);
                     prefill::nll_rows(pf.nll_logits, nb, kVocab, pf.targets + b0 + r0, pf.nll_out + b0 + r0);
                 }
             if (c0 + b0 + T == n) {   // the last token's logits, as step() computes them
-                ops::bf16_linear(pf.final_x + (size_t) (T - 1) * kDim, nullptr, head, kDim, kVocab, nullptr, logits);
+                head_logits(pf.final_x + (size_t) (T - 1) * kDim, 1, logits, 0);
                 lg.resize(kVocab);
                 ck(cudaMemcpy(lg.data(), logits, kVocab * 4, cudaMemcpyDeviceToHost), "logits");
             }
@@ -2313,7 +2333,7 @@ struct Engine::Impl {
         }
         ops::hc_pre(h, pre_in, final_x, 1, st);
         ops::rmsnorm(final_x, final_norm, final_x, kDim, kNormEps, 1, st);
-        ops::bf16_linear(final_x, nullptr, head, kDim, kVocab, nullptr, logits, st);
+        head_logits(final_x, 1, logits, st);
         ops::argmax_logits(logits, d_next, st);
         ck(cudaMemcpyAsync(hp_next, d_next, sizeof(int), cudaMemcpyDeviceToHost, st), "next token");
         ck(cudaMemcpyAsync(lg_pinned, logits, (size_t) kVocab * 4, cudaMemcpyDeviceToHost, st), "logits");

@@ -326,7 +326,7 @@ void Engine::Impl::enqueue_verify(int m) {
     }
     ops::hc_pre(v.h, v.mix, v.final_x, m, st);
     ops::rmsnorm(v.final_x, final_norm, v.final_x, kDim, kNormEps, m, st);
-    ops::bf16_linear_rows(v.final_x, m, head, kDim, kVocab, v.logits, st);   // the head read once (1.3 GB)
+    head_logits(v.final_x, m, v.logits, st);   // the head read once
     for (int t = 0; t < m; ++t) ops::argmax_logits(v.logits+t*kVocab, v.next+t, st);
     ck(cudaMemcpyAsync(v.next_host, v.next, m*sizeof(int), cudaMemcpyDeviceToHost, st), "verify next");
     ck(cudaMemcpyAsync(v.logits_host, v.logits, size_t(m)*kVocab*sizeof(float), cudaMemcpyDeviceToHost, st), "verify logits");

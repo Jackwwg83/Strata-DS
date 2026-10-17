@@ -401,7 +401,7 @@ void Engine::Impl::enqueue_draft(int n_pend) {
     // forward_head: the collapse (its pre-norm rows feed the confidence head), norm, the backbone's head
     ops::hc_pre(d.h, d.mix, d.xfin, B, st);
     ops::rmsnorm(d.xfin, d.norm, d.xn, kDim, kNormEps, B, st);
-    ops::bf16_linear_rows(d.xn, B, head, kDim, kVocab, d.logits, st);
+    head_logits(d.xn, B, d.logits, st);
     for (int i = 0; i < B; ++i) {   // draft i: the Markov bias of the token before it, then the greedy pick
         dsk::markov_bias(i == 0 ? d.prm : d.out + i - 1, d.m_embed, d.m_head, kVocab, d.logits + (size_t) i * kVocab,
                          d.memb + i * dsk::kMarkovRank, st);
