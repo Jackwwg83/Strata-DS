@@ -53,6 +53,21 @@ static void set_info(const std::string& dir, const std::string& key, const std::
 }
 
 int main() {
+    {   // an EXL3 pack's dense tensors pass the shape checks; a wrong trellis shape fails them
+        const std::string d = tmpdir("exl3dense");
+        ds41test::write_fake_pack(d, false, 256, false, true);
+        Pack p(d);
+        CHECK(p.has_dense("layers.0.attn.wq_b.trellis") && !p.has_dense("layers.0.attn.wq_b.weight"));
+        std::ifstream in(d + "/index.txt");
+        std::stringstream out;
+        std::string line;
+        while (std::getline(in, line)) {
+            if (line.rfind("layers.0.attn.wq_b.trellis ", 0) == 0) line = "layers.0.attn.wq_b.trellis i16 3 80 1024 80 0 0";
+            out << line << "\n";
+        }
+        std::ofstream(d + "/index.txt") << out.str();
+        CHECK(throws(d));
+    }
     {   // an old pack has no expert_format line: EXL3, components as before
         const std::string d = tmpdir("exl3");
         ds41test::write_fake_pack(d);

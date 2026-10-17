@@ -260,8 +260,17 @@ Pack::Pack(const std::string& dir) : dir_(dir) {
     };
     expect("embed.weight", {kVocab, kDim});
     expect("head.weight", {kVocab, kDim});
-    expect("layers.0.attn.wq_b.weight", {kHeads * kHeadDim, kQLora});
-    expect("layers.0.attn.wo_a.weight", {kOGroups * kOLora, kHeads * kHeadDim / kOGroups});
+    // an EXL3 pack's dense tensors: trellis [k/16][n/16][16K], wo_a in one slice per group of heads
+    auto expect_exl3 = [&](const char* n, int64_t k, int64_t out) {
+        const auto& t = dense(n).shape;
+        if (t.size() != 3 || t[0] != k / 16 || t[1] != out / 16) fail(std::string("unexpected shape for ") + n);
+    };
+    if (has_dense("layers.0.attn.wq_b.trellis")) expect_exl3("layers.0.attn.wq_b.trellis", kQLora, kHeads * kHeadDim);
+    else expect("layers.0.attn.wq_b.weight", {kHeads * kHeadDim, kQLora});
+    if (has_dense("layers.0.attn.wo_a.slice.0.trellis"))
+        expect_exl3("layers.0.attn.wo_a.slice.0.trellis", kHeads * kHeadDim / kOGroups, kOLora);
+    else
+        expect("layers.0.attn.wo_a.weight", {kOGroups * kOLora, kHeads * kHeadDim / kOGroups});
     expect("layers.0.hc_attn_fn", {kHcMix, kHc * kDim});
 }
 

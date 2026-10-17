@@ -36,16 +36,26 @@ inline uint64_t fake_offset(int l, int e, bool mixed, uint64_t gap = 256) {
 }
 
 /// mxfp4: the experts are listed as DeepSeek's FP4 (w*.weight and w*.scale, pack_info's expert_format mxfp4)
-inline void write_fake_pack(const std::string& dir, bool mixed = false, uint64_t gap = 256, bool mxfp4 = false) {
+/// exl3_dense: wq_b and wo_a are listed as an EXL3 pack's dense tensors (trellis [k/16][n/16][16K], wo_a as slices)
+inline void write_fake_pack(const std::string& dir, bool mixed = false, uint64_t gap = 256, bool mxfp4 = false,
+                            bool exl3_dense = false) {
     mkdir(dir.c_str(), 0755);
     {
         std::ofstream f(dir + "/index.txt");
         f << "embed.weight bf16 2 " << strata::ds41::kVocab << " " << strata::ds41::kDim << " 0 " << (uint64_t) strata::ds41::kVocab * strata::ds41::kDim * 2 << "\n";
         f << "head.weight bf16 2 " << strata::ds41::kVocab << " " << strata::ds41::kDim << " 0 " << (uint64_t) strata::ds41::kVocab * strata::ds41::kDim * 2 << "\n";
-        f << "layers.0.attn.wq_b.weight f8e4m3 2 " << strata::ds41::kHeads * strata::ds41::kHeadDim << " " << strata::ds41::kQLora << " 0 "
-          << (uint64_t) strata::ds41::kHeads * strata::ds41::kHeadDim * strata::ds41::kQLora << "\n";
-        f << "layers.0.attn.wo_a.weight bf16 2 " << strata::ds41::kOGroups * strata::ds41::kOLora << " " << strata::ds41::kHeads * strata::ds41::kHeadDim / strata::ds41::kOGroups
-          << " 0 " << (uint64_t) strata::ds41::kOGroups * strata::ds41::kOLora * (strata::ds41::kHeads * strata::ds41::kHeadDim / strata::ds41::kOGroups) * 2 << "\n";
+        if (exl3_dense) {
+            const int64_t qb = strata::ds41::kHeads * strata::ds41::kHeadDim, g = qb / strata::ds41::kOGroups;
+            f << "layers.0.attn.wq_b.trellis i16 3 " << strata::ds41::kQLora / 16 << " " << qb / 16 << " 80 0 "
+              << (uint64_t) strata::ds41::kQLora / 16 * (qb / 16) * 80 * 2 << "\n";
+            f << "layers.0.attn.wo_a.slice.0.trellis i16 3 " << g / 16 << " " << strata::ds41::kOLora / 16 << " 80 0 "
+              << (uint64_t) g / 16 * (strata::ds41::kOLora / 16) * 80 * 2 << "\n";
+        } else {
+            f << "layers.0.attn.wq_b.weight f8e4m3 2 " << strata::ds41::kHeads * strata::ds41::kHeadDim << " " << strata::ds41::kQLora << " 0 "
+              << (uint64_t) strata::ds41::kHeads * strata::ds41::kHeadDim * strata::ds41::kQLora << "\n";
+            f << "layers.0.attn.wo_a.weight bf16 2 " << strata::ds41::kOGroups * strata::ds41::kOLora << " " << strata::ds41::kHeads * strata::ds41::kHeadDim / strata::ds41::kOGroups
+              << " 0 " << (uint64_t) strata::ds41::kOGroups * strata::ds41::kOLora * (strata::ds41::kHeads * strata::ds41::kHeadDim / strata::ds41::kOGroups) * 2 << "\n";
+        }
         f << "layers.0.hc_attn_fn f32 2 " << strata::ds41::kHcMix << " " << strata::ds41::kHc * strata::ds41::kDim << " 0 "
           << (uint64_t) strata::ds41::kHcMix * strata::ds41::kHc * strata::ds41::kDim * 4 << "\n";
     }
