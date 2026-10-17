@@ -46,3 +46,13 @@ add_executable(k12_exl3_moe_prefill_test src/ds41/tests/k12_exl3_moe_prefill_tes
 target_link_libraries(k12_exl3_moe_prefill_test PRIVATE ds41_k12_exl3_moe_prefill ds41_k10_exl3_moe strata_ds41_engine)
 add_test(NAME k12_exl3_moe_prefill_test COMMAND k12_exl3_moe_prefill_test)
 set_tests_properties(k12_exl3_moe_prefill_test PROPERTIES SKIP_RETURN_CODE 77 TIMEOUT 900)
+
+# K17: prefill experts from MXFP4 weights (rows grouped by expert); the test uses K16 as its reference
+add_library(ds41_k17_mxfp4_moe_prefill STATIC src/ds41/kernels/k17_mxfp4_moe_prefill.cu)
+target_link_libraries(ds41_k17_mxfp4_moe_prefill PUBLIC strata_ds41_engine CUDA::cublas)
+target_link_libraries(strata_ds41_engine PUBLIC ds41_k17_mxfp4_moe_prefill)
+add_executable(k17_mxfp4_moe_prefill_test src/ds41/tests/k17_mxfp4_moe_prefill_test.cu)
+target_link_libraries(k17_mxfp4_moe_prefill_test PRIVATE ds41_k17_mxfp4_moe_prefill ds41_k16_mxfp4_moe
+                      strata_ds41_engine)
+add_test(NAME k17_mxfp4_moe_prefill_test COMMAND k17_mxfp4_moe_prefill_test)
+set_tests_properties(k17_mxfp4_moe_prefill_test PROPERTIES SKIP_RETURN_CODE 77 TIMEOUT 900)
