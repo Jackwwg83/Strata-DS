@@ -6,6 +6,8 @@
 
 #include "fake_pack.hpp"
 
+#include <cuda_runtime.h>
+
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
@@ -76,6 +78,23 @@ int main() {
             check(same, std::string("DS41_FILL_DIRECT=") + direct + ": every slot holds its expert's bytes");
         }
         unsetenv("DS41_FILL_DIRECT");
+        // host_alloc (unified memory): the arena from cudaHostAlloc, which the DGX Spark's GPU reads at 210 GB/s
+        // against 166 GB/s for registered anonymous memory; the same bytes, mapped, read with O_DIRECT
+        {
+            int n_dev = 0;
+            if (cudaGetDeviceCount(&n_dev) == cudaSuccess && n_dev > 0) {
+                HostExperts h(pack, ranked, res, want, {}, 2, true);
+                bool same = h.slots() == 20 && h.host_allocated() && h.mapped() && h.locked();
+                for (int i = 0; i < h.slots(); ++i) {
+                    const ExpertSlot& x = pack.expert(ranked[i].first, ranked[i].second);
+                    same &= std::memcmp(h.slot_ptr(h.slot_of(ranked[i].first, ranked[i].second)),
+                                        pack.expert_base() + x.offset, x.bytes) == 0;
+                }
+                check(same, "host_alloc: a mapped cudaHostAlloc arena; every slot holds its expert's bytes");
+            } else {
+                cudaGetLastError();
+            }
+        }
         HostExperts host(pack, ranked, res, want, {}, 2);
         check(host.slots() == 20, "the budget of the first 20 experts' bytes holds 20 of them, got " +
                                       std::to_string(host.slots()));

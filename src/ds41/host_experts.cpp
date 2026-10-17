@@ -90,7 +90,7 @@ size_t auto_ram_budget(size_t headroom) {
 
 HostExperts::HostExperts(const Pack& pack, const std::vector<std::pair<int, int>>& ranked,
                          const std::vector<int32_t>& vram_res, size_t budget, const std::vector<int64_t>& cpu_handles,
-                         int threads)
+                         int threads, bool host_alloc)
     : pack_(pack), handles_(cpu_handles), n_experts_(pack.n_experts()) {
     const int L = pack.n_layers();
     slot_.assign((size_t) L * n_experts_, -1);
@@ -109,8 +109,24 @@ HostExperts::HostExperts(const Pack& pack, const std::vector<std::pair<int, int>
         max_slot_bytes_ = std::max<size_t>(max_slot_bytes_, b);
     }
     arena_bytes_ = off_.back();
-    void* p = mmap(nullptr, arena_bytes_, PROT_READ | PROT_WRITE, MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
-    if (p == MAP_FAILED) throw std::runtime_error("ds41 RAM tier: cannot reserve " + std::to_string(arena_bytes_) + " B");
+    void* p = nullptr;
+    if (host_alloc) {   // pinned and mapped from the start: no pin step below
+        const size_t limit = detail::register_limit().load();
+        if ((!limit || arena_bytes_ <= limit) &&
+            cudaHostAlloc(&p, arena_bytes_, cudaHostAllocMapped | cudaHostAllocPortable) == cudaSuccess)
+            host_alloc_ = true;
+        else {
+            cudaGetLastError();
+            p = nullptr;
+            std::fprintf(stderr, "ds41 RAM tier: cudaHostAlloc of %.1f GiB failed; anonymous memory instead\n",
+                         arena_bytes_ / 1073741824.0);
+        }
+    }
+    if (!host_alloc_) {
+        p = mmap(nullptr, arena_bytes_, PROT_READ | PROT_WRITE, MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
+        if (p == MAP_FAILED)
+            throw std::runtime_error("ds41 RAM tier: cannot reserve " + std::to_string(arena_bytes_) + " B");
+    }
     arena_ = (uint8_t*) p;
     holder_ = plan;
     // Read the slots with O_DIRECT, 16 readers: the file cache cannot keep a pack beside a RAM tier this large, and
@@ -147,7 +163,7 @@ HostExperts::HostExperts(const Pack& pack, const std::vector<std::pair<int, int>
     });
     if (dfd >= 0) close(dfd);
     if (failed) {
-        munmap(arena_, arena_bytes_);
+        free_arena();
         arena_ = nullptr;
         throw std::runtime_error("ds41 RAM tier: a read of " + pack.dir() + "/experts.bin failed");
     }
@@ -163,7 +179,7 @@ HostExperts::HostExperts(const Pack& pack, const std::vector<std::pair<int, int>
         cudaGetLastError();
         return false;
     };
-    bool pinned = pin();
+    bool pinned = host_alloc_ || pin();
     const size_t full_bytes = arena_bytes_;
     // steps of 512 MiB, doubling (0.5, 1, 2, 4 GiB ...): a pin that fails now and then costs 0.5 GiB of tier (it
     // failed and then fit 0.5 GiB lower in 3 of 6 laptop starts; a failed attempt takes 1.4-3.9 s), one that keeps
@@ -219,8 +235,7 @@ HostExperts::HostExperts(const Pack& pack, const std::vector<std::pair<int, int>
             ck(cudaStreamSynchronize(nullptr), "descriptor publication");
         } catch (...) {
             cudaFree(experts_dev_);
-            cudaHostUnregister(arena_);
-            munmap(arena_, arena_bytes_);
+            free_arena();
             throw;
         }
     }
@@ -244,6 +259,14 @@ HostExperts::~HostExperts() {
     if (pend_idx_) cudaFreeHost(pend_idx_);
     if (pend_desc_) cudaFreeHost(pend_desc_);
     if (!arena_) return;
+    free_arena();
+}
+
+void HostExperts::free_arena() noexcept {
+    if (host_alloc_) {
+        cudaFreeHost(arena_);
+        return;
+    }
     if (registered_) cudaHostUnregister(arena_);
     else if (locked_) munlock(arena_, arena_bytes_);
     munmap(arena_, arena_bytes_);

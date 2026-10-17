@@ -789,11 +789,12 @@ struct Engine::Impl {
             const double t0 = now_ms();
             host = std::make_unique<HostExperts>(
                 pack, read_expert_profile(opt.expert_profile, kLayers, kExperts),
-                vram ? vram->res_host() : std::vector<int32_t>((size_t) kLayers * kExperts, -1), budget, handles, 8);
+                vram ? vram->res_host() : std::vector<int32_t>((size_t) kLayers * kExperts, -1), budget, handles, 8,
+                uma);
             if (vram) vram->set_host(host.get());
-            std::fprintf(stderr, "ds41: RAM tier %d experts (%.1f GiB, %s), filled in %.1f s\n", host->slots(),
-                         host->arena_bytes() / (double) (1ull << 30),
-                         host->locked() ? "locked" : "not locked", (now_ms() - t0) / 1000.0);
+            std::fprintf(stderr, "ds41: RAM tier %d experts (%.1f GiB, %s%s), filled in %.1f s\n", host->slots(),
+                         host->arena_bytes() / (double) (1ull << 30), host->locked() ? "locked" : "not locked",
+                         host->host_allocated() ? ", cudaHostAlloc" : "", (now_ms() - t0) / 1000.0);
             if (ram_adapt) {
                 host->enable_adapt(ram_adapt);
                 std::fprintf(stderr, "ds41: adaptive RAM tier, %d free slots per slot size (%d free)\n", ram_adapt,
