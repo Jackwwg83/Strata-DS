@@ -21,6 +21,8 @@
 #include "strata/ds41/kernels/k13_sparse_attn_prefill.hpp"
 #include "strata/ds41/kernels/k14_indexer_prefill.hpp"
 #include "strata/ds41/kernels/k15_hc_prefill.hpp"
+#include "strata/ds41/kernels/k18_exl3_linear.hpp"
+#include "strata/ds41/kernels/k20_exl3_mrow.hpp"
 #include "strata/ds41/kernels/k2_fp8_gemm.hpp"
 #include "strata/ds41/kernels/k3_sparse_attn.hpp"
 #include "strata/ds41/kernels/k5_indexer.hpp"
@@ -129,10 +131,21 @@ struct Engine::Impl {
     int max_seq;
     int cpu_threads;
 
-    struct Fp8 { const uint8_t* w; const uint8_t* s; int64_t n, k; };
+    /// A dense linear: FP8 with E8M0 block scales (w, s), or EXL3 (an EXL3 pack's dense tensors: e, run by x3 at
+    /// decode sizes, by K18 in prefill); n out, k in
+    struct Fp8 {
+        const uint8_t* w;
+        const uint8_t* s;
+        int64_t n, k;
+        const kernels::Exl3Mrow* x3 = nullptr;
+        kernels::Exl3Proj e{};
+    };
     struct Layer {
         Fp8 wq_a, wq_b, wkv, wo_b, sh_w1, sh_w2, sh_w3, idx_wq_b, eng_wkv;
         Fp8 wo_a8{};   // wo_a as FP8 with block scales (packs from 2026-10-06); wo_a below is then null
+        /// wo_a as eight EXL3 slices (one per group of heads: 4096 -> 1024), run in one K20 launch; wo_a null
+        const kernels::Exl3Mrow* wo_a3 = nullptr;
+        kernels::Exl3Proj wo_a3p[kOGroups] = {};
         const bf16 *q_norm, *kv_norm, *wo_a, *attn_norm, *ffn_norm, *gate_w;
         const float *sink, *gate_bias, *hc_attn_fn, *hc_attn_base, *hc_attn_scale, *hc_ffn_fn, *hc_ffn_base,
             *hc_ffn_scale;
@@ -379,6 +392,7 @@ struct Engine::Impl {
         for (const auto& y : L)
             if (y.moe_handle >= 0) cpu_free_layer(pack.expert_format(), y.moe_handle);
         for (void* p : owned_dev) cudaFree(p);
+        if (x3_ws) cudaFree(x3_ws);
         for (cudaEvent_t e : pfp.ev) cudaEventDestroy(e);
         if (dbg) std::fclose(dbg);
         if (eng_host) cudaFreeHost(eng_host);
@@ -492,7 +506,37 @@ struct Engine::Impl {
         return true;
     }
 
+    static constexpr int kX3PrefillRows = 512;   // prompt rows per K18 call (its scratch grows with the rows)
+    std::vector<std::unique_ptr<kernels::Exl3Mrow>> x3_groups;   // the EXL3 dense linears' K20 groups
+    void* x3_ws = nullptr;                        // K18's prefill workspace (EXL3 dense), allocated at the first prompt
+    size_t x3_ws_bytes = 0;
+    /// an EXL3 tensor set of the pack (trellis [k/16][n/16][16K], suh [k], svh [n])
+    kernels::Exl3Proj exl3(const std::string& name) {
+        const auto& t = pack.dense(name + ".trellis");
+        const auto& su = pack.dense(name + ".suh");
+        const auto& sv = pack.dense(name + ".svh");
+        if (t.dtype != DType::I16 || t.shape.size() != 3 || su.dtype != DType::F16 || sv.dtype != DType::F16)
+            throw std::runtime_error(name + " is not an EXL3 tensor set");
+        kernels::Exl3Proj p;
+        p.trellis = (const uint16_t*) t.device;
+        p.suh = (const __half*) su.device;
+        p.svh = (const __half*) sv.device;
+        p.k = (int) t.shape[0] * 16;
+        p.n = (int) t.shape[1] * 16;
+        p.tile_w = (int) t.shape[2];
+        x3_ws_bytes = std::max(x3_ws_bytes, kernels::exl3_linear_workspace_bytes(kX3PrefillRows, p.k, p.n));
+        return p;
+    }
     Fp8 fp8(const std::string& name) {
+        if (pack.has_dense(name + ".trellis")) {   // an EXL3 pack's dense linear
+            Fp8 f{nullptr, nullptr, 0, 0};
+            f.e = exl3(name);
+            f.n = f.e.n;
+            f.k = f.e.k;
+            x3_groups.push_back(std::make_unique<kernels::Exl3Mrow>(std::vector<kernels::MrowLinear>{{f.e, 0, 0}}));
+            f.x3 = x3_groups.back().get();
+            return f;
+        }
         const auto& w = pack.dense(name + ".weight");
         const auto& s = pack.dense(name + ".scale");
         if (w.dtype != DType::F8E4M3 || s.dtype != DType::E8M0) throw std::runtime_error(name + " is not FP8 + E8M0");
@@ -552,7 +596,15 @@ struct Engine::Impl {
             y.wo_b = fp8(p + "attn.wo_b");
             y.q_norm = bf(p + "attn.q_norm.weight");
             y.kv_norm = bf(p + "attn.kv_norm.weight");
-            if (pack.has_dense(p + "attn.wo_a.scale")) y.wo_a8 = fp8(p + "attn.wo_a");
+            if (pack.has_dense(p + "attn.wo_a.slice.0.trellis")) {   // EXL3: eight slices, one launch
+                std::vector<kernels::MrowLinear> g;
+                for (int i = 0; i < kOGroups; ++i) {
+                    y.wo_a3p[i] = exl3(p + "attn.wo_a.slice." + std::to_string(i));
+                    g.push_back({y.wo_a3p[i], i * y.wo_a3p[i].k, i * y.wo_a3p[i].n});
+                }
+                x3_groups.push_back(std::make_unique<kernels::Exl3Mrow>(g));
+                y.wo_a3 = x3_groups.back().get();
+            } else if (pack.has_dense(p + "attn.wo_a.scale")) y.wo_a8 = fp8(p + "attn.wo_a");
             else y.wo_a = bf(p + "attn.wo_a.weight");
             y.sink = f32(p + "attn.attn_sink");
             y.attn_norm = bf(p + "attn_norm.weight");
@@ -904,6 +956,10 @@ struct Engine::Impl {
     /// model.py linear() for one token: K1's activation quantizer, then K1's GEMV (act holds up to 8192 floats)
     void fp8_linear(const bf16* x, const Fp8& w, bf16* y) { fp8_linear_on(x, w, y, act, st); }
     void fp8_linear_on(const bf16* x, const Fp8& w, bf16* y, float* scratch, cudaStream_t s) {
+        if (w.x3) {   // EXL3 (exllamav3's LinearEXL3: bf16 in, no activation quantization)
+            w.x3->run(x, (int) w.k, y, (int) w.n, 1, s);
+            return;
+        }
         fp8_quantize_activation_f32((const uint16_t*) x, 1, w.k, scratch, s);
         fp8_block_gemv_q(scratch, 1, w.k, w.w, w.s, w.n, (uint16_t*) y, s);
     }
@@ -1315,6 +1371,7 @@ struct Engine::Impl {
         }
         ops::rope_device(o, kHeads, kHeadDim, rope, dp + 1, 0, true, st);
         if (y.wo_a8.w) wo_a_grouped_fp8(o, y.wo_a8.w, y.wo_a8.s, oa, st);
+        else if (y.wo_a3) y.wo_a3->run(o, kHeads * kHeadDim, oa, kOGroups * kOLora, 1, st);
         else ops::wo_a_grouped(o, y.wo_a, oa, st);
         fp8_linear(oa, y.wo_b, attn_out);
     }
@@ -1693,7 +1750,19 @@ struct Engine::Impl {
 
     /// model.py linear() for T rows (K2)
     void fp8_rows(const bf16* x, int T, const Fp8& w, bf16* y) {
+        if (w.x3) {
+            exl3_rows(x, (int) w.k, T, w.e, y, (int) w.n);
+            return;
+        }
         kernels::fp8_block_gemm(x, T, w.k, w.w, w.s, w.n, y, pf.k2_ws, 0);
+    }
+    /// An EXL3 linear over T prompt rows: K18 (the matrix reconstructed, cuBLAS) in chunks of kX3PrefillRows rows
+    void exl3_rows(const bf16* x, int ldx, int T, const kernels::Exl3Proj& w, bf16* y, int ldy) {
+        if (!x3_ws) ck(cudaMalloc(&x3_ws, x3_ws_bytes), "EXL3 prefill workspace");
+        for (int r = 0; r < T; r += kX3PrefillRows) {
+            const int n = std::min(kX3PrefillRows, T - r);
+            kernels::exl3_linear(x + (size_t) r * ldx, ldx, n, w, y + (size_t) r * ldy, ldy, x3_ws, x3_ws_bytes, 0);
+        }
     }
 
     /// K7's hyper-connection mixes for T rows (task K15)
@@ -1817,7 +1886,12 @@ struct Engine::Impl {
             dequant_wo_a(y.wo_a8.w, y.wo_a8.s, pf.wo_a_deq);
             wo_a = pf.wo_a_deq;
         }
-        prefill::wo_a_grouped_rows(pf.o, wo_a, T, pf.oa, pf.ftmp);
+        if (y.wo_a3)
+            for (int i = 0; i < kOGroups; ++i)
+                exl3_rows(pf.o + (size_t) i * y.wo_a3p[i].k, kHeads * kHeadDim, T, y.wo_a3p[i],
+                          pf.oa + (size_t) i * y.wo_a3p[i].n, kOGroups * kOLora);
+        else
+            prefill::wo_a_grouped_rows(pf.o, wo_a, T, pf.oa, pf.ftmp);
         fp8_rows(pf.oa, T, y.wo_b, pf.attn_out);
     }
 

@@ -71,6 +71,10 @@ void Engine::Impl::enqueue_slots(int m) {
         ck(cudaMemcpyAsync(dst, src, bytes, cudaMemcpyDeviceToDevice, st), "batch copy");
     };
     auto linear = [&](const bf16* x, const Fp8& w, bf16* out) {
+        if (w.x3) {
+            w.x3->run(x, (int) w.k, out, (int) w.n, m, st);
+            return;
+        }
         fp8_quantize_activation_f32((const uint16_t*) x, m, w.k, v.act, st);
         fp8_block_gemv_q(v.act, m, w.k, w.w, w.s, w.n, (uint16_t*) out, st);
     };
@@ -172,6 +176,7 @@ void Engine::Impl::enqueue_slots(int m) {
                                             float(std::pow(kHeadDim, -0.5)), ot, st);
             ops::rope_device(ot, kHeads, kHeadDim, rope, p + 1, 0, true, st);
             if (y.wo_a8.w) wo_a_grouped_fp8(ot, y.wo_a8.w, y.wo_a8.s, v.oa + t * kOGroups * kOLora, st);
+            else if (y.wo_a3) y.wo_a3->run(ot, kHeads * kHeadDim, v.oa + t * kOGroups * kOLora, kOGroups * kOLora, 1, st);
             else ops::wo_a_grouped(ot, y.wo_a, v.oa + t * kOGroups * kOLora, st);
         }
         linear(v.oa, y.wo_b, v.attn_out);

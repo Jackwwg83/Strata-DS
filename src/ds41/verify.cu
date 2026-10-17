@@ -127,6 +127,10 @@ void Engine::Impl::enqueue_verify(int m) {
         ck(cudaMemcpyAsync(dst, src, bytes, cudaMemcpyDeviceToDevice, st), "verify copy");
     };
     auto linear_on = [&](const bf16* x, const Fp8& w, bf16* out, float* act, cudaStream_t s) {
+        if (w.x3) {
+            w.x3->run(x, (int)w.k, out, (int)w.n, m, s);
+            return;
+        }
         fp8_quantize_activation_f32((const uint16_t*)x, m, w.k, act, s);
         fp8_block_gemv_q(act, m, w.k, w.w, w.s, w.n, (uint16_t*)out, s);
     };
@@ -266,10 +270,11 @@ void Engine::Impl::enqueue_verify(int m) {
                 kernels::sparse_attn_decode(qt, s.ring, nullptr, idx, 1, kWindow, y.sink,
                                             float(std::pow(kHeadDim,-0.5)), ot, st);
             ops::rope_device(ot, kHeads, kHeadDim, rope, p+1, 0, true, st);
-            if (!y.wo_a8.w) ops::wo_a_grouped(ot, y.wo_a, v.oa+t*kOGroups*kOLora, st);
+            if (!y.wo_a8.w && !y.wo_a3) ops::wo_a_grouped(ot, y.wo_a, v.oa+t*kOGroups*kOLora, st);
         }
         // every row at once, the weight read once (each row as wo_a_grouped_fp8 computes it)
         if (y.wo_a8.w) wo_a_grouped_fp8_rows(v.o, m, y.wo_a8.w, y.wo_a8.s, v.oa, st);
+        if (y.wo_a3) y.wo_a3->run(v.o, kHeads*kHeadDim, v.oa, kOGroups*kOLora, m, st);
         linear(v.oa, y.wo_b, v.attn_out);
         ops::hc_post(v.attn_out, v.h, v.apost, v.acomb, v.h2, m, st);
         kernels::hc_mixes_pre(v.h2, m, y.hc_ffn_fn, y.hc_ffn_scale, y.hc_ffn_base, v.apre,
