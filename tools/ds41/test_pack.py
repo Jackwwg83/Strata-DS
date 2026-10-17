@@ -247,6 +247,18 @@ class Mxfp4PackTest(unittest.TestCase):
                 np.testing.assert_array_equal(blob[a:a + cnb], want.numpy().reshape(-1), err_msg=f"{S}.{e}.{comp}")
         self.assertIn("finished 1", open(os.path.join(self.out, "pack_info.txt")).read())
 
+    def test_the_index_decides_which_tensors_exist(self):
+        # a merged checkpoint (official dense + another repo's experts) points its index at shards that also hold
+        # tensors it does not name: those are not part of the checkpoint
+        idx_path = os.path.join(self.src, "model.safetensors.index.json")
+        idx = json.load(open(idx_path))
+        gone = "layers.1.ffn.experts.1.w1.weight"
+        del idx["weight_map"][gone]
+        json.dump(idx, open(idx_path, "w"))
+        srcs = P.Source(self.src)
+        self.assertNotIn(gone, srcs.entries)
+        self.assertEqual(set(srcs.entries), set(idx["weight_map"]))
+
     def test_a_mixed_checkpoint_is_refused(self):
         # an EXL3 expert next to FP4 ones: one pack holds one expert format
         bad = os.path.join(self.tmp.name, "bad")
