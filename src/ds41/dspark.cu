@@ -6,6 +6,27 @@
 // Drafts only choose what a verify window checks: nothing here changes the output.
 namespace dsk = strata::ds41::dspark;
 
+namespace {
+/// the descriptor of a DSpark expert of layout x whose bytes start at dst (a VRAM slot or the mapped RAM copy)
+kernels::Exl3Expert mtp_desc(const ExpertSlot& x, const uint8_t* dst) {
+    auto proj = [&](int c0, int k, int nn) {
+        kernels::Exl3Proj p;
+        p.trellis = (const uint16_t*) (dst + x.comp_off[c0]);
+        p.suh = (const __half*) (dst + x.comp_off[c0 + 1]);
+        p.svh = (const __half*) (dst + x.comp_off[c0 + 2]);
+        p.k = k;
+        p.n = nn;
+        p.tile_w = (int) (x.comp_bytes[c0] / ((uint64_t) (k / 16) * (nn / 16) * 2));
+        return p;
+    };
+    kernels::Exl3Expert d;
+    d.w1 = proj(0, kDim, kMoeInter);
+    d.w3 = proj(4, kDim, kMoeInter);
+    d.w2 = proj(8, kMoeInter, kDim);
+    return d;
+}
+}  // namespace
+
 struct Engine::Impl::Dspark {
     static constexpr int B = dsk::kBlock;
     static constexpr int kHid = dsk::kTargets * kDim;   // 15360: the three target layers' means, concatenated
@@ -55,6 +76,8 @@ struct Engine::Impl::Dspark {
     std::vector<float> score = std::vector<float>(dsk::kStages * dsk::kExperts, 0.0f);
     void* vws = nullptr;                        // K10 workspace
     const void* registered = nullptr;
+    /// unified memory: every expert is computed by the GPU in place, from the mapped RAM copy (no slots, no swaps)
+    bool in_place = false;
     int last_hits = 0, last_uses = 0;
     std::map<int, cudaGraphExec_t> graphs;   // by pending rows (0..kVerifyMaxTokens)
     bool warmed = false;
@@ -172,6 +195,38 @@ void Engine::Impl::dspark_init() {
         d.vslots = (int) std::min<size_t>((mb << 20) / d.vslot_bytes, dsk::kStages * dsk::kExperts);
     }
     d.vres_host.assign(dsk::kStages * dsk::kExperts, -1);
+    if (uma && !std::getenv("DS41_DSPARK_VRAM_MB")) {   // unified memory: the GPU reads the RAM copy at memory speed
+        const uint64_t bytes = pack.load_mtp_experts();
+        void* base = (void*) pack.mtp_expert_base();
+        void* alias = nullptr;
+        if (cudaHostRegister(base, bytes, cudaHostRegisterMapped | cudaHostRegisterPortable) == cudaSuccess) {
+            d.registered = base;
+            if (cudaHostGetDevicePointer(&alias, base, 0) != cudaSuccess) alias = nullptr;
+        }
+        cudaGetLastError();
+        if (alias) {
+            const int n = dsk::kStages * dsk::kExperts;
+            std::vector<kernels::Exl3Expert> desc(n);
+            for (int i = 0; i < n; ++i) {
+                const auto& x = pack.mtp_expert(i / dsk::kExperts, i % dsk::kExperts);
+                desc[i] = mtp_desc(x, (const uint8_t*) alias + x.offset);
+                d.vres_host[i] = i;
+            }
+            d.in_place = true;
+            d.vslots = n;
+            d.vowner.resize(n);
+            for (int i = 0; i < n; ++i) d.vowner[i] = i;
+            d.vdesc = d.alloc<kernels::Exl3Expert>(n);
+            d.vres = d.alloc<int32_t>(n);
+            d.vws = d.alloc<uint8_t>(VramExperts::kWorkspaceBytes);
+            ck(cudaMemcpy(d.vdesc, desc.data(), n * sizeof(desc[0]), cudaMemcpyHostToDevice), "dspark descriptors");
+            ck(cudaMemcpy(d.vres, d.vres_host.data(), n * sizeof(int32_t), cudaMemcpyHostToDevice), "dspark table");
+            std::fprintf(stderr, "ds41: DSpark: all %d experts computed by the GPU in place (%.2f GiB, mapped)\n", n,
+                         bytes / (double) (1ull << 30));
+            return;
+        }
+        std::fprintf(stderr, "ds41: DSpark: the RAM copy could not be mapped; the CPU computes its experts\n");
+    }
     if (d.vslots > 0) {
         d.varena = d.alloc<uint8_t>((size_t) d.vslots * d.vslot_bytes);
         d.vdesc = d.alloc<kernels::Exl3Expert>(d.vslots);
@@ -195,7 +250,7 @@ void Engine::Impl::dspark_init() {
 void Engine::Impl::dspark_vram_update() {
     auto& d = *ds;
     const int n = dsk::kStages * dsk::kExperts;
-    if (d.vslots == 0) return;
+    if (d.vslots == 0 || d.in_place) return;
     int free_n = 0;
     for (int o : d.vowner) free_n += o < 0;
     int budget = free_n > 0 ? 8 : 2;
@@ -221,20 +276,7 @@ void Engine::Impl::dspark_vram_update() {
         ck(cudaMemcpy(dst, pack.mtp_expert_base() + x.offset, x.bytes, cudaMemcpyHostToDevice), "dspark vram copy");
         d.vowner[slot] = hot;
         d.vres_host[hot] = slot;
-        auto proj = [&](int c0, int k, int nn) {
-            kernels::Exl3Proj p;
-            p.trellis = (const uint16_t*) (dst + x.comp_off[c0]);
-            p.suh = (const __half*) (dst + x.comp_off[c0 + 1]);
-            p.svh = (const __half*) (dst + x.comp_off[c0 + 2]);
-            p.k = k;
-            p.n = nn;
-            p.tile_w = (int) (x.comp_bytes[c0] / ((uint64_t) (k / 16) * (nn / 16) * 2));
-            return p;
-        };
-        kernels::Exl3Expert desc;
-        desc.w1 = proj(0, kDim, kMoeInter);
-        desc.w3 = proj(4, kDim, kMoeInter);
-        desc.w2 = proj(8, kMoeInter, kDim);
+        const kernels::Exl3Expert desc = mtp_desc(x, dst);
         ck(cudaMemcpy(d.vdesc + slot, &desc, sizeof desc, cudaMemcpyHostToDevice), "dspark vram descriptor");
         changed = true;
     }

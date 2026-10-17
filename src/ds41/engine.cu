@@ -207,7 +207,8 @@ struct Engine::Impl {
         if (!v || !*v) return 8;
         char* end = nullptr;
         const long n = std::strtol(v, &end, 10);
-        if (end == v || *end || n < 0 || n > 64) throw std::invalid_argument("DS41_RAM_ADAPT must be an integer in [0, 64]");
+        if (end == v || *end || n < 0 || n > 256)
+            throw std::invalid_argument("DS41_RAM_ADAPT must be an integer in [0, 256]");
         return (int) n;
     }();
     int32_t* gpu_sel = nullptr;        // [6] per-call descriptor indices (-1: CPU)
@@ -1573,7 +1574,10 @@ struct Engine::Impl {
         int cap = std::max(1, std::min(n, opt.prefill_chunk)), sub = 0;
         for (; plan < 0; cap /= 2) {
             // the smallest pass is 16 tokens, or the whole prompt when it is shorter
-            if (cap < std::min(n, 16)) throw std::runtime_error("ds41 prefill: not enough VRAM for a 16-token pass");
+            if (cap < std::min(n, 16))
+                throw std::runtime_error("ds41 prefill: not enough VRAM for a 16-token pass (free " +
+                                         std::to_string(free_b >> 20) + " MiB, lendable " +
+                                         std::to_string(lendable >> 20) + " MiB)");
             for (sub = std::max(1, std::min(cap, opt.prefill_batch)); plan < 0 && sub >= std::min(cap, 512); sub /= 2) {
                 scratch = layout(pf, nullptr, cap, sub);
                 for (int r = std::max(opt.prefill_ring, kMinRing); plan < 0 && r >= kMinRing; r /= 2) {
