@@ -518,6 +518,15 @@ struct Engine::Impl {
             uma = cudaGetDevice(&dev) == cudaSuccess &&
                   cudaDeviceGetAttribute(&integrated, cudaDevAttrIntegrated, dev) == cudaSuccess && integrated;
         }
+        // Unified memory: one adaptive RAM tier that the GPU computes from, instead of a VRAM tier first. DGX Spark,
+        // DeepSeek-V4.1-Flash-1017 (MXFP4), code prompt, 96 tokens, no skips: the automatic VRAM tier (100 GiB, no RAM
+        // tier, misses computed by the CPU from the file) 437.7 ms per token; one RAM tier of 99 GiB 2710 ms with 8 free
+        // slots (a token misses ~100 experts, the tier takes 8 a step) and 121.6 ms (103.4 after 40 steps) with 64,
+        // when a token misses ~25. An explicit --vram-slots or DS41_RAM_ADAPT still wins.
+        if (uma) {
+            if (opt.vram_expert_slots < 0) opt.vram_expert_slots = 0;
+            if (ram_adapt > 0 && !std::getenv("DS41_RAM_ADAPT")) ram_adapt = 64;
+        }
         pack.upload_dense();
         pack.map_experts();
         if (opt.dspark) {   // before the RAM tier's automatic budget reads the available memory
