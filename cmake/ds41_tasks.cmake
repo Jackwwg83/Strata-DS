@@ -56,3 +56,13 @@ target_link_libraries(k17_mxfp4_moe_prefill_test PRIVATE ds41_k17_mxfp4_moe_pref
                       strata_ds41_engine)
 add_test(NAME k17_mxfp4_moe_prefill_test COMMAND k17_mxfp4_moe_prefill_test)
 set_tests_properties(k17_mxfp4_moe_prefill_test PROPERTIES SKIP_RETURN_CODE 77 TIMEOUT 900)
+
+# K18: one dense projection from EXL3 weights (an EXL3 checkpoint's attention, shared expert and head): K10's GEMV
+# for few rows, K12's reconstruction and cuBLAS for many; the test checks one path against the other. The engine does
+# not use it: on the DGX Spark (GB10) the GEMV decodes 46-96 GB/s of weights, FP8 reads 227 (see the test's speed).
+add_library(ds41_k18_exl3_linear STATIC src/ds41/kernels/k18_exl3_linear.cu)
+target_link_libraries(ds41_k18_exl3_linear PUBLIC ds41_k10_exl3_moe ds41_k12_exl3_moe_prefill CUDA::cublas)
+add_executable(k18_exl3_linear_test src/ds41/tests/k18_exl3_linear_test.cu)
+target_link_libraries(k18_exl3_linear_test PRIVATE ds41_k18_exl3_linear strata_ds41_engine)
+add_test(NAME k18_exl3_linear_test COMMAND k18_exl3_linear_test)
+set_tests_properties(k18_exl3_linear_test PROPERTIES SKIP_RETURN_CODE 77 TIMEOUT 900)
