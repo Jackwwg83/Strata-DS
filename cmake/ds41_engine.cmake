@@ -85,6 +85,11 @@ if(STRATA_BUILD_TESTS)
   target_compile_features(parallel_test PRIVATE cxx_std_17)
   target_link_libraries(parallel_test PRIVATE Threads::Threads)
   add_test(NAME parallel_test COMMAND parallel_test)
+  # DSpark's policy (ds41_generate and ds41_serve) on the host
+  add_executable(draft_scheduler_test src/ds41/tests/draft_scheduler_test.cpp)
+  target_include_directories(draft_scheduler_test PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/include)
+  target_compile_features(draft_scheduler_test PRIVATE cxx_std_17)
+  add_test(NAME draft_scheduler_test COMMAND draft_scheduler_test)
   # ds41_serve's line protocol on the host
   add_executable(serve_request_test src/ds41/tests/serve_request_test.cpp)
   target_include_directories(serve_request_test PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/include)

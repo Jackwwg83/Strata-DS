@@ -21,6 +21,7 @@
 // confidence head's first i probabilities, over the measured time of rounds with k drafts (DeepSeek's scheduler, and
 // upstream's DraftPolicy). --draft-k K verifies K drafts every round instead (raw acceptance).
 #include "strata/ds41/config.hpp"
+#include "strata/ds41/draft_scheduler.hpp"
 #include "strata/ds41/engine.hpp"
 #include "strata/ds41/suffix_drafter.hpp"
 
@@ -90,54 +91,6 @@ static void print_prefill(const Engine& engine, size_t n) {
 /// --step-log: one line per decode step (where the step's time went), for the decode profile
 static std::FILE* step_log = nullptr;
 
-/// DSpark's policy (DeepSeek's scheduler and upstream's DraftPolicy: expected tokens per measured millisecond).
-/// Before a round: draft only while drafting rounds commit more tokens per ms than plain steps (EMAs); after a losing
-/// round, plain steps for a backoff (4, doubling to 64 while drafting keeps losing), then one drafting round again.
-/// The first 16 tokens are plain steps.
-/// After a draft (its time is spent): the k drafts with the most E(k) / verify(k), E(k) = 1 + S1 + .. + Sk, Si the
-/// product of the first i confidence probabilities. Verify times are EMAs per k; a k not measured yet is the plain
-/// step's time times 1 + 0.45 k (measured on the laptop: each verify row adds ~45% of a step).
-struct DraftScheduler {
-    static constexpr int kMax = 8;
-    double vms[kMax] = {}, vn[kMax] = {};
-    double step_ms = 0, spec_rate = 0;   // EMAs: a plain step's time, a drafting round's tokens per ms
-    // the first 16 tokens are plain steps: they measure the step and keep drafting out of the cold start, when the
-    // tiers are empty and every extra verify row reads its experts from the SSD (a 4-row window took 2.7 s)
-    int backoff = 4, plain_left = 16;
-    double verify_cost(int k) const {
-        if (vn[k] > 0) return vms[k];
-        const double base = step_ms > 0 ? step_ms : 50.0;
-        return base * (1.0 + 0.45 * k);
-    }
-    bool want_draft() {
-        if (plain_left > 0) { --plain_left; return false; }
-        return true;
-    }
-    int choose(const Engine::Draft& d, int k_max) const {
-        int best = 0;
-        double e = 1, s = 1, best_rate = 1 / verify_cost(0);
-        for (int k = 1; k <= std::min(k_max, d.n); ++k) {
-            s *= d.accept[k - 1];
-            e += s;
-            if (e / verify_cost(k) > best_rate) { best_rate = e / verify_cost(k); best = k; }
-        }
-        return best;
-    }
-    void observe_step(double ms) { step_ms = step_ms > 0 ? 0.8 * step_ms + 0.2 * ms : ms; }
-    void observe_round(int k, double verify_ms, double round_ms, int tokens) {
-        vms[k] = vn[k] > 0 ? 0.8 * vms[k] + 0.2 * verify_ms : verify_ms;
-        vn[k] += 1;
-        const double rate = tokens / round_ms;
-        spec_rate = spec_rate > 0 ? 0.7 * spec_rate + 0.3 * rate : rate;
-        if (step_ms > 0 && spec_rate < 1.0 / step_ms) {   // drafting loses: plain steps for a while
-            plain_left = backoff;
-            backoff = std::min(backoff * 2, 64);
-        } else {
-            backoff = 4;
-        }
-    }
-};
-
 static void generate(Engine& engine, const EngineOptions& opt, const std::vector<int>& prompt,
                      int count, bool batched, bool suffix, int max_t, int eos, const std::vector<int>& cont = {},
                      bool oracle = false, bool dspark = false, int draft_k = -1) {
@@ -196,7 +149,7 @@ static void generate(Engine& engine, const EngineOptions& opt, const std::vector
             draft_cpu_ms += dd.cpu_experts_ms;
             draft_hits += dd.vram_hits;
             draft_uses += dd.uses;
-            proposed = draft_k >= 0 ? std::min({draft_k, dd.n, limit-1}) : sched.choose(dd, std::min(limit-1, dd.n));
+            proposed = draft_k >= 0 ? std::min({draft_k, dd.n, limit-1}) : sched.choose(dd.accept.data(), dd.n, limit-1);
             ++spec_rounds;
             for (int i = 0; i < proposed; ++i) draft[i] = dd.tokens[i];
         } else {
