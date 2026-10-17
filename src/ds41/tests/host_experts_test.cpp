@@ -16,6 +16,7 @@
 #include <unistd.h>
 #include <fstream>
 #include <string>
+#include <vector>
 
 using namespace strata::ds41;
 
@@ -90,7 +91,20 @@ int main() {
                     same &= std::memcmp(h.slot_ptr(h.slot_of(ranked[i].first, ranked[i].second)),
                                         pack.expert_base() + x.offset, x.bytes) == 0;
                 }
-                check(same, "host_alloc: a mapped cudaHostAlloc arena; every slot holds its expert's bytes");
+                check(same, "host_alloc: a mapped host arena; every slot holds its expert's bytes");
+                // an integrated GPU (DGX Spark): cuMemCreate on the host NUMA node, which its GPU reads at 233 GB/s
+                // against 220 for cudaHostAlloc; the GPU reads the slots' bytes through the device address
+                int integrated = 0;
+                cudaDeviceGetAttribute(&integrated, cudaDevAttrIntegrated, 0);
+                if (integrated) {
+                    check(h.numa_allocated(), "host_alloc on unified memory: the arena from cuMemCreate (host NUMA)");
+                    const ExpertSlot& x = pack.expert(ranked[3].first, ranked[3].second);
+                    std::vector<uint8_t> back(x.bytes);
+                    const uint8_t* dev = h.device_address(h.slot_ptr(h.slot_of(ranked[3].first, ranked[3].second)));
+                    const bool copied = dev && cudaMemcpy(back.data(), dev, x.bytes, cudaMemcpyDefault) == cudaSuccess;
+                    check(copied && std::memcmp(back.data(), pack.expert_base() + x.offset, x.bytes) == 0,
+                          "host_alloc on unified memory: the GPU reads the slot's bytes");
+                }
             } else {
                 cudaGetLastError();
             }

@@ -9,6 +9,7 @@
 #include "moe_mul1.h"   // third_party/exllamav3_moe
 #include "strata/ds41/routed_experts.hpp"
 
+#include <cuda.h>
 #include <cuda_runtime.h>
 #include <fcntl.h>
 #include <sys/mman.h>
@@ -71,6 +72,54 @@ std::vector<std::pair<int, int>> plan_ram_tier(const std::vector<std::pair<int, 
     return out;
 }
 
+/// An integrated GPU only: `bytes` of pinned host memory from cuMemCreate on host NUMA node 0, mapped at one address
+/// that the GPU and the CPU both read and write (vLLM #60844: streaming GPU reads at cudaMalloc speed; DGX Spark 233 GB/s
+/// against 220 for cudaHostAlloc). Null when the GPU is discrete or the driver refuses; size and handle for the free.
+static void* numa_arena(size_t bytes, size_t& mapped, unsigned long long& handle) {
+    int dev = 0, integrated = 0;
+    if (cudaGetDevice(&dev) != cudaSuccess || cudaDeviceGetAttribute(&integrated, cudaDevAttrIntegrated, dev) != cudaSuccess ||
+        !integrated || cudaFree(nullptr) != cudaSuccess) {   // cudaFree(0): the runtime's context, which cuMem uses
+        cudaGetLastError();
+        return nullptr;
+    }
+    CUmemAllocationProp prop = {};
+    prop.type = CU_MEM_ALLOCATION_TYPE_PINNED;
+    prop.location.type = CU_MEM_LOCATION_TYPE_HOST_NUMA;
+    prop.location.id = 0;
+    size_t gran = 0;
+    if (cuMemGetAllocationGranularity(&gran, &prop, CU_MEM_ALLOC_GRANULARITY_RECOMMENDED) != CUDA_SUCCESS || !gran)
+        return nullptr;
+    const size_t size = (bytes + gran - 1) / gran * gran;
+    CUmemGenericAllocationHandle h = 0;
+    if (cuMemCreate(&h, size, &prop, 0) != CUDA_SUCCESS) return nullptr;
+    CUdeviceptr va = 0;
+    if (cuMemAddressReserve(&va, size, gran, 0, 0) != CUDA_SUCCESS) {
+        cuMemRelease(h);
+        return nullptr;
+    }
+    CUmemAccessDesc acc[2] = {};
+    acc[0].location.type = CU_MEM_LOCATION_TYPE_DEVICE;
+    acc[0].location.id = dev;
+    acc[0].flags = CU_MEM_ACCESS_FLAGS_PROT_READWRITE;
+    acc[1].location.type = CU_MEM_LOCATION_TYPE_HOST_NUMA;
+    acc[1].location.id = 0;
+    acc[1].flags = CU_MEM_ACCESS_FLAGS_PROT_READWRITE;
+    if (cuMemMap(va, size, 0, h, 0) != CUDA_SUCCESS) {
+        cuMemAddressFree(va, size);
+        cuMemRelease(h);
+        return nullptr;
+    }
+    if (cuMemSetAccess(va, size, acc, 2) != CUDA_SUCCESS) {
+        cuMemUnmap(va, size);
+        cuMemAddressFree(va, size);
+        cuMemRelease(h);
+        return nullptr;
+    }
+    mapped = size;
+    handle = (unsigned long long) h;
+    return (void*) va;
+}
+
 size_t auto_ram_budget(size_t headroom) {
     uint64_t avail = read_field("/proc/meminfo", "MemAvailable", 1024);
     uint64_t limit = read_number("/sys/fs/cgroup/memory.max"), anon = 0;
@@ -112,7 +161,9 @@ HostExperts::HostExperts(const Pack& pack, const std::vector<std::pair<int, int>
     void* p = nullptr;
     if (host_alloc) {   // pinned and mapped from the start: no pin step below
         const size_t limit = detail::register_limit().load();
-        if ((!limit || arena_bytes_ <= limit) &&
+        if ((!limit || arena_bytes_ <= limit) && (p = numa_arena(arena_bytes_, numa_bytes_, numa_handle_)))
+            host_alloc_ = true;
+        else if ((!limit || arena_bytes_ <= limit) &&
             cudaHostAlloc(&p, arena_bytes_, cudaHostAllocMapped | cudaHostAllocPortable) == cudaSuccess)
             host_alloc_ = true;
         else {
@@ -208,7 +259,8 @@ HostExperts::HostExperts(const Pack& pack, const std::vector<std::pair<int, int>
     if (pinned) {
         locked_ = registered_ = true;
         void* alias = nullptr;
-        if (cudaHostGetDevicePointer(&alias, arena_, 0) == cudaSuccess)
+        if (numa_bytes_) device_alias_ = arena_;   // one address for the CPU and the GPU
+        else if (cudaHostGetDevicePointer(&alias, arena_, 0) == cudaSuccess)
             device_alias_ = static_cast<uint8_t*>(alias);
         else
             cudaGetLastError();
@@ -263,6 +315,12 @@ HostExperts::~HostExperts() {
 }
 
 void HostExperts::free_arena() noexcept {
+    if (numa_bytes_) {
+        cuMemUnmap((CUdeviceptr) arena_, numa_bytes_);
+        cuMemAddressFree((CUdeviceptr) arena_, numa_bytes_);
+        cuMemRelease((CUmemGenericAllocationHandle) numa_handle_);
+        return;
+    }
     if (host_alloc_) {
         cudaFreeHost(arena_);
         return;

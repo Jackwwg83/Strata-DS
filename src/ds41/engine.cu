@@ -807,7 +807,8 @@ struct Engine::Impl {
             if (vram) vram->set_host(host.get());
             std::fprintf(stderr, "ds41: RAM tier %d experts (%.1f GiB, %s%s), filled in %.1f s\n", host->slots(),
                          host->arena_bytes() / (double) (1ull << 30), host->locked() ? "locked" : "not locked",
-                         host->host_allocated() ? ", cudaHostAlloc" : "", (now_ms() - t0) / 1000.0);
+                         host->numa_allocated() ? ", cuMem host NUMA" : host->host_allocated() ? ", cudaHostAlloc" : "",
+                         (now_ms() - t0) / 1000.0);
             if (ram_adapt) {
                 host->enable_adapt(ram_adapt);
                 std::fprintf(stderr, "ds41: adaptive RAM tier, %d free slots per slot size (%d free)\n", ram_adapt,

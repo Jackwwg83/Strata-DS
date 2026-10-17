@@ -29,7 +29,7 @@ target_compile_features(strata_ds41_engine PUBLIC cxx_std_17)
 set_source_files_properties(third_party/exllamav3_moe/moe_mul1.cpp PROPERTIES COMPILE_OPTIONS "-O3")
 set_source_files_properties(src/ds41/mxfp4_cpu.cpp PROPERTIES COMPILE_OPTIONS "-O3")
 find_package(Threads REQUIRED)
-target_link_libraries(strata_ds41_engine PUBLIC strata_ds41 CUDA::cudart CUDA::cublas Threads::Threads)
+target_link_libraries(strata_ds41_engine PUBLIC strata_ds41 CUDA::cudart CUDA::cuda_driver CUDA::cublas Threads::Threads)
 
 add_executable(ds41_generate src/ds41/ds41_generate.cpp)
 target_link_libraries(ds41_generate PRIVATE strata_ds41_engine strata_ds41_suffix)

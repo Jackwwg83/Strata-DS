@@ -97,6 +97,9 @@ public:
     bool locked() const { return locked_; }
     /// the arena came from cudaHostAlloc (host_alloc)
     bool host_allocated() const { return host_alloc_; }
+    /// the host_alloc arena came from cuMemCreate on the host NUMA node (an integrated GPU): the GPU reads it at the
+    /// speed of cudaMalloc memory (DGX Spark: 233 GB/s, cudaHostAlloc 220), and the CPU uses the same address
+    bool numa_allocated() const { return numa_bytes_ != 0; }
     /// the GPU can read the arena (pinned and mapped)
     bool mapped() const { return device_alias_ != nullptr; }
     /// the slots were read with O_DIRECT (else copied from the mapped pack, through the file cache)
@@ -214,7 +217,9 @@ private:
     bool filled_direct_ = false;
     std::vector<uint8_t> held_;   ///< [n_layers][n_experts] pointed at a swap buffer (point_to)
     bool registered_ = false;
-    bool host_alloc_ = false;   ///< arena_ from cudaHostAlloc (freed with cudaFreeHost)
+    bool host_alloc_ = false;   ///< arena_ from cudaHostAlloc (freed with cudaFreeHost) or cuMemCreate
+    size_t numa_bytes_ = 0;      ///< arena_ from cuMemCreate (host NUMA): its mapped size; 0 otherwise
+    unsigned long long numa_handle_ = 0;
     void free_arena() noexcept;
     uint8_t* device_alias_ = nullptr;
     kernels::Exl3Expert* experts_dev_ = nullptr;
