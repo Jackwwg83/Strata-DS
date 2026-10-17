@@ -12,6 +12,7 @@ add_library(strata_ds41_engine STATIC
   src/ds41/engram_rows.cpp
   src/ds41/host_experts.cpp
   src/ds41/mxfp4_cpu.cpp
+  src/ds41/routed_experts.cpp
   src/ds41/lookahead.cpp
   src/ds41/expert_stream.cpp
   src/ds41/wo_a_fp8.cu

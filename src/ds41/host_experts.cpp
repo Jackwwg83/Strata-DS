@@ -7,6 +7,7 @@
 #include "strata/ds41/vram_experts.hpp"
 
 #include "moe_mul1.h"   // third_party/exllamav3_moe
+#include "strata/ds41/routed_experts.hpp"
 
 #include <cuda_runtime.h>
 #include <fcntl.h>
@@ -250,20 +251,7 @@ HostExperts::~HostExperts() {
 
 void HostExperts::point(int layer, int expert, const uint8_t* bytes) {
     if (handles_.empty()) return;   // no CPU kernel (tests)
-    const ExpertSlot& s = pack_.expert(layer, expert);
-    auto desc = [&](int c0, int k_tiles, int n_tiles) {
-        MoeCpuMatrixDesc d;
-        d.trellis = (const uint16_t*) (bytes + s.comp_off[c0]);
-        d.suh = (const at::Half*) (bytes + s.comp_off[c0 + 1]);
-        d.svh = (const at::Half*) (bytes + s.comp_off[c0 + 2]);
-        d.k_tiles = k_tiles;
-        d.n_tiles = n_tiles;
-        d.tile_w = (int) (s.comp_bytes[c0] / ((uint64_t) k_tiles * n_tiles * 2));
-        return d;
-    };
-    const MoeCpuMatrixDesc g = desc(0, kDim / 16, kMoeInter / 16), u = desc(4, kDim / 16, kMoeInter / 16),
-                           d = desc(8, kMoeInter / 16, kDim / 16);
-    exl3_moe_cpu_set_expert_raw(handles_[layer], expert, &g, &u, &d, 0);
+    cpu_set_expert(pack_.expert_format(), handles_[layer], expert, pack_.expert(layer, expert), bytes);
 }
 
 void HostExperts::reserve_pending(int n) {
@@ -573,6 +561,15 @@ int HostExperts::read_picked(int layer, const int32_t* ids, int n, const std::ve
         point(layer, ids[i], slot_ptr(pick[i]));
     }
     return read;
+}
+
+const uint8_t* HostExperts::slot_bytes(int layer, int expert) {
+    const int32_t s = slot_of(layer, expert);
+    if (s >= 0) return slot_ptr(s);
+    std::lock_guard<std::mutex> lk(admit_mu_);
+    for (const auto& a : admitted_)
+        if (a.second.first == layer && a.second.second == expert) return slot_ptr(a.first);
+    return nullptr;
 }
 
 void HostExperts::open_prefetch() {

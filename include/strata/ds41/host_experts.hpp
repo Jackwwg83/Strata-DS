@@ -103,6 +103,11 @@ public:
     /// RAM slot of (layer, expert), or -1 (the expert is read from the file)
     int32_t slot_of(int layer, int expert) const { return slot_[(size_t) layer * n_experts_ + expert]; }
     uint8_t* slot_ptr(int slot) const { return arena_ + off_[slot]; }
+    /// The bytes of (layer, expert) in the arena: its RAM slot, or the free slot an admit() of this step read it
+    /// into; null when it is in no slot (the file, or a swap buffer). Any thread, during a step.
+    const uint8_t* slot_bytes(int layer, int expert);
+    /// The GPU's address of arena bytes (mapped() only): the GPU computes from them in place (unified memory)
+    const uint8_t* device_address(const uint8_t* bytes) const { return device_alias_ + (bytes - arena_); }
     /// the largest expert the slot can hold: the size of the expert that first filled it
     size_t slot_capacity(int slot) const { return off_[slot + 1] - off_[slot]; }
 
