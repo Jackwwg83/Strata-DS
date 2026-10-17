@@ -523,10 +523,12 @@ struct Engine::Impl {
         // DeepSeek-V4.1-Flash-1017 (MXFP4), code prompt, 96 tokens, no skips: the automatic VRAM tier (100 GiB, no RAM
         // tier, misses computed by the CPU from the file) 437.7 ms per token; one RAM tier of 99 GiB 2710 ms with 8 free
         // slots (a token misses ~100 experts, the tier takes 8 a step) and 121.6 ms (103.4 after 40 steps) with 64,
-        // when a token misses ~25. An explicit --vram-slots or DS41_RAM_ADAPT still wins.
+        // when a token misses ~25. A DSpark verify window of up to 4 tokens misses up to ~120 a step: 160 free slots
+        // (code prompt, 128 tokens, 88 GiB tier: 64 slots 133.2 ms per token, 160 slots 96.8). An explicit
+        // --vram-slots or DS41_RAM_ADAPT still wins.
         if (uma) {
             if (opt.vram_expert_slots < 0) opt.vram_expert_slots = 0;
-            if (ram_adapt > 0 && !std::getenv("DS41_RAM_ADAPT")) ram_adapt = 64;
+            if (ram_adapt > 0 && !std::getenv("DS41_RAM_ADAPT")) ram_adapt = opt.dspark ? 160 : 64;
         }
         pack.upload_dense();
         pack.map_experts();
@@ -792,8 +794,9 @@ struct Engine::Impl {
         }
         // the RAM tier after it: the hottest experts the VRAM tier does not hold (upstream's resident budget)
         if (!opt.expert_profile.empty() && opt.ram_budget_gib != 0) {
-            const size_t budget = opt.ram_budget_gib < 0 ? auto_ram_budget(ram_adapt ? 8ull << 30 : 24ull << 30)
-                                                         : (size_t) (opt.ram_budget_gib * (double) (1ull << 30));
+            const size_t budget = opt.ram_budget_gib < 0
+                                      ? auto_ram_budget(ram_tier_headroom(ram_adapt > 0, uma, uma_headroom_bytes()))
+                                      : (size_t) (opt.ram_budget_gib * (double) (1ull << 30));
             std::vector<int64_t> handles;
             for (const auto& y : L) handles.push_back(y.moe_handle);
             const double t0 = now_ms();

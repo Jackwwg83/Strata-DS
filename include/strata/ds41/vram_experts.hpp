@@ -44,6 +44,12 @@ std::vector<std::pair<int, int>> read_expert_profile(const std::string& path, in
 size_t device_free_bytes();
 /// the rule of device_free_bytes() on unified memory: max(cuda_free, mem_available - headroom)
 uint64_t uma_free_bytes(uint64_t cuda_free, uint64_t mem_available, uint64_t headroom);
+/// the GPU's headroom on unified memory: STRATA_UMA_HEADROOM_GIB, 6 GiB by default
+uint64_t uma_headroom_bytes();
+/// The memory the automatic RAM tier leaves free: 8 GiB (adaptive tier) or 24 GiB (static tier, for the file cache).
+/// On unified memory the GPU's headroom comes on top: device_free_bytes() subtracts it from what the tier leaves, so
+/// without it the GPU's later buffers (the prefill ring and scratch) find almost nothing.
+uint64_t ram_tier_headroom(bool adaptive, bool unified, uint64_t uma_headroom);
 
 struct ExpertSwap {
     float gain;

@@ -40,6 +40,24 @@ uint64_t uma_free_bytes(uint64_t cuda_free, uint64_t mem_available, uint64_t hea
     return mem_available > headroom && mem_available - headroom > cuda_free ? mem_available - headroom : cuda_free;
 }
 
+uint64_t uma_headroom_bytes() {
+    // STRATA_UMA_HEADROOM_GIB: a whole number of GiB, 0..1024; anything else keeps the default 6 (said once)
+    static const long gib = [] {
+        const char* h = std::getenv("STRATA_UMA_HEADROOM_GIB");
+        if (h == nullptr) return 6L;
+        char* end = nullptr;
+        const long v = std::strtol(h, &end, 10);
+        if (end != h && *end == '\0' && v >= 0 && v <= 1024) return v;
+        std::fprintf(stderr, "ds41: STRATA_UMA_HEADROOM_GIB=%s is not a whole number of GiB (0-1024): using 6\n", h);
+        return 6L;
+    }();
+    return (uint64_t) gib << 30;
+}
+
+uint64_t ram_tier_headroom(bool adaptive, bool unified, uint64_t uma_headroom) {
+    return (adaptive ? 8ull << 30 : 24ull << 30) + (unified ? uma_headroom : 0);
+}
+
 size_t device_free_bytes() {
     size_t free_b = 0, total_b = 0;
     ck(cudaMemGetInfo(&free_b, &total_b), "cudaMemGetInfo");
@@ -54,17 +72,7 @@ size_t device_free_bytes() {
             if (std::sscanf(line, "MemAvailable: %llu kB", &kb) == 1) break;
         std::fclose(m);
     }
-    // STRATA_UMA_HEADROOM_GIB: a whole number of GiB, 0..1024; anything else keeps the default 6 (said once)
-    static const long gib = [] {
-        const char* h = std::getenv("STRATA_UMA_HEADROOM_GIB");
-        if (h == nullptr) return 6L;
-        char* end = nullptr;
-        const long v = std::strtol(h, &end, 10);
-        if (end != h && *end == '\0' && v >= 0 && v <= 1024) return v;
-        std::fprintf(stderr, "ds41: STRATA_UMA_HEADROOM_GIB=%s is not a whole number of GiB (0-1024): using 6\n", h);
-        return 6L;
-    }();
-    return (size_t) uma_free_bytes(free_b, (uint64_t) kb << 10, (uint64_t) gib << 30);
+    return (size_t) uma_free_bytes(free_b, (uint64_t) kb << 10, uma_headroom_bytes());
 }
 
 std::vector<std::pair<int, int>> read_expert_profile(const std::string& path, int n_layers, int n_experts) {

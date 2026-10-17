@@ -5,6 +5,7 @@
 #include "bench_util.hpp"
 
 #include <cstdio>
+#include <cstdlib>
 #include <functional>
 #include <string>
 
@@ -13,6 +14,8 @@ using strata::ds41::ExpertSwap;
 using strata::ds41::plan_expert_swaps;
 using strata::ds41::read_expert_profile;
 using strata::ds41::uma_free_bytes;
+using strata::ds41::ram_tier_headroom;
+using strata::ds41::uma_headroom_bytes;
 
 namespace {
 
@@ -58,6 +61,14 @@ int main() {
     v.check(uma_free_bytes(24 * G, 113 * G, 6 * G) == 107 * G, "UMA: MemAvailable less the headroom");
     v.check(uma_free_bytes(24 * G, 20 * G, 6 * G) == 24 * G, "UMA: never less than cudaMemGetInfo");
     v.check(uma_free_bytes(1 * G, 5 * G, 6 * G) == 1 * G, "UMA: MemAvailable under the headroom adds nothing");
+    // the RAM tier's headroom: on unified memory it also keeps the GPU's headroom free, or device_free_bytes() finds
+    // almost nothing after the tier (DGX Spark, DSpark on: 713 MiB, too little for a 16-token prefill pass)
+    v.check(ram_tier_headroom(true, false, 6 * G) == 8 * G, "RAM tier headroom: adaptive, discrete GPU");
+    v.check(ram_tier_headroom(false, false, 6 * G) == 24 * G, "RAM tier headroom: static, discrete GPU");
+    v.check(ram_tier_headroom(true, true, 6 * G) == 14 * G, "RAM tier headroom: adaptive, unified memory");
+    v.check(ram_tier_headroom(false, true, 2 * G) == 26 * G, "RAM tier headroom: static, unified memory");
+    if (std::getenv("STRATA_UMA_HEADROOM_GIB") == nullptr)
+        v.check(uma_headroom_bytes() == 6 * G, "UMA headroom: 6 GiB by default");
 
     // ---- swap plan: 2 layers x 6 experts
     const int L = 2, E = 6;
