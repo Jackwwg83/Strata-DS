@@ -169,6 +169,22 @@ int main() {
         const double gb = 6.0 * (3.0 * F * H * 17.0 / 32.0) / 1e9;
         std::printf("speed: m=1 x 6 experts %.1f us, %.0f GB/s of weights\n", us, gb / (us / 1e6));
         v.metric("decode_us", us);
+        // a verify window of 5 tokens that share 4 of their 6 experts: each shared expert is read once
+        std::vector<int32_t> sel5;
+        for (int t = 0; t < 5; ++t)
+            for (int j = 0; j < 6; ++j) sel5.push_back(j < 4 ? j : 4 + (t * 2 + j) % 4);
+        std::vector<float> w5(30, 0.1f);
+        std::vector<__half> x5(5 * H, __float2half_rn(0.01f));
+        Dev<__half> dx5(x5);
+        Dev<int32_t> ds5(sel5);
+        Dev<float> dw5(w5), dout5(5 * H);
+        const size_t wsb5 = kk::mxfp4_moe_workspace_bytes(30);
+        Dev<uint8_t> ws5(wsb5);
+        const double us5 = median_us([&] {
+            kk::mxfp4_moe_decode(dx5.p, 5, ds5.p, dw5.p, 6, dd.p, dout5.p, ws5.p, wsb5, 0);
+        }, 20);
+        std::printf("speed: m=5 window, 8 distinct experts of 30 uses: %.1f us (m=1 x 6: %.1f us)\n", us5, us);
+        v.metric("window5_us", us5);
     }
     return v.finish();
 }

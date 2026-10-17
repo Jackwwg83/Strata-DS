@@ -1,7 +1,9 @@
 // K16: routed experts from DeepSeek's FP4 (MXFP4) weights, decode and verify windows (m <= 8 tokens).
 // Four launches: gate/up GEMV (one warp per output row), the activation with its FP8 QDQ (one warp per 32-block),
-// the down GEMV (one warp per output row), and the per-token sum in slot order. The GEMVs read every weight byte once
-// per slot with 16-byte streaming loads; a token's activations stay in L1/L2.
+// the down GEMV (one warp per output row), and the per-token sum in slot order. In the GEMVs the first slot of an
+// expert leads: it reads each weight row once, with 16-byte streaming loads, for every slot of the call that uses that
+// expert (a token routes an expert once, so at most m); the other slots' blocks return. A verify window whose tokens
+// share experts reads them once. The arithmetic per slot is unchanged.
 #include "strata/ds41/kernels/k16_mxfp4_moe.hpp"
 
 #include <cuda_bf16.h>
@@ -45,22 +47,43 @@ __device__ __forceinline__ float2 fp4x2(uint32_t byte) {
     return __half22float2(*reinterpret_cast<const __half2*>(&r));
 }
 
-/// 8 codes (one 32-bit word) against 8 activations
-__device__ __forceinline__ float dot8(uint32_t q, const float* a) {
-    float s = 0.0f;
+__device__ __forceinline__ float warp_sum(float v) {
 #pragma unroll
-    for (int i = 0; i < 4; ++i) {
-        const float2 w = fp4x2((q >> (8 * i)) & 0xffu);
-        s = fmaf(w.x, a[2 * i], s);
-        s = fmaf(w.y, a[2 * i + 1], s);
-    }
-    return s;
+    for (int d = 16; d; d >>= 1) v += __shfl_xor_sync(0xffffffffu, v, d);
+    return v;
 }
 
-/// one 32-block: 16 code bytes against 32 fp16 activations
-__device__ __forceinline__ float block_dot(uint4 q, const __half* x) {
+constexpr int kMaxShare = 8;   // slots of one call that share an expert: one per token at most
+
+/// The slots of the call with slot's expert, in order, form groups of kMaxShare; a group's first slot leads. Returns
+/// the leader's group (slot first) in share, or 0 when slot does not lead.
+__device__ __forceinline__ int sharers(const int32_t* sel, int slots, int slot, int* share) {
+    const int id = sel[slot];
+    int before = 0;
+    for (int s = 0; s < slot; ++s) before += sel[s] == id;
+    if (before % kMaxShare) return 0;
+    int n = 0;
+    for (int s = slot; s < slots && n < kMaxShare; ++s)
+        if (sel[s] == id) share[n++] = s;
+    return n;
+}
+
+/// the 32 values of one block (16 code bytes), unscaled
+__device__ __forceinline__ void decode32(uint4 q, float* w) {
+    const uint32_t words[4] = {q.x, q.y, q.z, q.w};
+#pragma unroll
+    for (int i = 0; i < 4; ++i)
+#pragma unroll
+        for (int j = 0; j < 4; ++j) {
+            const float2 v = fp4x2((words[i] >> (8 * j)) & 0xffu);
+            w[8 * i + 2 * j] = v.x;
+            w[8 * i + 2 * j + 1] = v.y;
+        }
+}
+
+__device__ __forceinline__ float dot32(const float* w, const __half* x) {
     const uint4* xv = reinterpret_cast<const uint4*>(x);
-    float a[32];
+    float s = 0.0f;
 #pragma unroll
     for (int i = 0; i < 4; ++i) {
         const uint4 v = __ldg(xv + i);
@@ -68,16 +91,16 @@ __device__ __forceinline__ float block_dot(uint4 q, const __half* x) {
 #pragma unroll
         for (int j = 0; j < 4; ++j) {
             const float2 f = __half22float2(h[j]);
-            a[8 * i + 2 * j] = f.x;
-            a[8 * i + 2 * j + 1] = f.y;
+            s = fmaf(w[8 * i + 2 * j], f.x, s);
+            s = fmaf(w[8 * i + 2 * j + 1], f.y, s);
         }
     }
-    return dot8(q.x, a) + dot8(q.y, a + 8) + dot8(q.z, a + 16) + dot8(q.w, a + 24);
+    return s;
 }
 
-__device__ __forceinline__ float block_dot(uint4 q, const __nv_bfloat16* x) {
+__device__ __forceinline__ float dot32(const float* w, const __nv_bfloat16* x) {
     const uint4* xv = reinterpret_cast<const uint4*>(x);
-    float a[32];
+    float s = 0.0f;
 #pragma unroll
     for (int i = 0; i < 4; ++i) {
         const uint4 v = xv[i];
@@ -85,44 +108,57 @@ __device__ __forceinline__ float block_dot(uint4 q, const __nv_bfloat16* x) {
 #pragma unroll
         for (int j = 0; j < 4; ++j) {
             const float2 f = __bfloat1622float2(h[j]);
-            a[8 * i + 2 * j] = f.x;
-            a[8 * i + 2 * j + 1] = f.y;
+            s = fmaf(w[8 * i + 2 * j], f.x, s);
+            s = fmaf(w[8 * i + 2 * j + 1], f.y, s);
         }
     }
-    return dot8(q.x, a) + dot8(q.y, a + 8) + dot8(q.z, a + 16) + dot8(q.w, a + 24);
+    return s;
 }
 
-__device__ __forceinline__ float warp_sum(float v) {
-#pragma unroll
-    for (int d = 16; d; d >>= 1) v += __shfl_xor_sync(0xffffffffu, v, d);
-    return v;
-}
-
-/// one output row of a projection: sum over the k/32 blocks of scale * block_dot
-template <typename X>
-__device__ __forceinline__ float row_dot(const Exl3Proj& p, int row, int k, const X* x, int lane) {
+/// one output row of a projection against n activation vectors x(i): out[i] = sum over the k/32 blocks of
+/// scale * the block's dot product; each weight block is read and decoded once for all n
+template <int S, typename X, typename XOf>
+__device__ __forceinline__ void row_dot(const Exl3Proj& p, int row, int k, XOf x, int n, int lane, float* out) {
     const uint8_t* codes = mxfp4_codes(p) + (size_t) row * (k / 2);
     const uint8_t* scales = mxfp4_scales(p) + (size_t) row * (k / 32);
-    float acc = 0.0f;
+    float acc[S];
+#pragma unroll
+    for (int i = 0; i < S; ++i) acc[i] = 0.0f;
     for (int b = lane; b < k / 32; b += 32) {
         const uint4 q = __ldcs(reinterpret_cast<const uint4*>(codes) + b);
-        acc = fmaf(e8m0(__ldcs(scales + b)), block_dot(q, x + 32 * b), acc);
+        const float s = e8m0(__ldcs(scales + b));
+        float w[32];
+        decode32(q, w);
+#pragma unroll
+        for (int i = 0; i < S; ++i)
+            if (i < n) acc[i] = fmaf(s, dot32(w, (const X*) x(i) + 32 * b), acc[i]);
     }
-    return warp_sum(acc);
+#pragma unroll
+    for (int i = 0; i < S; ++i)
+        if (i < n) out[i] = warp_sum(acc[i]);
 }
 
 __device__ __forceinline__ float bf16r(float v) { return __bfloat162float(__float2bfloat16_rn(v)); }
 
-__global__ void gate_up(const __half* x, const int32_t* sel, int topk, const Exl3Expert* experts, float* gu) {
+/// S: the most slots that can share an expert in this call (1 when m = 1: no grouping, fewer registers)
+template <int S>
+__global__ void gate_up(const __half* x, const int32_t* sel, int topk, int slots, const Exl3Expert* experts,
+                        float* gu) {
     const int slot = blockIdx.y;
     const int id = sel[slot];
     if (id < 0) return;
+    int share[S];
+    share[0] = slot;
+    const int n = S == 1 ? 1 : sharers(sel, slots, slot, share);
+    if (n == 0) return;   // an earlier slot computes this expert for this slot too
     const int lane = threadIdx.x & 31;
     const int row = blockIdx.x * kWarps + (threadIdx.x >> 5);   // 0..2F-1
     const bool up = row >= F;
     const Exl3Proj& p = up ? experts[id].w3 : experts[id].w1;
-    const float v = row_dot(p, up ? row - F : row, H, x + (size_t) (slot / topk) * H, lane);
-    if (lane == 0) gu[(size_t) slot * 2 * F + row] = bf16r(v);
+    float v[S];
+    row_dot<S, __half>(p, up ? row - F : row, H, [&](int i) { return x + (size_t) (share[i] / topk) * H; }, n, lane, v);
+    if (lane == 0)
+        for (int i = 0; i < n; ++i) gu[(size_t) share[i] * 2 * F + row] = bf16r(v[i]);
 }
 
 __device__ __forceinline__ float round_pow2(float a) {
@@ -146,14 +182,21 @@ __global__ void activate(const int32_t* sel, const float* w, const float* gu, __
     hidden[(size_t) slot * F + i] = __float2bfloat16_rn(float(q) * scale);
 }
 
-__global__ void down(const int32_t* sel, const Exl3Expert* experts, const __nv_bfloat16* hidden, float* y) {
+template <int S>
+__global__ void down(const int32_t* sel, int slots, const Exl3Expert* experts, const __nv_bfloat16* hidden, float* y) {
     const int slot = blockIdx.y;
     const int id = sel[slot];
     if (id < 0) return;
+    int share[S];
+    share[0] = slot;
+    const int n = S == 1 ? 1 : sharers(sel, slots, slot, share);
+    if (n == 0) return;
     const int lane = threadIdx.x & 31;
     const int row = blockIdx.x * kWarps + (threadIdx.x >> 5);   // 0..H-1
-    const float v = row_dot(experts[id].w2, row, F, hidden + (size_t) slot * F, lane);
-    if (lane == 0) y[(size_t) slot * H + row] = bf16r(v);
+    float v[S];
+    row_dot<S, __nv_bfloat16>(experts[id].w2, row, F, [&](int i) { return hidden + (size_t) share[i] * F; }, n, lane, v);
+    if (lane == 0)
+        for (int i = 0; i < n; ++i) y[(size_t) share[i] * H + row] = bf16r(v[i]);
 }
 
 /// out[t] += y of the token's slots, in slot order
@@ -181,9 +224,16 @@ void mxfp4_moe_decode(const __half* x, int m, const int32_t* sel, const float* w
     if (reinterpret_cast<uintptr_t>(workspace) % 16 != 0 || reinterpret_cast<uintptr_t>(x) % 16 != 0)
         throw std::invalid_argument("K16: workspace and x must be 16-byte aligned");
     const Ws ws(workspace, slots);
-    gate_up<<<dim3(2 * F / kWarps, slots), 32 * kWarps, 0, stream>>>(x, sel, topk, experts, ws.gu);
+    if (m == 1)
+        gate_up<1><<<dim3(2 * F / kWarps, slots), 32 * kWarps, 0, stream>>>(x, sel, topk, slots, experts, ws.gu);
+    else
+        gate_up<kMaxShare><<<dim3(2 * F / kWarps, slots), 32 * kWarps, 0, stream>>>(x, sel, topk, slots, experts,
+                                                                                    ws.gu);
     activate<<<dim3(F / 32 / kWarps, slots), 32 * kWarps, 0, stream>>>(sel, w, ws.gu, ws.hidden);
-    down<<<dim3(H / kWarps, slots), 32 * kWarps, 0, stream>>>(sel, experts, ws.hidden, ws.y);
+    if (m == 1)
+        down<1><<<dim3(H / kWarps, slots), 32 * kWarps, 0, stream>>>(sel, slots, experts, ws.hidden, ws.y);
+    else
+        down<kMaxShare><<<dim3(H / kWarps, slots), 32 * kWarps, 0, stream>>>(sel, slots, experts, ws.hidden, ws.y);
     add_slots<<<dim3(H / 256, m), 256, 0, stream>>>(sel, topk, ws.y, out);
 }
 
