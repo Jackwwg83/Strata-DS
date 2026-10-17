@@ -58,10 +58,11 @@ add_test(NAME k17_mxfp4_moe_prefill_test COMMAND k17_mxfp4_moe_prefill_test)
 set_tests_properties(k17_mxfp4_moe_prefill_test PROPERTIES SKIP_RETURN_CODE 77 TIMEOUT 900)
 
 # K18: one dense projection from EXL3 weights (an EXL3 checkpoint's attention, shared expert and head): K10's GEMV
-# for few rows, K12's reconstruction and cuBLAS for many; the test checks one path against the other. The engine does
-# not use it: on the DGX Spark (GB10) the GEMV decodes 46-96 GB/s of weights, FP8 reads 227 (see the test's speed).
+# for few rows, K12's reconstruction and cuBLAS for many; the test checks one path against the other. The engine runs an
+# EXL3 pack's dense linears with it in prefill (decode sizes: K20, which reads the weights 2-3x faster on GB10).
 add_library(ds41_k18_exl3_linear STATIC src/ds41/kernels/k18_exl3_linear.cu)
 target_link_libraries(ds41_k18_exl3_linear PUBLIC ds41_k10_exl3_moe ds41_k12_exl3_moe_prefill CUDA::cublas)
+target_link_libraries(strata_ds41_engine PUBLIC ds41_k18_exl3_linear)
 add_executable(k18_exl3_linear_test src/ds41/tests/k18_exl3_linear_test.cu)
 target_link_libraries(k18_exl3_linear_test PRIVATE ds41_k18_exl3_linear strata_ds41_engine)
 add_test(NAME k18_exl3_linear_test COMMAND k18_exl3_linear_test)
@@ -76,3 +77,13 @@ add_executable(k19_exl3_smoe_test src/ds41/tests/k19_exl3_smoe_test.cu)
 target_link_libraries(k19_exl3_smoe_test PRIVATE ds41_k19_exl3_smoe ds41_k18_exl3_linear ds41_k10_exl3_moe strata_ds41_engine)
 add_test(NAME k19_exl3_smoe_test COMMAND k19_exl3_smoe_test)
 set_tests_properties(k19_exl3_smoe_test PROPERTIES SKIP_RETURN_CODE 77 TIMEOUT 900)
+
+# K20: dense EXL3 linears at decode sizes with sudoingX's mrow kernel (third_party/exl3_smoe), several per launch; the
+# test checks it against K18 and times both
+add_library(ds41_k20_exl3_mrow STATIC src/ds41/kernels/k20_exl3_mrow.cu)
+target_link_libraries(ds41_k20_exl3_mrow PUBLIC strata_ds41_engine)
+target_link_libraries(strata_ds41_engine PUBLIC ds41_k20_exl3_mrow)
+add_executable(k20_exl3_mrow_test src/ds41/tests/k20_exl3_mrow_test.cu)
+target_link_libraries(k20_exl3_mrow_test PRIVATE ds41_k20_exl3_mrow ds41_k18_exl3_linear strata_ds41_engine)
+add_test(NAME k20_exl3_mrow_test COMMAND k20_exl3_mrow_test)
+set_tests_properties(k20_exl3_mrow_test PROPERTIES SKIP_RETURN_CODE 77 TIMEOUT 900)
