@@ -245,6 +245,49 @@ int main() {
         v.check(counts.skipped == 4 && counts.cpu == 8, "ssd tail skip counts: 4 skipped, 8 CPU uses");
         cudaStreamDestroy(s);
     }
+    // 5b. the late list (unified memory): the CPU hands uses 1 and 4 of token 0 and use 2 of token 1 back to the GPU
+    //     with their descriptors; wait_add(late) copies the list to the device, and without late it does not
+    {
+        const int m = 2;
+        ExpertDoorbell db(m, kTopK, kDim);
+        std::vector<int32_t> ids = {1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12};
+        Dev<uint16_t> dx(std::vector<uint16_t>(m * kDim, 0));
+        Dev<int32_t> did(ids), sel(m * kTopK);
+        Dev<float> dw(std::vector<float>(m * kTopK, 0.5f)), dout(std::vector<float>(m * kDim, 0.0f));
+        cudaStream_t s;
+        ck(cudaStreamCreateWithFlags(&s, cudaStreamNonBlocking), "stream");
+        std::atomic<bool> stop{false};
+        auto desc_of = [](int i) {
+            strata::ds41::kernels::Exl3Expert d{};
+            d.w1.trellis = reinterpret_cast<const uint16_t*>(uintptr_t(4096 * (i + 1)));
+            d.w2.k = 1000 + i;
+            return d;
+        };
+        for (int round = 1; round <= 2; ++round) {
+            std::thread th([&] {
+                if (!db.wait_published(round, stop)) return;
+                for (int i = 0; i < m * kTopK; ++i) {
+                    const bool late = i == 1 || i == 4 || i == 8;
+                    db.late_sel()[i] = late && round == 1 ? i : -1;
+                    db.late_desc()[i] = desc_of(i);
+                }
+                std::fill_n(db.y(), m * kDim, 0.0f);
+                db.mark_done(round);
+            });
+            db.publish(dx.p, did.p, dw.p, m, nullptr, sel.p, round, s);
+            db.wait_add(dout.p, m, round, s, round == 1);
+            ck(cudaStreamSynchronize(s), "late list");
+            th.join();
+        }
+        std::vector<int32_t> got(m * kTopK);
+        std::vector<strata::ds41::kernels::Exl3Expert> gd(m * kTopK);
+        ck(cudaMemcpy(got.data(), db.late_sel_dev(), got.size() * 4, cudaMemcpyDeviceToHost), "late down");
+        ck(cudaMemcpy(gd.data(), db.late_desc_dev(), gd.size() * sizeof(gd[0]), cudaMemcpyDeviceToHost), "late down");
+        const std::vector<int32_t> want = {-1, 1, -1, -1, 4, -1, -1, -1, 8, -1, -1, -1};
+        v.check(got == want, "late list: round 1's list reaches the device; round 2 (late off) leaves it alone");
+        v.check(gd[4].w1.trellis == desc_of(4).w1.trellis && gd[8].w2.k == 1008, "late list: the descriptors arrive whole");
+        cudaStreamDestroy(s);
+    }
     // 6. the default skip ranks: tail 4 and SSD 3 with a VRAM tier under 90% of the experts; both off at 90% or
     //    without a VRAM tier; the env values win, and DS41_ROUTE_TAIL_SKIP=0 also turns the SSD default off.
     {

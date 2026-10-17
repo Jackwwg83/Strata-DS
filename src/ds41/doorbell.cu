@@ -116,12 +116,17 @@ __global__ void publish_k(const uint4* __restrict__ x, int n_x16, const int32_t*
     }
 }
 
-__global__ void wait_add_k(const volatile uint32_t* done, uint32_t round, const float4* y, float4* out, int n4) {
+__global__ void wait_add_k(const volatile uint32_t* done, uint32_t round, const float4* y, float4* out, int n4,
+                           const int32_t* late_sel, int n_late, const uint2* late_desc, int n_desc8,
+                           int32_t* late_sel_dev, uint2* late_desc_dev) {
     if (threadIdx.x == 0) {
         while (*done < round) __nanosleep(100);
         __threadfence_system();
     }
     __syncthreads();
+    // the late list, uncached as y: the host wrote it after this kernel may have started
+    for (int i = threadIdx.x; i < n_late; i += blockDim.x) late_sel_dev[i] = __ldcv(late_sel + i);
+    for (int i = threadIdx.x; i < n_desc8; i += blockDim.x) late_desc_dev[i] = __ldcv(late_desc + i);
     for (int i = threadIdx.x; i < n4; i += blockDim.x) {
         const float4 v = __ldcv(y + i);   // uncached: the host wrote it after this kernel may have started
         float4 o = out[i];
@@ -138,7 +143,8 @@ ExpertDoorbell::ExpertDoorbell(int max_m, int topk, int dim) : max_m_(max_m), to
     const size_t o_seq = 0, o_done = kAlign, o_x = 2 * kAlign;
     const size_t o_ids = o_x + up(rows * 2), o_w = o_ids + up(sel * 4), o_y = o_w + up(sel * 4);
     const size_t o_counts = o_y + up(rows * 4);
-    const size_t total = o_counts + up(sizeof(Counts));
+    const size_t o_late = o_counts + up(sizeof(Counts)), o_late_desc = o_late + up(sel * 4);
+    const size_t total = o_late_desc + up(sel * sizeof(kernels::Exl3Expert));
     ck(cudaHostAlloc(&host_, total, cudaHostAllocMapped), "cudaHostAlloc");
     std::memset(host_, 0, total);
     void* dev = nullptr;
@@ -157,9 +163,18 @@ ExpertDoorbell::ExpertDoorbell(int max_m, int topk, int dim) : max_m_(max_m), to
     h_w_ = (float*) hp(o_w);           d_w_ = (float*) dp(o_w);
     h_y_ = (float*) hp(o_y);           d_y_ = (float*) dp(o_y);
     h_counts_ = (Counts*) hp(o_counts); d_counts_ = (Counts*) dp(o_counts);
+    h_late_sel_ = (int32_t*) hp(o_late); d_late_sel_ = (int32_t*) dp(o_late);
+    h_late_desc_ = (kernels::Exl3Expert*) hp(o_late_desc); d_late_desc_ = (kernels::Exl3Expert*) dp(o_late_desc);
+    for (size_t i = 0; i < sel; ++i) h_late_sel_[i] = -1;
     try {
         ck(cudaMalloc(&gpu_experts_, sel * sizeof(*gpu_experts_)), "call descriptors");
+        ck(cudaMalloc(&late_sel_dev_, sel * sizeof(int32_t)), "late list");
+        ck(cudaMemset(late_sel_dev_, 0xff, sel * sizeof(int32_t)), "late list");
+        ck(cudaMalloc(&late_desc_dev_, sel * sizeof(kernels::Exl3Expert)), "late descriptors");
     } catch (...) {
+        cudaFree(gpu_experts_);
+        cudaFree(late_sel_dev_);
+        cudaFree(late_desc_dev_);
         cudaFreeHost(host_);
         throw;
     }
@@ -167,6 +182,8 @@ ExpertDoorbell::ExpertDoorbell(int max_m, int topk, int dim) : max_m_(max_m), to
 
 ExpertDoorbell::~ExpertDoorbell() {
     cudaFree(gpu_experts_);
+    cudaFree(late_sel_dev_);
+    cudaFree(late_desc_dev_);
     if (host_) cudaFreeHost(host_);
 }
 
@@ -187,9 +204,14 @@ void ExpertDoorbell::publish(const uint16_t* x, const int32_t* ids, const float*
     ck(cudaGetLastError(), "publish");
 }
 
-void ExpertDoorbell::wait_add(float* out, int m, uint32_t round, cudaStream_t stream) {
+void ExpertDoorbell::wait_add(float* out, int m, uint32_t round, cudaStream_t stream, bool late) {
     if (m < 1 || m > max_m_) throw std::invalid_argument("ExpertDoorbell::wait_add: bad m");
-    wait_add_k<<<1, 1024, 0, stream>>>(d_done_, round, (const float4*) d_y_, (float4*) out, m * dim_ / 4);
+    static_assert(sizeof(kernels::Exl3Expert) % 8 == 0, "the late descriptors are copied in 8-byte words");
+    const int n = late ? m * topk_ : 0;
+    wait_add_k<<<1, 1024, 0, stream>>>(d_done_, round, (const float4*) d_y_, (float4*) out, m * dim_ / 4, d_late_sel_,
+                                       n, (const uint2*) d_late_desc_,
+                                       n * (int) (sizeof(kernels::Exl3Expert) / 8), late_sel_dev_,
+                                       (uint2*) late_desc_dev_);
     ck(cudaGetLastError(), "wait_add");
 }
 
