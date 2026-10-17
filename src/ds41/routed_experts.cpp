@@ -5,10 +5,15 @@
 #include "strata/ds41/kernels/k12_exl3_moe_prefill.hpp"
 #include "strata/ds41/kernels/k16_mxfp4_moe.hpp"
 #include "strata/ds41/kernels/k17_mxfp4_moe_prefill.hpp"
+#include "strata/ds41/kernels/k19_exl3_smoe.hpp"
 #include "strata/ds41/mxfp4_cpu.hpp"
 
 #include "moe_mul1.h"   // third_party/exllamav3_moe
 
+#include <atomic>
+#include <cstdio>
+#include <cstdlib>
+#include <cstring>
 #include <stdexcept>
 #include <vector>
 
@@ -33,6 +38,35 @@ Mxfp4CpuExpert fp4_desc(const ExpertSlot& s, const uint8_t* bytes) {
     return {proj(0), proj(4), proj(8)};
 }
 
+/// exllamav3's CPU kernel (moe_mul1) is x86 only. Elsewhere (the DGX Spark's ARM CPU) an EXL3 pack has no CPU
+/// experts: on unified memory the GPU computes every expert it can reach, and a use left to the CPU (a miss with no
+/// free RAM slot) adds nothing; the first such call says so, with a count at exit.
+#if defined(__x86_64__) || defined(__i386__) || defined(_M_X64) || defined(_M_IX86)
+constexpr bool kExl3Cpu = true;
+#else
+constexpr bool kExl3Cpu = false;
+#endif
+std::atomic<long long> dropped{0};
+struct DropReport {
+    ~DropReport() {
+        if (dropped.load())
+            std::fprintf(stderr, "ds41: %lld EXL3 expert uses left to the CPU were dropped (no CPU kernel here)\n",
+                         dropped.load());
+    }
+} drop_report;
+
+/// K19 (sudoingX's streaming kernels) for EXL3 experts on an integrated GPU (GB10: 199-224 GB/s, K10 159-181);
+/// DS41_EXL3_K19=0 / 1 forces K10 / K19
+bool use_k19() {
+    static const bool on = [] {
+        if (const char* v = std::getenv("DS41_EXL3_K19")) return v[0] != '0';
+        int dev = 0, integrated = 0;
+        return cudaGetDevice(&dev) == cudaSuccess &&
+               cudaDeviceGetAttribute(&integrated, cudaDevAttrIntegrated, dev) == cudaSuccess && integrated != 0;
+    }();
+    return on;
+}
+
 }  // namespace
 
 void routed_moe_decode(ExpertFormat f, const __half* x, int m, const int32_t* sel, const float* w, int topk,
@@ -40,6 +74,8 @@ void routed_moe_decode(ExpertFormat f, const __half* x, int m, const int32_t* se
                        cudaStream_t stream) {
     if (f == ExpertFormat::Mxfp4)
         kernels::mxfp4_moe_decode(x, m, sel, w, topk, experts, out, workspace, workspace_bytes, stream);
+    else if (use_k19())
+        kernels::exl3_smoe_decode(x, m, sel, w, topk, experts, out, workspace, workspace_bytes, stream);
     else
         kernels::exl3_moe_decode(x, m, sel, w, topk, experts, out, workspace, workspace_bytes, stream);
 }
@@ -65,6 +101,7 @@ int64_t cpu_make_layer(ExpertFormat f, const ExpertSlot* const* slots, const uin
         for (int i = 0; i < n; ++i) e[i] = fp4_desc(*slots[i], bytes[i]);
         return mxfp4_cpu_make_layer(e.data(), n);
     }
+    if (!kExl3Cpu) return -1;   // no CPU kernel: no layer (cpu_forward adds nothing for it)
     std::vector<MoeCpuMatrixDesc> gate(n), up(n), down(n);
     for (int i = 0; i < n; ++i) {
         gate[i] = exl3_desc(*slots[i], bytes[i], 0, kDim, kMoeInter);   // w1: 5120 -> 2304
@@ -75,11 +112,13 @@ int64_t cpu_make_layer(ExpertFormat f, const ExpertSlot* const* slots, const uin
 }
 
 void cpu_free_layer(ExpertFormat f, int64_t handle) {
+    if (handle < 0) return;
     if (f == ExpertFormat::Mxfp4) mxfp4_cpu_free_layer(handle);
     else exl3_moe_cpu_free_layer(handle);
 }
 
 void cpu_set_expert(ExpertFormat f, int64_t handle, int e, const ExpertSlot& slot, const uint8_t* bytes) {
+    if (handle < 0) return;
     if (f == ExpertFormat::Mxfp4) {
         mxfp4_cpu_set_expert(handle, e, fp4_desc(slot, bytes));
         return;
@@ -96,6 +135,14 @@ void cpu_forward(ExpertFormat f, int64_t handle, const uint16_t* x, const int32_
         mxfp4_cpu_forward(handle, x, ids, w, out, rows, topk, threads);
         return;
     }
+    if (handle < 0) {   // no CPU kernel (EXL3 on ARM): these uses add nothing
+        long long n = 0;
+        for (int i = 0; i < rows * topk; ++i) n += ids[i] >= 0;
+        if (n && dropped.fetch_add(n) == 0)
+            std::fprintf(stderr, "ds41: an EXL3 expert use reached the CPU, which has no EXL3 kernel here: dropped\n");
+        std::memset(out, 0, sizeof(float) * (size_t) rows * kDim);
+        return;
+    }
     constexpr int kMax = 64 * 32;
     if (rows * topk > kMax) throw std::invalid_argument("cpu_forward: too many slots");
     c10::Half wh[kMax];
@@ -107,7 +154,7 @@ void cpu_forward(ExpertFormat f, int64_t handle, const uint16_t* x, const int32_
 }
 
 void cpu_pool_prime(ExpertFormat f, int threads) {
-    if (f == ExpertFormat::Exl3) exl3_moe_cpu_pool_prime(threads);
+    if (f == ExpertFormat::Exl3 && kExl3Cpu) exl3_moe_cpu_pool_prime(threads);
 }
 
 }  // namespace strata::ds41
