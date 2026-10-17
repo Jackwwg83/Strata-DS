@@ -35,7 +35,8 @@ inline uint64_t fake_offset(int l, int e, bool mixed, uint64_t gap = 256) {
     return off;
 }
 
-inline void write_fake_pack(const std::string& dir, bool mixed = false, uint64_t gap = 256) {
+/// mxfp4: the experts are listed as DeepSeek's FP4 (w*.weight and w*.scale, pack_info's expert_format mxfp4)
+inline void write_fake_pack(const std::string& dir, bool mixed = false, uint64_t gap = 256, bool mxfp4 = false) {
     mkdir(dir.c_str(), 0755);
     {
         std::ofstream f(dir + "/index.txt");
@@ -52,11 +53,14 @@ inline void write_fake_pack(const std::string& dir, bool mixed = false, uint64_t
         std::ofstream f(dir + "/experts.txt");
         const char* comp[12] = {"w1.trellis", "w1.suh", "w1.svh", "w1.mul1", "w3.trellis", "w3.suh",
                                 "w3.svh",     "w3.mul1", "w2.trellis", "w2.suh", "w2.svh", "w2.mul1"};
+        const char* fp4[6] = {"w1.weight", "w1.scale", "w3.weight", "w3.scale", "w2.weight", "w2.scale"};
         for (int l = 0; l < L; ++l)
             for (int e = 0; e < E; ++e) {
                 const int m = mixed ? fake_mult(l, e) : 1;
-                f << l << " " << e << " " << fake_offset(l, e, mixed, gap) << " " << fake_bytes(l, e, mixed) << " 3 3 3";
-                for (int c = 0; c < 12; ++c) f << " " << comp[c] << ":" << c * 256 * m << ":" << 256 * m;
+                f << l << " " << e << " " << fake_offset(l, e, mixed, gap) << " " << fake_bytes(l, e, mixed)
+                  << (mxfp4 ? " 4.25 4.25 4.25" : " 3 3 3");
+                for (int c = 0; c < (mxfp4 ? 6 : 12); ++c)
+                    f << " " << (mxfp4 ? fp4[c] : comp[c]) << ":" << c * 256 * m << ":" << 256 * m;
                 f << "\n";
             }
     }
@@ -74,7 +78,8 @@ inline void write_fake_pack(const std::string& dir, bool mixed = false, uint64_t
         std::ofstream f(dir + "/engram_tokenmap.bin", std::ios::binary);
         f.write((const char*) tm.data(), (std::streamsize) (tm.size() * 4));
     }
-    std::ofstream(dir + "/pack_info.txt") << "layers " << L << "\nexperts " << E << "\nfinished 1\n";
+    std::ofstream(dir + "/pack_info.txt") << "layers " << L << "\nexperts " << E << "\n"
+                                          << (mxfp4 ? "expert_format mxfp4\n" : "") << "finished 1\n";
 }
 
 /// STRP profile of the ranked pairs

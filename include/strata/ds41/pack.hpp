@@ -16,6 +16,12 @@ namespace strata::ds41 {
 
 enum class DType { F8E4M3, E8M0, BF16, F32, F16, I32, I16, I8, U8 };
 
+/// How the routed experts are stored (pack_info.txt expert_format; a pack without the line is exl3):
+///   Exl3   EXL3 mul1 tensors (trellis, suh, svh, mul1), SAGE or 3bpw
+///   Mxfp4  DeepSeek's own FP4: per projection a weight [n][k/2] of E2M1 codes (two per byte along k, the low nibble
+///          first) and a scale [n][k/32] of E8M0 bytes, value = E2M1(code) * 2^(scale - 127)
+enum class ExpertFormat { Exl3, Mxfp4 };
+
 struct DenseTensor {
     std::string name;
     DType dtype;
@@ -26,6 +32,8 @@ struct DenseTensor {
 };
 
 /// One routed expert: offsets are inside its slot.
+/// Mxfp4 fills the same 12 places, so code that walks them per projection (c0 = 0, 4, 8) works for both formats:
+/// c0 the weight, c0 + 1 and c0 + 2 the scale, c0 + 3 nothing (0 bytes).
 struct ExpertSlot {
     uint64_t offset = 0;             ///< in experts.bin
     uint64_t bytes = 0;
@@ -83,12 +91,14 @@ public:
     const EngramHash& engram_hash() const { return hash_; }
     int n_layers() const { return n_layers_; }
     int n_experts() const { return n_experts_; }
+    ExpertFormat expert_format() const { return format_; }
     const std::string& dir() const { return dir_; }
 
 private:
     std::string dir_;
     int n_layers_ = 0;
     int n_experts_ = 0;
+    ExpertFormat format_ = ExpertFormat::Exl3;
     std::map<std::string, DenseTensor> dense_;
     std::vector<ExpertSlot> experts_;
     std::vector<EngramTable> engram_;
