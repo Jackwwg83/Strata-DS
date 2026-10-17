@@ -37,6 +37,14 @@ class HostExperts;
 /// Reads a STRP profile: the ranked (layer, expert) pairs. Throws when the file is not a profile of this shape.
 std::vector<std::pair<int, int>> read_expert_profile(const std::string& path, int n_layers, int n_experts);
 
+/// Free device memory for the tiers (upstream's device_free_bytes, src/core/expert_cache.cpp). On an integrated GPU
+/// (the DGX Spark: one memory for the CPU and the GPU) cudaMemGetInfo counts only MemFree, not the page cache the OS
+/// gives back, so MemAvailable less a headroom (STRATA_UMA_HEADROOM_GIB, 6 by default) counts when it is more, as
+/// NVIDIA's DGX Spark Porting Guide (5.5) recommends. Swap is not counted.
+size_t device_free_bytes();
+/// the rule of device_free_bytes() on unified memory: max(cuda_free, mem_available - headroom)
+uint64_t uma_free_bytes(uint64_t cuda_free, uint64_t mem_available, uint64_t headroom);
+
 struct ExpertSwap {
     float gain;
     int32_t layer, in, out;   ///< `in` (missing) takes the slot of `out` (resident), same layer

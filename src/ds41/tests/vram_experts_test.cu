@@ -12,6 +12,7 @@ using namespace ds41test;
 using strata::ds41::ExpertSwap;
 using strata::ds41::plan_expert_swaps;
 using strata::ds41::read_expert_profile;
+using strata::ds41::uma_free_bytes;
 
 namespace {
 
@@ -49,6 +50,14 @@ int main() {
     write_profile(p, 3, 4, {{2, 1}, {2, 1}});
     v.check(throws([&] { read_expert_profile(p, 3, 4); }), "a repeated pair is rejected");
     std::remove(p.c_str());
+
+    // ---- free device memory on unified memory (upstream device_free_bytes): the OS's MemAvailable less the headroom
+    // counts when it is more than what cudaMemGetInfo reports (the DGX Spark reported 23.8 GiB free with 113 GiB
+    // available, the rest a page cache the OS gives back)
+    const uint64_t G = 1ull << 30;
+    v.check(uma_free_bytes(24 * G, 113 * G, 6 * G) == 107 * G, "UMA: MemAvailable less the headroom");
+    v.check(uma_free_bytes(24 * G, 20 * G, 6 * G) == 24 * G, "UMA: never less than cudaMemGetInfo");
+    v.check(uma_free_bytes(1 * G, 5 * G, 6 * G) == 1 * G, "UMA: MemAvailable under the headroom adds nothing");
 
     // ---- swap plan: 2 layers x 6 experts
     const int L = 2, E = 6;
