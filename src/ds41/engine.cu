@@ -32,6 +32,7 @@
 #include "strata/ds41/wo_a_fp8.hpp"
 
 #include "moe_mul1.h"   // third_party/exllamav3_moe
+#include "strata/ds41/routed_experts.hpp"
 
 #include <cuda_fp16.h>
 #include <cuda_runtime.h>
@@ -184,6 +185,14 @@ struct Engine::Impl {
     std::unique_ptr<VramExperts> vram;  // the VRAM tier (null: none)
     std::unique_ptr<HostExperts> host;  // the RAM tier (null: none); the rest is read from the mapped file
     std::atomic<int> worker_ram{0}, worker_file{0}, worker_ssd{0};   // CPU experts of the step by tier
+    std::atomic<int> worker_late{0};   // of those, the uses handed back to the GPU (gpu_misses)
+    /// unified memory (an integrated GPU: the DGX Spark): the GPU reads the RAM tier at memory speed, so the staging
+    /// copy, the prefetch copies and the PCIe quota are off and every RAM-tier expert is the GPU's
+    bool uma = false;
+    /// the CPU only reads misses from the SSD into the RAM tier and hands them back to the GPU (doorbell late list),
+    /// instead of computing them: on unified memory by default, DS41_GPU_MISSES=0 / 1 off / on. DGX Spark: the GPU
+    /// computes 6 MXFP4 experts in 0.5 ms, the CPU (16 threads) in 6.4 ms
+    bool gpu_misses = false;
     std::atomic<bool> admit_warned{false};
     std::vector<unsigned char> mincore_buf;
     std::unique_ptr<RouterLookahead> lookahead;   // warms the next layer's file-tier experts (DS41_LOOKAHEAD=0: off)
@@ -367,7 +376,7 @@ struct Engine::Impl {
         if (st) cudaStreamSynchronize(st);
         prefill_end_quiet();
         for (const auto& y : L)
-            if (y.moe_handle >= 0) exl3_moe_cpu_free_layer(y.moe_handle);
+            if (y.moe_handle >= 0) cpu_free_layer(pack.expert_format(), y.moe_handle);
         for (void* p : owned_dev) cudaFree(p);
         for (cudaEvent_t e : pfp.ev) cudaEventDestroy(e);
         if (dbg) std::fclose(dbg);
@@ -504,6 +513,11 @@ struct Engine::Impl {
         // says otherwise: with the adaptive tier the prefetch computes guessed RAM experts on the GPU, following the
         // tier's history, and step() and step_slots() would no longer give the same tokens (engine.hpp's promise)
         if (opt.adapt_every == 0 && !std::getenv("DS41_RAM_ADAPT")) ram_adapt = 0;
+        {
+            int dev = 0, integrated = 0;
+            uma = cudaGetDevice(&dev) == cudaSuccess &&
+                  cudaDeviceGetAttribute(&integrated, cudaDevAttrIntegrated, dev) == cudaSuccess && integrated;
+        }
         pack.upload_dense();
         pack.map_experts();
         if (opt.dspark) {   // before the RAM tier's automatic budget reads the available memory
@@ -697,7 +711,7 @@ struct Engine::Impl {
         const char* stage_env = std::getenv("DS41_ZC_STAGE");
         if (stage_env && std::strcmp(stage_env, "0") != 0 && std::strcmp(stage_env, "1") != 0)
             throw std::invalid_argument("DS41_ZC_STAGE must be 0 or 1");
-        if ((!stage_env || stage_env[0] != '0') && !opt.expert_profile.empty() && opt.ram_budget_gib != 0) {
+        if ((stage_env ? stage_env[0] != '0' : !uma) && !opt.expert_profile.empty() && opt.ram_budget_gib != 0) {
             std::vector<ExpertBlob> blobs;
             size_t largest = 0;
             for (int l = 0; l < kLayers; ++l) {
@@ -792,7 +806,7 @@ struct Engine::Impl {
             // With the adaptive RAM tier the CPU no longer waits for page faults and computes RAM experts faster than
             // the GPU reads them over PCIe: on the laptop (PCIe 5.0 x8, 256 tokens, code and agent prompts) quota
             // 0 / 1 / 2 / 4 / 6 took 59.7 / 60.1 / 61.7 / 63.7 / 66.6 ms per token. Its default is 0.
-            int quota = ram_adapt ? 0 : 4;
+            int quota = uma ? kTopK : ram_adapt ? 0 : 4;
             if (const char* value = std::getenv("DS41_ZC_QUOTA")) {
                 char* end = nullptr;
                 const long parsed = std::strtol(value, &end, 10);
@@ -810,6 +824,10 @@ struct Engine::Impl {
             ck(cudaStreamSynchronize(nullptr), "zero-copy initialization");
             std::fprintf(stderr, "ds41: mapped RAM experts enabled, GPU quota %d per token per layer, %s\n",
                          quota, zc_stage ? "staged" : "direct");
+            const char* gm = std::getenv("DS41_GPU_MISSES");
+            gpu_misses = (gm ? gm[0] != '0' : uma) && host->reserve() > 0;
+            if (gpu_misses)
+                std::fprintf(stderr, "ds41: misses: the CPU reads them into the RAM tier, the GPU computes them\n");
         }
         // the router lookahead: every expert outside the VRAM and RAM tiers is read from the file (upstream turns it
         // on with a RAM budget; here the file tier exists whenever the experts do not all fit in RAM)
@@ -855,25 +873,13 @@ struct Engine::Impl {
     }
 
     void register_cpu_experts(int l) {
-        std::vector<MoeCpuMatrixDesc> gate(kExperts), up(kExperts), down(kExperts);
-        const uint8_t* base = pack.expert_base();
+        std::vector<const ExpertSlot*> slots(kExperts);
+        std::vector<const uint8_t*> bytes(kExperts);
         for (int e = 0; e < kExperts; ++e) {
-            const auto& s = pack.expert(l, e);
-            auto desc = [&](int c0, int k_tiles, int n_tiles) {
-                MoeCpuMatrixDesc d;
-                d.trellis = (const uint16_t*) (base + s.offset + s.comp_off[c0]);
-                d.suh = (const at::Half*) (base + s.offset + s.comp_off[c0 + 1]);
-                d.svh = (const at::Half*) (base + s.offset + s.comp_off[c0 + 2]);
-                d.k_tiles = k_tiles;
-                d.n_tiles = n_tiles;
-                d.tile_w = (int) (s.comp_bytes[c0] / ((uint64_t) k_tiles * n_tiles * 2));
-                return d;
-            };
-            gate[e] = desc(0, kDim / 16, kMoeInter / 16);   // w1: 5120 -> 2304
-            up[e] = desc(4, kDim / 16, kMoeInter / 16);     // w3
-            down[e] = desc(8, kMoeInter / 16, kDim / 16);   // w2: 2304 -> 5120
+            slots[e] = &pack.expert(l, e);
+            bytes[e] = pack.expert_base() + slots[e]->offset;
         }
-        L[l].moe_handle = exl3_moe_cpu_make_layer_raw(gate.data(), up.data(), down.data(), kExperts, 0, kSwigluLimit, 0);
+        L[l].moe_handle = cpu_make_layer(pack.expert_format(), slots.data(), bytes.data(), kExperts, kSwigluLimit);
     }
 
     const float* rope_at(bool yarn, int pos) const {
@@ -933,13 +939,10 @@ struct Engine::Impl {
             if (lookahead && m == 1 && pred_stats && l + pred_ahead < kLayers)   // DS41_PREDICT_STATS: layer l+A's top 12
                 lookahead->predict_now(l + pred_ahead, (const uint16_t*) d->x(), kPredK,
                                        pred_ids.data() + (l + pred_ahead) * kPredK);
-            c10::Half wh[kMaxUses];
-            for (int i = 0; i < uses; ++i) {
-                const __half hv = __float2half_rn(d->w()[i]);
-                wh[i] = c10::Half(__half_as_ushort(hv), c10::Half::from_bits());
-            }
             int misses = 0, n_file = 0;
-            int32_t file_ids[kMaxUses];   // the layer's file experts, each once for all rows
+            int32_t file_ids[kMaxUses];
+            int32_t cpu_ids[kMaxUses];
+            std::copy(d->ids(), d->ids() + uses, cpu_ids);   // the layer's file experts, each once for all rows
             for (int i = 0; i < uses; ++i) {
                 const int32_t e = d->ids()[i];
                 if (e < 0) continue;
@@ -966,7 +969,7 @@ struct Engine::Impl {
                 // (code, agent): 0.6-1.2 ms per token less, mostly as shorter reads (busy cores, quicker I/O
                 // completions); in the bench a nap costs a call ~100 us after a 2 ms gap
                 try {
-                    exl3_moe_cpu_pool_prime(cpu_threads);
+                    cpu_pool_prime(pack.expert_format(), cpu_threads);
                 } catch (...) {   // e.g. no thread could start: the forward below reports it as before
                 }
                 const double a0 = now_ms();
@@ -999,9 +1002,10 @@ struct Engine::Impl {
             const double t0 = now_ms();
             try {
                 if (fault("worker")) throw std::runtime_error("ds41 test fault: CPU expert worker");
-                if (misses)
-                    exl3_moe_cpu_forward_raw(L[l].moe_handle, (const at::Half*) d->x(), d->ids(), wh, d->y(), m,
-                                             kTopK, cpu_threads);
+                const int left = misses - (gpu_misses ? hand_back(d, l, uses, cpu_ids) : 0);
+                if (left)
+                    cpu_forward(pack.expert_format(), L[l].moe_handle, d->x(), cpu_ids, d->w(), d->y(), m, kTopK,
+                                cpu_threads);
                 else
                     std::fill_n(d->y(), (size_t) m * kDim, 0.0f);
             } catch (...) {
@@ -1021,6 +1025,26 @@ struct Engine::Impl {
             }
             d->mark_done(l + 1);
         }
+    }
+
+    /// gpu_misses: hand the CPU's uses whose expert sits in the RAM arena (its RAM slot, or the slot this step's admit
+    /// read it into) back to the GPU through the doorbell's late list, with descriptors of the arena's device alias.
+    /// cpu_ids keeps the rest (-1 for each handed back). Writes every entry of the late list. Returns the uses handed back.
+    int hand_back(ExpertDoorbell* d, int l, int uses, int32_t* cpu_ids) {
+        int n = 0;
+        for (int i = 0; i < uses; ++i) {
+            d->late_sel()[i] = -1;
+            const int32_t e = cpu_ids[i];
+            if (e < 0) continue;
+            const uint8_t* b = host->slot_bytes(l, e);
+            if (!b) continue;
+            d->late_desc()[i] = VramExperts::describe_at(pack, l, e, host->device_address(b));
+            d->late_sel()[i] = i;
+            cpu_ids[i] = -1;
+            ++n;
+        }
+        worker_late += n;
+        return n;
     }
 
     /// Lookahead callback: (layer, expert) is in neither the VRAM nor the RAM tier. pages: ask the OS for its pages
@@ -1050,7 +1074,7 @@ struct Engine::Impl {
         }
         if (u == 0) return 0;
         try {
-            exl3_moe_cpu_pool_prime(cpu_threads);
+            cpu_pool_prime(pack.expert_format(), cpu_threads);
         } catch (...) {
         }
         bool kept[kVerifyMaxTokens * kTopK] = {};
@@ -1317,15 +1341,21 @@ struct Engine::Impl {
         ck(cudaMemsetAsync(routed, 0, kDim * sizeof(float), st), "routed");
         if (pf && l > 0) prefetch->join(l, st);   // the GPU computes the prefetched experts below
         if (!staged && (tier || ram))
-            kernels::exl3_moe_decode((const __half*) x_half_dev, 1, gpu_sel, w, kTopK, db->gpu_experts(), routed,
-                                     vram ? vram->workspace() : zc_workspace.get(), VramExperts::kWorkspaceBytes, st);
+            routed_moe_decode(pack.expert_format(), (const __half*) x_half_dev, 1, gpu_sel, w, kTopK,
+                              db->gpu_experts(), routed, vram ? vram->workspace() : zc_workspace.get(),
+                              VramExperts::kWorkspaceBytes, st);
         // One K10 call preserves route reduction order.
         if (staged) {
             zc_stage->join(st);
-            kernels::exl3_moe_decode((const __half*) x_half_dev, 1, gpu_sel, w, kTopK, db->gpu_experts(), routed,
-                                     vram ? vram->workspace() : zc_workspace.get(), VramExperts::kWorkspaceBytes, st);
+            routed_moe_decode(pack.expert_format(), (const __half*) x_half_dev, 1, gpu_sel, w, kTopK,
+                              db->gpu_experts(), routed, vram ? vram->workspace() : zc_workspace.get(),
+                              VramExperts::kWorkspaceBytes, st);
         }
-        db->wait_add(routed, 1, (uint32_t) (l + 1), st);
+        db->wait_add(routed, 1, (uint32_t) (l + 1), st, gpu_misses);
+        if (gpu_misses)   // the misses the CPU read into the RAM tier
+            routed_moe_decode(pack.expert_format(), (const __half*) x_half_dev, 1, db->late_sel_dev(), w, kTopK,
+                              db->late_desc_dev(), routed, vram ? vram->workspace() : zc_workspace.get(),
+                              VramExperts::kWorkspaceBytes, st);
         // layer l + 1's guesses are read by its publish, and the next layer overwrites xf, which they read
         if (pf && l + 1 < kLayers) prefetch->ready(l + 1, st);
         ck(cudaStreamWaitEvent(st, sh_done, 0), "shared join");
@@ -1504,7 +1534,7 @@ struct Engine::Impl {
         p.eng_dev = carve<uint8_t>(base, u, std::max<size_t>((size_t) n_eng * b * kEngRows * (256 + 8), 1));
         p.desc = carve<kernels::Exl3Expert>(base, u, 2 * kExperts);
         p.k2_ws = carve<uint8_t>(base, u, b * (size_t) max_k * 4);
-        p.k12_bytes = kernels::exl3_moe_prefill_workspace_bytes(cap * kTopK, kExperts);
+        p.k12_bytes = routed_moe_prefill_workspace_bytes(pack.expert_format(), cap * kTopK, kExperts);
         p.k12_ws = carve<uint8_t>(base, u, p.k12_bytes);
         p.k14_bytes = kernels::indexer_topk_prefill_workspace_bytes(sub, max_seq);
         p.k14_ws = carve<uint8_t>(base, u, p.k14_bytes);
@@ -1526,8 +1556,7 @@ struct Engine::Impl {
         pf.slot_bytes = (pf.slot_bytes + 255) & ~(size_t) 255;
         // the bytes of the last 90% of the tier's slots (upstream lends up to 90% of the tier)
         const size_t lendable = vram ? vram->tail_bytes(vram->slots() * 9 / 10) : 0;
-        size_t free_b = 0, total_b = 0;
-        ck(cudaMemGetInfo(&free_b, &total_b), "cudaMemGetInfo");
+        const size_t free_b = device_free_bytes();
         const size_t spare = free_b > (512ull << 20) ? free_b - (512ull << 20) : 0;   // cuBLAS and K13 scratch
         size_t scratch = 0, ring = 0;
         int plan = -1;   // 0: both lent; 1: scratch lent, ring cudaMalloc; 2: ring lent, scratch cudaMalloc; 3: both cudaMalloc
@@ -1839,8 +1868,8 @@ struct Engine::Impl {
             for (int i = 0; i < n_res; ++i) pfh.desc[i] = vram->desc(vram->res_host()[(size_t) l * kExperts + order[i]]);
             ck(cudaMemcpyAsync(pf.desc, pfh.desc, n_res * sizeof(kernels::Exl3Expert), cudaMemcpyHostToDevice, 0),
                "descriptors up");
-            kernels::exl3_moe_prefill(xh, pf.rows_tok, pf.rows_w, off.data(), n_res, pf.desc, pf.routed, pf.k12_ws,
-                                      pf.k12_bytes, 0);
+            routed_moe_prefill(pack.expert_format(), xh, pf.rows_tok, pf.rows_w, off.data(), n_res, pf.desc,
+                               pf.routed, pf.k12_ws, pf.k12_bytes, 0);
             ptm->vram_experts += n_res;
         }
         const int group = std::max(1, pf.ring_slots / 4);
@@ -1852,8 +1881,8 @@ struct Engine::Impl {
             }
             ck(cudaMemcpyAsync(pf.desc + kExperts + g0, pfh.desc + kExperts + g0, n * sizeof(kernels::Exl3Expert),
                                cudaMemcpyHostToDevice, 0), "descriptors up");
-            kernels::exl3_moe_prefill(xh, pf.rows_tok, pf.rows_w, off.data() + n_res + g0, n, pf.desc + kExperts + g0,
-                                      pf.routed, pf.k12_ws, pf.k12_bytes, 0);
+            routed_moe_prefill(pack.expert_format(), xh, pf.rows_tok, pf.rows_w, off.data() + n_res + g0, n,
+                               pf.desc + kExperts + g0, pf.routed, pf.k12_ws, pf.k12_bytes, 0);
             for (int i = 0; i < n; ++i) estream->release(first_job + g0 + i, 0);
         }
         ptm->streamed += n_jobs;
@@ -2307,7 +2336,7 @@ struct Engine::Impl {
         if (prefetch) prefetch->begin_step();
         worker_us = 0;
         worker_misses = 0;
-        worker_ram = worker_file = worker_ssd = 0;
+        worker_ram = worker_file = worker_ssd = worker_late = 0;
         worker_prefetched = 0;
         worker_skipped = 0;
         {
@@ -2393,6 +2422,7 @@ struct Engine::Impl {
         tm.ram_experts = worker_ram.load();
         tm.file_experts = worker_file.load();
         tm.ssd_experts = worker_ssd.load();
+        tm.late_experts = worker_late.load();
         tm.prefetched = worker_prefetched.load();
         tm.skipped = worker_skipped.load();
         if (lookahead) {

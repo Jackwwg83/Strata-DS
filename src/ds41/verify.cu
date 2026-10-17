@@ -305,9 +305,14 @@ void Engine::Impl::enqueue_verify(int m) {
         ck(cudaMemsetAsync(v.routed, 0, m*kDim*sizeof(float), st), "verify routed");
         if (pf && l > 0) prefetch->join(l, st);   // the GPU computes the prefetched experts below
         if (tier || ram)
-            kernels::exl3_moe_decode((const __half*)v.half, m, v.selected, w, kTopK, v.db->gpu_experts(), v.routed,
-                                    vram ? vram->workspace() : zc_workspace.get(), VramExperts::kWorkspaceBytes, st);
-        v.db->wait_add(v.routed, m, l+1, st);
+            routed_moe_decode(pack.expert_format(), (const __half*)v.half, m, v.selected, w, kTopK,
+                              v.db->gpu_experts(), v.routed, vram ? vram->workspace() : zc_workspace.get(),
+                              VramExperts::kWorkspaceBytes, st);
+        v.db->wait_add(v.routed, m, l+1, st, gpu_misses);
+        if (gpu_misses)   // the misses the CPU read into the RAM tier
+            routed_moe_decode(pack.expert_format(), (const __half*)v.half, m, v.db->late_sel_dev(), w, kTopK,
+                              v.db->late_desc_dev(), v.routed, vram ? vram->workspace() : zc_workspace.get(),
+                              VramExperts::kWorkspaceBytes, st);
         if (pf && l+1 < kLayers) prefetch->ready(l+1, st);   // the next layer overwrites v.xf, which the guesses read
         ck(cudaStreamWaitEvent(st, sh_done, 0), "verify shared join");
         ops::add_f32_bf16(v.routed, v.sh_out, v.ffn_out, m*kDim, st);

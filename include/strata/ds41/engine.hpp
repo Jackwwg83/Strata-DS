@@ -174,6 +174,7 @@ public:
         /// the CPU's experts by tier: from the RAM copy, from the mapped file, and of those, the ones with pages
         /// missing from RAM when computed (read from the SSD)
         int ram_experts = 0, file_experts = 0, ssd_experts = 0;
+        int late_experts = 0;   ///< of the CPU's experts, the uses the GPU computed after the CPU read them (gpu_misses)
         int warmed = 0, warmed_useful = 0;   ///< lookahead: file-tier experts warmed, and of those, used next layer
         int prefetched = 0;   ///< misses the GPU computed from the prefetch buffer (DS41_PREFETCH), in zero_copy_experts()
         int skipped = 0;      ///< uses left out by the route tail skip (DS41_ROUTE_TAIL_SKIP), outside VRAM hits
