@@ -1755,6 +1755,17 @@ struct Engine::Impl {
     }
 
     bool resident(int l, int e) const { return vram && vram->res_host()[(size_t) l * kExperts + e] >= 0; }
+    /// unified memory: an expert of the RAM tier is computed in place by the prompt's experts, not copied to the ring
+    /// (the tier does not change during a prompt: misses are admitted only by decode steps)
+    bool in_place(int l, int e) const { return uma && host && host->mapped() && host->slot_of(l, e) >= 0; }
+    /// read from the SSD (or the file cache) into the ring for the prompt
+    bool streamed(int l, int e) const { return !resident(l, e) && !in_place(l, e); }
+    /// in neither the VRAM nor the RAM tier: its weights come from the SSD
+    bool on_ssd(int l, int e) const { return !resident(l, e) && !(host && host->slot_of(l, e) >= 0); }
+    /// Unified memory: the SSD tail skip (ssd_rank) also applies to prompts. A row that routes an expert on the SSD at
+    /// rank ssd_rank or lower is left out, and an expert left with no row is not read; nothing is streamed before the
+    /// routing is known. DGX Spark, EXL3 pack, SSD skip 1, 10K-token context plus N new tokens: see the commit.
+    bool prompt_ssd_skip() const { return uma && ssd_rank > 0; }
 
     /// model.py linear() for T rows (K2)
     /// FP32 logits of m rows of the final hidden state: the EXL3 head (K20) or the BF16 head
@@ -1935,23 +1946,31 @@ struct Engine::Impl {
         ck(cudaMemcpyAsync(pfh.wts, pf.wts, (size_t) S * kTopK * 4, cudaMemcpyDeviceToHost, 0), "weights down");
         ck(cudaMemsetAsync(pf.routed, 0, (size_t) S * kDim * 4, 0), "routed");
         ck(cudaStreamSynchronize(0), "routes");
+        // rows left out by the SSD tail skip: an expert on the SSD routed at rank ssd_rank or lower
+        auto kept = [&](int i) {
+            return !prompt_ssd_skip() || i % kTopK < ssd_rank || !on_ssd(l, pfh.ids[i]);
+        };
         std::vector<int> count(kExperts, 0);
-        for (int i = 0; i < S * kTopK; ++i) count[pfh.ids[i]]++;
+        for (int i = 0; i < S * kTopK; ++i)
+            if (kept(i)) count[pfh.ids[i]]++;
         std::vector<int> order;
         for (int e = 0; e < kExperts; ++e)
             if (count[e] && resident(l, e)) order.push_back(e);
         const int n_res = (int) order.size();
+        for (int e = 0; e < kExperts; ++e)
+            if (count[e] && in_place(l, e)) order.push_back(e);
+        const int n_inp = (int) order.size() - n_res;
         int64_t first_job;
         int n_jobs = 0;
-        if (S >= kStreamAll) {
+        if (S >= kStreamAll && !prompt_ssd_skip()) {
             first_job = layer_first_job[l];
             n_jobs = (int) (layer_first_job[l + 1] - first_job);
             for (int e = 0; e < kExperts; ++e)
-                if (!resident(l, e)) order.push_back(e);
+                if (streamed(l, e)) order.push_back(e);
         } else {
             std::vector<std::pair<int, int>> jobs;
             for (int e = 0; e < kExperts; ++e)
-                if (count[e] && !resident(l, e)) {
+                if (count[e] && streamed(l, e)) {
                     jobs.push_back({l, e});
                     order.push_back(e);
                 }
@@ -1966,6 +1985,7 @@ struct Engine::Impl {
         }
         for (int t = 0; t < S; ++t)
             for (int j = 0; j < kTopK; ++j) {
+                if (!kept(t * kTopK + j)) continue;
                 const int e = pfh.ids[t * kTopK + j];
                 const int r = start[e] + fill[e]++;
                 pfh.rows_tok[r] = t;
@@ -1983,16 +2003,27 @@ struct Engine::Impl {
                                pf.routed, pf.k12_ws, pf.k12_bytes, 0);
             ptm->vram_experts += n_res;
         }
+        if (n_inp) {   // the RAM tier's experts in place (unified memory): their descriptors point into the arena
+            for (int i = 0; i < n_inp; ++i) {
+                const int e = order[n_res + i];
+                pfh.desc[n_res + i] =
+                    VramExperts::describe_at(pack, l, e, host->device_address(host->slot_ptr(host->slot_of(l, e))));
+            }
+            ck(cudaMemcpyAsync(pf.desc + n_res, pfh.desc + n_res, n_inp * sizeof(kernels::Exl3Expert),
+                               cudaMemcpyHostToDevice, 0), "descriptors up");
+            routed_moe_prefill(pack.expert_format(), xh, pf.rows_tok, pf.rows_w, off.data() + n_res, n_inp,
+                               pf.desc + n_res, pf.routed, pf.k12_ws, pf.k12_bytes, 0);
+        }
         const int group = std::max(1, pf.ring_slots / 4);
         for (int g0 = 0; g0 < n_jobs; g0 += group) {
             const int n = std::min(group, n_jobs - g0);
             for (int i = 0; i < n; ++i) {
                 uint8_t* slot = estream->wait(first_job + g0 + i, 0);   // stream 0 waits for the copy on the GPU
-                pfh.desc[kExperts + g0 + i] = VramExperts::describe_at(pack, l, order[n_res + g0 + i], slot);
+                pfh.desc[kExperts + g0 + i] = VramExperts::describe_at(pack, l, order[n_res + n_inp + g0 + i], slot);
             }
             ck(cudaMemcpyAsync(pf.desc + kExperts + g0, pfh.desc + kExperts + g0, n * sizeof(kernels::Exl3Expert),
                                cudaMemcpyHostToDevice, 0), "descriptors up");
-            routed_moe_prefill(pack.expert_format(), xh, pf.rows_tok, pf.rows_w, off.data() + n_res + g0, n,
+            routed_moe_prefill(pack.expert_format(), xh, pf.rows_tok, pf.rows_w, off.data() + n_res + n_inp + g0, n,
                                pf.desc + kExperts + g0, pf.routed, pf.k12_ws, pf.k12_bytes, 0);
             for (int i = 0; i < n; ++i) estream->release(first_job + g0 + i, 0);
         }
@@ -2104,12 +2135,12 @@ struct Engine::Impl {
         // throughput when the expert stream's large reads share the SSD (measured at 32K: 10.3 s alone, 14.9 s
         // shared). So the stream starts with layer 0's experts only and gets the rest once that table is read.
         std::vector<std::pair<int, int>> later_jobs;
-        if (S >= kStreamAll) {
+        if (S >= kStreamAll && !prompt_ssd_skip()) {
             layer_first_job.assign(kLayers + 1, 0);
             std::vector<std::pair<int, int>> jobs;
             for (int l = 0; l < kLayers; ++l) {
                 for (int e = 0; e < kExperts; ++e)
-                    if (!resident(l, e)) jobs.push_back({l, e});
+                    if (streamed(l, e)) jobs.push_back({l, e});
                 layer_first_job[l + 1] = (int64_t) jobs.size();
             }
             const size_t now = n_eng ? (size_t) layer_first_job[1] : jobs.size();
