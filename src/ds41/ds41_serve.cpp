@@ -189,6 +189,12 @@ struct Options {
     bool dspark = false;
     int draft_k = -1;
     bool draft_always = false;   ///< --draft-always: DraftScheduler::always (every round drafts, k by confidence)
+    /// --prompt-cache-root N (0: off): a prompt read through the end of a system prompt of N tokens or more (its first
+    /// --turn-token, DeepSeek's <｜User｜>) keeps the engine's root checkpoint there (Engine::save_root), and a later
+    /// prompt that starts with it - a new conversation of the same agent client - starts reading after it (upstream's
+    /// system-prompt checkpoint, --prompt-cache-root, engine 0.1.20)
+    int root_min = 2048;
+    int turn_token = 128803;
     EngineOptions eng;
 };
 
@@ -199,6 +205,7 @@ struct Options {
                  "       [--vram-slots N] [--vram-reserve-mib M] [--ram-budget-gib G] [--adapt-every N] [--adapt-swaps N] [--prefill-chunk N]\n"
                  "       [--prefill-batch N] [--prefill-ring N] [--prefill-threads N] [--window-prompt-max N]\n"
                  "       [--snapshots N] [--batch N] [--spec none|dspark] [--draft-k K] [--draft-always]\n"
+                 "       [--prompt-cache-root N] [--turn-token ID]\n"
                  "       [--eos-id ID ...]\n",
                  why.c_str());
     std::exit(2);
@@ -246,6 +253,8 @@ Options parse_args(int argc, char** argv) {
             o.dspark = v == "dspark";
         } else if (a == "--draft-k") o.draft_k = (int) num(next());
         else if (a == "--draft-always") o.draft_always = true;
+        else if (a == "--prompt-cache-root") o.root_min = (int) num(next());
+        else if (a == "--turn-token") o.turn_token = (int) num(next());
         else if (a == "--eos-id") {
             if (!eos_given) o.eos.clear();
             eos_given = true;
@@ -379,7 +388,15 @@ int main(int argc, char** argv) {
                     from_slot = b;
                 }
             }
-            if (from_slot >= 0) {
+            // the root checkpoint: the end of a long system prompt that this prompt starts with
+            const std::vector<int>& root = e.root_tokens();
+            const bool from_root = o.root_min > 0 && !root.empty() && (int64_t) root.size() > best &&
+                                   root.size() + 1 <= r.ids.size() &&
+                                   std::equal(root.begin(), root.end(), r.ids.begin());
+            if (from_root) {
+                resume = e.restore_root();
+                s.live = root;
+            } else if (from_slot >= 0) {
                 e.copy_from_slot(from_slot);
                 s.live = slots[(size_t) from_slot].ids;
                 resume = best;
@@ -435,16 +452,33 @@ int main(int argc, char** argv) {
                 e.set_prefill_progress(nullptr);
                 return true;
             };
-            const bool windows = (int) rest.size() <= o.window_prompt_max;
-            if (rest.size() >= 2 && !s.snaps.empty()) {
+            // read through the end of a long system prompt: the root checkpoint there first (a new one replaces it)
+            size_t from = 0;
+            if (o.root_min > 0) {
+                const auto turn = std::find(r.ids.begin(), r.ids.end(), o.turn_token);
+                const int64_t b = turn - r.ids.begin();
+                const bool same = (int64_t) root.size() == b && std::equal(root.begin(), root.end(), r.ids.begin());
+                if (turn != r.ids.end() && b >= o.root_min && b > resume && b + 1 < n && !same) {
+                    cancelled = !feed(rest.begin(), rest.begin() + (b - resume), false);
+                    if (!cancelled) {
+                        e.save_root(std::vector<int>(r.ids.begin(), r.ids.begin() + b));
+                        std::fprintf(stderr, "ds41_serve: root checkpoint at %lld tokens\n", (long long) b);
+                        from = (size_t) (b - resume);
+                    }
+                }
+            }
+            const auto rb = rest.begin() + (std::ptrdiff_t) from;
+            const bool windows = (int) (rest.end() - rb) <= o.window_prompt_max;
+            if (cancelled) {
+            } else if (rest.end() - rb >= 2 && !s.snaps.empty()) {
                 // all but the last token, a snapshot, then the last token (one window)
-                cancelled = !feed(rest.begin(), rest.end() - 1, windows);
+                cancelled = !feed(rb, rest.end() - 1, windows);
                 if (!cancelled) {
                     s.save();
                     cancelled = !feed(rest.end() - 1, rest.end(), true);
                 }
             } else {
-                cancelled = !feed(rest.begin(), rest.end(), windows);
+                cancelled = !feed(rb, rest.end(), windows);
             }
             d.read = read;
             d.prompt_ms = now_ms() - r0;

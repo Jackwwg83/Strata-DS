@@ -13,6 +13,7 @@
 // Needs the model pack: --pack DIR (without it the test is skipped with code 77).
 #include "strata/ds41/config.hpp"
 #include "strata/ds41/engine.hpp"
+#include "strata/ds41/verify.hpp"
 
 #include <cstdlib>
 #include <algorithm>
@@ -74,14 +75,16 @@ int main(int argc, char** argv) {
         std::printf("RESULT skip (no --pack)\n");
         return 77;
     }
+    // DS41_TEST_PROMPT=N: the first prompt's length (default 700; the root case at long contexts)
+    const int na = std::getenv("DS41_TEST_PROMPT") ? std::atoi(std::getenv("DS41_TEST_PROMPT")) : 700;
     EngineOptions opt;
-    opt.max_seq = 4096;
+    opt.max_seq = std::max(4096, na + 1024);
     opt.cpu_threads = 8;
     opt.expert_profile = profile;
     opt.vram_expert_slots = profile.empty() ? 0 : -1;
     opt.adapt_every = 0;   // static residency: the same experts on the same path in every run
     // (adapt_every 0 keeps the RAM tier static too: the engine's rule, not the test's)
-    const std::vector<int> a = prompt(700, 1), b = prompt(600, 2);
+    const std::vector<int> a = prompt(na, 1), b = prompt(600, 2);
     try {
         Engine e(pack, opt);
         check(e.position() == 0, "a new engine is at position 0");
@@ -210,6 +213,25 @@ int main(int argc, char** argv) {
             e.restore_root();
             e.prefill(tail, (int) a.size());
             check(same_logits(e.last_logits(), want, "after a pending verify window"), "a root can be restored again");
+            // the tail in verify windows of 4 (as ds41_serve reads a short rest), against a fresh start
+            auto windows = [&](int pos) {
+                std::vector<float> last;
+                for (size_t i = 0; i < tail.size(); i += 4) {
+                    const std::vector<int> win(tail.begin() + i, tail.begin() + std::min(tail.size(), i + 4));
+                    const VerifyResult v = e.verify(win, pos + (int) i, true);
+                    e.commit((int) win.size());
+                    last = v.logits.back();
+                }
+                return last;
+            };
+            e.reset();
+            e.prefill(a, 0);
+            const std::vector<float> want_w = windows((int) a.size());
+            e.reset();
+            e.prefill(b, 0);
+            e.restore_root();
+            check(same_logits(windows((int) a.size()), want_w, "verify windows after a root restore"),
+                  "verify windows after a root restore");
         } else {
             std::printf("unknown --case %s\n", which.c_str());
             return 2;
