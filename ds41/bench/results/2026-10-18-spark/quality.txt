@@ -1,0 +1,22 @@
+# Quality on the DGX Spark: 50 segments x 255 tokens, teacher-forced decode, KL against the official MXFP4 pack without skips (a1)
+# q-1017: official MXFP4 pack (a1, a2: no skip; s3, s2: DS41_SSD_TAIL_SKIP=3 / 2)
+a1 exit 0 2746 s | force_list sequences 50 scored 12750 mean_nll 2.167728 decode_ms_per_token 203.2 over 12750 steps 
+s3 exit 0 1077 s | force_list sequences 50 scored 12750 mean_nll 2.164158 decode_ms_per_token 78.3 over 12750 steps 
+s2 exit 0 957 s | force_list sequences 50 scored 12750 mean_nll 2.158479 decode_ms_per_token 69.1 over 12750 steps 
+a2 exit 0 2714 s | force_list sequences 50 scored 12750 mean_nll 2.167728 decode_ms_per_token 206.6 over 12750 steps 
+== a1 vs a2
+quality/lp_a2.bin vs quality/lp_a1.bin: KL mean 0.00000 [0.0, 3.053786043483164e-11] median 0.00000 p99 0.0000 | top1 1.0000 [1.0, 1.0] | dnll -0.0000 [-1.887714162762677e-08, 0.0]
+== a1 vs s3
+quality/lp_s3.bin vs quality/lp_a1.bin: KL mean 0.03707 [0.03243941068649292, 0.0421941801905632] median 0.01423 p99 0.3149 | top1 0.9147 [0.9036843137254902, 0.9250196078431372] | dnll -0.0036 [-0.009510752744972706, 0.0023161035496741533]
+== a1 vs s2
+quality/lp_s2.bin vs quality/lp_a1.bin: KL mean 0.04580 [0.03960694000124931, 0.05257093533873558] median 0.01725 p99 0.4440 | top1 0.9107 [0.8998431372549018, 0.9211764705882353] | dnll -0.0092 [-0.01661170832812786, -0.00205023679882288]
+Q_DONE
+
+# q-exl3h: this recipe (h0: no skip; h2, h1: DS41_SSD_TAIL_SKIP=2 / 1)
+h0 exit 0 798 s | force_list sequences 50 scored 12750 mean_nll 2.166943 | ds41: 3192 EXL3 expert uses left to the CPU were dropped (no CPU kernel here)
+quality/lp_h0.bin vs quality/lp_a1.bin: KL mean 0.05323 [0.04718783125281334, 0.06009948253631592] median 0.02136 p99 0.4892 | top1 0.9021 [0.8910588235294117, 0.9130980392156861] | dnll -0.0008 [-0.007502756081521511, 0.005761935841292143]
+h2 exit 0 607 s | force_list sequences 50 scored 12750 mean_nll 2.159857 | 
+quality/lp_h2.bin vs quality/lp_a1.bin: KL mean 0.06219 [0.055275727063417435, 0.07008003443479538] median 0.02508 p99 0.5559 | top1 0.8940 [0.8825098039215686, 0.9052549019607842] | dnll -0.0079 [-0.017500286921858788, 0.0003470211522653699]
+h1 exit 0 576 s | force_list sequences 50 scored 12750 mean_nll 2.155412 | 
+quality/lp_h1.bin vs quality/lp_a1.bin: KL mean 0.07399 [0.06388135999441147, 0.0857739970088005] median 0.02915 p99 0.7183 | top1 0.8857 [0.8724705882352941, 0.8985098039215687] | dnll -0.0123 [-0.020358333364129066, -0.004005094990134239]
+Q_DONE
