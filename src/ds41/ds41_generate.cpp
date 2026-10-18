@@ -93,7 +93,7 @@ static std::FILE* step_log = nullptr;
 
 static void generate(Engine& engine, const EngineOptions& opt, const std::vector<int>& prompt,
                      int count, bool batched, bool suffix, int max_t, int eos, const std::vector<int>& cont = {},
-                     bool oracle = false, bool dspark = false, int draft_k = -1) {
+                     bool oracle = false, bool dspark = false, int draft_k = -1, bool draft_always = false) {
     if (prompt.empty()) throw std::invalid_argument("generation needs a nonempty prompt");
     int next = -1;
     if (batched) {
@@ -112,6 +112,7 @@ static void generate(Engine& engine, const EngineOptions& opt, const std::vector
     int differ = 0;                // oracle: rows whose prediction differs from the file
     int64_t hits = 0, routed = 0, skipped = 0;
     DraftScheduler sched;
+    sched.always = draft_always;
     double draft_ms = 0, draft_cpu_ms = 0;
     int spec_rounds = 0;   // DSpark: rounds that drafted (the others were plain steps)
     int64_t draft_hits = 0, draft_uses = 0;
@@ -281,6 +282,7 @@ static void force_list(Engine& engine, const std::string& list_path, const std::
 int main(int argc, char** argv) {
     std::string pack, ids_s, dump_path, force_path, cont_path, list_path, logprobs_path, spec = "none";
     int spec_max = kVerifyMaxTokens, eos = -1, draft_k = -1;
+    bool draft_always = false;
     int gen = 32;
     bool batched = false;
     EngineOptions opt;
@@ -294,6 +296,7 @@ int main(int argc, char** argv) {
         else if (a == "--spec-max") spec_max = std::stoi(next());
         else if (a == "--eos-id") eos = std::stoi(next());
         else if (a == "--draft-k") draft_k = std::stoi(next());
+        else if (a == "--draft-always") draft_always = true;
         else if (a == "--threads") opt.cpu_threads = std::stoi(next());
         else if (a == "--max-seq") opt.max_seq = std::stoi(next());
         else if (a == "--expert-profile") opt.expert_profile = next();
@@ -323,7 +326,7 @@ int main(int argc, char** argv) {
         else { std::fprintf(stderr, "unknown argument %s\n", a.c_str()); return 2; }
     }
     if (pack.empty() || (ids_s.empty() && force_path.empty() && list_path.empty())) {
-        std::fprintf(stderr, "usage: ds41_generate --pack DIR --ids a,b,c [--gen N] [--threads T] [--dump F] [--force-ids F] [--spec none|suffix|oracle|dspark] [--spec-max 1..8] [--draft-k 0..5] [--eos-id ID]\n");
+        std::fprintf(stderr, "usage: ds41_generate --pack DIR --ids a,b,c [--gen N] [--threads T] [--dump F] [--force-ids F] [--spec none|suffix|oracle|dspark] [--spec-max 1..8] [--draft-k 0..5] [--draft-always] [--eos-id ID]\n");
         return 2;
     }
     std::vector<int> prompt = parse_ids(ids_s), forced;
@@ -368,7 +371,7 @@ int main(int argc, char** argv) {
         }
         if (force_path.empty() && dump_path.empty()) {
             generate(engine, opt, prompt, gen, batched, spec != "none", spec_max, eos, cont, spec == "oracle",
-                     spec == "dspark", draft_k);
+                     spec == "dspark", draft_k, draft_always);
             return 0;
         }
         if (batched) {   // prefill the prompt (or the forced sequence) in one call, then decode with step()

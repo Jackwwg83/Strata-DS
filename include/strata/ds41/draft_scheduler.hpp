@@ -21,6 +21,10 @@ struct DraftScheduler {
     // the first 16 tokens are plain steps: they measure the step and keep drafting out of the cold start, when the
     // tiers are empty and every extra verify row reads its experts from the SSD (a 4-row window took 2.7 s)
     int backoff = 4, plain_left = 16;
+    /// always (--draft-always): after the first 16 tokens every round drafts, k still chosen by choose(); no backoff.
+    /// DGX Spark, EXL3 pack, SSD skip 2, ms/token code / zh / en: backoff 42.9 / 53.4 / 50.0, always 39.3 / 48.1 / 48.4
+    /// (fixed k = 2: 39.8 / 49.7 / 48.6). A losing round there costs little: the RAM tier serves most verify rows.
+    bool always = false;
     double verify_cost(int k) const {
         if (vn[k] > 0) return vms[k];
         const double base = step_ms > 0 ? step_ms : 50.0;
@@ -47,7 +51,7 @@ struct DraftScheduler {
         vn[k] += 1;
         const double rate = tokens / round_ms;
         spec_rate = spec_rate > 0 ? 0.7 * spec_rate + 0.3 * rate : rate;
-        if (step_ms > 0 && spec_rate < 1.0 / step_ms) {   // drafting loses: plain steps for a while
+        if (!always && step_ms > 0 && spec_rate < 1.0 / step_ms) {   // drafting loses: plain steps for a while
             plain_left = backoff;
             backoff = std::min(backoff * 2, 64);
         } else {

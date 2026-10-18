@@ -57,6 +57,14 @@ int main() {
         w.observe_round(3, 60, 70, 4);     // 0.057 tok/ms: wins
         check(w.want_draft(), "a winning round keeps drafting");
     }
+    {   // always: the same losing rounds leave no plain steps
+        DraftScheduler s;
+        s.always = true;
+        for (int i = 0; i < 16; ++i) s.want_draft();
+        s.observe_step(50);
+        s.observe_round(1, 200, 200, 1);
+        check(s.want_draft(), "always: drafting goes on after a losing round");
+    }
     {   // round_keep: the matching drafts, the correction, and an early end of sequence
         const std::vector<int> eos = {1};
         check(round_keep({7, 8, 9, 10}, {8, 9, 10, 11}, eos) == 4, "all drafts accepted: 4 tokens");

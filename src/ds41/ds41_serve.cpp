@@ -188,6 +188,7 @@ struct Options {
     /// --draft-k K: K drafts a round (0..3); without it DraftScheduler chooses, and drafts only while drafting pays.
     bool dspark = false;
     int draft_k = -1;
+    bool draft_always = false;   ///< --draft-always: DraftScheduler::always (every round drafts, k by confidence)
     EngineOptions eng;
 };
 
@@ -197,7 +198,7 @@ struct Options {
                  "usage: ds41_serve --serve --pack DIR [--max-context N] [--threads T] [--expert-profile F]\n"
                  "       [--vram-slots N] [--vram-reserve-mib M] [--ram-budget-gib G] [--adapt-every N] [--adapt-swaps N] [--prefill-chunk N]\n"
                  "       [--prefill-batch N] [--prefill-ring N] [--prefill-threads N] [--window-prompt-max N]\n"
-                 "       [--snapshots N] [--batch N] [--spec none|dspark] [--draft-k K]\n"
+                 "       [--snapshots N] [--batch N] [--spec none|dspark] [--draft-k K] [--draft-always]\n"
                  "       [--eos-id ID ...]\n",
                  why.c_str());
     std::exit(2);
@@ -244,6 +245,7 @@ Options parse_args(int argc, char** argv) {
             if (v != "none" && v != "dspark") usage("--spec is none or dspark");
             o.dspark = v == "dspark";
         } else if (a == "--draft-k") o.draft_k = (int) num(next());
+        else if (a == "--draft-always") o.draft_always = true;
         else if (a == "--eos-id") {
             if (!eos_given) o.eos.clear();
             eos_given = true;
@@ -336,6 +338,7 @@ int main(int argc, char** argv) {
     const std::string batch_info =
         nslots >= 2 ? " batch_slots=" + std::to_string(nslots) + " slot_cache=1" : std::string();
     DraftScheduler sched;   // DSpark: one policy for the process (its step and verify times carry over requests)
+    sched.always = o.draft_always;
     say("INFO context=%d expert_slots=%d spec=0 model=deepseek-v4.1-flash engine=" STRATA_VERSION "%s", o.max_context,
         e.vram_expert_slots(), batch_info.c_str());
     say("READY %d stop", o.max_context);   // "stop": this engine honours STOP
