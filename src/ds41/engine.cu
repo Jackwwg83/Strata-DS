@@ -394,6 +394,7 @@ struct Engine::Impl {
             if (y.moe_handle >= 0) cpu_free_layer(pack.expert_format(), y.moe_handle);
         for (void* p : owned_dev) cudaFree(p);
         if (x3_ws) cudaFree(x3_ws);
+        if (root.buf) cudaFree(root.buf);
         for (cudaEvent_t e : pfp.ev) cudaEventDestroy(e);
         if (dbg) std::fclose(dbg);
         if (eng_host) cudaFreeHost(eng_host);
@@ -2445,6 +2446,68 @@ struct Engine::Impl {
         return sn.pos;
     }
 
+    /// the root checkpoint (save_root): the snapshot's state and every attention cache up to pos, in one buffer
+    struct Root {
+        int pos = -1;
+        std::vector<int> tokens;          // the caller's tokens before pos
+        std::vector<int32_t> history;     // the engine's history there
+        uint8_t* buf = nullptr;
+        size_t bytes = 0;
+    } root;
+    /// copies the root's parts (save: device state -> root.buf), or returns the bytes they take at position pos
+    size_t root_copy(int pos, bool save, bool count_only) {
+        size_t at = 0;
+        auto part = [&](void* state, size_t bytes) {
+            if (!count_only)
+                ck(cudaMemcpyAsync(save ? root.buf + at : state, save ? state : root.buf + at, bytes,
+                                   cudaMemcpyDeviceToDevice, st), "root copy");
+            at += (bytes + 255) & ~(size_t) 255;
+        };
+        for (int l = 0; l < kLayers; ++l) {
+            auto& y = L[l];
+            part(y.window, (size_t) kWindow * kHeadDim * sizeof(bf16));
+            if (y.kv_state) {
+                part(y.kv_state, (size_t) y.ratio * kHeadDim * sizeof(float));
+                part(y.score_state, (size_t) y.ratio * kHeadDim * sizeof(float));
+            }
+            if (y.comp) {
+                const size_t rows = (size_t) pos / y.ratio + 1;
+                part(y.comp, rows * kHeadDim * sizeof(bf16));
+                if (y.idx_keys) part(y.idx_keys, rows * kIndexDim * sizeof(bf16));
+            }
+        }
+        if (!count_only) ck(cudaStreamSynchronize(st), "root copy");
+        return at;
+    }
+    void save_root(const std::vector<int>& tokens) {
+        usable();
+        if (verify_pending) throw std::logic_error("commit the pending verify window first");
+        const int pos = (int) history.size();
+        if ((int) tokens.size() != pos) throw std::invalid_argument("save_root: the tokens are not the position's");
+        root.pos = -1;   // a failed copy leaves no root
+        const size_t bytes = root_copy(pos, true, true);
+        if (bytes > root.bytes) {
+            if (root.buf) cudaFree(root.buf);
+            root.buf = nullptr;
+            root.bytes = 0;
+            ck(cudaMalloc(&root.buf, bytes), "root checkpoint");
+            root.bytes = bytes;
+        }
+        root_copy(pos, true, false);
+        root.tokens = tokens;
+        root.history = history;
+        root.pos = pos;
+    }
+    int restore_root() {
+        usable();
+        if (root.pos < 0) throw std::logic_error("ds41: no root checkpoint");
+        verify_pending = verify_failed = false;
+        root_copy(root.pos, false, false);
+        history = root.history;
+        if (ds) ds_set_pending(0, 0);   // DSpark's rings are not in the root: stale rows cost draft quality only
+        return root.pos;
+    }
+
     int step(int token, int pos, StepDump* dump, Timing& tm) {
         usable();
         check_token(token);
@@ -2615,6 +2678,9 @@ void Engine::set_prefill_progress(PrefillProgress fn) { impl_->progress = std::m
 void Engine::reset() { impl_->reset(); }
 
 void Engine::save_snapshot(int slot) { impl_->save_snapshot(slot); }
+void Engine::save_root(const std::vector<int>& tokens) { impl_->save_root(tokens); }
+int Engine::restore_root() { return impl_->restore_root(); }
+const std::vector<int>& Engine::root_tokens() const { return impl_->root.tokens; }
 
 int Engine::restore_snapshot(int slot) { return impl_->restore_snapshot(slot); }
 

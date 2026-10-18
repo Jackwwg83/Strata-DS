@@ -8,6 +8,8 @@
 //   --case snapshot   restore_snapshot() goes back to a saved position: after decode steps past it, and after a
 //                     pending verify window, the next tokens give the logits of a fresh engine fed the same tokens;
 //                     a snapshot past the current position, or an empty slot, is refused
+//   --case root       save_root() keeps the whole state at a position (caches included): after another conversation
+//                     from position 0, restore_root() and the same next tokens give a fresh engine's logits
 // Needs the model pack: --pack DIR (without it the test is skipped with code 77).
 #include "strata/ds41/config.hpp"
 #include "strata/ds41/engine.hpp"
@@ -180,6 +182,34 @@ int main(int argc, char** argv) {
             check(throws([&] { e.restore_snapshot(1); }), "a snapshot past the current position is refused");
             check(throws([&] { e.restore_snapshot(0); }), "an empty slot is refused");
             check(throws([&] { e.save_snapshot(e.snapshot_slots()); }), "a slot past the last is refused");
+        } else if (which == "root") {
+            // reference: a fresh start fed a, then b's first 40 tokens (a batched prefill, as below)
+            const std::vector<int> tail(b.begin(), b.begin() + 40);
+            e.reset();
+            e.prefill(a, 0);
+            e.prefill(tail, (int) a.size());
+            const std::vector<float> want = e.last_logits();
+            check(throws([&] { e.restore_root(); }), "no root yet: refused");
+            // the case: a, the root saved there, another conversation from position 0, then back to the root
+            e.reset();
+            e.prefill(a, 0);
+            check(throws([&] { e.save_root(b); }), "save_root refuses tokens of another length");
+            e.save_root(a);
+            check(e.root_tokens() == a, "the root holds a's tokens");
+            e.reset();
+            e.prefill(b, 0);   // overwrites the caches the root covers
+            int next = e.step(5, (int) b.size());
+            for (int i = 1; i < 6; ++i) next = e.step(next, (int) b.size() + i);
+            check(e.restore_root() == (int) a.size() && e.position() == (int) a.size(), "restore_root goes to a's end");
+            e.prefill(tail, (int) a.size());
+            check(same_logits(e.last_logits(), want, "after another conversation and a root restore"),
+                  "the root survives another conversation");
+            // again, after decode steps from the root and a pending verify window
+            e.restore_root();
+            e.verify({7, 8, 9}, (int) a.size());
+            e.restore_root();
+            e.prefill(tail, (int) a.size());
+            check(same_logits(e.last_logits(), want, "after a pending verify window"), "a root can be restored again");
         } else {
             std::printf("unknown --case %s\n", which.c_str());
             return 2;

@@ -141,6 +141,14 @@ public:
     /// position are still the ones fed when it was saved. Refused when the slot is empty or past position(). A pending
     /// verify window is dropped. The slot stays valid.
     int restore_snapshot(int slot);
+    /// The root checkpoint (ds41_serve: the end of a long system prompt, which new conversations share): the whole state
+    /// at position() - the snapshot's state and the attention caches up to there - copied aside, sized to the position.
+    /// It survives reset() and other conversations; a new save_root replaces it. Throws on a pending verify window.
+    /// tokens: the tokens fed so far (the caller's record, returned by root_tokens()).
+    void save_root(const std::vector<int>& tokens);
+    /// Back to the root: position() becomes its position and the tokens before it are root_tokens(). Throws without one.
+    int restore_root();
+    const std::vector<int>& root_tokens() const;
     int snapshot_slots() const;
 
     /// Concurrent requests. A request is read in the main session (prefill, step, verify), then copied into a slot.
