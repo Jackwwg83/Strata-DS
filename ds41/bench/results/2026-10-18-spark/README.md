@@ -13,13 +13,14 @@ them: `--max-context 262144 --threads 16 --window-prompt-max 32 --spec dspark --
 | --- | --- |
 | [agent-session.txt](agent-session.txt) | every request of a coding-agent session (DeepSeek Harness on a MacBook, through an SSH tunnel), as the server logged it: prompt tokens, reused and read, prompt time, tokens written, ms per token, DSpark windows / drafts / accepted |
 | [runs.txt](runs.txt) | single `ds41_serve` runs: the context sweep (8K-250K), the time to the first token after a 10,000-token context (several `--window-prompt-max` values), the root checkpoint, a teacher-forced 4,000-token prefill |
+| [install/](install) | a fresh setup from a new clone: its log, and the sha256 of the pack it wrote, compared with the measured pack (byte for byte the same) |
 | [quality.txt](quality.txt) | the KL runs: 50 segments x 255 tokens teacher-forced, against the official MXFP4 pack without skips |
 | [deepseek-1017-dgx-spark.png](deepseek-1017-dgx-spark.png), [x-chart-data.json](x-chart-data.json), [x-chart.py](x-chart.py) | the chart, its numbers (from runs.txt) and the script that draws it |
 
 ## Results
 
-- Agent session (29 turns after the first, context 10,310-58,516 tokens): 39,079 tokens written at 30.6 tokens/s
-  (the engine's time per token over all of them); per turn 23.6-36.4, median 28.7; DSpark accepted 82.1% of its drafts.
+- Agent session (29 turns after the first, context 10,310-58,516 tokens): 70,211 tokens written at 30.8 tokens/s
+  (the engine's time per token over all of them); per turn 23.6-36.4, median 28.6; DSpark accepted 84.2% of its drafts.
 - Context sweep, 200 tokens each: 8K 24.2, 32K 27.4, 64K 27.4, 128K 27.3, 250K 22.9 tokens/s.
 - Quality against the official MXFP4 weights: KL 0.0740 [0.0639, 0.0858], same top token 88.6% (the default); 0.0532
   and 90.2% without the SSD skip.

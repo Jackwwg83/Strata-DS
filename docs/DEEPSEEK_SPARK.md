@@ -6,9 +6,9 @@ experts: the most used experts stay in memory, the rest are read from the SSD wh
 
 Measured on 2026-10-18 on one DGX Spark:
 
-- **30.6 tokens/s** over a real coding-agent session: 29 turns of an agent client (DeepSeek Harness), 39,079 tokens
-  written, the context growing from 10K to 59K
-  tokens. Per turn 23.6-36.4 tokens/s, median 28.7. Code and file writing run fastest.
+- **30.8 tokens/s** over a real coding-agent session: 48 turns of an agent client (DeepSeek Harness), 70,211 tokens
+  written, the context growing from 10K to 91K
+  tokens. Per turn 23.6-36.4 tokens/s, median 28.6. Code and file writing run fastest.
 - **About 1 s to the first token** of an agent turn that adds up to 50 tokens (a tool result), 1.3 s for 51-150 tokens.
 - **22.9 tokens/s with a 250K-token context.** The server is set up for 256K tokens.
 - Quality: against the official MXFP4 weights (the checkpoint DeepSeek published), KL divergence 0.074 and the same
@@ -27,22 +27,23 @@ own (the server log).
 
 | | Value |
 | --- | ---: |
-| turns (after the first) | 29 |
-| context | 10,310 - 58,516 tokens |
-| tokens written | 39,079 |
-| decode, all tokens | 30.6 tokens/s |
-| decode per turn, min / median / max | 23.6 / 28.7 / 36.4 tokens/s |
-| DSpark drafts accepted | 82.1% (2.83 tokens per verify pass) |
+| turns (after the first) | 48 |
+| context | 10,310 - 91,310 tokens |
+| tokens written | 70,211 |
+| decode, all tokens | 30.8 tokens/s |
+| decode per turn, min / median / max | 23.6 / 28.6 / 36.4 tokens/s |
+| DSpark drafts accepted | 84.2% (2.97 tokens per verify pass) |
 
 Time to read a turn's new tokens (the time to the first token, without the client's own time):
 
 | New tokens in the turn | Turns | Median | Most |
 | --- | ---: | ---: | ---: |
 | 1-50 | 7 | 0.57 s | 1.15 s |
-| 51-150 | 15 | 1.27 s | 1.65 s |
-| 151-500 | 4 | 1.94 s | 2.32 s |
-| 501-1,500 | 1 | 2.49 s | |
+| 51-150 | 28 | 1.27 s | 1.65 s |
+| 151-500 | 8 | 1.84 s | 2.32 s |
+| 501-1,500 | 2 | 2.79 s | 3.09 s |
 | 1,501-5,000 | 2 | 8.43 s | 10.60 s |
+| 10,007 (the client sent back a 10K-token answer without its thinking, so the cache matched only up to it) | 1 | 24.96 s | |
 
 **Decode by context length** (one run each, a code prompt, 200 tokens written, `ds41_serve` with the setup's
 settings):
@@ -130,6 +131,15 @@ SSD held it up 22 ms.
    To use it from another machine, set an API key: `./setup.sh --setup --family deepseek --host 0.0.0.0 --api-key KEY`.
    Agent clients: [docs/DETAILS.md](DETAILS.md#using-it).
 
+**Repeated from scratch on 2026-10-18** on this DGX Spark: a fresh clone in a new folder, only the commands above
+(`--data-dir` pointed into it). The 44 large shards were already on disk and were hard-linked into the new folder
+first; LibertAI's first shard (1.3 GB) and DeepSeek's single tensors (1.0 GB, by range) were downloaded. Setup took
+15 minutes: the engine build, the merge, the pack and DSpark's experts. A second run took 0.7 s and changed nothing.
+The pack it wrote is byte for byte the measured pack (sha256 of every file; `engram.txt` and `pack_info.txt` differ
+only in their absolute paths): [install/sha256.txt](../ds41/bench/results/2026-10-18-spark/install/sha256.txt),
+[install/setup.log](../ds41/bench/results/2026-10-18-spark/install/setup.log). A full download of 414.8 GB takes
+hours more, at the speed of the connection.
+
 ## Settings that matter
 
 Setup writes all of these. Each was measured on this DGX Spark when it was added (the build of that day).
@@ -172,7 +182,7 @@ Task accuracy (HumanEval, GSM8K) was not measured for this recipe. To run withou
 | official MXFP4 pack, plain decode, no skip | 104 ms/token (9.6 tokens/s) |
 | LibertAI EXL3 experts and dense layers (K19, K20), DSpark, no skip | 54.4 ms/token |
 | + EXL3 head, SSD tail skip at rank 2, DSpark every step | 36.3 ms/token (27.5 tokens/s) |
-| the coding-agent session above | 30.6 tokens/s |
+| the coding-agent session above | 30.8 tokens/s |
 
 ## Method and limits
 
@@ -182,6 +192,10 @@ Task accuracy (HumanEval, GSM8K) was not measured for this recipe. To run withou
   (code is drafted best).
 - **Prompts read differently in different runs.** A batched prefill plans its passes from the free memory at the
   time, so the same prompt can give slightly different states (1 of 3 runs differed). Decode alone is deterministic.
+- **An agent client that drops its reasoning from the history re-reads the answer.** After a turn with a long answer
+  (here 10,007 tokens, mostly thinking) the next request did not repeat it as the model wrote it, so the server's
+  cache matched only up to that answer: 25 s to the first token. Upstream's message-boundary cache
+  ([MESSAGE_BOUNDARY_CACHE.md](MESSAGE_BOUNDARY_CACHE.md)) is the place to look; not done for DeepSeek yet.
 - **A long prompt added to a long context reads slowly:** 122K new tokens after a 128K context took 1,466 s, three
   times a cold 250K read. Not investigated yet.
 - **No EXL3 CPU kernel on Arm.** With the SSD skip off, 0.7% of the expert uses that the engine gives the CPU are

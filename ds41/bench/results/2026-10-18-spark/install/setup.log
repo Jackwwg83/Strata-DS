@@ -1,0 +1,274 @@
+2026年 10月 18日 星期日 08:33:58 UTC
+Strata - DeepSeek V4.1 Flash (Linux + NVIDIA)
+  [ok] DeepSeek V4.1 Flash 1017 EXL3 2.9bpw (the DGX Spark recipe): GPU 0 (NVIDIA GB10, 0 GB); RAM 121.7 GiB; a DGX Spark (128 GB unified memory)
+  Disk: about 624 GB (413.4 GB download + 210.2 GB pack). Keep the source shards: Engram reads them in place.
+  1) 8K tokens
+  2) 32K tokens
+  3) 64K tokens
+  4) 128K tokens
+  5) 200K tokens
+  6) 256K tokens (recommended)
+  Installing Strata Python packages (pack: numpy) ...
+  > /home/issuser/strata-ds/repro/Strata-DS/.venv/bin/python -m pip install --quiet --disable-pip-version-check numpy==2.5.3; python_version >= "3.12" numpy==2.4.6; python_version == "3.11" numpy==2.2.6; python_version < "3.11" jinja2==3.1.6 regex==2026.9.10 pyyaml==6.0.3 tqdm==4.70.1 requests==2.34.2 cmake==4.4.3 ninja==1.13.2 pillow==12.3.0 psutil==7.2.2 markupsafe==3.0.3 certifi==2026.7.22 charset-normalizer==3.5.1 idna==3.20 urllib3==2.8.0 colorama==0.4.6; sys_platform == "win32"
+  [ok] Strata Python packages (pack: numpy) installed
+  [ok] build tools present (CUDA 13.0)
+  [ok] llama.cpp source downloaded
+  > /usr/bin/cmake -G Ninja -DCMAKE_MAKE_PROGRAM=/home/issuser/strata-ds/repro/Strata-DS/.venv/bin/ninja -S /home/issuser/strata-ds/repro/Strata-DS -B /home/issuser/strata-ds/repro/Strata-DS/build-ds41 -DCMAKE_BUILD_TYPE=Release -DSTRATA_ENABLE_CUDA=ON -DSTRATA_ENABLE_HIP=OFF -DSTRATA_BUILD_TESTS=OFF -DCMAKE_CUDA_ARCHITECTURES=121 -DCMAKE_CUDA_COMPILER=/usr/local/cuda-13.0/bin/nvcc -DSTRATA_GGML_DIR=/home/issuser/strata-ds/repro/Strata-DS/third_party/llama.cpp
+-- The CXX compiler identification is GNU 13.3.0
+-- Detecting CXX compiler ABI info
+-- Detecting CXX compiler ABI info - done
+-- Check for working CXX compiler: /usr/bin/c++ - skipped
+-- Detecting CXX compile features
+-- Detecting CXX compile features - done
+-- The CUDA compiler identification is NVIDIA 13.0.88
+-- Detecting CUDA compiler ABI info
+-- Detecting CUDA compiler ABI info - done
+-- Check for working CUDA compiler: /usr/local/cuda-13.0/bin/nvcc - skipped
+-- Detecting CUDA compile features
+-- Detecting CUDA compile features - done
+-- Found CUDAToolkit: /usr/local/cuda-13.0/targets/sbsa-linux/include (found version "13.0.88") 
+-- Performing Test CMAKE_HAVE_LIBC_PTHREAD
+-- Performing Test CMAKE_HAVE_LIBC_PTHREAD - Success
+-- Found Threads: TRUE  
+-- Strata: CUDA enabled, arch 121
+-- strata: pack/full/experts.bin absent - the expert arena load test is NOT registered
+-- Performing Test STRATA_HAVE_AVXVNNI_INTRINSICS
+-- Performing Test STRATA_HAVE_AVXVNNI_INTRINSICS - Failed
+-- The C compiler identification is GNU 13.3.0
+-- Detecting C compiler ABI info
+-- Detecting C compiler ABI info - done
+-- Check for working C compiler: /usr/bin/cc - skipped
+-- Detecting C compile features
+-- Detecting C compile features - done
+-- The ASM compiler identification is GNU
+-- Found assembler: /usr/bin/cc
+-- Warning: ccache not found - consider installing it for faster compilation or disable this warning with GGML_CCACHE=OFF
+-- CMAKE_SYSTEM_PROCESSOR: aarch64
+-- GGML_SYSTEM_ARCH: ARM
+-- Including CPU backend
+-- ARM detected
+-- Performing Test GGML_COMPILER_SUPPORTS_FP16_FORMAT_I3E
+-- Performing Test GGML_COMPILER_SUPPORTS_FP16_FORMAT_I3E - Failed
+CMake Warning at third_party/llama.cpp/ggml/src/ggml-cpu/CMakeLists.txt:140 (message):
+  ARM -march/-mcpu not found, -mcpu=native will be used
+Call Stack (most recent call first):
+  third_party/llama.cpp/ggml/src/CMakeLists.txt:586 (ggml_add_cpu_backend_variant_impl)
+-- Performing Test GGML_MACHINE_SUPPORTS_dotprod
+-- Performing Test GGML_MACHINE_SUPPORTS_dotprod - Failed
+-- Performing Test GGML_MACHINE_SUPPORTS_nodotprod
+-- Performing Test GGML_MACHINE_SUPPORTS_nodotprod - Failed
+-- Performing Test GGML_MACHINE_SUPPORTS_i8mm
+-- Performing Test GGML_MACHINE_SUPPORTS_i8mm - Failed
+-- Performing Test GGML_MACHINE_SUPPORTS_noi8mm
+-- Performing Test GGML_MACHINE_SUPPORTS_noi8mm - Failed
+-- Performing Test GGML_MACHINE_SUPPORTS_sve
+-- Performing Test GGML_MACHINE_SUPPORTS_sve - Failed
+-- Performing Test GGML_MACHINE_SUPPORTS_nosve
+-- Performing Test GGML_MACHINE_SUPPORTS_nosve - Failed
+-- Performing Test GGML_MACHINE_SUPPORTS_sme
+-- Performing Test GGML_MACHINE_SUPPORTS_sme - Failed
+-- Performing Test GGML_MACHINE_SUPPORTS_nosme
+-- Performing Test GGML_MACHINE_SUPPORTS_nosme - Failed
+-- Checking for ARM features using flags:
+--   -mcpu=native
+-- Performing Test HAVE_DOTPROD
+-- Performing Test HAVE_DOTPROD - Failed
+-- Performing Test HAVE_SVE
+-- Performing Test HAVE_SVE - Failed
+-- Performing Test HAVE_MATMUL_INT8
+-- Performing Test HAVE_MATMUL_INT8 - Failed
+-- Performing Test HAVE_FMA
+-- Performing Test HAVE_FMA - Success
+-- Performing Test HAVE_FP16_VECTOR_ARITHMETIC
+-- Performing Test HAVE_FP16_VECTOR_ARITHMETIC - Failed
+-- Performing Test HAVE_SME
+-- Performing Test HAVE_SME - Failed
+-- Adding CPU backend variant ggml-cpu: -mcpu=native 
+-- ggml version: 0.24.0
+-- ggml commit:  905516d
+-- Configuring done (3.7s)
+-- Generating done (0.1s)
+-- Build files have been written to: /home/issuser/strata-ds/repro/Strata-DS/build-ds41
+  > /usr/bin/cmake --build /home/issuser/strata-ds/repro/Strata-DS/build-ds41 --target ds41_serve -j 10
+[35/55] Linking CUDA static library libstrata_ds41.a
+[36/55] Linking CXX static library libds41_k20_exl3_mrow.a
+[37/55] Linking CXX static library libds41_k19_exl3_smoe.a
+[38/55] Linking CXX static library libds41_k18_exl3_linear.a
+[39/55] Linking CXX static library libds41_k17_mxfp4_moe_prefill.a
+[40/55] Linking CXX static library libds41_k12_exl3_moe_prefill.a
+[41/55] Linking CXX static library libds41_k16_mxfp4_moe.a
+[42/55] Linking CXX static library libds41_k15_hc_prefill.a
+[43/55] Linking CXX static library libds41_k14_indexer_prefill.a
+[44/55] Linking CXX static library libds41_k13_sparse_attn_prefill.a
+[45/55] Linking CXX static library libds41_k10_exl3_moe.a
+[46/55] Linking CXX static library libds41_k8_router.a
+[47/55] Linking CXX static library libds41_k7_hc.a
+[48/55] Linking CXX static library libds41_k5_indexer.a
+[49/55] Linking CXX static library libds41_k3_sparse_attn.a
+[50/55] Linking CXX static library libds41_k2_fp8_gemm.a
+[52/55] Linking CUDA static library libstrata_ds41_sampler.a
+[54/55] Linking CXX static library libstrata_ds41_engine.a
+[55/55] Linking CXX executable ds41_serve
+  [ok] official.safetensors.index.json downloaded
+  [ok] exl3.safetensors.index.json downloaded
+  [ok] config.json downloaded
+  [ok] tokenizer.json downloaded
+  [ok] tokenizer_config.json downloaded
+  [ok] model-00001-of-00043.safetensors downloaded
+  [ok] model-00002-of-00043.safetensors already downloaded
+  [ok] model-00003-of-00043.safetensors already downloaded
+  [ok] model-00004-of-00043.safetensors already downloaded
+  [ok] model-00005-of-00043.safetensors already downloaded
+  [ok] model-00006-of-00043.safetensors already downloaded
+  [ok] model-00007-of-00043.safetensors already downloaded
+  [ok] model-00008-of-00043.safetensors already downloaded
+  [ok] model-00009-of-00043.safetensors already downloaded
+  [ok] model-00010-of-00043.safetensors already downloaded
+  [ok] model-00011-of-00043.safetensors already downloaded
+  [ok] model-00012-of-00043.safetensors already downloaded
+  [ok] model-00013-of-00043.safetensors already downloaded
+  [ok] model-00014-of-00043.safetensors already downloaded
+  [ok] model-00015-of-00043.safetensors already downloaded
+  [ok] model-00016-of-00043.safetensors already downloaded
+  [ok] model-00017-of-00043.safetensors already downloaded
+  [ok] model-00018-of-00043.safetensors already downloaded
+  [ok] model-00019-of-00043.safetensors already downloaded
+  [ok] model-00020-of-00043.safetensors already downloaded
+  [ok] model-00021-of-00043.safetensors already downloaded
+  [ok] model-00022-of-00043.safetensors already downloaded
+  [ok] model-00023-of-00043.safetensors already downloaded
+  [ok] model-00024-of-00043.safetensors already downloaded
+  [ok] model-00025-of-00043.safetensors already downloaded
+  [ok] model-00026-of-00043.safetensors already downloaded
+  [ok] model-00027-of-00043.safetensors already downloaded
+  [ok] model-00028-of-00043.safetensors already downloaded
+  [ok] model-00029-of-00043.safetensors already downloaded
+  [ok] model-00030-of-00043.safetensors already downloaded
+  [ok] model-00031-of-00043.safetensors already downloaded
+  [ok] model-00032-of-00043.safetensors already downloaded
+  [ok] model-00033-of-00043.safetensors already downloaded
+  [ok] model-00034-of-00043.safetensors already downloaded
+  [ok] model-00035-of-00043.safetensors already downloaded
+  [ok] model-00036-of-00043.safetensors already downloaded
+  [ok] model-00037-of-00043.safetensors already downloaded
+  [ok] model-00038-of-00043.safetensors already downloaded
+  [ok] model-00039-of-00043.safetensors already downloaded
+  [ok] model-00040-of-00043.safetensors already downloaded
+  [ok] model-00041-of-00043.safetensors already downloaded
+  [ok] model-00042-of-00043.safetensors already downloaded
+  [ok] model-00043-of-00043.safetensors already downloaded
+  [ok] model-00003-of-00048.safetensors: 2 tensors (0.00 GB) downloaded
+  [ok] model-00004-of-00048.safetensors: 2 tensors (0.00 GB) downloaded
+  [ok] model-00005-of-00048.safetensors: 8 tensors (0.02 GB) downloaded
+  [ok] model-00006-of-00048.safetensors: 2 tensors (0.00 GB) downloaded
+  [ok] model-00007-of-00048.safetensors: 2 tensors (0.00 GB) downloaded
+  [ok] model-00008-of-00048.safetensors: 2 tensors (0.00 GB) downloaded
+  [ok] model-00009-of-00048.safetensors: 2 tensors (0.00 GB) downloaded
+  [ok] model-00010-of-00048.safetensors: 2 tensors (0.00 GB) downloaded
+  [ok] model-00011-of-00048.safetensors: 8 tensors (0.02 GB) downloaded
+  [ok] model-00012-of-00048.safetensors: 2 tensors (0.00 GB) downloaded
+  [ok] model-00013-of-00048.safetensors: 2 tensors (0.00 GB) downloaded
+  [ok] model-00014-of-00048.safetensors: 2 tensors (0.00 GB) downloaded
+  [ok] model-00015-of-00048.safetensors: 2 tensors (0.00 GB) downloaded
+  [ok] model-00016-of-00048.safetensors: 2 tensors (0.00 GB) downloaded
+  [ok] model-00017-of-00048.safetensors: 8 tensors (0.02 GB) downloaded
+  [ok] model-00018-of-00048.safetensors: 2 tensors (0.00 GB) downloaded
+  [ok] model-00019-of-00048.safetensors: 2 tensors (0.00 GB) downloaded
+  [ok] model-00020-of-00048.safetensors: 2 tensors (0.00 GB) downloaded
+  [ok] model-00021-of-00048.safetensors: 2 tensors (0.00 GB) downloaded
+  [ok] model-00022-of-00048.safetensors: 2 tensors (0.00 GB) downloaded
+  [ok] model-00023-of-00048.safetensors: 7 tensors (0.01 GB) downloaded
+  [ok] model-00024-of-00048.safetensors: 2 tensors (0.00 GB) downloaded
+  [ok] model-00025-of-00048.safetensors: 2 tensors (0.00 GB) downloaded
+  [ok] model-00026-of-00048.safetensors: 2 tensors (0.00 GB) downloaded
+  [ok] model-00027-of-00048.safetensors: 5 tensors (0.01 GB) downloaded
+  [ok] model-00028-of-00048.safetensors: 2 tensors (0.00 GB) downloaded
+  [ok] model-00029-of-00048.safetensors: 2 tensors (0.00 GB) downloaded
+  [ok] model-00030-of-00048.safetensors: 2 tensors (0.00 GB) downloaded
+  [ok] model-00031-of-00048.safetensors: 5 tensors (0.01 GB) downloaded
+  [ok] model-00032-of-00048.safetensors: 2 tensors (0.00 GB) downloaded
+  [ok] model-00033-of-00048.safetensors: 2 tensors (0.00 GB) downloaded
+  [ok] model-00034-of-00048.safetensors: 2 tensors (0.00 GB) downloaded
+  [ok] model-00035-of-00048.safetensors: 5 tensors (0.01 GB) downloaded
+  [ok] model-00036-of-00048.safetensors: 2 tensors (0.00 GB) downloaded
+  [ok] model-00037-of-00048.safetensors: 2 tensors (0.00 GB) downloaded
+  [ok] model-00038-of-00048.safetensors: 2 tensors (0.00 GB) downloaded
+  [ok] model-00039-of-00048.safetensors: 5 tensors (0.01 GB) downloaded
+  [ok] model-00040-of-00048.safetensors: 2 tensors (0.00 GB) downloaded
+  [ok] model-00041-of-00048.safetensors: 2 tensors (0.00 GB) downloaded
+  [ok] model-00042-of-00048.safetensors: 2 tensors (0.00 GB) downloaded
+  [ok] model-00044-of-00048.safetensors: 33 tensors (0.25 GB) downloaded
+  [ok] model-00045-of-00048.safetensors: 30 tensors (0.17 GB) downloaded
+  [ok] model-00046-of-00048.safetensors: 34 tensors (0.30 GB) downloaded
+  > /home/issuser/strata-ds/repro/Strata-DS/.venv/bin/python /home/issuser/strata-ds/repro/Strata-DS/tools/ds41/pack.py --src /home/issuser/strata-ds/repro/data/models/deepseek-1017-exl3-2.9bpw --out /home/issuser/strata-ds/repro/data/packs/deepseek-1017-exl3-2.9bpw --engram-from /home/issuser/strata-ds/repro/Strata-DS/ds41/data/engram
+layer 0 done, 4.76 GiB, 8 s
+layer 1 done, 9.53 GiB, 15 s
+layer 2 done, 14.29 GiB, 23 s
+layer 3 done, 19.05 GiB, 30 s
+layer 4 done, 23.82 GiB, 37 s
+layer 5 done, 28.58 GiB, 46 s
+layer 6 done, 33.35 GiB, 59 s
+layer 7 done, 38.11 GiB, 72 s
+layer 8 done, 42.87 GiB, 86 s
+layer 9 done, 47.64 GiB, 100 s
+layer 10 done, 52.40 GiB, 114 s
+layer 11 done, 57.16 GiB, 126 s
+layer 12 done, 61.93 GiB, 136 s
+layer 13 done, 66.69 GiB, 147 s
+layer 14 done, 71.46 GiB, 158 s
+layer 15 done, 76.22 GiB, 169 s
+layer 16 done, 80.98 GiB, 178 s
+layer 17 done, 85.75 GiB, 187 s
+layer 18 done, 88.93 GiB, 193 s
+layer 19 done, 92.11 GiB, 200 s
+layer 20 done, 95.29 GiB, 209 s
+layer 21 done, 98.47 GiB, 219 s
+layer 22 done, 101.65 GiB, 228 s
+layer 23 done, 106.42 GiB, 241 s
+layer 24 done, 111.18 GiB, 255 s
+layer 25 done, 115.95 GiB, 269 s
+layer 26 done, 120.71 GiB, 281 s
+layer 27 done, 125.47 GiB, 291 s
+layer 28 done, 130.24 GiB, 301 s
+layer 29 done, 135.00 GiB, 312 s
+layer 30 done, 139.76 GiB, 326 s
+layer 31 done, 144.53 GiB, 337 s
+layer 32 done, 149.29 GiB, 349 s
+layer 33 done, 154.05 GiB, 363 s
+layer 34 done, 158.82 GiB, 377 s
+layer 35 done, 163.58 GiB, 390 s
+layer 36 done, 168.35 GiB, 404 s
+layer 37 done, 173.11 GiB, 419 s
+layer 38 done, 177.87 GiB, 432 s
+layer 39 done, 182.64 GiB, 446 s
+  > /home/issuser/strata-ds/repro/Strata-DS/.venv/bin/python /home/issuser/strata-ds/repro/Strata-DS/tools/ds41/pack.py --src /home/issuser/strata-ds/repro/data/models/deepseek-1017-exl3-2.9bpw --out /home/issuser/strata-ds/repro/data/packs/deepseek-1017-exl3-2.9bpw --mtp-experts
+layer 0 done, 2.12 GiB, 6 s
+layer 1 done, 4.23 GiB, 12 s
+layer 2 done, 6.35 GiB, 18 s
+  [ok] start script: run-deepseek-1017-exl3-2.9bpw.sh
+  [ok] --max-context 262144 --threads 16 --window-prompt-max 32 --spec dspark --draft-always; server 127.0.0.1:8080, gpu 0
+	Command being timed: "nice -n 19 ionice -c3 ./setup.sh --setup --yes --family deepseek --no-start --data-dir /home/issuser/strata-ds/repro/data"
+	User time (seconds): 102.24
+	System time (seconds): 161.01
+	Percent of CPU this job got: 29%
+	Elapsed (wall clock) time (h:mm:ss or m:ss): 14:54.23
+	Average shared text size (kbytes): 0
+	Average unshared data size (kbytes): 0
+	Average stack size (kbytes): 0
+	Average total size (kbytes): 0
+	Maximum resident set size (kbytes): 1441568
+	Average resident set size (kbytes): 0
+	Major (requiring I/O) page faults: 1443
+	Minor (reclaiming a frame) page faults: 6967923
+	Voluntary context switches: 944632
+	Involuntary context switches: 10094
+	Swaps: 0
+	File system inputs: 408343080
+	File system outputs: 416729192
+	Socket messages sent: 0
+	Socket messages received: 0
+	Signals delivered: 0
+	Page size (bytes): 4096
+	Exit status: 0
+SETUP_EXIT 0
+2026年 10月 18日 星期日 08:48:52 UTC
