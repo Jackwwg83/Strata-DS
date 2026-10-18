@@ -239,7 +239,7 @@ MODELS = {
                      "ram_gb": 128, "arena_gb": 108.9, "families": ("deepseek",), "nvidia_only": True},
     # docs/DEEPSEEK_SPARK.md: the default on a GPU with unified memory (DGX Spark)
     "1017-EXL3-2.9BPW": {"about": "DeepSeek V4.1 Flash 1017, LibertAI EXL3 2.9bpw (the DGX Spark recipe)",
-                         "download_gb": 413.4, "ram_gb": 120, "arena_gb": 196.1, "families": ("deepseek",),
+                         "download_gb": 414.8, "ram_gb": 120, "arena_gb": 196.1, "families": ("deepseek",),
                          "nvidia_only": True},
 }
 # The experimental Unsloth file's four shards at the pinned revision: name -> (bytes, sha256), checked after the
@@ -309,7 +309,7 @@ FAMILIES = {
                 "vision": False, "pack_args": ["--compat-bf16"],
                 "sha256": {**UNSLOTH_SHARDS, **UNSLOTH_IQ4_XS_SHARDS}},
     "deepseek": {"title": "DeepSeek V4.1 Flash", "by": "SAGE EXL3 1.59bpw by vcruz305 (DGX Spark: 1017, EXL3 2.9bpw)",
-                 "about": "Linux + NVIDIA only; 128 GB RAM recommended; 462 GB disk (DGX Spark: 624 GB)",
+                 "about": "Linux + NVIDIA only; 128 GB RAM recommended; 462 GB disk (DGX Spark: 625 GB)",
                  "hf": hf("vcruz305/DSV4.1-Flash-SAGE-EXL3-1.59bpw"), "tag": "deepseek-",
                  "file": "model-{i:05d}-of-00017.safetensors", "shards": 17,
                  "name": "deepseek-v4.1-flash", "vision": False, "nvidia_only": True},
@@ -4501,7 +4501,7 @@ DEEPSEEK_SOURCES = (*ENGINE_SOURCES, "cmake", "third_party/exllamav3_moe", "thir
 # DeepSeek's checkpoint: the tensors LibertAI does not have or stores in another dtype (the routers in F16, Engram's
 # q/k in F32), the indexer and compressor weights, Engram and DSpark's dense layers. The rest is the same in both
 # (byte for byte) and comes from LibertAI's shards, which are downloaded anyway. Of DeepSeek's 48 shards only the two
-# with the Engram tables are downloaded whole; of the others, the tensors the merge takes (0.9 GB).
+# with the Engram tables are downloaded whole; of the others, the tensors the merge takes (1.0 GB).
 SPARK_MODEL = "1017-EXL3-2.9BPW"
 SPARK_TAG = "deepseek-1017-exl3-2.9bpw"
 SPARK_EXL3_REPO = "LibertAIDAI/DeepSeek-V4.1-Flash-1017-EXL3-2.9bpw"
@@ -4515,7 +4515,7 @@ DEEPSEEK_RECIPES = {
     DEEPSEEK_MODEL: {"tag": DEEPSEEK_TAG, "title": "DeepSeek V4.1 Flash SAGE 1.59bpw", "name": "deepseek-v4.1-flash",
                      "download_gb": 341.8, "pack_gb": DEEPSEEK_PACK_GB},
     SPARK_MODEL: {"tag": SPARK_TAG, "title": "DeepSeek V4.1 Flash 1017 EXL3 2.9bpw (the DGX Spark recipe)",
-                  "name": "deepseek-v4.1-flash-1017", "download_gb": 413.4, "pack_gb": SPARK_PACK_GB},
+                  "name": "deepseek-v4.1-flash-1017", "download_gb": 414.8, "pack_gb": SPARK_PACK_GB},
 }
 
 
@@ -4525,7 +4525,7 @@ def spark_merge(official, exl3):
     comes from LibertAI unless SPARK_OFFICIAL names it."""
     out = {}
     for name, shard in official.items():
-        if SPARK_EXL3.match(name):
+        if SPARK_EXL3.match(name) or name.startswith(("vision.", "aligner.", "image_")):   # the pack has no vision
             continue
         out[name] = ("exl3", exl3[name]) if name in exl3 and not SPARK_OFFICIAL.match(name) else ("official", shard)
     for name, shard in exl3.items():   # the linears as trellis, suh, svh (their mul1 is not used); experts whole
@@ -5335,7 +5335,7 @@ def main() -> int:
             if "deepseek" in d.get("families", ()):
                 if m == DEEPSEEK_MODEL:                # one line for both recipes
                     say("  DeepSeek: " + (deepseek_problem(gpu) or (
-                        "the DGX Spark recipe (1017, EXL3 2.9bpw); 624 GB disk" if gpu and gpu.get("unified") else
+                        "the DGX Spark recipe (1017, EXL3 2.9bpw); 625 GB disk" if gpu and gpu.get("unified") else
                         "Linux + NVIDIA; 128 GB RAM recommended; below 120 GiB not tested; 462 GB disk")))
                 continue
             verdict = "fits" if ram >= d["ram_gb"] else "tight" if ram >= d["ram_gb"] - 8 else "does not fit"

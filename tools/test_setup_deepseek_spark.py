@@ -32,6 +32,7 @@ OFFICIAL_TENSORS = {
     'layers.0.ffn.gate.weight': (O1, 48), 'layers.0.ffn.gate.bias': (O1, 8),
     'layers.0.attn.compressor.wkv.weight': (O1, 40), 'layers.0.attn.indexer.k_norm.weight': (O1, 24),
     'mtp.0.attn.wq_a.weight': (O2, 56), 'mtp.0.ffn.experts.0.w1.weight': (O2, 3000), 'head.weight': (O2, 900),
+    'vision.blocks.0.norm1.weight': (O1, 12),     # in both repositories; the pack leaves vision out
     'layers.1.engram.embed.weight': (O3, 5000), 'layers.1.engram.embed.scale': (O3, 80),
 }
 EXL3_TENSORS = {
@@ -265,14 +266,14 @@ class Installer(unittest.TestCase):
 
     def test_disk_before_download(self):
         self.assertNotEqual(self.invoke(['--no-start'], free=600), 0)
-        for text in ('624', '413.4', '210.2'):
+        for text in ('625', '414.8', '210.2'):
             self.assertIn(text, self.output)
         self.assertFalse(self.downloads)
 
     def test_check_names_the_spark_recipe(self):
         self.assertEqual(self.invoke(['--check']), 0, self.output)
         self.assertIn('DGX Spark', self.output)
-        self.assertIn('624', self.output)
+        self.assertIn('625', self.output)
         self.assertFalse(self.downloads)
 
     def test_a_discrete_gpu_keeps_sage_and_may_ask_for_the_spark_recipe(self):
