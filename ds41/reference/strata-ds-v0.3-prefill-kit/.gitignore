@@ -1,9 +1,0 @@
-__pycache__/
-*.pyc
-.venv*/
-*.egg-info/
-build/
-weights/
-private-results/
-*.key
-.env
