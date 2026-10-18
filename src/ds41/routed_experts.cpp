@@ -88,10 +88,36 @@ size_t routed_moe_prefill_workspace_bytes(ExpertFormat f, int max_rows, int max_
 void routed_moe_prefill(ExpertFormat f, const __half* x, const int32_t* tok, const float* w, const int32_t* off,
                         int n_groups, const kernels::Exl3Expert* experts, float* out, void* workspace,
                         size_t workspace_bytes, cudaStream_t stream) {
-    if (f == ExpertFormat::Mxfp4)
+    if (f == ExpertFormat::Mxfp4) {
         kernels::mxfp4_moe_prefill(x, tok, w, off, n_groups, experts, out, workspace, workspace_bytes, stream);
-    else
+        return;
+    }
+    if (!use_k19()) {
         kernels::exl3_moe_prefill(x, tok, w, off, n_groups, experts, out, workspace, workspace_bytes, stream);
+        return;
+    }
+    // K19's GPU: a group of up to kSmallGroup rows runs as K21 (each expert read once per 8 rows, ~63 us for 13 MB),
+    // batched up to kExl3SmoePrefillRows rows a call; a larger group as K12 (the expert dequantized once, then cuBLAS).
+    // DGX Spark, a 240-token prompt: the routed experts took 3.28 s with K12 alone.
+    constexpr int kSmallGroup = 128;
+    static void* ws21 = nullptr;
+    static const size_t ws21_bytes = kernels::exl3_smoe_workspace_bytes(1, 1);
+    if (!ws21 && cudaMalloc(&ws21, ws21_bytes) != cudaSuccess) {
+        cudaGetLastError();
+        throw std::runtime_error("K21: cannot allocate its workspace");
+    }
+    int g = 0;
+    while (g < n_groups) {
+        if (off[g + 1] - off[g] > kSmallGroup) {
+            kernels::exl3_moe_prefill(x, tok, w, off + g, 1, experts + g, out, workspace, workspace_bytes, stream);
+            ++g;
+            continue;
+        }
+        int e = g;   // groups g..e-1: small, at most kExl3SmoePrefillRows rows in all
+        while (e < n_groups && off[e + 1] - off[e] <= kSmallGroup && off[e + 1] - off[g] <= kernels::kExl3SmoePrefillRows) ++e;
+        kernels::exl3_smoe_prefill(x, tok, w, off + g, e - g, experts + g, out, ws21, ws21_bytes, stream);
+        g = e;
+    }
 }
 
 int64_t cpu_make_layer(ExpertFormat f, const ExpertSlot* const* slots, const uint8_t* const* bytes, int n,

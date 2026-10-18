@@ -20,8 +20,10 @@
 #include <cuda_bf16.h>
 #include <cuda_fp16.h>
 
+#include <algorithm>
 #include <stdexcept>
 #include <string>
+#include <vector>
 
 namespace strata::ds41::kernels {
 namespace {
@@ -33,7 +35,7 @@ constexpr int WARPS = 8;            // decode warps
 constexpr int CT = WARPS * 32;      // consumer threads
 constexpr int THREADS = CT + 32;    // + the producer warp
 constexpr int RX = 8;               // rows per run
-constexpr int MAX_SLOTS = 64;       // 8 tokens x 6 picks, and room
+constexpr int MAX_SLOTS = 512;      // decode: 8 tokens x 6 picks; prompts (K21): rows of one call
 constexpr int PIPE = 8;             // k-rows in flight per block
 constexpr int OBI = 2;              // 128-column output blocks per down item
 constexpr int ROT_WARPS = 8;
@@ -61,6 +63,11 @@ struct Call {
     float* ys;   // [MAX_SLOTS][H] weighted down outputs per slot
     int* rt;     // run table
     int* ctr;    // [8][H / 128] arrivals per (token, 128 block): cleared by the call, self-resetting
+    // prompts (K21): a slot is a row of token rows_tok[row] and expert row_p[row]; the host writes the run table, down
+    // leaves the weighted rows in ys and scatter_rows adds them to their tokens
+    int prefill = 0, n_rows = 0;
+    const int32_t* rows_tok = nullptr;
+    const int32_t* row_p = nullptr;
 };
 
 __device__ __forceinline__ const unsigned char* w1_of(const Call& c, int p) { return (const unsigned char*) c.e[p].w1.trellis; }
@@ -142,9 +149,8 @@ __device__ void build_runs(const Call& c) {
 }
 
 // one warp: slot s (descriptor p, -1 = none), projection proj, 128-wide block hb of x -> c.hs
-__device__ __forceinline__ void rot_unit(const Call& c, int s, int p, int proj, int hb, int lane) {
+__device__ __forceinline__ void rot_unit(const Call& c, int s, int t, int p, int proj, int hb, int lane) {
     if (p < 0) return;
-    const int t = s / c.top_k;
     const int col = hb * 128 + lane * 4;
     float xv[4], hv[4];
     unpack_h4(*reinterpret_cast<const uint2*>(c.x + (size_t) t * H + col), xv);
@@ -157,14 +163,15 @@ __device__ __forceinline__ void rot_unit(const Call& c, int s, int p, int proj, 
 }
 
 __global__ void __launch_bounds__(ROT_WARPS * 32) smoe_rot(const __grid_constant__ Call c) {
-    if (blockIdx.x == 0) build_runs(c);
+    if (blockIdx.x == 0 && !c.prefill) build_runs(c);
     const int lane = threadIdx.x % 32, warp = threadIdx.x / 32;
     const int hbn = H / 128;
     const int kp = c.top_k;
-    const int tasks = c.m * kp * 2 * hbn;   // (slot, projection, 128 block)
+    const int tasks = (c.prefill ? c.n_rows : c.m * kp) * 2 * hbn;   // (slot, projection, 128 block)
     for (int u = blockIdx.x * ROT_WARPS + warp; u < tasks; u += gridDim.x * ROT_WARPS) {
         const int s = u / (2 * hbn);
-        rot_unit(c, s, pick_slot(c, s / kp, s % kp), (u / hbn) % 2, u % hbn, lane);
+        if (c.prefill) rot_unit(c, s, c.rows_tok[s], c.row_p[s], (u / hbn) % 2, u % hbn, lane);
+        else rot_unit(c, s, s / kp, pick_slot(c, s / kp, s % kp), (u / hbn) % 2, u % hbn, lane);
     }
 }
 
@@ -395,6 +402,7 @@ __device__ __forceinline__ void down_item(const Call& c, int rc, int p, int nr, 
             make_float4(v[0] * RSQRT128 * sv[0] * wgt, v[1] * RSQRT128 * sv[1] * wgt,
                         v[2] * RSQRT128 * sv[2] * wgt, v[3] * RSQRT128 * sv[3] * wgt);
     }
+    if (c.prefill) return;   // the rows stay in ys: scatter_rows adds them to their tokens
     __threadfence();
     consumer_sync();
     if (threadIdx.x < nr * OBI) {   // one arrival per (row, block); the last one of a token sums it
@@ -449,17 +457,24 @@ __global__ void __launch_bounds__(THREADS, 1) smoe_down(const __grid_constant__ 
     }
 }
 
+/// prompts: out[tok[r]] += ys[r] for every row in row order, one thread per column (deterministic, as K12's scatter)
+__global__ void scatter_rows(const float* ys, const int32_t* tok, int n_rows, float* out) {
+    const int col = blockIdx.x * blockDim.x + threadIdx.x;
+    for (int r = 0; r < n_rows; ++r) out[(size_t) tok[r] * H + col] += ys[(size_t) r * H + col];
+}
+
 size_t align256(size_t b) { return (b + 255) & ~size_t(255); }
 
 struct Layout {
-    size_t hs, act, ys, rt, ctr, end;
+    size_t hs, act, ys, rt, ctr, row_p, end;
     Layout() {
         hs = 0;
         act = align256(hs + (size_t) MAX_SLOTS * H * 2 * 2);
         ys = align256(act + (size_t) MAX_SLOTS * I * RX * 2);
         rt = align256(ys + (size_t) MAX_SLOTS * H * 4);
         ctr = align256(rt + (size_t) RT_LEN * 4);
-        end = align256(ctr + (size_t) 8 * (H / 128) * 4);
+        row_p = align256(ctr + (size_t) 8 * (H / 128) * 4);
+        end = align256(row_p + (size_t) MAX_SLOTS * 4);
     }
 };
 
@@ -500,6 +515,60 @@ void exl3_smoe_decode(const __half* x, int m, const int32_t* sel, const float* w
     smoe_rot<<<(rot_tasks + ROT_WARPS - 1) / ROT_WARPS, ROT_WARPS * 32, 0, stream>>>(c);
     smoe_gu<<<slots * (I / 128), THREADS, gu_smem_bytes(6), stream>>>(c);
     smoe_down<<<slots * (H / 128 / OBI), THREADS, dn_smem_bytes(6), stream>>>(c);
+    ck(cudaPeekAtLastError(), "launches");
+}
+
+void exl3_smoe_prefill(const __half* x, const int32_t* tok, const float* w, const int32_t* off, int n_groups,
+                       const Exl3Expert* experts, float* out, void* workspace, size_t workspace_bytes,
+                       cudaStream_t stream) {
+    if (n_groups <= 0) return;
+    const int rows = off[n_groups] - off[0];
+    if (rows <= 0) return;
+    if (rows > MAX_SLOTS || !x || !tok || !w || !experts || !out || !workspace)
+        throw std::invalid_argument("K21: 1..512 rows a call");
+    if (workspace_bytes < exl3_smoe_workspace_bytes(1, 1)) throw std::invalid_argument("K21: insufficient workspace");
+    const Layout l;
+    char* base = reinterpret_cast<char*>((reinterpret_cast<uintptr_t>(workspace) + 255) & ~uintptr_t(255));
+    // the run table and each row's expert, on the host: groups split into runs of up to RX rows
+    std::vector<int32_t> rt(RT_LEN, 0), row_p((size_t) rows);
+    int runs = 0;
+    for (int g = 0; g < n_groups; ++g)
+        for (int r0 = off[g]; r0 < off[g + 1]; r0 += RX, ++runs) {
+            const int n = std::min(RX, off[g + 1] - r0);
+            rt[RT_P + runs] = g;
+            rt[RT_N + runs] = n;
+            for (int i = 0; i < n; ++i) {
+                rt[RT_SLOT + runs * RX + i] = r0 - off[0] + i;
+                row_p[(size_t) (r0 - off[0] + i)] = g;
+            }
+        }
+    rt[RT_RC] = runs;
+    Call c;
+    c.e = experts;
+    c.x = reinterpret_cast<const half*>(x);
+    c.ids = nullptr;
+    c.w = w + off[0];
+    c.out = out;
+    c.m = 0;
+    c.top_k = 1;
+    c.limit = 10.0f;
+    c.hs = reinterpret_cast<half*>(base + l.hs);
+    c.act = reinterpret_cast<half*>(base + l.act);
+    c.ys = reinterpret_cast<float*>(base + l.ys);
+    c.rt = reinterpret_cast<int*>(base + l.rt);
+    c.ctr = reinterpret_cast<int*>(base + l.ctr);
+    c.prefill = 1;
+    c.n_rows = rows;
+    c.rows_tok = tok + off[0];
+    c.row_p = reinterpret_cast<int32_t*>(base + l.row_p);
+    ck(cudaMemcpyAsync(c.rt, rt.data(), rt.size() * 4, cudaMemcpyHostToDevice, stream), "run table");
+    ck(cudaMemcpyAsync(base + l.row_p, row_p.data(), row_p.size() * 4, cudaMemcpyHostToDevice, stream), "row experts");
+    ck(cudaStreamSynchronize(stream), "run table");   // the host vectors go out of scope
+    const int rot_tasks = rows * 2 * (H / 128);
+    smoe_rot<<<(rot_tasks + ROT_WARPS - 1) / ROT_WARPS, ROT_WARPS * 32, 0, stream>>>(c);
+    smoe_gu<<<runs * (I / 128), THREADS, gu_smem_bytes(6), stream>>>(c);
+    smoe_down<<<runs * (H / 128 / OBI), THREADS, dn_smem_bytes(6), stream>>>(c);
+    scatter_rows<<<H / 256, 256, 0, stream>>>(c.ys, c.rows_tok, rows, out);
     ck(cudaPeekAtLastError(), "launches");
 }
 

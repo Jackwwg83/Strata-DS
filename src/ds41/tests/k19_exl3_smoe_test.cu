@@ -9,6 +9,8 @@
 
 #include <cuda_fp16.h>
 
+#include <stdexcept>
+
 using namespace ds41test;
 namespace kk = strata::ds41::kernels;
 
@@ -173,6 +175,43 @@ int main() {
                 v.check(same, "a token without picks keeps its out row");
             }
         }
+    }
+    {   // prefill (K21): the rows of 8 tokens grouped by expert give the decode call's sums (a different add order)
+        Experts ex(12, kgu_mixed, kd_mixed);
+        Dev<kk::Exl3Expert> experts(ex.host);
+        const int m = 8;
+        std::vector<int32_t> sel = {0, 1, 2, 3, 4, 5,  1, 2, 6, 7, 8, 0,  2, 9, 10, 11, 1, 3,  4, 5, 6, 7, 8, 9,
+                                    11, 10, 9, 8, 7, 6,  1, 3, 5, 7, 9, 11,  0, 2, 4, 6, 8, 10,  5, 4, 3, -1, 1, 0};
+        std::vector<float> w((size_t) m * TOPK);
+        for (size_t i = 0; i < w.size(); ++i) w[i] = 0.05f + 0.03f * (float) (i % 5);
+        // rows by expert (groups 0..11), tokens ascending inside a group
+        std::vector<int32_t> tok, off(13, 0);
+        std::vector<float> rw;
+        for (int e = 0; e < 12; ++e) {
+            for (int t = 0; t < m; ++t)
+                for (int j = 0; j < TOPK; ++j)
+                    if (sel[(size_t) t * TOPK + j] == e) { tok.push_back(t); rw.push_back(w[(size_t) t * TOPK + j]); }
+            off[(size_t) e + 1] = (int32_t) tok.size();
+        }
+        const auto xh = to_half(rand_f32((size_t) m * H, 1.0f, 77));
+        const auto init = rand_f32((size_t) m * H, 0.5f, 78);
+        Dev<__half> dx(xh);
+        Dev<int32_t> dsel(sel), dtok(tok);
+        Dev<float> dw(w), drw(rw), dec(init), pre(init);
+        const size_t wb = kk::exl3_smoe_workspace_bytes(m, TOPK);
+        Dev<uint8_t> ws(wb);
+        kk::exl3_smoe_decode(dx.p, m, dsel.p, dw.p, TOPK, experts.p, dec.p, ws.p, wb, 0);
+        kk::exl3_smoe_prefill(dx.p, dtok.p, drw.p, off.data(), 12, experts.p, pre.p, ws.p, wb, 0);
+        ck(cudaDeviceSynchronize(), "prefill");
+        const double e = delta_err(pre.down(), dec.down(), init);
+        std::printf("prefill (K21) vs decode rel L2 %.2e over %zu rows\n", e, tok.size());
+        v.check(e < 1e-5, "K21: the grouped rows give the decode call's sums");
+        // more rows than one call holds are refused
+        std::vector<int32_t> big = {0, 600};
+        bool threw = false;
+        try { kk::exl3_smoe_prefill(dx.p, dtok.p, drw.p, big.data(), 1, experts.p, pre.p, ws.p, wb, 0); }
+        catch (const std::invalid_argument&) { threw = true; }
+        v.check(threw, "K21: a call of more than 512 rows is refused");
     }
     {   // speed: 3-bit experts, as LibertAI's 1017 EXL3 2.9 bpw backbone layers (13.3 MB each)
         Experts ex(48, k3, k3);

@@ -20,4 +20,13 @@ size_t exl3_smoe_workspace_bytes(int m, int topk);
 void exl3_smoe_decode(const __half* x, int m, const int32_t* sel, const float* w, int topk, const Exl3Expert* experts,
                       float* out, void* workspace, size_t workspace_bytes, cudaStream_t stream);
 
+/// K21 (prompts): K12's grouped call with K19's kernels, for groups with few rows (K12 dequantizes a whole expert
+/// even for one row). Group g is experts[g] with rows off[g]..off[g + 1] (off on the host, tok and w on the device, rows
+/// of a group with distinct tokens); out[tok[r]] += the row's weighted output, in row order. At most
+/// kExl3SmoePrefillRows rows a call. The workspace is exl3_smoe_workspace_bytes'.
+constexpr int kExl3SmoePrefillRows = 512;
+void exl3_smoe_prefill(const __half* x, const int32_t* tok, const float* w, const int32_t* off, int n_groups,
+                       const Exl3Expert* experts, float* out, void* workspace, size_t workspace_bytes,
+                       cudaStream_t stream);
+
 }  // namespace strata::ds41::kernels
