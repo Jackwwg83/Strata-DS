@@ -95,7 +95,7 @@ DeepSeek is an explicit choice. Setup never selects it by default. `--family dee
 | Machine | `--family` / `--model` | Notes |
 | --- | --- | --- |
 | PC or laptop, NVIDIA 24 GB, 64-128 GB RAM | `--family deepseek` (= `--model SAGE-1.59BPW`) | 341.8 GB download plus about 120 GB pack; about 462 GB disk in total; 30-39 tokens/s on an RTX 5090 Laptop with 64 GB ([DEEPSEEK_LAPTOP.md](DEEPSEEK_LAPTOP.md)) |
-| DGX Spark (GB10) | `--family deepseek` (= `--model 1017-EXL3-2.9BPW`) | DeepSeek V4.1 Flash 1017; 414.8 GB download plus 210.2 GB pack; about 625 GB disk; 30.6 tokens/s over a coding-agent session, 256K context by default ([DEEPSEEK_SPARK.md](DEEPSEEK_SPARK.md)) |
+| DGX Spark (GB10) | `--family deepseek` (= `--model 1017-EXL3-2.9BPW`) | DeepSeek V4.1 Flash 1017; 414.8 GB download plus 210.2 GB pack; about 625 GB disk; 30.8 tokens/s over a coding-agent session, 256K context by default ([DEEPSEEK_SPARK.md](DEEPSEEK_SPARK.md)) |
 
 Measured on Linux with about 120 GiB of usable RAM (a 128 GB PC), 2026-10-07: an RTX 5090 (PCIe 5.0) writes 26-32
 tokens/s, an RTX 3090 (PCIe 4.0) 16-17 tokens/s; a 2000-token prompt took 13.4 s on the RTX 3090 PC, a short chat

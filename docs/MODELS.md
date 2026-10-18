@@ -204,7 +204,7 @@ the attention and shared-expert linears, the head) and `deepseek-ai/DeepSeek-V4.
 
 - About 625 GB disk: 414.8 GB download plus 210.2 GB pack (with DSpark's experts). Keep the downloaded files.
 - Context: 256K by default. The server runs DSpark on every step and `DS41_SSD_TAIL_SKIP=1`.
-- 30.6 tokens/s over a coding-agent session (context 10K-59K), 22.9 at 250K; KL 0.074 against the official MXFP4
+- 30.8 tokens/s over a coding-agent session (context 10K-91K), 22.9 at 250K; KL 0.074 against the official MXFP4
   weights. Everything else: [DEEPSEEK_SPARK.md](DEEPSEEK_SPARK.md).
 
 ```sh

@@ -3,7 +3,7 @@
 **English** · [简体中文](README.zh-CN.md) · [日本語](README.ja.md) · [Deutsch](README.de.md) · [Français](README.fr.md) · [Español](README.es.md) · [Português](README.pt-BR.md)
 
 <p align="center"><b>DeepSeek V4.1 Flash (763B MoE) on a gaming laptop or a DGX Spark</b><br>
-Laptop: 30-39 tokens/s, 24.4 with a 256K-token prompt · DGX Spark: 30.6 tokens/s over a coding-agent session, 256K context · Linux + NVIDIA</p>
+Laptop: 30-39 tokens/s, 24.4 with a 256K-token prompt · DGX Spark: 30.8 tokens/s over a coding-agent session, 256K context · Linux + NVIDIA</p>
 
 <p align="center"><img src="docs/media/deepseek-laptop-context.svg" width="760" alt="DeepSeek V4.1 Flash decode and prefill speed by context length on an RTX 5090 Laptop with 64 GB of RAM"></p>
 
@@ -15,7 +15,7 @@ recipes from the GPU:
 | Machine | Model and quantization | Measured | Recipe |
 | --- | --- | --- | --- |
 | RTX 5090 Laptop 24 GB, 64 GB RAM | V4.1 Flash, SAGE EXL3 1.59bpw (462 GB disk) | 30-32 tokens/s from a cold start, 33-39 on a running server; 24.4 with a 256K-token prompt | **[docs/DEEPSEEK_LAPTOP.md](docs/DEEPSEEK_LAPTOP.md)** |
-| DGX Spark (GB10, 128 GB unified memory) | V4.1 Flash 1017, LibertAI EXL3 2.9bpw (625 GB disk) | 30.6 tokens/s over a coding-agent session (23.6-36.4 per turn); 22.9 at 250K context | **[docs/DEEPSEEK_SPARK.md](docs/DEEPSEEK_SPARK.md)** |
+| DGX Spark (GB10, 128 GB unified memory) | V4.1 Flash 1017, LibertAI EXL3 2.9bpw (625 GB disk) | 30.8 tokens/s over a coding-agent session (23.6-36.4 per turn); 22.9 at 250K context | **[docs/DEEPSEEK_SPARK.md](docs/DEEPSEEK_SPARK.md)** |
 
 Both are the same 763B architecture and run on the same engine. The Spark recipe uses DeepSeek's 1017 release and a
 larger quantization (2.9 instead of 1.59 bits per expert weight), which 128 GB of unified memory holds better. Each

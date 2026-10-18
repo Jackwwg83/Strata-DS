@@ -3,7 +3,7 @@
 [English](README.md) · **简体中文** · [日本語](README.ja.md) · [Deutsch](README.de.md) · [Français](README.fr.md) · [Español](README.es.md) · [Português](README.pt-BR.md)
 
 <p align="center"><b>在游戏本或 DGX Spark 上运行 DeepSeek V4.1 Flash（7630 亿参数 MoE）</b><br>
-笔记本：30-39 token/s，256K 提示 24.4 token/s · DGX Spark：一次真实编码 agent 会话平均 30.6 token/s，256K 上下文 · Linux + NVIDIA</p>
+笔记本：30-39 token/s，256K 提示 24.4 token/s · DGX Spark：一次真实编码 agent 会话平均 30.8 token/s，256K 上下文 · Linux + NVIDIA</p>
 
 <p align="center"><img src="docs/media/deepseek-laptop-context.svg" width="760" alt="DeepSeek V4.1 Flash 在 RTX 5090 笔记本、64 GB 内存上各上下文长度的生成和读入速度"></p>
 
@@ -14,7 +14,7 @@
 | 机器 | 模型和量化 | 实测 | 配方 |
 | --- | --- | --- | --- |
 | RTX 5090 笔记本 24 GB，64 GB 内存 | V4.1 Flash，SAGE EXL3 1.59bpw（磁盘 462 GB） | 冷启动 30-32 token/s，服务运行后 33-39；256K 提示 24.4 | **[docs/DEEPSEEK_LAPTOP.md](docs/DEEPSEEK_LAPTOP.md)**（英文） |
-| DGX Spark（GB10，128 GB 统一内存） | V4.1 Flash 1017，LibertAI EXL3 2.9bpw（磁盘 625 GB） | 一次编码 agent 会话平均 30.6 token/s（每轮 23.6-36.4）；250K 上下文 22.9 | **[docs/DEEPSEEK_SPARK.md](docs/DEEPSEEK_SPARK.md)**（英文） |
+| DGX Spark（GB10，128 GB 统一内存） | V4.1 Flash 1017，LibertAI EXL3 2.9bpw（磁盘 625 GB） | 一次编码 agent 会话平均 30.8 token/s（每轮 23.6-36.4）；250K 上下文 22.9 | **[docs/DEEPSEEK_SPARK.md](docs/DEEPSEEK_SPARK.md)**（英文） |
 
 两个配方是同一个 7630 亿参数的架构，用同一个引擎。Spark 配方用 DeepSeek 的 1017 版本和更大的量化（每个专家权重
 2.9 bit，而不是 1.59 bit），128 GB 统一内存放得下更多。每个配方页都有全部设置、设置对质量的实测影响、时间花在哪里和原始数据。
