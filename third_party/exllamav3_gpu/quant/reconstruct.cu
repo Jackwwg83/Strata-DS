@@ -122,7 +122,9 @@ void reconstruct_mul1_job(half* unpacked, const ReconstructJob* job, int blocks_
         case 4: reconstruct_tile<4, 2, false>(unpacked, packed, blocks_n, 0); break;
         case 5: reconstruct_tile<5, 2, false>(unpacked, packed, blocks_n, 0); break;
         case 6: reconstruct_tile<6, 2, false>(unpacked, packed, blocks_n, 0); break;
-        default: assert(false && "K12: expected integer K1..K6");
+        case 7: reconstruct_tile<7, 2, false>(unpacked, packed, blocks_n, 0); break;   // K18's dequant: 8-bit heads
+        case 8: reconstruct_tile<8, 2, false>(unpacked, packed, blocks_n, 0); break;
+        default: assert(false && "K12: expected integer K1..K8");
     }
 }
 

@@ -9,6 +9,7 @@
 #include "../../../third_party/exllamav3_gpu/quant/reconstruct.cuh"
 #include "k12/blas.cuh"
 
+#include <algorithm>
 #include <stdexcept>
 
 namespace strata::ds41::kernels {
@@ -56,6 +57,25 @@ __global__ void output_had(const float* c, Exl3Proj w, __nv_bfloat16* y, int ldy
 
 __global__ void prepare(Exl3Proj w, strata_exl3::ReconstructJob* job) { *job = {w.trellis, w.tile_w / 16}; }
 
+/// x = rows r0.. of the k x k identity (rows rows)
+__global__ void identity_rows(__nv_bfloat16* x, int rows, int k, int r0) {
+    const size_t i = blockIdx.x * (size_t) blockDim.x + threadIdx.x;
+    if (i >= (size_t) rows * k) return;
+    const int r = (int) (i / k), c = (int) (i % k);
+    x[i] = __float2bfloat16_rn(c == r0 + r ? 1.0f : 0.0f);
+}
+
+/// out[j][r0 + r] = y[r][j]: y [rows][n] holds W's columns r0.. as rows
+__global__ void transpose_into(const __nv_bfloat16* y, int rows, int n, __nv_bfloat16* out, int k, int r0) {
+    __shared__ __nv_bfloat16 t[32][33];
+    const int j0 = blockIdx.x * 32, r1 = blockIdx.y * 32;
+    for (int i = threadIdx.y; i < 32; i += blockDim.y)
+        if (r1 + i < rows) t[i][threadIdx.x] = y[(size_t) (r1 + i) * n + j0 + threadIdx.x];
+    __syncthreads();
+    for (int i = threadIdx.y; i < 32; i += blockDim.y)
+        if (r1 + threadIdx.x < rows) out[(size_t) (j0 + i) * k + r0 + r1 + threadIdx.x] = t[threadIdx.x][i];
+}
+
 }  // namespace
 
 size_t exl3_linear_workspace_bytes(int m, int k, int n) {
@@ -66,8 +86,8 @@ size_t exl3_linear_workspace_bytes(int m, int k, int n) {
 void exl3_linear(const __nv_bfloat16* x, int ldx, int m, const Exl3Proj& w, __nv_bfloat16* y, int ldy,
                  void* workspace, size_t workspace_bytes, cudaStream_t stream) {
     if (m < 1 || !x || !y || !workspace || !w.trellis || !w.suh || !w.svh || w.k % 128 || w.n % 128 || ldx < w.k ||
-        ldy < w.n || w.tile_w % 16 || w.tile_w / 16 < 1 || w.tile_w / 16 > 6)
-        throw std::invalid_argument("K18: invalid arguments");
+        ldy < w.n || w.tile_w % 16 || w.tile_w / 16 < 1 || w.tile_w / 16 > (m <= kExl3GemvRows ? 6 : 8))
+        throw std::invalid_argument("K18: invalid arguments (the GEMV path takes K1..K6, more rows K1..K8)");
     const Layout l(m, w.k, w.n);
     if (workspace_bytes < l.end + 255) throw std::invalid_argument("K18: insufficient workspace");
     char* base = reinterpret_cast<char*>((reinterpret_cast<uintptr_t>(workspace) + 255) & ~uintptr_t(255));
@@ -94,6 +114,32 @@ void exl3_linear(const __nv_bfloat16* x, int ldx, int m, const Exl3Proj& w, __nv
     }
     output_had<<<dim3(m, w.n / 128), 32, 0, stream>>>(c, w, y, ldy);
     k12::check_cuda(cudaPeekAtLastError(), "K18 launches");
+}
+
+void exl3_dequant_bf16(const Exl3Proj& w, __nv_bfloat16* out, cudaStream_t stream) {
+    if (!out || w.n % 32) throw std::invalid_argument("K18 dequant: invalid arguments");
+    // W x for the unit vectors x = e_r, a chunk of rows at a time (more than kExl3GemvRows: the reconstruct path)
+    const int chunk = std::min(w.k, 512);
+    const size_t wb = exl3_linear_workspace_bytes(chunk, w.k, w.n);
+    void *x = nullptr, *y = nullptr, *ws = nullptr;
+    k12::check_cuda(cudaMalloc(&x, (size_t) chunk * w.k * 2), "K18 dequant x");
+    k12::check_cuda(cudaMalloc(&y, (size_t) chunk * w.n * 2), "K18 dequant y");
+    k12::check_cuda(cudaMalloc(&ws, wb), "K18 dequant workspace");
+    try {
+        for (int r0 = 0; r0 < w.k; r0 += chunk) {
+            const int rows = std::min(chunk, w.k - r0);
+            auto* xb = static_cast<__nv_bfloat16*>(x);
+            auto* yb = static_cast<__nv_bfloat16*>(y);
+            identity_rows<<<(unsigned) (((size_t) rows * w.k + 255) / 256), 256, 0, stream>>>(xb, rows, w.k, r0);
+            exl3_linear(xb, w.k, rows, w, yb, w.n, ws, wb, stream);   // rows >= 128 > kExl3GemvRows
+            transpose_into<<<dim3(w.n / 32, (rows + 31) / 32), dim3(32, 8), 0, stream>>>(yb, rows, w.n, out, w.k, r0);
+        }
+        k12::check_cuda(cudaStreamSynchronize(stream), "K18 dequant");
+    } catch (...) {
+        cudaFree(x), cudaFree(y), cudaFree(ws);
+        throw;
+    }
+    cudaFree(x), cudaFree(y), cudaFree(ws);
 }
 
 }  // namespace strata::ds41::kernels

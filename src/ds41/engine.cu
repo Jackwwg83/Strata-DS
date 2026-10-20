@@ -585,7 +585,15 @@ struct Engine::Impl {
                          (now_ms() - t0) / 1000.0);
         }
         embed = bf("embed.weight");
-        if (pack.has_dense("head.trellis")) {   // EXL3 head: K20 in every path (prompts too, 16 rows a launch)
+        if (pack.has_dense("head.trellis") && exl3("head", false).tile_w / 16 > 6) {
+            // an EXL3 head of 7 or 8 bits (SAGE 1.62's), which K20 does not take: made a BF16 head once (K18)
+            const kernels::Exl3Proj hp = exl3("head", false);
+            bf16* h = dalloc_own<bf16>((size_t) kVocab * kDim);
+            kernels::exl3_dequant_bf16(hp, h, nullptr);
+            head = h;
+            std::fprintf(stderr, "ds41: the %d-bit EXL3 head runs as a BF16 head (%.2f GiB)\n", hp.tile_w / 16,
+                         (double) kVocab * kDim * sizeof(bf16) / (1ull << 30));
+        } else if (pack.has_dense("head.trellis")) {   // EXL3 head: K20 in every path (prompts too, 16 rows a launch)
             x3_groups.push_back(std::make_unique<kernels::Exl3Mrow>(
                 std::vector<kernels::MrowLinear>{{exl3("head", false), 0, 0}}));
             head3 = x3_groups.back().get();

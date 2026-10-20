@@ -78,6 +78,35 @@ int main() {
         std::printf("%-12s %5d -> %6d K%d: GEMV vs cuBLAS rel L2 %.2e\n", s.name, s.k, s.n, s.bits, err);
         v.check(err < 5e-3, std::string(s.name) + ": GEMV and cuBLAS paths agree");
     }
+    // ---- exl3_dequant_bf16: W as BF16 [n][k]. Rates the GEMV path takes (K3, K6): W x on the host matches the GEMV
+    // path; K8 (the GEMV path has no K8): W x matches the cuBLAS path, which reconstructs the matrix itself
+    for (int bits : {3, 6, 8}) {
+        const int k = 512, n = 1024;
+        Proj w(k, n, bits, 0x99u + bits);
+        Dev<__nv_bfloat16> wq((size_t) n * k);
+        kk::exl3_dequant_bf16(w.p, wq.p, 0);
+        const int M = bits == 8 ? 12 : 1;
+        const std::vector<__nv_bfloat16> xh = rand_bf16((size_t) M * k, 1.0f, 11);
+        Dev<__nv_bfloat16> x(xh), y((size_t) M * n);
+        const size_t wb = kk::exl3_linear_workspace_bytes(M, k, n);
+        Dev<uint8_t> ws(wb);
+        kk::exl3_linear(x.p, k, M, w.p, y.p, n, ws.p, wb, 0);
+        ck(cudaDeviceSynchronize(), "dequant");
+        const std::vector<__nv_bfloat16> wh = wq.down();
+        std::vector<float> ref((size_t) M * n), got((size_t) M * n);
+        const std::vector<__nv_bfloat16> yh = y.down();
+        for (int r = 0; r < M; ++r)
+            for (int j = 0; j < n; ++j) {
+                double acc = 0;
+                for (int i = 0; i < k; ++i)
+                    acc += (double) __bfloat162float(wh[(size_t) j * k + i]) * __bfloat162float(xh[(size_t) r * k + i]);
+                got[(size_t) r * n + j] = (float) acc;
+                ref[(size_t) r * n + j] = __bfloat162float(yh[(size_t) r * n + j]);
+            }
+        const double err = rel_l2(got, ref);
+        std::printf("dequant K%d %d -> %d: W x vs %s path rel L2 %.2e\n", bits, k, n, M == 1 ? "GEMV" : "cuBLAS", err);
+        v.check(err < 1e-2, "K" + std::to_string(bits) + ": the BF16 matrix computes what the projection computes");
+    }
     // ---- speed of the GEMV path, m = 1 and m = 4
     for (const Shape& s : shapes) {
         Proj w(s.k, s.n, s.bits, 0x77u + s.n);

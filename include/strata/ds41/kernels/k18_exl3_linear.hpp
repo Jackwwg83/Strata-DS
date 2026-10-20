@@ -23,4 +23,9 @@ size_t exl3_linear_workspace_bytes(int m, int k, int n);
 void exl3_linear(const __nv_bfloat16* x, int ldx, int m, const Exl3Proj& w, __nv_bfloat16* y, int ldy,
                  void* workspace, size_t workspace_bytes, cudaStream_t stream);
 
+/// The projection's matrix as BF16, out [n][k] (row j: W's row for output j), so that out x = y as exl3_linear computes
+/// it, up to BF16 rounding. Through the reconstruct path, so K1..K8 (the GEMV path takes K1..K6). Allocates its own
+/// scratch and synchronizes the stream: for loading (an 8-bit head becomes a BF16 head).
+void exl3_dequant_bf16(const Exl3Proj& w, __nv_bfloat16* out, cudaStream_t stream);
+
 }  // namespace strata::ds41::kernels
