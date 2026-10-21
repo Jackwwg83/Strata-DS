@@ -59,6 +59,10 @@ struct EngineOptions {
     /// decode together, at most kVerifyMaxTokens (the CPU expert kernel's rows). 0: none. Each slot holds about
     /// 90 MB of VRAM at 32K context, and the slots share a staging area of 4 x 6 experts.
     int batch_slots = 0;
+    /// root checkpoint slots (save_root): each holds the whole state at a position, about 37 KB a token, allocated when
+    /// first saved. ds41_serve keeps the end of a client's system prompt in one, and the end of what the client's new
+    /// conversations share in another.
+    int roots = 1;
     /// DSpark, DeepSeek's MTP drafter (Engine::draft): its routed experts (6.8 GB, pack.py --mtp-experts) are read
     /// into RAM before the RAM tier sizes itself, and step, verify and prefill keep its input (the attention input of
     /// layers 37-39). Off: none of that.
@@ -141,20 +145,24 @@ public:
     /// position are still the ones fed when it was saved. Refused when the slot is empty or past position(). A pending
     /// verify window is dropped. The slot stays valid.
     int restore_snapshot(int slot);
-    /// The root checkpoint (ds41_serve: the end of a long system prompt, which new conversations share): the whole state
-    /// at position() - the snapshot's state and the attention caches up to there - copied aside, sized to the position.
-    /// It survives reset() and other conversations; a new save_root replaces it. Throws on a pending verify window.
-    /// tokens: the tokens fed so far (the caller's record, returned by root_tokens()).
-    void save_root(const std::vector<int>& tokens);
-    /// Back to the root: position() becomes its position and the tokens before it are root_tokens(). Throws without one.
-    int restore_root();
-    const std::vector<int>& root_tokens() const;
-    /// The root on disk (ds41_serve --root-file), so a restart keeps it: its position, tokens, the engine's history and
-    /// state, keyed by the pack's pack_info.txt, with a checksum. write_root throws without a root (written to path.tmp,
-    /// then renamed). read_root returns false and keeps the root in memory when the file is missing, of another pack or
-    /// damaged.
+    /// The root checkpoints (ds41_serve: the end of a long system prompt, which new conversations share): the whole
+    /// state at position() - the snapshot's state and the attention caches up to there - copied into `slot`
+    /// (0 .. root_slots() - 1), sized to the position. A root survives reset() and other conversations; a new save_root
+    /// replaces the slot's root. Throws on a pending verify window or a slot past the last.
+    /// tokens: the tokens fed so far (the caller's record, returned by root_tokens(slot)).
+    void save_root(int slot, const std::vector<int>& tokens);
+    /// Back to the root in `slot`: position() becomes its position and the tokens before it are root_tokens(slot).
+    /// Throws when the slot is empty.
+    int restore_root(int slot);
+    /// The slot's tokens; empty when the slot is empty or past the last
+    const std::vector<int>& root_tokens(int slot) const;
+    int root_slots() const;
+    /// The roots on disk (ds41_serve --root-file), so a restart keeps them: each one's position, tokens, the engine's
+    /// history and state, keyed by the pack's pack_info.txt, with a checksum. write_root throws without a root (written
+    /// to path.tmp, then renamed). read_root fills slots 0, 1, ... and returns how many; 0 keeps the roots in memory
+    /// when the file is missing, of another pack or version, or damaged.
     void write_root(const std::string& path) const;
-    bool read_root(const std::string& path);
+    int read_root(const std::string& path);
     int snapshot_slots() const;
 
     /// Concurrent requests. A request is read in the main session (prefill, step, verify), then copied into a slot.

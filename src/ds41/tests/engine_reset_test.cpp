@@ -9,7 +9,8 @@
 //                     pending verify window, the next tokens give the logits of a fresh engine fed the same tokens;
 //                     a snapshot past the current position, or an empty slot, is refused
 //   --case root       save_root() keeps the whole state at a position (caches included): after another conversation
-//                     from position 0, restore_root() and the same next tokens give a fresh engine's logits
+//                     from position 0, restore_root() and the same next tokens give a fresh engine's logits; two root
+//                     slots keep two states, and both go to disk and back
 // Needs the model pack: --pack DIR (without it the test is skipped with code 77).
 #include "strata/ds41/config.hpp"
 #include "strata/ds41/engine.hpp"
@@ -82,6 +83,9 @@ int main(int argc, char** argv) {
     opt.cpu_threads = 8;
     opt.expert_profile = profile;
     opt.vram_expert_slots = profile.empty() ? 0 : -1;
+    opt.roots = 2;
+    // DS41_TEST_RAM_GIB=N: the RAM tier at most N GiB (a box that runs other services)
+    if (std::getenv("DS41_TEST_RAM_GIB")) opt.ram_budget_gib = std::atof(std::getenv("DS41_TEST_RAM_GIB"));
     opt.adapt_every = 0;   // static residency: the same experts on the same path in every run
     // (adapt_every 0 keeps the RAM tier static too: the engine's rule, not the test's)
     const std::vector<int> a = prompt(na, 1), b = prompt(600, 2);
@@ -192,25 +196,25 @@ int main(int argc, char** argv) {
             e.prefill(a, 0);
             e.prefill(tail, (int) a.size());
             const std::vector<float> want = e.last_logits();
-            check(throws([&] { e.restore_root(); }), "no root yet: refused");
+            check(throws([&] { e.restore_root(0); }), "no root yet: refused");
             // the case: a, the root saved there, another conversation from position 0, then back to the root
             e.reset();
             e.prefill(a, 0);
-            check(throws([&] { e.save_root(b); }), "save_root refuses tokens of another length");
-            e.save_root(a);
-            check(e.root_tokens() == a, "the root holds a's tokens");
+            check(throws([&] { e.save_root(0, b); }), "save_root refuses tokens of another length");
+            e.save_root(0, a);
+            check(e.root_tokens(0) == a, "the root holds a's tokens");
             e.reset();
             e.prefill(b, 0);   // overwrites the caches the root covers
             int next = e.step(5, (int) b.size());
             for (int i = 1; i < 6; ++i) next = e.step(next, (int) b.size() + i);
-            check(e.restore_root() == (int) a.size() && e.position() == (int) a.size(), "restore_root goes to a's end");
+            check(e.restore_root(0) == (int) a.size() && e.position() == (int) a.size(), "restore_root goes to a's end");
             e.prefill(tail, (int) a.size());
             check(same_logits(e.last_logits(), want, "after another conversation and a root restore"),
                   "the root survives another conversation");
             // again, after decode steps from the root and a pending verify window
-            e.restore_root();
+            e.restore_root(0);
             e.verify({7, 8, 9}, (int) a.size());
-            e.restore_root();
+            e.restore_root(0);
             e.prefill(tail, (int) a.size());
             check(same_logits(e.last_logits(), want, "after a pending verify window"), "a root can be restored again");
             // the tail in verify windows of 4 (as ds41_serve reads a short rest), against a fresh start
@@ -229,22 +233,22 @@ int main(int argc, char** argv) {
             const std::vector<float> want_w = windows((int) a.size());
             e.reset();
             e.prefill(b, 0);
-            e.restore_root();
+            e.restore_root(0);
             check(same_logits(windows((int) a.size()), want_w, "verify windows after a root restore"),
                   "verify windows after a root restore");
             // the root on disk (ds41_serve --root-file): written, replaced in memory by b's root, read back
             const std::string file = "/tmp/ds41_root_test.bin";
             e.reset();
             e.prefill(a, 0);
-            e.save_root(a);
+            e.save_root(0, a);
             e.write_root(file);
             e.reset();
             e.prefill(b, 0);
-            e.save_root(b);
-            check(e.read_root(file) && e.root_tokens() == a, "read_root brings back a's root");
+            e.save_root(0, b);
+            check(e.read_root(file) == 1 && e.root_tokens(0) == a, "read_root brings back a's root");
             e.reset();
             e.prefill(b, 0);
-            check(e.restore_root() == (int) a.size(), "the read root restores to a's end");
+            check(e.restore_root(0) == (int) a.size(), "the read root restores to a's end");
             e.prefill(tail, (int) a.size());
             check(same_logits(e.last_logits(), want, "after a root read from disk"), "a root read from disk");
             {   // a file of another pack or a damaged one is refused, and the root in memory stays
@@ -252,9 +256,43 @@ int main(int argc, char** argv) {
                 std::fseek(f, 8, SEEK_SET);
                 std::fputc('X', f);
                 std::fclose(f);
-                check(!e.read_root(file) && e.root_tokens() == a, "a damaged root file is refused");
-                check(!e.read_root("/tmp/ds41_no_such_root.bin"), "a missing root file is refused");
+                check(e.read_root(file) == 0 && e.root_tokens(0) == a, "a damaged root file is refused");
+                check(e.read_root("/tmp/ds41_no_such_root.bin") == 0, "a missing root file is refused");
             }
+            std::remove(file.c_str());
+            // two roots (two clients' system prompts): each one restores to its own end, and both go to disk
+            const std::vector<int> b_tail(a.begin(), a.begin() + 40);
+            e.reset();
+            e.prefill(b, 0);
+            e.prefill(b_tail, (int) b.size());
+            const std::vector<float> want_b = e.last_logits();
+            check(e.root_slots() == 2, "the engine has 2 root slots");
+            check(throws([&] { e.restore_root(1); }), "an empty root slot is refused");
+            check(throws([&] { e.save_root(2, b); }), "a root slot past the last is refused");
+            check(e.root_tokens(2).empty(), "no tokens past the last slot");
+            e.reset();
+            e.prefill(b, 0);
+            e.save_root(1, b);
+            e.reset();
+            e.prefill(a, 0);
+            e.save_root(0, a);
+            e.restore_root(1);
+            e.prefill(b_tail, (int) b.size());
+            check(same_logits(e.last_logits(), want_b, "root 1 after root 0 was saved"), "root 1 keeps b's state");
+            e.restore_root(0);
+            e.prefill(tail, (int) a.size());
+            check(same_logits(e.last_logits(), want, "root 0 after root 1 was used"), "root 0 keeps a's state");
+            e.write_root(file);
+            e.reset();
+            e.prefill(b, 0);
+            e.save_root(0, b);   // both slots hold b now
+            check(e.read_root(file) == 2 && e.root_tokens(0) == a && e.root_tokens(1) == b, "both roots read back");
+            e.restore_root(1);
+            e.prefill(b_tail, (int) b.size());
+            check(same_logits(e.last_logits(), want_b, "root 1 read from disk"), "root 1 from disk");
+            e.restore_root(0);
+            e.prefill(tail, (int) a.size());
+            check(same_logits(e.last_logits(), want, "root 0 read from disk"), "root 0 from disk");
             std::remove(file.c_str());
         } else {
             std::printf("unknown --case %s\n", which.c_str());

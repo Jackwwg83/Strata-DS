@@ -224,9 +224,14 @@ struct Options {
     /// system-prompt checkpoint, --prompt-cache-root, engine 0.1.20)
     int root_min = 2048;
     int turn_token = 128803;
-    /// --root-file PATH: the root checkpoint on disk, read at the start and written after each new one, so a restart
-    /// keeps it (a new conversation of the agent client starts after its system prompt at once)
+    /// --root-file PATH: the root checkpoints on disk, read at the start and written when the engine is idle after a
+    /// new one, so a restart keeps them (a new conversation of the agent client starts after its system prompt at once)
     std::string root_file;
+    /// --roots N: root checkpoint slots (EngineOptions::roots, least recently used first). Each client's system prompt
+    /// keeps one, and with 2 or more a new conversation also keeps one where it stops sharing tokens with one of the
+    /// last new conversations (--root-deep N tokens or more past what it reuses: an agent client's first message
+    /// repeats its context files). Each root takes about 37 KB a token.
+    int root_deep = 512;
     EngineOptions eng;
 };
 
@@ -237,7 +242,7 @@ struct Options {
                  "       [--vram-slots N] [--vram-reserve-mib M] [--ram-budget-gib G] [--adapt-every N] [--adapt-swaps N] [--prefill-chunk N]\n"
                  "       [--prefill-batch N] [--prefill-ring N] [--prefill-threads N] [--window-prompt-max N]\n"
                  "       [--snapshots N] [--batch N] [--spec none|dspark] [--draft-k K] [--draft-always]\n"
-                 "       [--prompt-cache-root N] [--turn-token ID] [--root-file PATH]\n"
+                 "       [--prompt-cache-root N] [--turn-token ID] [--root-file PATH] [--roots N] [--root-deep N]\n"
                  "       [--eos-id ID ...]\n",
                  why.c_str());
     std::exit(2);
@@ -288,6 +293,8 @@ Options parse_args(int argc, char** argv) {
         else if (a == "--prompt-cache-root") o.root_min = (int) num(next());
         else if (a == "--turn-token") o.turn_token = (int) num(next());
         else if (a == "--root-file") o.root_file = next();
+        else if (a == "--roots") o.eng.roots = (int) num(next());
+        else if (a == "--root-deep") o.root_deep = (int) num(next());
         else if (a == "--eos-id") {
             if (!eos_given) o.eos.clear();
             eos_given = true;
@@ -378,12 +385,48 @@ int main(int argc, char** argv) {
     std::vector<Slot> slots((size_t) nslots);
     const std::string batch_info =
         nslots >= 2 ? " batch_slots=" + std::to_string(nslots) + " slot_cache=1" : std::string();
+    // the root checkpoints: when each slot was last used, the last new conversations' prompts, and whether a root
+    // is newer than the file
+    std::vector<uint64_t> root_used((size_t) e.root_slots(), 0);
+    uint64_t root_clock = 0;
+    std::vector<std::vector<int>> recent_new;
+    bool roots_dirty = false;
     if (!o.root_file.empty() && o.root_min > 0) {
         const double t0 = now_ms();
-        if (e.read_root(o.root_file))
-            std::fprintf(stderr, "ds41_serve: root checkpoint at %zu tokens read from %s in %.1f s\n",
-                         e.root_tokens().size(), o.root_file.c_str(), (now_ms() - t0) / 1000.0);
+        const int got = e.read_root(o.root_file);
+        for (int i = 0; i < got; ++i) {
+            root_used[(size_t) i] = ++root_clock;
+            std::fprintf(stderr, "ds41_serve: root checkpoint %d at %zu tokens read from %s\n", i,
+                         e.root_tokens(i).size(), o.root_file.c_str());
+        }
+        if (got) std::fprintf(stderr, "ds41_serve: %d root checkpoints read in %.1f s\n", got, (now_ms() - t0) / 1000.0);
     }
+    // the session's tokens so far as a root, in the least recently used slot. A failed save (no memory for it) only
+    // costs the reuse, so the request goes on.
+    auto keep_root = [&](const std::vector<int>& tokens) {
+        if (root_used.empty()) return;
+        const int slot = (int) (std::min_element(root_used.begin(), root_used.end()) - root_used.begin());
+        try {
+            e.save_root(slot, tokens);
+            root_used[(size_t) slot] = ++root_clock;
+            roots_dirty = true;
+            std::fprintf(stderr, "ds41_serve: root checkpoint %d at %zu tokens\n", slot, tokens.size());
+        } catch (const std::exception& ex) {
+            std::fprintf(stderr, "ds41_serve: no root checkpoint at %zu tokens (%s)\n", tokens.size(), ex.what());
+        }
+    };
+    auto write_roots = [&] {
+        if (!roots_dirty || o.root_file.empty()) return;
+        roots_dirty = false;
+        const double t0 = now_ms();
+        try {
+            e.write_root(o.root_file);
+            std::fprintf(stderr, "ds41_serve: root checkpoints written to %s in %.1f s\n", o.root_file.c_str(),
+                         (now_ms() - t0) / 1000.0);
+        } catch (const std::exception& ex) {   // the next start reads the older file, or none
+            std::fprintf(stderr, "ds41_serve: the root checkpoints were not written (%s)\n", ex.what());
+        }
+    };
     DraftScheduler sched;   // DSpark: one policy for the process (its step and verify times carry over requests)
     sched.always = o.draft_always;
     say("INFO context=%d expert_slots=%d spec=0 model=deepseek-v4.1-flash engine=" STRATA_VERSION "%s", o.max_context,
@@ -426,14 +469,14 @@ int main(int argc, char** argv) {
                     from_slot = b;
                 }
             }
-            // the root checkpoint: the end of a long system prompt that this prompt starts with
-            const std::vector<int>& root = e.root_tokens();
-            const bool from_root = o.root_min > 0 && !root.empty() && (int64_t) root.size() > best &&
-                                   root.size() + 1 <= r.ids.size() &&
-                                   std::equal(root.begin(), root.end(), r.ids.begin());
-            if (from_root) {
-                resume = e.restore_root();
-                s.live = root;
+            // a root checkpoint: the longest one this prompt starts with (a system prompt's end, or deeper)
+            std::vector<std::vector<int>> root_toks((size_t) e.root_slots());
+            for (int i = 0; i < e.root_slots(); ++i) root_toks[(size_t) i] = e.root_tokens(i);
+            const int from_root = o.root_min > 0 ? serve::pick_root(root_toks, r.ids, best) : -1;
+            if (from_root >= 0) {
+                resume = e.restore_root(from_root);
+                s.live = root_toks[(size_t) from_root];
+                root_used[(size_t) from_root] = ++root_clock;
             } else if (from_slot >= 0) {
                 e.copy_from_slot(from_slot);
                 s.live = slots[(size_t) from_slot].ids;
@@ -443,6 +486,8 @@ int main(int argc, char** argv) {
             } else if (resume == 0 && !s.live.empty()) {
                 s.restart();
             }
+            // a new conversation: from a root or from position 0, not a later turn of one
+            const bool fresh = from_root >= 0 || (from_slot < 0 && snap < 0 && resume == 0);
             d.reused = resume;
             say("RESUME %lld", (long long) resume);
             const std::vector<int> rest(r.ids.begin() + resume, r.ids.end());
@@ -490,26 +535,28 @@ int main(int argc, char** argv) {
                 e.set_prefill_progress(nullptr);
                 return true;
             };
-            // read through the end of a long system prompt: the root checkpoint there first (a new one replaces it)
+            // read through the end of a long system prompt and keep a root there, then (a new conversation) through
+            // what it shares with one of the last new conversations and keep a deeper root there
             size_t from = 0;
+            auto cut_root = [&](int64_t at) {
+                cancelled = !feed(rest.begin() + (std::ptrdiff_t) from, rest.begin() + (at - resume), false);
+                if (cancelled) return;
+                keep_root(std::vector<int>(r.ids.begin(), r.ids.begin() + at));
+                from = (size_t) (at - resume);
+            };
             if (o.root_min > 0) {
                 const auto turn = std::find(r.ids.begin(), r.ids.end(), o.turn_token);
                 const int64_t b = turn - r.ids.begin();
-                const bool same = (int64_t) root.size() == b && std::equal(root.begin(), root.end(), r.ids.begin());
-                if (turn != r.ids.end() && b >= o.root_min && b > resume && b + 1 < n && !same) {
-                    cancelled = !feed(rest.begin(), rest.begin() + (b - resume), false);
-                    if (!cancelled) {
-                        e.save_root(std::vector<int>(r.ids.begin(), r.ids.begin() + b));
-                        std::fprintf(stderr, "ds41_serve: root checkpoint at %lld tokens\n", (long long) b);
-                        if (!o.root_file.empty()) {
-                            try {
-                                e.write_root(o.root_file);
-                            } catch (const std::exception& ex) {   // the request goes on; the next start reads none
-                                std::fprintf(stderr, "ds41_serve: the root checkpoint was not written (%s)\n", ex.what());
-                            }
-                        }
-                        from = (size_t) (b - resume);
-                    }
+                if (turn != r.ids.end() && b >= o.root_min && b > resume && b + 1 < n) cut_root(b);
+                if (!cancelled && fresh && o.root_deep > 0 && e.root_slots() >= 2) {
+                    int64_t deep = 0;
+                    for (const std::vector<int>& prev : recent_new)
+                        deep = std::max(deep, serve::deep_checkpoint(prev, r.ids, resume + (int64_t) from, o.root_deep));
+                    if (deep > 0) cut_root(deep);
+                }
+                if (!cancelled && fresh) {
+                    recent_new.push_back(r.ids);
+                    if (recent_new.size() > 4) recent_new.erase(recent_new.begin());
                 }
             }
             const auto rb = rest.begin() + (std::ptrdiff_t) from;
@@ -684,8 +731,9 @@ int main(int argc, char** argv) {
                 if (!batch_step()) return 1;
                 continue;
             }
-        } else if (!in.next(line)) {
-            break;
+        } else {
+            write_roots();   // idle: a new root goes to disk now, not inside a request
+            if (!in.next(line)) break;
         }
         if (line == "QUIT") break;
         if (line.empty()) continue;

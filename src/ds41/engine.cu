@@ -400,7 +400,8 @@ struct Engine::Impl {
             if (y.moe_handle >= 0) cpu_free_layer(pack.expert_format(), y.moe_handle);
         for (void* p : owned_dev) cudaFree(p);
         if (x3_ws) cudaFree(x3_ws);
-        if (root.buf) cudaFree(root.buf);
+        for (Root& rt : roots)
+            if (rt.buf) cudaFree(rt.buf);
         for (cudaEvent_t e : pfp.ev) cudaEventDestroy(e);
         if (dbg) std::fclose(dbg);
         if (eng_host) cudaFreeHost(eng_host);
@@ -2417,6 +2418,7 @@ struct Engine::Impl {
         for (auto& y : L)
             if (y.kv_state) snap_comp_floats += 2 * (size_t) y.ratio * kHeadDim;
         snaps.resize(std::max(0, opt.snapshots));
+        roots.resize((size_t) std::max(0, opt.roots));
         for (auto& sn : snaps) {
             sn.win = dalloc_own<bf16>((size_t) kLayers * kWindow * kHeadDim);
             sn.comp = dalloc_own<float>(std::max<size_t>(1, snap_comp_floats));
@@ -2472,21 +2474,26 @@ struct Engine::Impl {
         return sn.pos;
     }
 
-    /// the root checkpoint (save_root): the snapshot's state and every attention cache up to pos, in one buffer
+    /// the root checkpoints (save_root): the snapshot's state and every attention cache up to pos, in one buffer each
     struct Root {
         int pos = -1;
         std::vector<int> tokens;          // the caller's tokens before pos
         std::vector<int32_t> history;     // the engine's history there
         uint8_t* buf = nullptr;
         size_t bytes = 0;
-    } root;
-    /// copies the root's parts (save: device state -> root.buf), or returns the bytes they take at position pos
-    size_t root_copy(int pos, bool save, bool count_only) {
+    };
+    std::vector<Root> roots;
+    Root& root_at(int slot) {
+        if (slot < 0 || slot >= (int) roots.size()) throw std::out_of_range("ds41: no root slot " + std::to_string(slot));
+        return roots[(size_t) slot];
+    }
+    /// copies the root's parts (save: device state -> buf), or returns the bytes they take at position pos
+    size_t root_copy(uint8_t* buf, int pos, bool save, bool count_only) {
         size_t at = 0;
         auto part = [&](void* state, size_t bytes) {
             if (!count_only)
-                ck(cudaMemcpyAsync(save ? root.buf + at : state, save ? state : root.buf + at, bytes,
-                                   cudaMemcpyDeviceToDevice, st), "root copy");
+                ck(cudaMemcpyAsync(save ? buf + at : state, save ? state : buf + at, bytes, cudaMemcpyDeviceToDevice,
+                                   st), "root copy");
             at += (bytes + 255) & ~(size_t) 255;
         };
         for (int l = 0; l < kLayers; ++l) {
@@ -2505,47 +2512,53 @@ struct Engine::Impl {
         if (!count_only) ck(cudaStreamSynchronize(st), "root copy");
         return at;
     }
-    void save_root(const std::vector<int>& tokens) {
+    /// room for nb bytes in rt (an empty root while it grows)
+    static void root_room(Root& rt, size_t nb) {
+        if (nb <= rt.bytes) return;
+        if (rt.buf) cudaFree(rt.buf);
+        rt.buf = nullptr;
+        rt.bytes = 0;
+        rt.pos = -1;
+        ck(cudaMalloc(&rt.buf, nb), "root checkpoint");
+        rt.bytes = nb;
+    }
+    void save_root(int slot, const std::vector<int>& tokens) {
         usable();
+        Root& rt = root_at(slot);
         if (verify_pending) throw std::logic_error("commit the pending verify window first");
         const int pos = (int) history.size();
         if ((int) tokens.size() != pos) throw std::invalid_argument("save_root: the tokens are not the position's");
-        root.pos = -1;   // a failed copy leaves no root
-        const size_t bytes = root_copy(pos, true, true);
-        if (bytes > root.bytes) {
-            if (root.buf) cudaFree(root.buf);
-            root.buf = nullptr;
-            root.bytes = 0;
-            ck(cudaMalloc(&root.buf, bytes), "root checkpoint");
-            root.bytes = bytes;
-        }
-        root_copy(pos, true, false);
-        root.tokens = tokens;
-        root.history = history;
-        root.pos = pos;
+        rt.pos = -1;   // a failed copy leaves the slot empty
+        rt.tokens.clear();
+        root_room(rt, root_copy(nullptr, pos, true, true));
+        root_copy(rt.buf, pos, true, false);
+        rt.tokens = tokens;
+        rt.history = history;
+        rt.pos = pos;
     }
-    int restore_root() {
+    int restore_root(int slot) {
         usable();
-        if (root.pos < 0) throw std::logic_error("ds41: no root checkpoint");
+        Root& rt = root_at(slot);
+        if (rt.pos < 0) throw std::logic_error("ds41: root slot " + std::to_string(slot) + " is empty");
         verify_pending = verify_failed = false;
-        root_copy(root.pos, false, false);
-        history = root.history;
+        root_copy(rt.buf, rt.pos, false, false);
+        history = rt.history;
         if (ds) ds_set_pending(0, 0);   // DSpark's rings are not in the root: stale rows cost draft quality only
-        return root.pos;
+        return rt.pos;
     }
 
-    // ---- the root on disk: "DS41ROOT", u32 version, the pack key, pos, tokens, history, the state bytes, then an
-    // FNV-1a 64 checksum of everything before it
-    static constexpr uint32_t kRootFileVersion = 1;
+    // ---- the roots on disk: "DS41ROOT", u32 version, the pack key, u32 count, then per root pos, tokens, history and
+    // the state bytes, then an FNV-1a 64 checksum of everything before it
+    static constexpr uint32_t kRootFileVersion = 2;
     static uint64_t fnv(const void* p, size_t n, uint64_t h) {
         const auto* b = static_cast<const uint8_t*>(p);
         for (size_t i = 0; i < n; ++i) h = (h ^ b[i]) * 1099511628211ull;
         return h;
     }
     void write_root(const std::string& path) const {
-        if (root.pos < 0) throw std::logic_error("ds41: no root checkpoint to write");
-        std::vector<uint8_t> state(root.bytes);
-        ck(cudaMemcpy(state.data(), root.buf, root.bytes, cudaMemcpyDeviceToHost), "root write");
+        uint32_t count = 0;
+        for (const Root& rt : roots) count += rt.pos >= 0;
+        if (count == 0) throw std::logic_error("ds41: no root checkpoint to write");
         const std::string tmp = path + ".tmp";
         std::FILE* f = std::fopen(tmp.c_str(), "wb");
         if (!f) throw std::runtime_error("ds41: cannot write " + tmp);
@@ -2555,58 +2568,86 @@ struct Engine::Impl {
             h = fnv(p, n, h);
         };
         const uint32_t ver = kRootFileVersion, klen = (uint32_t) pack_key.size();
-        const int32_t pos = root.pos;
-        const uint64_t nt = root.tokens.size(), nh = root.history.size(), nb = root.bytes;
-        put("DS41ROOT", 8); put(&ver, 4); put(&klen, 4); put(pack_key.data(), klen); put(&pos, 4);
-        put(&nt, 8); put(root.tokens.data(), nt * sizeof(int)); put(&nh, 8); put(root.history.data(), nh * 4);
-        put(&nb, 8); put(state.data(), nb);
+        put("DS41ROOT", 8); put(&ver, 4); put(&klen, 4); put(pack_key.data(), klen); put(&count, 4);
+        std::vector<uint8_t> state;
+        for (const Root& rt : roots) {
+            if (rt.pos < 0) continue;
+            state.resize(rt.bytes);
+            if (cudaMemcpy(state.data(), rt.buf, rt.bytes, cudaMemcpyDeviceToHost) != cudaSuccess) {
+                std::fclose(f);
+                throw std::runtime_error("ds41: root write: the copy failed");
+            }
+            const int32_t pos = rt.pos;
+            const uint64_t nt = rt.tokens.size(), nh = rt.history.size(), nb = rt.bytes;
+            put(&pos, 4); put(&nt, 8); put(rt.tokens.data(), nt * sizeof(int)); put(&nh, 8);
+            put(rt.history.data(), nh * 4); put(&nb, 8); put(state.data(), nb);
+        }
         const uint64_t sum = h;
         if (std::fwrite(&sum, 8, 1, f) != 1 || std::fclose(f) != 0) throw std::runtime_error("ds41: cannot write " + tmp);
         if (std::rename(tmp.c_str(), path.c_str()) != 0) throw std::runtime_error("ds41: cannot rename " + tmp);
     }
-    bool read_root(const std::string& path) {
+    /// the whole file is checked before a slot changes; roots past root_slots() are skipped
+    int read_root(const std::string& path) {
         usable();
         std::ifstream f(path, std::ios::binary);
-        if (!f) return false;
+        if (!f) return 0;
         std::vector<char> all((std::istreambuf_iterator<char>(f)), std::istreambuf_iterator<char>());
+        if (all.size() < 8) return 0;
+        uint64_t sum = 0;
+        std::memcpy(&sum, all.data() + all.size() - 8, 8);
+        if (fnv(all.data(), all.size() - 8, 14695981039346656037ull) != sum) return 0;
+        const size_t end = all.size() - 8;
         size_t at = 0;
         auto take = [&](void* p, size_t n) {
-            if (at + n > all.size()) return false;
+            if (n > end - at) return false;
             std::memcpy(p, all.data() + at, n);
             at += n;
             return true;
         };
         char magic[8];
-        uint32_t ver = 0, klen = 0;
-        int32_t pos = -1;
-        uint64_t nt = 0, nh = 0, nb = 0, sum = 0;
+        uint32_t ver = 0, klen = 0, count = 0;
         if (!take(magic, 8) || std::memcmp(magic, "DS41ROOT", 8) != 0 || !take(&ver, 4) || ver != kRootFileVersion ||
-            !take(&klen, 4) || klen != pack_key.size() || at + klen > all.size() ||
+            !take(&klen, 4) || klen != pack_key.size() || klen > end - at ||
             std::memcmp(all.data() + at, pack_key.data(), klen) != 0)
-            return false;
+            return 0;
         at += klen;
-        if (!take(&pos, 4) || pos < 1 || pos > max_seq || !take(&nt, 8) || nt != (uint64_t) pos) return false;
-        std::vector<int> tokens(nt);
-        if (!take(tokens.data(), nt * sizeof(int)) || !take(&nh, 8) || nh != (uint64_t) pos) return false;
-        std::vector<int32_t> hist(nh);
-        if (!take(hist.data(), nh * 4) || !take(&nb, 8) || nb != root_copy(pos, true, true) || at + nb + 8 != all.size())
-            return false;
-        std::memcpy(&sum, all.data() + at + nb, 8);
-        if (fnv(all.data(), at + nb, 14695981039346656037ull) != sum) return false;
-        if (nb > root.bytes) {
-            if (root.buf) cudaFree(root.buf);
-            root.buf = nullptr;
-            root.bytes = 0;
-            root.pos = -1;
-            ck(cudaMalloc(&root.buf, nb), "root checkpoint");
-            root.bytes = nb;
+        if (!take(&count, 4) || count == 0) return 0;
+        struct Part {
+            int32_t pos;
+            std::vector<int> tokens;
+            std::vector<int32_t> hist;
+            size_t state, bytes;
+        };
+        std::vector<Part> parts;
+        for (uint32_t i = 0; i < count; ++i) {
+            Part p{};
+            uint64_t nt = 0, nh = 0, nb = 0;
+            if (!take(&p.pos, 4) || p.pos < 1 || p.pos > max_seq || !take(&nt, 8) || nt != (uint64_t) p.pos) return 0;
+            p.tokens.resize(nt);
+            if (!take(p.tokens.data(), nt * sizeof(int)) || !take(&nh, 8) || nh != (uint64_t) p.pos) return 0;
+            p.hist.resize(nh);
+            if (!take(p.hist.data(), nh * 4) || !take(&nb, 8) || nb != root_copy(nullptr, p.pos, true, true) ||
+                nb > end - at)
+                return 0;
+            p.state = at;
+            p.bytes = nb;
+            at += nb;
+            parts.push_back(std::move(p));
         }
-        root.pos = -1;   // a failed copy leaves no root
-        ck(cudaMemcpy(root.buf, all.data() + at, nb, cudaMemcpyHostToDevice), "root read");
-        root.tokens = std::move(tokens);
-        root.history = std::move(hist);
-        root.pos = pos;
-        return true;
+        if (at != end) return 0;
+        const int n = std::min((int) parts.size(), (int) roots.size());
+        for (int i = 0; i < n; ++i) {
+            Root& rt = roots[(size_t) i];
+            Part& p = parts[(size_t) i];
+            rt.pos = -1;   // a failed copy leaves the slot empty
+            rt.tokens.clear();
+            root_room(rt, p.bytes);
+            ck(cudaMemcpy(rt.buf, all.data() + p.state, p.bytes, cudaMemcpyHostToDevice), "root read");
+            rt.tokens = std::move(p.tokens);
+            rt.history = std::move(p.hist);
+            rt.pos = p.pos;
+        }
+        return n;
     }
 
     int step(int token, int pos, StepDump* dump, Timing& tm) {
@@ -2779,11 +2820,16 @@ void Engine::set_prefill_progress(PrefillProgress fn) { impl_->progress = std::m
 void Engine::reset() { impl_->reset(); }
 
 void Engine::save_snapshot(int slot) { impl_->save_snapshot(slot); }
-void Engine::save_root(const std::vector<int>& tokens) { impl_->save_root(tokens); }
-int Engine::restore_root() { return impl_->restore_root(); }
-const std::vector<int>& Engine::root_tokens() const { return impl_->root.tokens; }
+void Engine::save_root(int slot, const std::vector<int>& tokens) { impl_->save_root(slot, tokens); }
+int Engine::restore_root(int slot) { return impl_->restore_root(slot); }
+const std::vector<int>& Engine::root_tokens(int slot) const {
+    static const std::vector<int> none;
+    if (slot < 0 || slot >= (int) impl_->roots.size()) return none;
+    return impl_->roots[(size_t) slot].tokens;
+}
+int Engine::root_slots() const { return (int) impl_->roots.size(); }
 void Engine::write_root(const std::string& path) const { impl_->write_root(path); }
-bool Engine::read_root(const std::string& path) { return impl_->read_root(path); }
+int Engine::read_root(const std::string& path) { return impl_->read_root(path); }
 
 int Engine::restore_snapshot(int slot) { return impl_->restore_snapshot(slot); }
 

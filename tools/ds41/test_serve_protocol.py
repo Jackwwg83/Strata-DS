@@ -1,15 +1,20 @@
 """tools/ds41/test_serve_protocol.py - ds41_serve end to end over its pipes, as serve/server.py drives it.
 
     python tools/ds41/test_serve_protocol.py --exe build/ds41_serve --pack PACK [--expert-profile F] [--threads T]
+        [--case all|roots] [--ram-budget-gib N]
 
 Needs a GPU and the model pack. Checks: READY and INFO; a request's RESUME, PP, T and DONE lines; the session reuse
 (a prompt that continues the session reads only the new tokens, and gives the tokens a fresh start gives); a prompt
 that does not continue it starts over; STOP while the prompt is read and while tokens are written; the ERR answers;
 QUIT ends the engine with code 0; with static residency (--adapt-every 0) a seeded sampled request repeats.
+--case roots: the root checkpoints (--roots, --root-deep, --root-file): a new conversation starts after its client's
+system prompt, then after what the client's new conversations share, two clients keep their own roots, and a restart
+reads them from the file.
 """
 from __future__ import annotations
 
 import argparse
+import os
 import queue
 import random
 import subprocess
@@ -82,6 +87,57 @@ def prompt(n: int, seed: int) -> list[int]:
     return [0] + [rng.randrange(3, 128000) for _ in range(n - 1)]
 
 
+TURN = 128803   # <｜User｜>, ds41_serve's default --turn-token
+
+
+def roots_case(cmd: list[str], root_file: str) -> None:
+    """Two clients' new conversations: a system prompt, the turn token, a context every first message repeats, then
+    the question. Static residency, and every part of a prompt read by prefill (--window-prompt-max 0: a box with a
+    small RAM tier drops experts on the windows' path), so the reference and the roots read the same way."""
+    sys_a, sys_b, ctx = prompt(120, 41), prompt(120, 43), prompt(81, 42)[1:]
+    conv = lambda sysp, i: sysp + [TURN] + ctx + prompt(21, 50 + i)[1:]
+    shared = len(sys_a) + 1 + len(ctx)   # where conversations of one client stop sharing tokens
+
+    same_path = ["--adapt-every", "0", "--window-prompt-max", "0"]
+    e = Engine(cmd + same_path + ["--prompt-cache-root", "0"])   # the reference: no roots
+    _, fresh, _, _ = e.request(conv(sys_a, 4), 6)
+    e.send("QUIT")
+    t0 = time.time()
+    e.p.wait(timeout=900)
+    print(f"  roots: the reference engine ended in {time.time() - t0:.0f} s", flush=True)
+
+    roots = same_path + ["--prompt-cache-root", "64", "--roots", "4", "--root-deep", "32",
+             "--root-file", root_file]
+    e = Engine(cmd + roots)
+    lines, _, _, _ = e.request(conv(sys_a, 1), 2)
+    check(lines[0] == "RESUME 0", f"roots: the first conversation reads everything ({lines[0]})")
+    lines, _, _, _ = e.request(conv(sys_a, 2), 2)
+    check(lines[0] == f"RESUME {len(sys_a)}", f"roots: the second starts after the system prompt ({lines[0]})")
+    lines, _, _, _ = e.request(conv(sys_a, 3), 2)
+    check(lines[0] == f"RESUME {shared}", f"roots: the third starts after the shared context ({lines[0]})")
+    lines, _, _, _ = e.request(conv(sys_b, 1), 2)
+    check(lines[0] == "RESUME 0", f"roots: another client reads everything ({lines[0]})")
+    lines, from_root, _, _ = e.request(conv(sys_a, 4), 6)
+    check(lines[0] == f"RESUME {shared}", f"roots: the first client's roots stay ({lines[0]})")
+    lines, _, _, _ = e.request(conv(sys_b, 2), 2)
+    check(lines[0] == f"RESUME {len(sys_b)}", f"roots: the other client's root stays ({lines[0]})")
+    lines, _, _, _ = e.request(conv(sys_b, 3), 2)
+    check(lines[0] == f"RESUME {shared}", f"roots: the other client keeps a deep root too ({lines[0]})")
+    print(f"  roots: from the deep root {from_root}, fresh {fresh}", flush=True)
+    check(from_root[:1] == fresh[:1], "roots: the deep root gives the first token of a fresh start")
+    e.send("QUIT")
+    check(e.p.wait(timeout=900) == 0, "roots: QUIT ends the engine with code 0 (the file written)")
+
+    e = Engine(cmd + roots)   # a restart: the roots come from the file
+    lines, again, _, _ = e.request(conv(sys_a, 4), 6)
+    check(lines[0] == f"RESUME {shared}", f"roots: after a restart the deep root is there ({lines[0]})")
+    check(again == from_root, f"roots: the root from the file gives the same tokens ({again})")
+    lines, _, _, _ = e.request(conv(sys_b, 3), 2)
+    check(lines[0] == f"RESUME {shared}", f"roots: after a restart the other client's roots are there ({lines[0]})")
+    e.send("QUIT")
+    check(e.p.wait(timeout=900) == 0, "roots: the restarted engine ends with code 0")
+
+
 def main() -> int:
     ap = argparse.ArgumentParser()
     ap.add_argument("--exe", required=True)
@@ -89,10 +145,23 @@ def main() -> int:
     ap.add_argument("--expert-profile", default="")
     ap.add_argument("--threads", default="8")
     ap.add_argument("--max-context", default="16384")
+    ap.add_argument("--case", default="all", choices=["all", "roots"])
+    ap.add_argument("--ram-budget-gib", default="")
+    ap.add_argument("--root-file", default="/tmp/ds41_serve_roots_test.bin")
     a = ap.parse_args()
     cmd = [a.exe, "--serve", "--pack", a.pack, "--max-context", a.max_context, "--threads", a.threads]
     if a.expert_profile:
         cmd += ["--expert-profile", a.expert_profile]
+    if a.ram_budget_gib:
+        cmd += ["--ram-budget-gib", a.ram_budget_gib]
+    for _ in range(2):   # no file before the case, none left after it
+        if os.path.exists(a.root_file):
+            os.remove(a.root_file)
+        if _ == 0:
+            roots_case(cmd, a.root_file)
+    if a.case == "roots":
+        print(f"RESULT {'fail' if failures else 'pass'} serve_protocol roots", flush=True)
+        return 1 if failures else 0
     t0 = time.time()
     e = Engine(cmd)
     print(f"READY after {time.time() - t0:.0f} s: {' '.join(e.ready)}; INFO {e.info}", flush=True)
