@@ -73,8 +73,8 @@ class Source:
             hdr.pop("__metadata__", None)
             self.fds[fname] = os.open(path, os.O_RDONLY)
             for k, v in hdr.items():
-                if files is None and k not in idx:   # the index names the checkpoint's tensors (a merged one
-                    continue                         # points at shards that hold others too)
+                if files is None and idx.get(k) != fname:   # the index names each tensor's shard (a merged one
+                    continue                                # points at shards that hold others, or the same names)
                 a, b = v["data_offsets"]
                 self.entries[k] = (fname, v["dtype"], v["shape"], 8 + n + a, b - a)
         missing = set(idx) - set(self.entries)
