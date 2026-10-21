@@ -5,6 +5,7 @@
 
 #include <cerrno>
 #include <climits>
+#include <algorithm>
 #include <cstdint>
 #include <cstdio>
 #include <cstdlib>
@@ -112,6 +113,33 @@ inline int pick_snapshot(const std::vector<std::vector<int>>& snaps, const std::
         }
     }
     return best;
+}
+
+/// Which root checkpoint a prompt starts from, or -1: the longest root the prompt starts with that reuses more than
+/// `reuse` (what the session, a snapshot or a slot gives) and leaves the prompt's last token to read.
+inline int pick_root(const std::vector<std::vector<int>>& roots, const std::vector<int>& prompt, int64_t reuse) {
+    int best = -1;
+    size_t best_n = 0;
+    for (size_t i = 0; i < roots.size(); ++i) {
+        const size_t n = roots[i].size();
+        if (n == 0 || (int64_t) n <= reuse || n <= best_n || n + 1 > prompt.size()) continue;
+        if (std::equal(roots[i].begin(), roots[i].end(), prompt.begin())) {
+            best = (int) i;
+            best_n = n;
+        }
+    }
+    return best;
+}
+
+/// Where a new conversation keeps a deeper root checkpoint, or 0: the end of the tokens it shares with the previous
+/// new conversation (an agent client's system prompt plus the context it adds to every first message), when that is
+/// at least `min_gain` tokens past what it reuses and short of its last token.
+inline int64_t deep_checkpoint(const std::vector<int>& prev_new, const std::vector<int>& prompt, int64_t reuse,
+                               int64_t min_gain) {
+    size_t n = 0;
+    while (n < prev_new.size() && n < prompt.size() && prev_new[n] == prompt[n]) ++n;
+    if (n + 1 > prompt.size()) n = prompt.size() - 1;
+    return (int64_t) n >= reuse + min_gain ? (int64_t) n : 0;
 }
 
 /// The fields of the DONE line

@@ -84,6 +84,26 @@ int main() {
         check(pick_snapshot({{1, 9}}, {1, 9, 4}, {1, 9, 5}, 0) == 0, "a two-token snapshot");
     }
     {
+        // root checkpoints: the longest one the prompt starts with, past what the session reuses
+        const std::vector<std::vector<int>> roots = {{1, 2, 3}, {1, 2, 3, 4, 5}, {7, 8}};
+        check(pick_root(roots, {1, 2, 3, 4, 5, 6}, 0) == 1, "the longest root the prompt starts with");
+        check(pick_root(roots, {1, 2, 3, 9, 9}, 0) == 0, "a shorter root when the longer differs");
+        check(pick_root(roots, {7, 8, 1}, 0) == 2, "another client's root");
+        check(pick_root(roots, {1, 2, 3, 4, 5}, 0) == 0, "never all of the prompt: its last token is read again");
+        check(pick_root(roots, {1, 2, 3, 4, 5, 6}, 5) == -1, "none when something else reuses as much");
+        check(pick_root({}, {1, 2}, 0) == -1, "none without roots");
+    }
+    {
+        // a deeper checkpoint: where a new conversation and the previous new one stop sharing tokens, when that is at
+        // least min_gain past what this prompt reuses and short of its last token
+        const std::vector<int> prev = {1, 2, 3, 4, 5, 6, 7, 8, 9};
+        check(deep_checkpoint(prev, {1, 2, 3, 4, 5, 6, 7, 0, 0}, 2, 4) == 7, "the shared prefix ends at 7");
+        check(deep_checkpoint(prev, {1, 2, 3, 4, 5, 6, 7, 0, 0}, 4, 4) == 0, "less than min_gain past the reuse");
+        check(deep_checkpoint(prev, {1, 2, 3, 4, 5, 6, 7, 8}, 0, 4) == 7, "never the prompt's last token");
+        check(deep_checkpoint({}, {1, 2, 3}, 0, 1) == 0, "no previous conversation");
+        check(deep_checkpoint(prev, {9, 9, 9, 9, 9, 9}, 0, 1) == 0, "nothing shared");
+    }
+    {
         DoneStats d;
         d.generated = 5;
         d.prompt = 100;
