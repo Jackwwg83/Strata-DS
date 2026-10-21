@@ -4866,12 +4866,14 @@ def setup_deepseek(a, data, elsewhere, adopted=None):
         if not deepseek_pack_ready(pack, src, mtp=True):
             fail("DeepSeek pack has no DSpark experts; run setup again")
     # the Spark recipe as measured (docs/DEEPSEEK_SPARK.md): 16 threads, DSpark drafting every step, verify windows
-    # for prompts up to 32 tokens
+    # for prompts up to 32 tokens; 4 root checkpoints (each client's system prompt and what its new conversations
+    # share; the 128 GB of unified memory has room, a discrete card's VRAM keeps one), kept on disk across restarts
     threads = min(16, os.cpu_count() or 16) if spark else deepseek_threads()
     args = ["--pack", str(pack), "--max-context", str(ctx), "--expert-profile",
             str(ROOT / "ds41/data/expert-profile.bin"), "--threads", str(threads)]
     if spark:
-        args += ["--window-prompt-max", "32", "--spec", "dspark", "--draft-always"]
+        args += ["--window-prompt-max", "32", "--spec", "dspark", "--draft-always",
+                 "--roots", "4", "--root-file", str(ROOT / f"strata-{tag}-roots.bin")]
     if a.resident_budget_gib is not None:
         args += ["--ram-budget-gib", f"{a.resident_budget_gib:g}"]
     # --parallel N: N requests decode together (ds41_serve --batch, at most 4 slots); a run without it keeps the last

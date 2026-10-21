@@ -229,7 +229,8 @@ class Installer(unittest.TestCase):
         self.assertEqual(cfg['model_name'], 'deepseek-v4.1-flash-1017')
         self.assertEqual(cfg['args'], ['--pack', str(self.pack), '--max-context', '262144', '--expert-profile',
                                        str(self.root / 'ds41/data/expert-profile.bin'), '--threads', '16',
-                                       '--window-prompt-max', '32', '--spec', 'dspark', '--draft-always'])
+                                       '--window-prompt-max', '32', '--spec', 'dspark', '--draft-always',
+                                       '--roots', '4', '--root-file', str(self.root / f'strata-{TAG}-roots.bin')])
         self.assertEqual(cfg['env'], {'DS41_SSD_TAIL_SKIP': '1'})
         # LibertAI: the two shards the merge uses (not the vision one); DeepSeek: the Engram shard whole, the
         # small tensors of the others by range; the indexes and the tokenizer files
