@@ -184,7 +184,9 @@ struct Options {
     /// ~4.6 ms per token; equal at about 125 tokens (128 new: 3.9 s both).
     int window_prompt_max = 120;
     std::vector<int> eos = {1};   ///< <｜end▁of▁sentence｜>
-    /// --spec dspark: greedy requests decode in DSpark's verify windows (exact: the same tokens as plain steps).
+    /// --spec dspark: requests decode in DSpark's verify windows. Greedy: the same tokens as plain steps. Sampling: each
+    /// row sampled with the plain path's chain, counter and history, a draft kept only when it equals the pick (upstream's
+    /// exact-match verify), so the text depends on the seed, not on the drafts.
     /// --draft-k K: K drafts a round (0..3); without it DraftScheduler chooses, and drafts only while drafting pays.
     bool dspark = false;
     int draft_k = -1;
@@ -522,7 +524,7 @@ int main(int argc, char** argv) {
                     // max_new (the round writes at most k + 1 tokens) or the context
                     const long long room = std::min<long long>(r.max_new - d.generated,
                                                                (long long) o.max_context - e.position() - 2);
-                    if (o.dspark && r.greedy() && room >= 2 && (o.draft_k >= 0 || sched.want_draft())) {
+                    if (o.dspark && room >= 2 && (o.draft_k >= 0 || sched.want_draft())) {
                         const double r0 = now_ms();
                         const Engine::Draft dd = e.draft(tok);
                         const int cap = (int) std::min<long long>(room - 1, kVerifyMaxTokens - 1);
@@ -531,9 +533,18 @@ int main(int argc, char** argv) {
                         std::vector<int> window{tok};
                         window.insert(window.end(), dd.tokens.begin(), dd.tokens.begin() + k);
                         const double v0 = now_ms();
-                        const VerifyResult v = e.verify(window, e.position());
+                        // a request that samples: row t is sampled as the plain path would sample that token (the
+                        // same chain, counter and penalty history), and a draft is kept only when it equals the pick
+                        const VerifyResult v = e.verify(window, e.position(), !r.greedy());
                         const double verify_ms = now_ms() - v0;
-                        const int keep = round_keep(window, v.next, o.eos);
+                        std::vector<int> next = v.next;
+                        const int keep = r.greedy() ? round_keep(window, v.next, o.eos)
+                                                    : round_picks(window, [&](int t) {
+                                                          return sampler->pick(v.logits[(size_t) t], r,
+                                                                               row_history(s.live, window, t, r.penalty_last_n),
+                                                                               oc.seed, oc.counter + (uint64_t) t);
+                                                      }, o.eos, next);
+                        if (!r.greedy()) oc.counter += (uint64_t) keep;
                         e.commit(keep);
                         s.live.insert(s.live.end(), window.begin(), window.begin() + keep);
                         add_timing();
@@ -543,7 +554,7 @@ int main(int argc, char** argv) {
                         d_drafted += k;
                         d_accepted += keep - 1;
                         for (int i = 0; i < keep && !ended; ++i) {
-                            tok = v.next[(size_t) i];
+                            tok = next[(size_t) i];
                             ended = emit(tok);
                         }
                         continue;
@@ -551,7 +562,7 @@ int main(int argc, char** argv) {
                     greedy_next = e.step(tok, e.position());
                     s.live.push_back(tok);
                     add_timing();
-                    if (o.dspark && r.greedy()) sched.observe_step(e.last_timing().total_ms);
+                    if (o.dspark) sched.observe_step(e.last_timing().total_ms);
                     tok = r.greedy() ? greedy_next : sampler->pick(e.last_logits(), r, s.live, oc.seed, oc.counter++);
                     ended = emit(tok);
                 }

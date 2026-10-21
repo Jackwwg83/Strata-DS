@@ -73,6 +73,32 @@ int main() {
         check(round_keep({7, 8, 1, 10}, {8, 1, 10, 11}, eos) == 2, "the end of sequence ends the round");
         check(round_keep({7}, {1}, eos) == 1, "a one-row window");
     }
+    {   // round_picks: a sampled request's round picks row t only while the drafts before it matched; with the same
+        // picks it keeps what round_keep keeps
+        const std::vector<int> eos = {1};
+        struct Case { std::vector<int> window, picks; int keep, calls; const char* what; };
+        const Case cases[] = {{{7, 8, 9, 10}, {8, 9, 10, 11}, 4, 4, "all drafts match: every row picked"},
+                              {{7, 8, 9, 10}, {8, 5, 10, 11}, 2, 2, "second draft differs: two rows picked"},
+                              {{7, 8, 9, 10}, {6, 9, 10, 11}, 1, 1, "first draft differs: one row picked"},
+                              {{7, 8, 1, 10}, {8, 1, 10, 11}, 2, 2, "the end of sequence ends the round"},
+                              {{7}, {1}, 1, 1, "a one-row window"}};
+        for (const Case& c : cases) {
+            int calls = 0;
+            std::vector<int> next;
+            const int keep = strata::ds41::round_picks(c.window, [&](int t) { ++calls; return c.picks[(size_t) t]; },
+                                                       eos, next);
+            check(keep == c.keep && calls == c.calls, std::string("round_picks: ") + c.what);
+            check(keep == round_keep(c.window, c.picks, eos), std::string("round_picks = round_keep: ") + c.what);
+            check(next == std::vector<int>(c.picks.begin(), c.picks.begin() + keep), std::string("next: ") + c.what);
+        }
+    }
+    {   // row_history: row t of a window counts penalties over the session's last h tokens, then window[0..t]
+        const std::vector<int> live = {1, 2, 3, 4, 5}, window = {6, 7, 8};
+        check(strata::ds41::row_history(live, window, 0, 3) == std::vector<int>({3, 4, 5, 6}), "row 0: the fed token");
+        check(strata::ds41::row_history(live, window, 2, 2) == std::vector<int>({4, 5, 6, 7, 8}), "row 2: two drafts");
+        check(strata::ds41::row_history(live, window, 1, 9) == std::vector<int>({1, 2, 3, 4, 5, 6, 7}), "short session");
+        check(strata::ds41::row_history(live, window, 1, 0) == std::vector<int>({6, 7}), "no penalty window");
+    }
     std::printf("RESULT %s\n", fails ? "fail" : "pass");
     return fails ? 1 : 0;
 }

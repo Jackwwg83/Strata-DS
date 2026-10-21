@@ -71,4 +71,26 @@ inline int round_keep(const std::vector<int>& window, const std::vector<int>& ne
     return keep;
 }
 
+/// round_keep for a request that samples (upstream's verify: a draft is kept only when it EQUALS the token the target
+/// samples at that row, so the text depends on the seed, not on the drafts). pick(t) samples the token after
+/// window[0..t]; it is called for row t only while the drafts before it matched, so a round samples keep rows.
+/// next gets the picks; returns keep, as round_keep would for the same picks.
+template <typename Pick>
+int round_picks(const std::vector<int>& window, Pick pick, const std::vector<int>& eos, std::vector<int>& next) {
+    next.assign(1, pick(0));
+    auto is_eos = [&](int t) { return std::find(eos.begin(), eos.end(), t) != eos.end(); };
+    while ((int) next.size() < (int) window.size() && window[next.size()] == next.back() && !is_eos(next.back()))
+        next.push_back(pick((int) next.size()));
+    return (int) next.size();
+}
+
+/// The penalty history of a window's row t: the session's last h tokens, then window[0..t] (the fed token and the
+/// drafts before row t). The sampler counts the last penalty_last_n of it.
+inline std::vector<int> row_history(const std::vector<int>& live, const std::vector<int>& window, int t, int h) {
+    const size_t from = live.size() - std::min(live.size(), (size_t) std::max(h, 0));
+    std::vector<int> out(live.begin() + (std::ptrdiff_t) from, live.end());
+    out.insert(out.end(), window.begin(), window.begin() + t + 1);
+    return out;
+}
+
 }  // namespace strata::ds41
