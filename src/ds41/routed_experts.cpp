@@ -69,6 +69,19 @@ bool use_k19() {
 
 }  // namespace
 
+void check_routed_experts(ExpertFormat f, const ExpertSlot* const* slots, int n, int group, const char* what) {
+    if (f != ExpertFormat::Exl3 || !use_k19()) return;
+    for (int e = 0; e < n; ++e) {
+        const float* b = slots[e]->bits;
+        const auto k = [](float x) { return x == (float) (int) x ? (int) x : 0; };   // half K: not K19's
+        if (!kernels::k19_takes(k(b[0]), k(b[1]), k(b[2])))
+            throw std::runtime_error("ds41: " + std::string(what) + " " + std::to_string(group) + " expert " +
+                                     std::to_string(e) + " has gate / up / down at " + std::to_string(b[0]) + " / " +
+                                     std::to_string(b[1]) + " / " + std::to_string(b[2]) +
+                                     " bits, which K19 does not decode (DS41_EXL3_K19=0: K10)");
+    }
+}
+
 void routed_moe_decode(ExpertFormat f, const __half* x, int m, const int32_t* sel, const float* w, int topk,
                        const kernels::Exl3Expert* experts, float* out, void* workspace, size_t workspace_bytes,
                        cudaStream_t stream) {

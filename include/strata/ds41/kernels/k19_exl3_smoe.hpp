@@ -8,6 +8,12 @@
 
 namespace strata::ds41::kernels {
 
+/// The bitrates K19 decodes: integer K 1..6 per projection, gate and up the same or one apart (SAGE's pairs)
+constexpr bool k19_takes(int k_gate, int k_up, int k_down) {
+    return k_gate >= 1 && k_gate <= 6 && k_up >= 1 && k_up <= 6 && k_down >= 1 && k_down <= 6 &&
+           k_gate - k_up <= 1 && k_up - k_gate <= 1;
+}
+
 /// Workspace bytes for exl3_smoe_decode with m tokens of topk picks
 size_t exl3_smoe_workspace_bytes(int m, int topk);
 

@@ -20,6 +20,10 @@ void routed_moe_decode(ExpertFormat f, const __half* x, int m, const int32_t* se
                        const kernels::Exl3Expert* experts, float* out, void* workspace, size_t workspace_bytes,
                        cudaStream_t stream);
 
+/// Throws when the GPU's kernel for these experts cannot decode one of them (K19: bitrates outside k19_takes); what
+/// names them in the message ("layer", "DSpark stage"). A pack the kernels cannot run is refused at load.
+void check_routed_experts(ExpertFormat f, const ExpertSlot* const* slots, int n, int group, const char* what);
+
 /// The prompt's routed experts, rows grouped by expert: K12's contract, computed by K12 (exl3) or K17 (mxfp4)
 size_t routed_moe_prefill_workspace_bytes(ExpertFormat f, int max_rows, int max_groups);
 void routed_moe_prefill(ExpertFormat f, const __half* x, const int32_t* tok, const float* w, const int32_t* off,

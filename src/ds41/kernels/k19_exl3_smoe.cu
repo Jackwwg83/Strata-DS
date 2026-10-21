@@ -74,6 +74,7 @@ __device__ __forceinline__ const unsigned char* w1_of(const Call& c, int p) { re
 __device__ __forceinline__ const unsigned char* w3_of(const Call& c, int p) { return (const unsigned char*) c.e[p].w3.trellis; }
 __device__ __forceinline__ const unsigned char* w2_of(const Call& c, int p) { return (const unsigned char*) c.e[p].w2.trellis; }
 __device__ __forceinline__ int kgu_of(const Call& c, int p) { return c.e[p].w1.tile_w / 16; }
+__device__ __forceinline__ int ku_of(const Call& c, int p) { return c.e[p].w3.tile_w / 16; }
 __device__ __forceinline__ int kd_of(const Call& c, int p) { return c.e[p].w2.tile_w / 16; }
 __device__ __forceinline__ const half* gu_suh_of(const Call& c, int p, int g) { return g ? c.e[p].w3.suh : c.e[p].w1.suh; }
 __device__ __forceinline__ const half* gu_svh_of(const Call& c, int p, int g) { return g ? c.e[p].w3.svh : c.e[p].w1.svh; }
@@ -177,24 +178,25 @@ __global__ void __launch_bounds__(ROT_WARPS * 32) smoe_rot(const __grid_constant
 
 // ---- 2. gate + up + activation
 
-__host__ __device__ constexpr int gu_stage_bytes(int K) { return 2 * WARPS * 32 * K + RX * 64; }
+/// gate at KG bits, up at KU (SAGE gives them different K for 5% of its experts, never more than one apart)
+__host__ __device__ constexpr int gu_stage_bytes(int KG, int KU) { return WARPS * 32 * (KG + KU) + RX * 64; }
 __host__ __device__ constexpr int gu_smem_bytes(int K) {
-    return PIPE * gu_stage_bytes(K) > 2 * RX * 128 * 4 ? PIPE * gu_stage_bytes(K) : 2 * RX * 128 * 4;
+    return PIPE * gu_stage_bytes(K, K) > 2 * RX * 128 * 4 ? PIPE * gu_stage_bytes(K, K) : 2 * RX * 128 * 4;
 }
 
-template <int K>
+template <int KG, int KU>
 __device__ __forceinline__ void gu_item(const Call& c, int rc, int p, int nr, int cb, unsigned char* ring,
                                         uint64_t* full, uint64_t* empty) {
-    constexpr int TB = 32 * K;              // bytes per 16x16 tile
-    constexpr int CH = WARPS * TB;          // one projection's 8 tiles of a k-row, contiguous
-    constexpr int SB = gu_stage_bytes(K);   // [gate chunk][up chunk][rows x (gate 16 | up 16) fp16]
+    constexpr int TBG = 32 * KG, TBU = 32 * KU;           // bytes per 16x16 tile
+    constexpr int CHG = WARPS * TBG, CHU = WARPS * TBU;   // one projection's 8 tiles of a k-row, contiguous
+    constexpr int SB = gu_stage_bytes(KG, KU);   // [gate chunk][up chunk][rows x (gate 16 | up 16) fp16]
     const int lane = threadIdx.x % 32, warp = threadIdx.x / 32;
     constexpr int kts = H / 16;
 
     if (warp == WARPS) {   // the producer: all 32 lanes copy 16-byte pieces of the stage
-        const size_t row_bytes = (size_t) (I / 16) * TB;
-        const unsigned char* g1 = w1_of(c, p) + (size_t) cb * CH;
-        const unsigned char* g3 = w3_of(c, p) + (size_t) cb * CH;
+        const size_t row_g = (size_t) (I / 16) * TBG, row_u = (size_t) (I / 16) * TBU;
+        const unsigned char* g1 = w1_of(c, p) + (size_t) cb * CHG;
+        const unsigned char* g3 = w3_of(c, p) + (size_t) cb * CHU;
         const int my_row = lane / 4;   // input-row pieces: 4 per row
         const int my_slot = my_row < nr ? c.rt[RT_SLOT + rc * RX + my_row] : 0;
         const uint32_t ring_s = smem_u32(ring), full_s = smem_u32(full), empty_s = smem_u32(empty);
@@ -203,26 +205,26 @@ __device__ __forceinline__ void gu_item(const Call& c, int rc, int p, int nr, in
             const int s = kk % PIPE;
             if (kk >= PIPE) mbar_wait_s(empty_s + s * 8, ((kk / PIPE) - 1) & 1);
             const uint32_t st = ring_s + s * SB;
-            const unsigned char* a1 = g1 + kk * row_bytes;
-            const unsigned char* a3 = g3 + kk * row_bytes;
-            for (int i = lane; i < CH / 16; i += 32) {
-                cp_async16(st + i * 16, a1 + i * 16);
-                cp_async16(st + CH + i * 16, a3 + i * 16);
-            }
+            const unsigned char* a1 = g1 + kk * row_g;
+            const unsigned char* a3 = g3 + kk * row_u;
+            for (int i = lane; i < CHG / 16; i += 32) cp_async16(st + i * 16, a1 + i * 16);
+            for (int i = lane; i < CHU / 16; i += 32) cp_async16(st + CHG + i * 16, a3 + i * 16);
             if (my_row < nr)
-                cp_async16(st + 2 * CH + lane * 16, c.hs + ((size_t) my_slot * kts + kk) * 32 + (lane % 4) * 8);
+                cp_async16(st + CHG + CHU + lane * 16, c.hs + ((size_t) my_slot * kts + kk) * 32 + (lane % 4) * 8);
             cp_async_arrive_noinc(full_s + s * 8);
         }
         return;
     }
 
     const int gq = lane / 4, tq = lane % 4;
-    const LaneDq<K> cfg(lane);
+    const LaneDq<KG> cfg_g(lane);
+    const LaneDq<KU> cfg_u(lane);
     float g0[4] = {0.f, 0.f, 0.f, 0.f}, g1[4] = {0.f, 0.f, 0.f, 0.f};
     float u0[4] = {0.f, 0.f, 0.f, 0.f}, u1[4] = {0.f, 0.f, 0.f, 0.f};
     const uint32_t full_s = smem_u32(full), empty_s = smem_u32(empty);
-    const unsigned char* wt = ring + warp * TB;
-    const unsigned char* xr = ring + 2 * CH + gq * 64;   // this lane's input row (rows >= nr: stale, unused)
+    const unsigned char* wg = ring + warp * TBG;
+    const unsigned char* wu = ring + CHG + warp * TBU;
+    const unsigned char* xr = ring + CHG + CHU + gq * 64;   // this lane's input row (rows >= nr: stale, unused)
 #pragma unroll 1
     for (int kk = 0; kk < kts; kk += 2) {   // two k-rows per step
         const int s0 = kk % PIPE;
@@ -233,8 +235,8 @@ __device__ __forceinline__ void gu_item(const Call& c, int rc, int p, int nr, in
         for (int h = 0; h < 2; ++h) {
             const int off = (s0 + h) * SB;
             half2 fg0[2], fg1[2], fu0[2], fu1[2];
-            decode_tile<K>(reinterpret_cast<const uint32_t*>(wt + off), cfg, fg0, fg1);
-            decode_tile<K>(reinterpret_cast<const uint32_t*>(wt + off + CH), cfg, fu0, fu1);
+            decode_tile<KG>(reinterpret_cast<const uint32_t*>(wg + off), cfg_g, fg0, fg1);
+            decode_tile<KU>(reinterpret_cast<const uint32_t*>(wu + off), cfg_u, fu0, fu1);
             const uint32_t* xa = reinterpret_cast<const uint32_t*>(xr + off);
             const uint32_t ag[4] = {xa[tq], 0u, xa[tq + 4], 0u};
             const uint32_t au[4] = {xa[8 + tq], 0u, xa[12 + tq], 0u};
@@ -297,13 +299,12 @@ __global__ void __launch_bounds__(THREADS, 1) smoe_gu(const __grid_constant__ Ca
         mbar_fence_init();
     }
     __syncthreads();
-    switch (kgu_of(c, p)) {
-        case 1: gu_item<1>(c, rc, p, nr, cb, smem, full, empty); break;
-        case 2: gu_item<2>(c, rc, p, nr, cb, smem, full, empty); break;
-        case 3: gu_item<3>(c, rc, p, nr, cb, smem, full, empty); break;
-        case 4: gu_item<4>(c, rc, p, nr, cb, smem, full, empty); break;
-        case 5: gu_item<5>(c, rc, p, nr, cb, smem, full, empty); break;
-        case 6: gu_item<6>(c, rc, p, nr, cb, smem, full, empty); break;
+    // (gate K, up K): the same, or one apart (the host refuses others: k19_supports)
+    switch (kgu_of(c, p) * 8 + ku_of(c, p)) {
+#define K19_GU(g, u) case g * 8 + u: gu_item<g, u>(c, rc, p, nr, cb, smem, full, empty); break;
+        K19_GU(1, 1) K19_GU(1, 2) K19_GU(2, 1) K19_GU(2, 2) K19_GU(2, 3) K19_GU(3, 2) K19_GU(3, 3) K19_GU(3, 4)
+        K19_GU(4, 3) K19_GU(4, 4) K19_GU(4, 5) K19_GU(5, 4) K19_GU(5, 5) K19_GU(5, 6) K19_GU(6, 5) K19_GU(6, 6)
+#undef K19_GU
         default: break;
     }
 }

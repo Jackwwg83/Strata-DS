@@ -1,7 +1,8 @@
 // src/ds41/tests/k19_exl3_smoe_test.cu - task K19 acceptance: the streaming EXL3 routed experts against a reference
 // built from K18 (exllamav3's LinearEXL3 per projection, the same math as K19), against K10 loosely (K10 also
 // FP8-quantizes the hidden activation and weights it before the down projection), then speed. Synthetic experts
-// (random trellis, random signed scales), K 1..6 with gate and up of the same K (K1: SAGE 1.62's coldest experts).
+// (random trellis, random signed scales), K 1..6; gate and up of an expert at the same K or one apart, as SAGE 1.62
+// assigns them (5% of its experts; K1: its coldest experts).
 #include "bench_util.hpp"
 
 #include "strata/ds41/kernels/k18_exl3_linear.hpp"
@@ -40,11 +41,12 @@ __global__ void fill_scale(__half* p, size_t n, float scale, uint32_t seed) {
 
 size_t a256(size_t b) { return (b + 255) & ~(size_t) 255; }
 
-/// n synthetic experts; expert e: gate / up at kgu(e) bits, down at kd(e) bits
+/// n synthetic experts; expert e: gate at kgu(e) bits, up at ku(e) (default kgu(e)), down at kd(e)
 struct Experts {
     void* base = nullptr;
     std::vector<kk::Exl3Expert> host;
-    Experts(int n, int (*kgu)(int), int (*kd)(int)) {
+    Experts(int n, int (*kgu)(int), int (*kd)(int), int (*ku)(int) = nullptr) {
+        if (!ku) ku = kgu;
         const size_t tb = (size_t) (H / 16) * (F / 16) * 96 * 2;   // room for K = 6
         const size_t per = 3 * (a256(tb) + 2 * a256(H * 2));   // per projection: trellis, suh, svh (H >= F)
         ck(cudaMalloc(&base, per * n), "experts");
@@ -69,7 +71,7 @@ struct Experts {
             };
             const uint32_t s = 0x9e3779b9U * (uint32_t) (e + 1);
             host[e].w1 = proj(H, F, 1.0f, 0.02f, s ^ 1, kgu(e));
-            host[e].w3 = proj(H, F, 1.0f, 0.02f, s ^ 3, kgu(e));
+            host[e].w3 = proj(H, F, 1.0f, 0.02f, s ^ 3, ku(e));
             host[e].w2 = proj(F, H, 1.0f, 0.05f, s ^ 2, kd(e));
         }
         ck(cudaDeviceSynchronize(), "fill experts");
@@ -127,15 +129,19 @@ double delta_err(const std::vector<float>& got, const std::vector<float>& want, 
 
 int kgu_mixed(int e) { return 1 + e % 6; }         // 1..6
 int kd_mixed(int e) { return 1 + (e + 2) % 6; }
+int ku_mixed(int e) { const int k = kgu_mixed(e) + e % 3 - 1; return k < 1 ? 1 : k > 6 ? 6 : k; }   // +-1
 int k3(int) { return 3; }
 
 }  // namespace
 
 int main() {
-    require_gpu();
     Verdict v;
+    // the bitrates K19 takes (the engine refuses a pack with others at load, rather than decode them wrongly)
+    v.check(kk::k19_takes(3, 3, 3) && kk::k19_takes(1, 2, 1) && kk::k19_takes(4, 3, 6), "K 1..6, gate and up one apart");
+    v.check(!kk::k19_takes(1, 3, 2) && !kk::k19_takes(7, 7, 7) && !kk::k19_takes(0, 1, 1), "two apart, K7 or K0: refused");
+    require_gpu();
     {   // parity: decode (m = 1), a verify window sharing experts (m = 4), a full call with empty picks (m = 8)
-        Experts ex(12, kgu_mixed, kd_mixed);
+        Experts ex(12, kgu_mixed, kd_mixed, ku_mixed);
         Dev<kk::Exl3Expert> experts(ex.host);
         struct Case { const char* name; int m; std::vector<int32_t> sel; };
         const std::vector<Case> cases = {
@@ -177,7 +183,7 @@ int main() {
         }
     }
     {   // prefill (K21): the rows of 8 tokens grouped by expert give the decode call's sums (a different add order)
-        Experts ex(12, kgu_mixed, kd_mixed);
+        Experts ex(12, kgu_mixed, kd_mixed, ku_mixed);
         Dev<kk::Exl3Expert> experts(ex.host);
         const int m = 8;
         std::vector<int32_t> sel = {0, 1, 2, 3, 4, 5,  1, 2, 6, 7, 8, 0,  2, 9, 10, 11, 1, 3,  4, 5, 6, 7, 8, 9,
