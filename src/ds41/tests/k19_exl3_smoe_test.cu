@@ -1,7 +1,7 @@
 // src/ds41/tests/k19_exl3_smoe_test.cu - task K19 acceptance: the streaming EXL3 routed experts against a reference
 // built from K18 (exllamav3's LinearEXL3 per projection, the same math as K19), against K10 loosely (K10 also
 // FP8-quantizes the hidden activation and weights it before the down projection), then speed. Synthetic experts
-// (random trellis, random signed scales), K 2..6 with gate and up of the same K.
+// (random trellis, random signed scales), K 1..6 with gate and up of the same K (K1: SAGE 1.62's coldest experts).
 #include "bench_util.hpp"
 
 #include "strata/ds41/kernels/k18_exl3_linear.hpp"
@@ -125,8 +125,8 @@ double delta_err(const std::vector<float>& got, const std::vector<float>& want, 
     return rel_l2(a, b);
 }
 
-int kgu_mixed(int e) { return 2 + e % 5; }         // 2..6
-int kd_mixed(int e) { return 2 + (e + 2) % 5; }
+int kgu_mixed(int e) { return 1 + e % 6; }         // 1..6
+int kd_mixed(int e) { return 1 + (e + 2) % 6; }
 int k3(int) { return 3; }
 
 }  // namespace

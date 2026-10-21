@@ -97,7 +97,13 @@ struct LaneDq
     __device__ __forceinline__ explicit LaneDq(int lane)
     {
         const int t = lane * 8;
-        if constexpr (K == 2)
+        if constexpr (K == 1)   // dq8_aligned_1bit (Strata-DS: SAGE 1.62's 1-bit experts)
+        {
+            const int i1 = t >> 5;
+            idx[0] = (i1 + 7) & 7; idx[1] = i1;
+            sh[0] = (~t) & 24; sh[1] = 0;
+        }
+        else if constexpr (K == 2)
         {
             const int i1 = t >> 4;
             idx[0] = (i1 + 15) & 15; idx[1] = i1;
@@ -135,7 +141,15 @@ template <int K>
 __device__ __forceinline__ void dq_words(const uint32_t (&w)[LaneDq<K>::NW], const LaneDq<K>& c,
                                          half2 (&f0)[2], half2 (&f1)[2])
 {
-    if constexpr (K == 2)
+    if constexpr (K == 1)
+    {
+        const uint32_t b = fshift(w[1], w[0], c.sh[0]);
+        f0[0] = mul1_2(bfe16(b, 7), bfe16(b, 6));
+        f0[1] = mul1_2(bfe16(b, 5), bfe16(b, 4));
+        f1[0] = mul1_2(bfe16(b, 3), bfe16(b, 2));
+        f1[1] = mul1_2(bfe16(b, 1), b & 0xffff);
+    }
+    else if constexpr (K == 2)
     {
         const uint32_t b = fshift(w[1], w[0], c.sh[0]);
         f0[0] = mul1_2(bfe16(b, 14), bfe16(b, 12));

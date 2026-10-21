@@ -298,6 +298,7 @@ __global__ void __launch_bounds__(THREADS, 1) smoe_gu(const __grid_constant__ Ca
     }
     __syncthreads();
     switch (kgu_of(c, p)) {
+        case 1: gu_item<1>(c, rc, p, nr, cb, smem, full, empty); break;
         case 2: gu_item<2>(c, rc, p, nr, cb, smem, full, empty); break;
         case 3: gu_item<3>(c, rc, p, nr, cb, smem, full, empty); break;
         case 4: gu_item<4>(c, rc, p, nr, cb, smem, full, empty); break;
@@ -448,6 +449,7 @@ __global__ void __launch_bounds__(THREADS, 1) smoe_down(const __grid_constant__ 
     }
     __syncthreads();
     switch (kd_of(c, p)) {
+        case 1: down_item<1>(c, rc, p, nr, ob0, smem, full, empty, last); break;
         case 2: down_item<2>(c, rc, p, nr, ob0, smem, full, empty, last); break;
         case 3: down_item<3>(c, rc, p, nr, ob0, smem, full, empty, last); break;
         case 4: down_item<4>(c, rc, p, nr, ob0, smem, full, empty, last); break;
