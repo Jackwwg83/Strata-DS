@@ -232,6 +232,30 @@ int main(int argc, char** argv) {
             e.restore_root();
             check(same_logits(windows((int) a.size()), want_w, "verify windows after a root restore"),
                   "verify windows after a root restore");
+            // the root on disk (ds41_serve --root-file): written, replaced in memory by b's root, read back
+            const std::string file = "/tmp/ds41_root_test.bin";
+            e.reset();
+            e.prefill(a, 0);
+            e.save_root(a);
+            e.write_root(file);
+            e.reset();
+            e.prefill(b, 0);
+            e.save_root(b);
+            check(e.read_root(file) && e.root_tokens() == a, "read_root brings back a's root");
+            e.reset();
+            e.prefill(b, 0);
+            check(e.restore_root() == (int) a.size(), "the read root restores to a's end");
+            e.prefill(tail, (int) a.size());
+            check(same_logits(e.last_logits(), want, "after a root read from disk"), "a root read from disk");
+            {   // a file of another pack or a damaged one is refused, and the root in memory stays
+                std::FILE* f = std::fopen(file.c_str(), "r+b");
+                std::fseek(f, 8, SEEK_SET);
+                std::fputc('X', f);
+                std::fclose(f);
+                check(!e.read_root(file) && e.root_tokens() == a, "a damaged root file is refused");
+                check(!e.read_root("/tmp/ds41_no_such_root.bin"), "a missing root file is refused");
+            }
+            std::remove(file.c_str());
         } else {
             std::printf("unknown --case %s\n", which.c_str());
             return 2;

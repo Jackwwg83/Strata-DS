@@ -149,6 +149,12 @@ public:
     /// Back to the root: position() becomes its position and the tokens before it are root_tokens(). Throws without one.
     int restore_root();
     const std::vector<int>& root_tokens() const;
+    /// The root on disk (ds41_serve --root-file), so a restart keeps it: its position, tokens, the engine's history and
+    /// state, keyed by the pack's pack_info.txt, with a checksum. write_root throws without a root (written to path.tmp,
+    /// then renamed). read_root returns false and keeps the root in memory when the file is missing, of another pack or
+    /// damaged.
+    void write_root(const std::string& path) const;
+    bool read_root(const std::string& path);
     int snapshot_slots() const;
 
     /// Concurrent requests. A request is read in the main session (prefill, step, verify), then copied into a slot.

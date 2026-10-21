@@ -197,6 +197,9 @@ struct Options {
     /// system-prompt checkpoint, --prompt-cache-root, engine 0.1.20)
     int root_min = 2048;
     int turn_token = 128803;
+    /// --root-file PATH: the root checkpoint on disk, read at the start and written after each new one, so a restart
+    /// keeps it (a new conversation of the agent client starts after its system prompt at once)
+    std::string root_file;
     EngineOptions eng;
 };
 
@@ -207,7 +210,7 @@ struct Options {
                  "       [--vram-slots N] [--vram-reserve-mib M] [--ram-budget-gib G] [--adapt-every N] [--adapt-swaps N] [--prefill-chunk N]\n"
                  "       [--prefill-batch N] [--prefill-ring N] [--prefill-threads N] [--window-prompt-max N]\n"
                  "       [--snapshots N] [--batch N] [--spec none|dspark] [--draft-k K] [--draft-always]\n"
-                 "       [--prompt-cache-root N] [--turn-token ID]\n"
+                 "       [--prompt-cache-root N] [--turn-token ID] [--root-file PATH]\n"
                  "       [--eos-id ID ...]\n",
                  why.c_str());
     std::exit(2);
@@ -257,6 +260,7 @@ Options parse_args(int argc, char** argv) {
         else if (a == "--draft-always") o.draft_always = true;
         else if (a == "--prompt-cache-root") o.root_min = (int) num(next());
         else if (a == "--turn-token") o.turn_token = (int) num(next());
+        else if (a == "--root-file") o.root_file = next();
         else if (a == "--eos-id") {
             if (!eos_given) o.eos.clear();
             eos_given = true;
@@ -348,6 +352,12 @@ int main(int argc, char** argv) {
     std::vector<Slot> slots((size_t) nslots);
     const std::string batch_info =
         nslots >= 2 ? " batch_slots=" + std::to_string(nslots) + " slot_cache=1" : std::string();
+    if (!o.root_file.empty() && o.root_min > 0) {
+        const double t0 = now_ms();
+        if (e.read_root(o.root_file))
+            std::fprintf(stderr, "ds41_serve: root checkpoint at %zu tokens read from %s in %.1f s\n",
+                         e.root_tokens().size(), o.root_file.c_str(), (now_ms() - t0) / 1000.0);
+    }
     DraftScheduler sched;   // DSpark: one policy for the process (its step and verify times carry over requests)
     sched.always = o.draft_always;
     say("INFO context=%d expert_slots=%d spec=0 model=deepseek-v4.1-flash engine=" STRATA_VERSION "%s", o.max_context,
@@ -465,6 +475,13 @@ int main(int argc, char** argv) {
                     if (!cancelled) {
                         e.save_root(std::vector<int>(r.ids.begin(), r.ids.begin() + b));
                         std::fprintf(stderr, "ds41_serve: root checkpoint at %lld tokens\n", (long long) b);
+                        if (!o.root_file.empty()) {
+                            try {
+                                e.write_root(o.root_file);
+                            } catch (const std::exception& ex) {   // the request goes on; the next start reads none
+                                std::fprintf(stderr, "ds41_serve: the root checkpoint was not written (%s)\n", ex.what());
+                            }
+                        }
                         from = (size_t) (b - resume);
                     }
                 }
