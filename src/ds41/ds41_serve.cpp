@@ -37,7 +37,6 @@
 #include <cstdarg>
 #include <cstdio>
 #include <deque>
-#include <iostream>
 #include <memory>
 #include <mutex>
 #include <stdexcept>
@@ -129,49 +128,77 @@ private:
 
 /// stdin on its own thread (upstream): STOP is seen while a request runs, everything else is queued
 struct Input {
-    std::mutex mu;
-    std::condition_variable cv;
-    std::deque<std::string> lines;
-    bool eof = false;
-    std::atomic<bool> stop{false};
+    /// what the reader thread touches: shared with it, never main's locals, since it is detached and may sit in
+    /// read(2) past QUIT (upstream 0.1.44)
+    struct Shared {
+        std::mutex mu;
+        std::condition_variable cv;
+        std::deque<std::string> lines;
+        bool eof = false;
+        std::atomic<bool> stop{false};
+    };
+    std::shared_ptr<Shared> sh = std::make_shared<Shared>();
+    std::atomic<bool>& stop = sh->stop;
 
     void start() {
-        std::thread([this] {
-            std::string l;
-            while (std::getline(std::cin, l)) {
+        std::thread([st = sh] {
+            // read(2) on the descriptor, not std::cin: glibc's exit() flushes every stdio stream and waits for stdin's
+            // lock, which getline holds while it waits for input, so the process hung at its end until stdin closed
+            std::string l, buf;
+            char chunk[4096];
+            auto getline_fd = [&](std::string& out) -> bool {
+                for (;;) {
+                    const size_t nl = buf.find('\n');
+                    if (nl != std::string::npos) {
+                        out.assign(buf, 0, nl);
+                        buf.erase(0, nl + 1);
+                        return true;
+                    }
+                    const ssize_t n = ::read(0, chunk, sizeof chunk);
+                    if (n < 0 && errno == EINTR) continue;
+                    if (n <= 0) {
+                        if (buf.empty()) return false;
+                        out.swap(buf);
+                        buf.clear();
+                        return true;
+                    }
+                    buf.append(chunk, (size_t) n);
+                }
+            };
+            while (getline_fd(l)) {
                 if (!l.empty() && l.back() == '\r') l.pop_back();
                 if (l == "STOP") {
-                    stop.store(true);
+                    st->stop.store(true);
                     continue;
                 }
-                std::lock_guard<std::mutex> lk(mu);
-                lines.push_back(l);
-                cv.notify_one();
+                std::lock_guard<std::mutex> lk(st->mu);
+                st->lines.push_back(l);
+                st->cv.notify_one();
             }
-            std::lock_guard<std::mutex> lk(mu);
-            eof = true;
-            cv.notify_one();
+            std::lock_guard<std::mutex> lk(st->mu);
+            st->eof = true;
+            st->cv.notify_one();
         }).detach();
     }
     bool next(std::string& out) {
-        std::unique_lock<std::mutex> lk(mu);
-        cv.wait(lk, [&] { return !lines.empty() || eof; });
-        if (lines.empty()) return false;
-        out = std::move(lines.front());
-        lines.pop_front();
+        std::unique_lock<std::mutex> lk(sh->mu);
+        sh->cv.wait(lk, [&] { return !sh->lines.empty() || sh->eof; });
+        if (sh->lines.empty()) return false;
+        out = std::move(sh->lines.front());
+        sh->lines.pop_front();
         return true;
     }
     /// a waiting line, without blocking (batch slots decode while nothing arrives)
     bool poll(std::string& out) {
-        std::lock_guard<std::mutex> lk(mu);
-        if (lines.empty()) return false;
-        out = std::move(lines.front());
-        lines.pop_front();
+        std::lock_guard<std::mutex> lk(sh->mu);
+        if (sh->lines.empty()) return false;
+        out = std::move(sh->lines.front());
+        sh->lines.pop_front();
         return true;
     }
     bool ended() {
-        std::lock_guard<std::mutex> lk(mu);
-        return eof && lines.empty();
+        std::lock_guard<std::mutex> lk(sh->mu);
+        return sh->eof && sh->lines.empty();
     }
 };
 
