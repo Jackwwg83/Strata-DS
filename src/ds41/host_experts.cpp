@@ -7,7 +7,9 @@
 #include "strata/ds41/vram_experts.hpp"
 
 #include "moe_mul1.h"   // third_party/exllamav3_moe
+#include "strata/ds41/routed_experts.hpp"
 
+#include <cuda.h>
 #include <cuda_runtime.h>
 #include <fcntl.h>
 #include <sys/mman.h>
@@ -70,6 +72,54 @@ std::vector<std::pair<int, int>> plan_ram_tier(const std::vector<std::pair<int, 
     return out;
 }
 
+/// An integrated GPU only: `bytes` of pinned host memory from cuMemCreate on host NUMA node 0, mapped at one address
+/// that the GPU and the CPU both read and write (vLLM #60844: streaming GPU reads at cudaMalloc speed; DGX Spark 233 GB/s
+/// against 220 for cudaHostAlloc). Null when the GPU is discrete or the driver refuses; size and handle for the free.
+static void* numa_arena(size_t bytes, size_t& mapped, unsigned long long& handle) {
+    int dev = 0, integrated = 0;
+    if (cudaGetDevice(&dev) != cudaSuccess || cudaDeviceGetAttribute(&integrated, cudaDevAttrIntegrated, dev) != cudaSuccess ||
+        !integrated || cudaFree(nullptr) != cudaSuccess) {   // cudaFree(0): the runtime's context, which cuMem uses
+        cudaGetLastError();
+        return nullptr;
+    }
+    CUmemAllocationProp prop = {};
+    prop.type = CU_MEM_ALLOCATION_TYPE_PINNED;
+    prop.location.type = CU_MEM_LOCATION_TYPE_HOST_NUMA;
+    prop.location.id = 0;
+    size_t gran = 0;
+    if (cuMemGetAllocationGranularity(&gran, &prop, CU_MEM_ALLOC_GRANULARITY_RECOMMENDED) != CUDA_SUCCESS || !gran)
+        return nullptr;
+    const size_t size = (bytes + gran - 1) / gran * gran;
+    CUmemGenericAllocationHandle h = 0;
+    if (cuMemCreate(&h, size, &prop, 0) != CUDA_SUCCESS) return nullptr;
+    CUdeviceptr va = 0;
+    if (cuMemAddressReserve(&va, size, gran, 0, 0) != CUDA_SUCCESS) {
+        cuMemRelease(h);
+        return nullptr;
+    }
+    CUmemAccessDesc acc[2] = {};
+    acc[0].location.type = CU_MEM_LOCATION_TYPE_DEVICE;
+    acc[0].location.id = dev;
+    acc[0].flags = CU_MEM_ACCESS_FLAGS_PROT_READWRITE;
+    acc[1].location.type = CU_MEM_LOCATION_TYPE_HOST_NUMA;
+    acc[1].location.id = 0;
+    acc[1].flags = CU_MEM_ACCESS_FLAGS_PROT_READWRITE;
+    if (cuMemMap(va, size, 0, h, 0) != CUDA_SUCCESS) {
+        cuMemAddressFree(va, size);
+        cuMemRelease(h);
+        return nullptr;
+    }
+    if (cuMemSetAccess(va, size, acc, 2) != CUDA_SUCCESS) {
+        cuMemUnmap(va, size);
+        cuMemAddressFree(va, size);
+        cuMemRelease(h);
+        return nullptr;
+    }
+    mapped = size;
+    handle = (unsigned long long) h;
+    return (void*) va;
+}
+
 size_t auto_ram_budget(size_t headroom) {
     uint64_t avail = read_field("/proc/meminfo", "MemAvailable", 1024);
     uint64_t limit = read_number("/sys/fs/cgroup/memory.max"), anon = 0;
@@ -89,7 +139,7 @@ size_t auto_ram_budget(size_t headroom) {
 
 HostExperts::HostExperts(const Pack& pack, const std::vector<std::pair<int, int>>& ranked,
                          const std::vector<int32_t>& vram_res, size_t budget, const std::vector<int64_t>& cpu_handles,
-                         int threads)
+                         int threads, bool host_alloc)
     : pack_(pack), handles_(cpu_handles), n_experts_(pack.n_experts()) {
     const int L = pack.n_layers();
     slot_.assign((size_t) L * n_experts_, -1);
@@ -108,8 +158,26 @@ HostExperts::HostExperts(const Pack& pack, const std::vector<std::pair<int, int>
         max_slot_bytes_ = std::max<size_t>(max_slot_bytes_, b);
     }
     arena_bytes_ = off_.back();
-    void* p = mmap(nullptr, arena_bytes_, PROT_READ | PROT_WRITE, MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
-    if (p == MAP_FAILED) throw std::runtime_error("ds41 RAM tier: cannot reserve " + std::to_string(arena_bytes_) + " B");
+    void* p = nullptr;
+    if (host_alloc) {   // pinned and mapped from the start: no pin step below
+        const size_t limit = detail::register_limit().load();
+        if ((!limit || arena_bytes_ <= limit) && (p = numa_arena(arena_bytes_, numa_bytes_, numa_handle_)))
+            host_alloc_ = true;
+        else if ((!limit || arena_bytes_ <= limit) &&
+            cudaHostAlloc(&p, arena_bytes_, cudaHostAllocMapped | cudaHostAllocPortable) == cudaSuccess)
+            host_alloc_ = true;
+        else {
+            cudaGetLastError();
+            p = nullptr;
+            std::fprintf(stderr, "ds41 RAM tier: cudaHostAlloc of %.1f GiB failed; anonymous memory instead\n",
+                         arena_bytes_ / 1073741824.0);
+        }
+    }
+    if (!host_alloc_) {
+        p = mmap(nullptr, arena_bytes_, PROT_READ | PROT_WRITE, MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
+        if (p == MAP_FAILED)
+            throw std::runtime_error("ds41 RAM tier: cannot reserve " + std::to_string(arena_bytes_) + " B");
+    }
     arena_ = (uint8_t*) p;
     holder_ = plan;
     // Read the slots with O_DIRECT, 16 readers: the file cache cannot keep a pack beside a RAM tier this large, and
@@ -146,7 +214,7 @@ HostExperts::HostExperts(const Pack& pack, const std::vector<std::pair<int, int>
     });
     if (dfd >= 0) close(dfd);
     if (failed) {
-        munmap(arena_, arena_bytes_);
+        free_arena();
         arena_ = nullptr;
         throw std::runtime_error("ds41 RAM tier: a read of " + pack.dir() + "/experts.bin failed");
     }
@@ -162,7 +230,7 @@ HostExperts::HostExperts(const Pack& pack, const std::vector<std::pair<int, int>
         cudaGetLastError();
         return false;
     };
-    bool pinned = pin();
+    bool pinned = host_alloc_ || pin();
     const size_t full_bytes = arena_bytes_;
     // steps of 512 MiB, doubling (0.5, 1, 2, 4 GiB ...): a pin that fails now and then costs 0.5 GiB of tier (it
     // failed and then fit 0.5 GiB lower in 3 of 6 laptop starts; a failed attempt takes 1.4-3.9 s), one that keeps
@@ -191,7 +259,8 @@ HostExperts::HostExperts(const Pack& pack, const std::vector<std::pair<int, int>
     if (pinned) {
         locked_ = registered_ = true;
         void* alias = nullptr;
-        if (cudaHostGetDevicePointer(&alias, arena_, 0) == cudaSuccess)
+        if (numa_bytes_) device_alias_ = arena_;   // one address for the CPU and the GPU
+        else if (cudaHostGetDevicePointer(&alias, arena_, 0) == cudaSuccess)
             device_alias_ = static_cast<uint8_t*>(alias);
         else
             cudaGetLastError();
@@ -218,8 +287,7 @@ HostExperts::HostExperts(const Pack& pack, const std::vector<std::pair<int, int>
             ck(cudaStreamSynchronize(nullptr), "descriptor publication");
         } catch (...) {
             cudaFree(experts_dev_);
-            cudaHostUnregister(arena_);
-            munmap(arena_, arena_bytes_);
+            free_arena();
             throw;
         }
     }
@@ -243,6 +311,20 @@ HostExperts::~HostExperts() {
     if (pend_idx_) cudaFreeHost(pend_idx_);
     if (pend_desc_) cudaFreeHost(pend_desc_);
     if (!arena_) return;
+    free_arena();
+}
+
+void HostExperts::free_arena() noexcept {
+    if (numa_bytes_) {
+        cuMemUnmap((CUdeviceptr) arena_, numa_bytes_);
+        cuMemAddressFree((CUdeviceptr) arena_, numa_bytes_);
+        cuMemRelease((CUmemGenericAllocationHandle) numa_handle_);
+        return;
+    }
+    if (host_alloc_) {
+        cudaFreeHost(arena_);
+        return;
+    }
     if (registered_) cudaHostUnregister(arena_);
     else if (locked_) munlock(arena_, arena_bytes_);
     munmap(arena_, arena_bytes_);
@@ -250,20 +332,7 @@ HostExperts::~HostExperts() {
 
 void HostExperts::point(int layer, int expert, const uint8_t* bytes) {
     if (handles_.empty()) return;   // no CPU kernel (tests)
-    const ExpertSlot& s = pack_.expert(layer, expert);
-    auto desc = [&](int c0, int k_tiles, int n_tiles) {
-        MoeCpuMatrixDesc d;
-        d.trellis = (const uint16_t*) (bytes + s.comp_off[c0]);
-        d.suh = (const at::Half*) (bytes + s.comp_off[c0 + 1]);
-        d.svh = (const at::Half*) (bytes + s.comp_off[c0 + 2]);
-        d.k_tiles = k_tiles;
-        d.n_tiles = n_tiles;
-        d.tile_w = (int) (s.comp_bytes[c0] / ((uint64_t) k_tiles * n_tiles * 2));
-        return d;
-    };
-    const MoeCpuMatrixDesc g = desc(0, kDim / 16, kMoeInter / 16), u = desc(4, kDim / 16, kMoeInter / 16),
-                           d = desc(8, kMoeInter / 16, kDim / 16);
-    exl3_moe_cpu_set_expert_raw(handles_[layer], expert, &g, &u, &d, 0);
+    cpu_set_expert(pack_.expert_format(), handles_[layer], expert, pack_.expert(layer, expert), bytes);
 }
 
 void HostExperts::reserve_pending(int n) {
@@ -573,6 +642,15 @@ int HostExperts::read_picked(int layer, const int32_t* ids, int n, const std::ve
         point(layer, ids[i], slot_ptr(pick[i]));
     }
     return read;
+}
+
+const uint8_t* HostExperts::slot_bytes(int layer, int expert) {
+    const int32_t s = slot_of(layer, expert);
+    if (s >= 0) return slot_ptr(s);
+    std::lock_guard<std::mutex> lk(admit_mu_);
+    for (const auto& a : admitted_)
+        if (a.second.first == layer && a.second.second == expert) return slot_ptr(a.first);
+    return nullptr;
 }
 
 void HostExperts::open_prefetch() {

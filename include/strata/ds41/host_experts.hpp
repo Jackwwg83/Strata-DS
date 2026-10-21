@@ -80,9 +80,11 @@ class HostExperts {
 public:
     /// Copies the planned experts into the arena (`threads` readers), points the CPU kernel's layers (cpu_handles,
     /// one per layer; none: no CPU kernel, for tests) at the copies, and hands their file pages back to the OS.
-    /// budget 0: no RAM tier.
+    /// budget 0: no RAM tier. host_alloc (unified memory): the arena comes from cudaHostAlloc, which the DGX Spark's
+    /// GPU reads at 210 GB/s against 166 GB/s for anonymous memory pinned with cudaHostRegister (8 GiB read, 2026-10-17);
+    /// when that allocation fails, the anonymous arena as before.
     HostExperts(const Pack& pack, const std::vector<std::pair<int, int>>& ranked, const std::vector<int32_t>& vram_res,
-                size_t budget, const std::vector<int64_t>& cpu_handles, int threads);
+                size_t budget, const std::vector<int64_t>& cpu_handles, int threads, bool host_alloc = false);
     ~HostExperts();
     HostExperts(const HostExperts&) = delete;
     HostExperts& operator=(const HostExperts&) = delete;
@@ -93,6 +95,11 @@ public:
     /// the largest slot
     size_t max_slot_bytes() const { return max_slot_bytes_; }
     bool locked() const { return locked_; }
+    /// the arena came from cudaHostAlloc (host_alloc)
+    bool host_allocated() const { return host_alloc_; }
+    /// the host_alloc arena came from cuMemCreate on the host NUMA node (an integrated GPU): the GPU reads it at the
+    /// speed of cudaMalloc memory (DGX Spark: 233 GB/s, cudaHostAlloc 220), and the CPU uses the same address
+    bool numa_allocated() const { return numa_bytes_ != 0; }
     /// the GPU can read the arena (pinned and mapped)
     bool mapped() const { return device_alias_ != nullptr; }
     /// the slots were read with O_DIRECT (else copied from the mapped pack, through the file cache)
@@ -103,6 +110,11 @@ public:
     /// RAM slot of (layer, expert), or -1 (the expert is read from the file)
     int32_t slot_of(int layer, int expert) const { return slot_[(size_t) layer * n_experts_ + expert]; }
     uint8_t* slot_ptr(int slot) const { return arena_ + off_[slot]; }
+    /// The bytes of (layer, expert) in the arena: its RAM slot, or the free slot an admit() of this step read it
+    /// into; null when it is in no slot (the file, or a swap buffer). Any thread, during a step.
+    const uint8_t* slot_bytes(int layer, int expert);
+    /// The GPU's address of arena bytes (mapped() only): the GPU computes from them in place (unified memory)
+    const uint8_t* device_address(const uint8_t* bytes) const { return device_alias_ + (bytes - arena_); }
     /// the largest expert the slot can hold: the size of the expert that first filled it
     size_t slot_capacity(int slot) const { return off_[slot + 1] - off_[slot]; }
 
@@ -205,6 +217,10 @@ private:
     bool filled_direct_ = false;
     std::vector<uint8_t> held_;   ///< [n_layers][n_experts] pointed at a swap buffer (point_to)
     bool registered_ = false;
+    bool host_alloc_ = false;   ///< arena_ from cudaHostAlloc (freed with cudaFreeHost) or cuMemCreate
+    size_t numa_bytes_ = 0;      ///< arena_ from cuMemCreate (host NUMA): its mapped size; 0 otherwise
+    unsigned long long numa_handle_ = 0;
+    void free_arena() noexcept;
     uint8_t* device_alias_ = nullptr;
     kernels::Exl3Expert* experts_dev_ = nullptr;
     std::vector<int32_t> slot_;                     ///< [n_layers][n_experts] RAM slot or -1

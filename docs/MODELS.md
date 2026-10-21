@@ -2,7 +2,8 @@
 
 Strata runs [Qwen3.8-Flash-Next](https://huggingface.co/Qwen/Qwen3.8-Flash-Next), in several **sizes**
 (the same model, compressed more or less) and several **versions** (the original, a coding version, a fine-tune).
-It also offers DeepSeek V4.1 Flash SAGE 1.59bpw on Linux + NVIDIA.
+It also offers DeepSeek V4.1 Flash on Linux + NVIDIA: SAGE 1.59bpw on a PC, the 1017 release with LibertAI's EXL3
+2.9bpw on a DGX Spark.
 The installer recommends a Qwen choice for your PC; this page explains the choice. Back to the [README](../README.md).
 
 > **On this page:** [Pick by RAM](#pick-by-ram) · [Speed](#how-fast-is-each-size) · [The sizes](#the-sizes) ·
@@ -153,7 +154,8 @@ explicit packing conversion and is not an installer menu option.
 
 ### DeepSeek V4.1 Flash (SAGE 1.59bpw)
 
-`--family deepseek` selects only the SAGE 1.59bpw EXL3 checkpoint. It is never the default family.
+`--family deepseek` selects the SAGE 1.59bpw EXL3 checkpoint on a PC (on a DGX Spark: [the Spark recipe](#deepseek-v41-flash-1017-on-a-dgx-spark-exl3-29bpw)).
+It is never the default family.
 The source is `vcruz305/DSV4.1-Flash-SAGE-EXL3-1.59bpw`, pinned to
 `eca94a388a70841858feed8f057a9862e897aba4`.
 
@@ -191,6 +193,24 @@ Windows, AMD, GPUs under 24 GB and lower RAM configurations are not tested for m
 Setup builds `ds41_serve` from source. The release zip does not contain it. Optional `--resident-budget-gib N`
 sets the engine's RAM budget. The pack uses verified Engram hash files from `ds41/data/engram/`; it needs numpy
 and does not import torch, transformers or sympy. See [AI_SETUP.md](AI_SETUP.md) for the full flow.
+
+### DeepSeek V4.1 Flash 1017 on a DGX Spark (EXL3 2.9bpw)
+
+On a GPU with unified memory (DGX Spark's GB10), `--family deepseek` selects `--model 1017-EXL3-2.9BPW`; a PC can ask
+for it too (setup warns that it is tested on a DGX Spark only). Setup merges two repositories, each pinned:
+`LibertAIDAI/DeepSeek-V4.1-Flash-1017-EXL3-2.9bpw` (`afc7aa0aab98ee735c0f54e0a122019af1ac08f1`: the routed experts,
+the attention and shared-expert linears, the head) and `deepseek-ai/DeepSeek-V4.1-Flash-1017`
+(`1bae0e1088993b9b82de08f59de5be5a34e42170`: the rest; only its two Engram shards whole, other tensors by HTTP range).
+
+- About 625 GB disk: 414.8 GB download plus 210.2 GB pack (with DSpark's experts). Keep the downloaded files.
+- Context: 256K by default. The server runs DSpark on every step and `DS41_SSD_TAIL_SKIP=1`.
+- 30.8 tokens/s over a coding-agent session (context 10K-91K), 22.9 at 250K; KL 0.074 against the official MXFP4
+  weights. Everything else: [DEEPSEEK_SPARK.md](DEEPSEEK_SPARK.md).
+
+```sh
+./setup.sh --setup --yes --family deepseek --no-start
+./run-deepseek-1017-exl3-2.9bpw.sh
+```
 
 ## Adding or switching models
 

@@ -71,6 +71,10 @@ void Engine::Impl::enqueue_slots(int m) {
         ck(cudaMemcpyAsync(dst, src, bytes, cudaMemcpyDeviceToDevice, st), "batch copy");
     };
     auto linear = [&](const bf16* x, const Fp8& w, bf16* out) {
+        if (w.x3) {
+            w.x3->run(x, (int) w.k, out, (int) w.n, m, st);
+            return;
+        }
         fp8_quantize_activation_f32((const uint16_t*) x, m, w.k, v.act, st);
         fp8_block_gemv_q(v.act, m, w.k, w.w, w.s, w.n, (uint16_t*) out, st);
     };
@@ -172,6 +176,7 @@ void Engine::Impl::enqueue_slots(int m) {
                                             float(std::pow(kHeadDim, -0.5)), ot, st);
             ops::rope_device(ot, kHeads, kHeadDim, rope, p + 1, 0, true, st);
             if (y.wo_a8.w) wo_a_grouped_fp8(ot, y.wo_a8.w, y.wo_a8.s, v.oa + t * kOGroups * kOLora, st);
+            else if (y.wo_a3) y.wo_a3->run(ot, kHeads * kHeadDim, v.oa + t * kOGroups * kOLora, kOGroups * kOLora, 1, st);
             else ops::wo_a_grouped(ot, y.wo_a, v.oa + t * kOGroups * kOLora, st);
         }
         linear(v.oa, y.wo_b, v.attn_out);
@@ -194,18 +199,24 @@ void Engine::Impl::enqueue_slots(int m) {
         if (staged) batch_stage->fork_copy(st);
         ck(cudaMemsetAsync(v.routed, 0, m * kDim * sizeof(float), st), "batch routed");
         if (!staged && (tier || ram))
-            kernels::exl3_moe_decode((const __half*) v.half, m, v.selected, w, kTopK, v.db->gpu_experts(), v.routed,
-                                     vram ? vram->workspace() : zc_workspace.get(), VramExperts::kWorkspaceBytes, st);
+            routed_moe_decode(pack.expert_format(), (const __half*) v.half, m, v.selected, w, kTopK,
+                              v.db->gpu_experts(), v.routed, vram ? vram->workspace() : zc_workspace.get(),
+                              VramExperts::kWorkspaceBytes, st);
         linear(v.xf, y.sh_w1, v.g);
         linear(v.xf, y.sh_w3, v.u);
         ops::swiglu(v.g, v.u, kSwigluLimit, v.sh_h, m * kMoeInter, st);
         linear(v.sh_h, y.sh_w2, v.sh_out);
         if (staged) {
             batch_stage->join(st);
-            kernels::exl3_moe_decode((const __half*) v.half, m, v.selected, w, kTopK, v.db->gpu_experts(), v.routed,
-                                     vram ? vram->workspace() : zc_workspace.get(), VramExperts::kWorkspaceBytes, st);
+            routed_moe_decode(pack.expert_format(), (const __half*) v.half, m, v.selected, w, kTopK,
+                              v.db->gpu_experts(), v.routed, vram ? vram->workspace() : zc_workspace.get(),
+                              VramExperts::kWorkspaceBytes, st);
         }
-        v.db->wait_add(v.routed, m, l + 1, st);
+        v.db->wait_add(v.routed, m, l + 1, st, gpu_misses);
+        if (gpu_misses)   // the misses the CPU read into the RAM tier
+            routed_moe_decode(pack.expert_format(), (const __half*) v.half, m, v.db->late_sel_dev(), w, kTopK,
+                              v.db->late_desc_dev(), v.routed, vram ? vram->workspace() : zc_workspace.get(),
+                              VramExperts::kWorkspaceBytes, st);
         ops::add_f32_bf16(v.routed, v.sh_out, v.ffn_out, m * kDim, st);
         ops::hc_post(v.ffn_out, v.h2, v.fpost, v.fcomb, v.h, m, st);
         copy(v.mix, v.fpre, m * kHc * sizeof(float));
@@ -213,7 +224,7 @@ void Engine::Impl::enqueue_slots(int m) {
     ops::hc_pre(v.h, v.mix, v.final_x, m, st);
     ops::rmsnorm(v.final_x, final_norm, v.final_x, kDim, kNormEps, m, st);
     for (int t = 0; t < m; ++t) {
-        ops::bf16_linear(v.final_x + t * kDim, nullptr, head, kDim, kVocab, nullptr, v.logits + t * kVocab, st);
+        head_logits(v.final_x + t * kDim, 1, v.logits + t * kVocab, st);
         ops::argmax_logits(v.logits + t * kVocab, v.next + t, st);
     }
     ck(cudaMemcpyAsync(v.next_host, v.next, m * sizeof(int), cudaMemcpyDeviceToHost, st), "batch next");
@@ -332,10 +343,8 @@ std::vector<int> Engine::Impl::step_slots(const std::vector<int>& rows, const st
             hits += v.db->counts().vram;
             if (!cpu_error) {
                 try {
-                    c10::Half weights[kVerifyMaxTokens * kTopK];
                     int misses = 0;
                     for (int i = 0; i < m * kTopK; ++i) {
-                        weights[i] = c10::Half(__half_as_ushort(__float2half_rn(v.db->w()[i])), c10::Half::from_bits());
                         const int e = v.db->ids()[i];
                         if (e < 0) continue;
                         ++misses;
@@ -350,9 +359,12 @@ std::vector<int> Engine::Impl::step_slots(const std::vector<int>& rows, const st
                     }
                     if (misses) admit_rows(l, v.db->ids(), m * kTopK);   // the adaptive RAM tier keeps them
                     const double start = now_ms();
-                    if (misses)
-                        exl3_moe_cpu_forward_raw(L[l].moe_handle, (const at::Half*) v.db->x(), v.db->ids(), weights,
-                                                 v.db->y(), m, kTopK, cpu_threads);
+                    int32_t cpu_ids[kVerifyMaxTokens * kTopK];
+                    std::copy(v.db->ids(), v.db->ids() + m * kTopK, cpu_ids);
+                    const int left = misses - (gpu_misses ? hand_back(v.db.get(), l, m * kTopK, cpu_ids) : 0);
+                    if (left)
+                        cpu_forward(pack.expert_format(), L[l].moe_handle, v.db->x(), cpu_ids, v.db->w(),
+                                    v.db->y(), m, kTopK, cpu_threads);
                     else
                         std::fill_n(v.db->y(), m * kDim, 0.0f);
                     cpu_us += (int64_t) ((now_ms() - start) * 1000.0);

@@ -60,8 +60,17 @@ public:
     struct Counts { int vram, zero_copy, cpu, prefetched, skipped; };
     /// Read after wait_published, before mark_done. Counts refer to this call.
     Counts counts() const { return *h_counts_; }
-    /// Wait until the CPU raised done to `round`, then out[i] += its rows [m][dim] (FP32).
-    void wait_add(float* out, int m, uint32_t round, cudaStream_t stream);
+    /// Wait until the CPU raised done to `round`, then out[i] += its rows [m][dim] (FP32). late: also copy the CPU's
+    /// late list (late_sel / late_desc) to the device for late_sel_dev() / late_desc_dev().
+    void wait_add(float* out, int m, uint32_t round, cudaStream_t stream, bool late = false);
+    /// The late list, on unified memory (the DGX Spark): misses that the CPU read from the SSD into the RAM tier and
+    /// hands back to the GPU instead of computing them. Use i of the call: late_sel[i] = i and late_desc[i] its
+    /// descriptor (device addresses), or late_sel[i] = -1. The CPU writes all m * topk entries before mark_done; after
+    /// wait_add(.., late = true) the GPU computes them with routed_moe_decode(late_sel_dev(), .., late_desc_dev()).
+    int32_t* late_sel() { return h_late_sel_; }
+    kernels::Exl3Expert* late_desc() { return h_late_desc_; }
+    const int32_t* late_sel_dev() const { return late_sel_dev_; }
+    const kernels::Exl3Expert* late_desc_dev() const { return late_desc_dev_; }
 
     // ---- host side
     /// Zero both words. Call only while no step is in flight.
@@ -86,6 +95,8 @@ private:
     int32_t *h_ids_ = nullptr, *d_ids_ = nullptr;
     float *h_w_ = nullptr, *d_w_ = nullptr;
     float *h_y_ = nullptr, *d_y_ = nullptr;
+    int32_t *h_late_sel_ = nullptr, *d_late_sel_ = nullptr, *late_sel_dev_ = nullptr;
+    kernels::Exl3Expert *h_late_desc_ = nullptr, *d_late_desc_ = nullptr, *late_desc_dev_ = nullptr;
 };
 
 /// The tail_rank and ssd_rank of publish (0 = off, valid 1..5). route_env / ssd_env: DS41_ROUTE_TAIL_SKIP /

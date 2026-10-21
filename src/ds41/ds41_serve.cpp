@@ -23,6 +23,7 @@
 // state (upstream's slot_cache). Any other prompt starts over at position 0. A BGEN is read in the main session (the
 // slots wait), then its state is copied into the slot.
 #include "strata/ds41/config.hpp"
+#include "strata/ds41/draft_scheduler.hpp"
 #include "strata/ds41/engine.hpp"
 #include "strata/ds41/serve_request.hpp"
 #include "strata/kernels/sampler.hpp"
@@ -183,6 +184,17 @@ struct Options {
     /// ~4.6 ms per token; equal at about 125 tokens (128 new: 3.9 s both).
     int window_prompt_max = 120;
     std::vector<int> eos = {1};   ///< <｜end▁of▁sentence｜>
+    /// --spec dspark: greedy requests decode in DSpark's verify windows (exact: the same tokens as plain steps).
+    /// --draft-k K: K drafts a round (0..3); without it DraftScheduler chooses, and drafts only while drafting pays.
+    bool dspark = false;
+    int draft_k = -1;
+    bool draft_always = false;   ///< --draft-always: DraftScheduler::always (every round drafts, k by confidence)
+    /// --prompt-cache-root N (0: off): a prompt read through the end of a system prompt of N tokens or more (its first
+    /// --turn-token, DeepSeek's <｜User｜>) keeps the engine's root checkpoint there (Engine::save_root), and a later
+    /// prompt that starts with it - a new conversation of the same agent client - starts reading after it (upstream's
+    /// system-prompt checkpoint, --prompt-cache-root, engine 0.1.20)
+    int root_min = 2048;
+    int turn_token = 128803;
     EngineOptions eng;
 };
 
@@ -192,7 +204,8 @@ struct Options {
                  "usage: ds41_serve --serve --pack DIR [--max-context N] [--threads T] [--expert-profile F]\n"
                  "       [--vram-slots N] [--vram-reserve-mib M] [--ram-budget-gib G] [--adapt-every N] [--adapt-swaps N] [--prefill-chunk N]\n"
                  "       [--prefill-batch N] [--prefill-ring N] [--prefill-threads N] [--window-prompt-max N]\n"
-                 "       [--snapshots N] [--batch N]\n"
+                 "       [--snapshots N] [--batch N] [--spec none|dspark] [--draft-k K] [--draft-always]\n"
+                 "       [--prompt-cache-root N] [--turn-token ID]\n"
                  "       [--eos-id ID ...]\n",
                  why.c_str());
     std::exit(2);
@@ -234,6 +247,14 @@ Options parse_args(int argc, char** argv) {
         else if (a == "--window-prompt-max") o.window_prompt_max = (int) num(next());
         else if (a == "--snapshots") o.eng.snapshots = (int) num(next());
         else if (a == "--batch") o.eng.batch_slots = (int) num(next());
+        else if (a == "--spec") {
+            const std::string v = next();
+            if (v != "none" && v != "dspark") usage("--spec is none or dspark");
+            o.dspark = v == "dspark";
+        } else if (a == "--draft-k") o.draft_k = (int) num(next());
+        else if (a == "--draft-always") o.draft_always = true;
+        else if (a == "--prompt-cache-root") o.root_min = (int) num(next());
+        else if (a == "--turn-token") o.turn_token = (int) num(next());
         else if (a == "--eos-id") {
             if (!eos_given) o.eos.clear();
             eos_given = true;
@@ -244,6 +265,9 @@ Options parse_args(int argc, char** argv) {
     if (o.pack.empty()) usage("--pack is required");
     if (o.max_context < 64) usage("--max-context must be at least 64");
     o.eng.max_seq = o.max_context;
+    if (o.draft_k > kVerifyMaxTokens - 1 || (o.draft_k >= 0 && !o.dspark)) usage("--draft-k 0..3 needs --spec dspark");
+    if (o.dspark && o.eng.batch_slots >= 2) usage("--spec dspark decodes the main session only: no --batch");
+    o.eng.dspark = o.dspark;
     return o;
 }
 
@@ -322,6 +346,8 @@ int main(int argc, char** argv) {
     std::vector<Slot> slots((size_t) nslots);
     const std::string batch_info =
         nslots >= 2 ? " batch_slots=" + std::to_string(nslots) + " slot_cache=1" : std::string();
+    DraftScheduler sched;   // DSpark: one policy for the process (its step and verify times carry over requests)
+    sched.always = o.draft_always;
     say("INFO context=%d expert_slots=%d spec=0 model=deepseek-v4.1-flash engine=" STRATA_VERSION "%s", o.max_context,
         e.vram_expert_slots(), batch_info.c_str());
     say("READY %d stop", o.max_context);   // "stop": this engine honours STOP
@@ -341,6 +367,7 @@ int main(int argc, char** argv) {
         }
         DoneStats d;
         d.prompt = n;
+        long long d_rounds = 0, d_drafted = 0, d_accepted = 0;   // DSpark's verify windows of this request
         const double r0 = now_ms();
         oc.seed = r.seed ? r.seed : (uint64_t) std::chrono::steady_clock::now().time_since_epoch().count();
         try {
@@ -361,7 +388,15 @@ int main(int argc, char** argv) {
                     from_slot = b;
                 }
             }
-            if (from_slot >= 0) {
+            // the root checkpoint: the end of a long system prompt that this prompt starts with
+            const std::vector<int>& root = e.root_tokens();
+            const bool from_root = o.root_min > 0 && !root.empty() && (int64_t) root.size() > best &&
+                                   root.size() + 1 <= r.ids.size() &&
+                                   std::equal(root.begin(), root.end(), r.ids.begin());
+            if (from_root) {
+                resume = e.restore_root();
+                s.live = root;
+            } else if (from_slot >= 0) {
                 e.copy_from_slot(from_slot);
                 s.live = slots[(size_t) from_slot].ids;
                 resume = best;
@@ -417,16 +452,33 @@ int main(int argc, char** argv) {
                 e.set_prefill_progress(nullptr);
                 return true;
             };
-            const bool windows = (int) rest.size() <= o.window_prompt_max;
-            if (rest.size() >= 2 && !s.snaps.empty()) {
+            // read through the end of a long system prompt: the root checkpoint there first (a new one replaces it)
+            size_t from = 0;
+            if (o.root_min > 0) {
+                const auto turn = std::find(r.ids.begin(), r.ids.end(), o.turn_token);
+                const int64_t b = turn - r.ids.begin();
+                const bool same = (int64_t) root.size() == b && std::equal(root.begin(), root.end(), r.ids.begin());
+                if (turn != r.ids.end() && b >= o.root_min && b > resume && b + 1 < n && !same) {
+                    cancelled = !feed(rest.begin(), rest.begin() + (b - resume), false);
+                    if (!cancelled) {
+                        e.save_root(std::vector<int>(r.ids.begin(), r.ids.begin() + b));
+                        std::fprintf(stderr, "ds41_serve: root checkpoint at %lld tokens\n", (long long) b);
+                        from = (size_t) (b - resume);
+                    }
+                }
+            }
+            const auto rb = rest.begin() + (std::ptrdiff_t) from;
+            const bool windows = (int) (rest.end() - rb) <= o.window_prompt_max;
+            if (cancelled) {
+            } else if (rest.end() - rb >= 2 && !s.snaps.empty()) {
                 // all but the last token, a snapshot, then the last token (one window)
-                cancelled = !feed(rest.begin(), rest.end() - 1, windows);
+                cancelled = !feed(rb, rest.end() - 1, windows);
                 if (!cancelled) {
                     s.save();
                     cancelled = !feed(rest.end() - 1, rest.end(), true);
                 }
             } else {
-                cancelled = !feed(rest.begin(), rest.end(), windows);
+                cancelled = !feed(rb, rest.end(), windows);
             }
             d.read = read;
             d.prompt_ms = now_ms() - r0;
@@ -436,42 +488,82 @@ int main(int argc, char** argv) {
             if (cancelled) {
                 d.finish = "cancel";
             } else {
-                int tok = r.greedy() ? greedy_next : sampler->pick(e.last_logits(), r, s.live, oc.seed, oc.counter++);
-                for (;;) {
-                    say("T %d", tok);
-                    oc.last = tok;
-                    ++d.generated;
-                    if (std::find(o.eos.begin(), o.eos.end(), tok) != o.eos.end()) {
-                        d.finish = "stop";
-                        break;
-                    }
-                    if (d.generated >= r.max_new) {
-                        d.finish = "length";
-                        break;
-                    }
-                    if (in.stop.load()) {
-                        d.finish = "cancel";
-                        break;
-                    }
-                    greedy_next = e.step(tok, e.position());
-                    s.live.push_back(tok);
+                auto add_timing = [&] {
                     const Engine::Timing& tm = e.last_timing();
                     d.hits += tm.expert_hits;
                     d.lookups += tm.expert_total;
                     d.ram += tm.ram_experts;
                     d.file += tm.file_experts;
                     d.offloaded += tm.zero_copy_experts();
+                };
+                // one output token: the T line, then whether the request ends there (stop, length)
+                auto emit = [&](int t) -> bool {
+                    say("T %d", t);
+                    oc.last = t;
+                    ++d.generated;
+                    if (std::find(o.eos.begin(), o.eos.end(), t) != o.eos.end()) {
+                        d.finish = "stop";
+                        return true;
+                    }
+                    if (d.generated >= r.max_new) {
+                        d.finish = "length";
+                        return true;
+                    }
+                    return false;
+                };
+                int tok = r.greedy() ? greedy_next : sampler->pick(e.last_logits(), r, s.live, oc.seed, oc.counter++);
+                bool ended = emit(tok);
+                while (!ended) {
+                    if (in.stop.load()) {
+                        d.finish = "cancel";
+                        break;
+                    }
+                    // tok is written and not fed. DSpark: a verify window of tok and up to 3 drafts, never past
+                    // max_new (the round writes at most k + 1 tokens) or the context
+                    const long long room = std::min<long long>(r.max_new - d.generated,
+                                                               (long long) o.max_context - e.position() - 2);
+                    if (o.dspark && r.greedy() && room >= 2 && (o.draft_k >= 0 || sched.want_draft())) {
+                        const double r0 = now_ms();
+                        const Engine::Draft dd = e.draft(tok);
+                        const int cap = (int) std::min<long long>(room - 1, kVerifyMaxTokens - 1);
+                        const int k = o.draft_k >= 0 ? std::min({o.draft_k, dd.n, cap})
+                                                     : sched.choose(dd.accept.data(), dd.n, cap);
+                        std::vector<int> window{tok};
+                        window.insert(window.end(), dd.tokens.begin(), dd.tokens.begin() + k);
+                        const double v0 = now_ms();
+                        const VerifyResult v = e.verify(window, e.position());
+                        const double verify_ms = now_ms() - v0;
+                        const int keep = round_keep(window, v.next, o.eos);
+                        e.commit(keep);
+                        s.live.insert(s.live.end(), window.begin(), window.begin() + keep);
+                        add_timing();
+                        sched.observe_round(k, verify_ms, now_ms() - r0, keep);
+                        if (k == 0) sched.observe_step(verify_ms);   // a one-row window costs about a step
+                        ++d_rounds;
+                        d_drafted += k;
+                        d_accepted += keep - 1;
+                        for (int i = 0; i < keep && !ended; ++i) {
+                            tok = v.next[(size_t) i];
+                            ended = emit(tok);
+                        }
+                        continue;
+                    }
+                    greedy_next = e.step(tok, e.position());
+                    s.live.push_back(tok);
+                    add_timing();
+                    if (o.dspark && r.greedy()) sched.observe_step(e.last_timing().total_ms);
                     tok = r.greedy() ? greedy_next : sampler->pick(e.last_logits(), r, s.live, oc.seed, oc.counter++);
+                    ended = emit(tok);
                 }
             }
             d.decode_ms = now_ms() - t0;
             say("%s", serve::done_line(d).c_str());
             std::fprintf(stderr,
                          "ds41_serve: prompt %lld (reused %lld, read %lld) %.0f ms, %lld out %.1f ms/token, "
-                         "VRAM hits %lld of %lld, %s\n",
+                         "VRAM hits %lld of %lld, %s; DSpark windows %lld, drafts %lld, accepted %lld\n",
                          n, d.reused, d.read, d.prompt_ms, d.generated,
                          d.generated > 1 ? d.decode_ms / (double) (d.generated - 1) : 0.0, d.hits, d.lookups,
-                         d.finish.c_str());
+                         d.finish.c_str(), d_rounds, d_drafted, d_accepted);
             std::fflush(stderr);
             oc.status = Outcome::kDone;
             oc.finish = d.finish;

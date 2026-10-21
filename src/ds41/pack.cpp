@@ -60,9 +60,12 @@ bool skip(const std::string& line) { return line.empty() || line[0] == '#'; }
 
 const char* kComp[12] = {"w1.trellis", "w1.suh", "w1.svh", "w1.mul1", "w3.trellis", "w3.suh",
                          "w3.svh",     "w3.mul1", "w2.trellis", "w2.suh", "w2.svh", "w2.mul1"};
+/// Mxfp4: the components in file order, and the ExpertSlot place each fills (pack.hpp)
+const char* kFp4Comp[6] = {"w1.weight", "w1.scale", "w3.weight", "w3.scale", "w2.weight", "w2.scale"};
+const int kFp4Place[6] = {0, 1, 4, 5, 8, 9};
 
 /// experts.txt or mtp_experts.txt: every (layer, expert) of n_layers x n_experts exactly once
-std::vector<ExpertSlot> read_expert_index(const std::string& path, int n_layers, int n_experts) {
+std::vector<ExpertSlot> read_expert_index(const std::string& path, int n_layers, int n_experts, ExpertFormat fmt) {
     std::vector<ExpertSlot> slots((size_t) n_layers * n_experts);
     std::vector<bool> seen(slots.size(), false);
     auto f = open_text(path);
@@ -74,16 +77,25 @@ std::vector<ExpertSlot> read_expert_index(const std::string& path, int n_layers,
         int l = 0, e = 0;
         ExpertSlot x;
         s >> l >> e >> x.offset >> x.bytes >> x.bits[0] >> x.bits[1] >> x.bits[2];
-        for (int c = 0; c < 12; ++c) {
+        const bool fp4 = fmt == ExpertFormat::Mxfp4;
+        for (int i = 0; i < (fp4 ? 6 : 12); ++i) {
             std::string item;
             s >> item;
             const auto a = item.find(':'), b = item.rfind(':');
-            if (a == std::string::npos || b <= a || item.substr(0, a) != kComp[c])
+            if (a == std::string::npos || b <= a || item.substr(0, a) != (fp4 ? kFp4Comp[i] : kComp[i]))
                 fail("bad component in " + name + ": " + item);
+            const int c = fp4 ? kFp4Place[i] : i;
             x.comp_off[c] = component_number(item.substr(a + 1, b - a - 1));
             x.comp_bytes[c] = component_number(item.substr(b + 1));
             if (!contains(x.bytes, x.comp_off[c], x.comp_bytes[c])) fail("component outside its slot: " + line);
         }
+        if (fp4)
+            for (int c0 = 0; c0 < 12; c0 += 4) {   // the scale in both scale places, nothing in the fourth
+                x.comp_off[c0 + 2] = x.comp_off[c0 + 1];
+                x.comp_bytes[c0 + 2] = x.comp_bytes[c0 + 1];
+                x.comp_off[c0 + 3] = x.comp_off[c0];
+                x.comp_bytes[c0 + 3] = 0;
+            }
         if (!s || l < 0 || l >= n_layers || e < 0 || e >= n_experts) fail("bad " + name + " line: " + line);
         // The tiers round slot sizes up to 4 KiB.
         if (x.bytes > std::numeric_limits<size_t>::max() - 4095)
@@ -115,8 +127,17 @@ Pack::Pack(const std::string& dir) : dir_(dir) {
         bool finished = false;
         while (std::getline(f, line)) {
             std::istringstream s(line);
+            s >> key;
+            if (key == "expert_format") {
+                std::string v;
+                s >> v;
+                if (v == "exl3") format_ = ExpertFormat::Exl3;
+                else if (v == "mxfp4") format_ = ExpertFormat::Mxfp4;
+                else fail("unknown expert_format '" + v + "' in pack_info.txt");
+                continue;
+            }
             long long v = 0;
-            s >> key >> v;
+            s >> v;
             if (key == "finished") finished = v == 1;
             if (key == "layers") n_layers_ = (int) v;
             if (key == "experts") n_experts_ = (int) v;
@@ -155,8 +176,8 @@ Pack::Pack(const std::string& dir) : dir_(dir) {
             dense_[t.name] = t;
         }
     }
-    experts_ = read_expert_index(dir + "/experts.txt", n_layers_, n_experts_);
-    if (mtp_stages_) mtp_ = read_expert_index(dir + "/mtp_experts.txt", mtp_stages_, mtp_experts_);
+    experts_ = read_expert_index(dir + "/experts.txt", n_layers_, n_experts_, format_);
+    if (mtp_stages_) mtp_ = read_expert_index(dir + "/mtp_experts.txt", mtp_stages_, mtp_experts_, format_);
     {
         auto f = open_text(dir + "/engram.txt");
         std::string line;
@@ -238,9 +259,19 @@ Pack::Pack(const std::string& dir) : dir_(dir) {
         if (dense(n).shape != shape) fail(std::string("unexpected shape for ") + n);
     };
     expect("embed.weight", {kVocab, kDim});
-    expect("head.weight", {kVocab, kDim});
-    expect("layers.0.attn.wq_b.weight", {kHeads * kHeadDim, kQLora});
-    expect("layers.0.attn.wo_a.weight", {kOGroups * kOLora, kHeads * kHeadDim / kOGroups});
+    // an EXL3 pack's dense tensors: trellis [k/16][n/16][16K], wo_a in one slice per group of heads
+    auto expect_exl3 = [&](const char* n, int64_t k, int64_t out) {
+        const auto& t = dense(n).shape;
+        if (t.size() != 3 || t[0] != k / 16 || t[1] != out / 16) fail(std::string("unexpected shape for ") + n);
+    };
+    if (has_dense("head.trellis")) expect_exl3("head.trellis", kDim, kVocab);
+    else expect("head.weight", {kVocab, kDim});
+    if (has_dense("layers.0.attn.wq_b.trellis")) expect_exl3("layers.0.attn.wq_b.trellis", kQLora, kHeads * kHeadDim);
+    else expect("layers.0.attn.wq_b.weight", {kHeads * kHeadDim, kQLora});
+    if (has_dense("layers.0.attn.wo_a.slice.0.trellis"))
+        expect_exl3("layers.0.attn.wo_a.slice.0.trellis", kHeads * kHeadDim / kOGroups, kOLora);
+    else
+        expect("layers.0.attn.wo_a.weight", {kOGroups * kOLora, kHeads * kHeadDim / kOGroups});
     expect("layers.0.hc_attn_fn", {kHcMix, kHc * kDim});
 }
 

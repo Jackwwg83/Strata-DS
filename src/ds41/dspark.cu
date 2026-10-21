@@ -6,6 +6,27 @@
 // Drafts only choose what a verify window checks: nothing here changes the output.
 namespace dsk = strata::ds41::dspark;
 
+namespace {
+/// the descriptor of a DSpark expert of layout x whose bytes start at dst (a VRAM slot or the mapped RAM copy)
+kernels::Exl3Expert mtp_desc(const ExpertSlot& x, const uint8_t* dst) {
+    auto proj = [&](int c0, int k, int nn) {
+        kernels::Exl3Proj p;
+        p.trellis = (const uint16_t*) (dst + x.comp_off[c0]);
+        p.suh = (const __half*) (dst + x.comp_off[c0 + 1]);
+        p.svh = (const __half*) (dst + x.comp_off[c0 + 2]);
+        p.k = k;
+        p.n = nn;
+        p.tile_w = (int) (x.comp_bytes[c0] / ((uint64_t) (k / 16) * (nn / 16) * 2));
+        return p;
+    };
+    kernels::Exl3Expert d;
+    d.w1 = proj(0, kDim, kMoeInter);
+    d.w3 = proj(4, kDim, kMoeInter);
+    d.w2 = proj(8, kMoeInter, kDim);
+    return d;
+}
+}  // namespace
+
 struct Engine::Impl::Dspark {
     static constexpr int B = dsk::kBlock;
     static constexpr int kHid = dsk::kTargets * kDim;   // 15360: the three target layers' means, concatenated
@@ -41,6 +62,7 @@ struct Engine::Impl::Dspark {
     std::vector<int64_t> uses = std::vector<int64_t>(dsk::kStages * dsk::kExperts, 0);
     std::unique_ptr<ExpertDoorbell> db;
     int64_t moe[dsk::kStages] = {-1, -1, -1};
+    ExpertFormat fmt = ExpertFormat::Exl3;   ///< the pack's: moe[] are its CPU kernel's layers
     // the VRAM set (DS41_DSPARK_VRAM_MB): DSpark's hottest experts in VRAM slots, computed by K10 on the GPU, the
     // others by the CPU. Scores decay per draft; before a draft the hottest expert outside VRAM replaces the coldest
     // inside (copied from the RAM copy, registered for DMA)
@@ -54,13 +76,15 @@ struct Engine::Impl::Dspark {
     std::vector<float> score = std::vector<float>(dsk::kStages * dsk::kExperts, 0.0f);
     void* vws = nullptr;                        // K10 workspace
     const void* registered = nullptr;
+    /// unified memory: every expert is computed by the GPU in place, from the mapped RAM copy (no slots, no swaps)
+    bool in_place = false;
     int last_hits = 0, last_uses = 0;
     std::map<int, cudaGraphExec_t> graphs;   // by pending rows (0..kVerifyMaxTokens)
     bool warmed = false;
     ~Dspark() {
         for (auto& [k, e] : graphs) cudaGraphExecDestroy(e);
         for (int64_t hnd : moe)
-            if (hnd >= 0) exl3_moe_cpu_free_layer(hnd);
+            if (hnd >= 0) cpu_free_layer(fmt, hnd);
         if (!profile_path.empty())
             if (std::FILE* f = std::fopen(profile_path.c_str(), "w")) {
                 std::fprintf(f, "# ds41 DSpark routes: stage expert uses\n");
@@ -109,25 +133,14 @@ void Engine::Impl::dspark_init() {
         y.sh_w2 = fp8(p + "ffn.shared_experts.w2");
         y.sh_w3 = fp8(p + "ffn.shared_experts.w3");
         y.window = d.alloc<bf16>((size_t) kWindow * kHeadDim);
-        std::vector<MoeCpuMatrixDesc> gate(dsk::kExperts), up(dsk::kExperts), down(dsk::kExperts);
-        const uint8_t* base = pack.mtp_expert_base();
+        std::vector<const ExpertSlot*> slots(dsk::kExperts);
+        std::vector<const uint8_t*> bytes(dsk::kExperts);
         for (int e = 0; e < dsk::kExperts; ++e) {
-            const auto& x = pack.mtp_expert(s, e);
-            auto desc = [&](int c0, int k_tiles, int n_tiles) {
-                MoeCpuMatrixDesc m;
-                m.trellis = (const uint16_t*) (base + x.offset + x.comp_off[c0]);
-                m.suh = (const at::Half*) (base + x.offset + x.comp_off[c0 + 1]);
-                m.svh = (const at::Half*) (base + x.offset + x.comp_off[c0 + 2]);
-                m.k_tiles = k_tiles;
-                m.n_tiles = n_tiles;
-                m.tile_w = (int) (x.comp_bytes[c0] / ((uint64_t) k_tiles * n_tiles * 2));
-                return m;
-            };
-            gate[e] = desc(0, kDim / 16, kMoeInter / 16);
-            up[e] = desc(4, kDim / 16, kMoeInter / 16);
-            down[e] = desc(8, kMoeInter / 16, kDim / 16);
+            slots[e] = &pack.mtp_expert(s, e);
+            bytes[e] = pack.mtp_expert_base() + slots[e]->offset;
         }
-        d.moe[s] = exl3_moe_cpu_make_layer_raw(gate.data(), up.data(), down.data(), dsk::kExperts, 0, kSwigluLimit, 0);
+        d.fmt = pack.expert_format();
+        d.moe[s] = cpu_make_layer(d.fmt, slots.data(), bytes.data(), dsk::kExperts, kSwigluLimit);
     }
     d.main_proj = fp8("mtp.0.main_proj");
     if (d.main_proj.k != Dspark::kHid || d.main_proj.n != kDim) throw std::runtime_error("ds41 dspark: main_proj shape");
@@ -182,6 +195,38 @@ void Engine::Impl::dspark_init() {
         d.vslots = (int) std::min<size_t>((mb << 20) / d.vslot_bytes, dsk::kStages * dsk::kExperts);
     }
     d.vres_host.assign(dsk::kStages * dsk::kExperts, -1);
+    if (uma && !std::getenv("DS41_DSPARK_VRAM_MB")) {   // unified memory: the GPU reads the RAM copy at memory speed
+        const uint64_t bytes = pack.load_mtp_experts();
+        void* base = (void*) pack.mtp_expert_base();
+        void* alias = nullptr;
+        if (cudaHostRegister(base, bytes, cudaHostRegisterMapped | cudaHostRegisterPortable) == cudaSuccess) {
+            d.registered = base;
+            if (cudaHostGetDevicePointer(&alias, base, 0) != cudaSuccess) alias = nullptr;
+        }
+        cudaGetLastError();
+        if (alias) {
+            const int n = dsk::kStages * dsk::kExperts;
+            std::vector<kernels::Exl3Expert> desc(n);
+            for (int i = 0; i < n; ++i) {
+                const auto& x = pack.mtp_expert(i / dsk::kExperts, i % dsk::kExperts);
+                desc[i] = mtp_desc(x, (const uint8_t*) alias + x.offset);
+                d.vres_host[i] = i;
+            }
+            d.in_place = true;
+            d.vslots = n;
+            d.vowner.resize(n);
+            for (int i = 0; i < n; ++i) d.vowner[i] = i;
+            d.vdesc = d.alloc<kernels::Exl3Expert>(n);
+            d.vres = d.alloc<int32_t>(n);
+            d.vws = d.alloc<uint8_t>(VramExperts::kWorkspaceBytes);
+            ck(cudaMemcpy(d.vdesc, desc.data(), n * sizeof(desc[0]), cudaMemcpyHostToDevice), "dspark descriptors");
+            ck(cudaMemcpy(d.vres, d.vres_host.data(), n * sizeof(int32_t), cudaMemcpyHostToDevice), "dspark table");
+            std::fprintf(stderr, "ds41: DSpark: all %d experts computed by the GPU in place (%.2f GiB, mapped)\n", n,
+                         bytes / (double) (1ull << 30));
+            return;
+        }
+        std::fprintf(stderr, "ds41: DSpark: the RAM copy could not be mapped; the CPU computes its experts\n");
+    }
     if (d.vslots > 0) {
         d.varena = d.alloc<uint8_t>((size_t) d.vslots * d.vslot_bytes);
         d.vdesc = d.alloc<kernels::Exl3Expert>(d.vslots);
@@ -205,7 +250,7 @@ void Engine::Impl::dspark_init() {
 void Engine::Impl::dspark_vram_update() {
     auto& d = *ds;
     const int n = dsk::kStages * dsk::kExperts;
-    if (d.vslots == 0) return;
+    if (d.vslots == 0 || d.in_place) return;
     int free_n = 0;
     for (int o : d.vowner) free_n += o < 0;
     int budget = free_n > 0 ? 8 : 2;
@@ -231,20 +276,7 @@ void Engine::Impl::dspark_vram_update() {
         ck(cudaMemcpy(dst, pack.mtp_expert_base() + x.offset, x.bytes, cudaMemcpyHostToDevice), "dspark vram copy");
         d.vowner[slot] = hot;
         d.vres_host[hot] = slot;
-        auto proj = [&](int c0, int k, int nn) {
-            kernels::Exl3Proj p;
-            p.trellis = (const uint16_t*) (dst + x.comp_off[c0]);
-            p.suh = (const __half*) (dst + x.comp_off[c0 + 1]);
-            p.svh = (const __half*) (dst + x.comp_off[c0 + 2]);
-            p.k = k;
-            p.n = nn;
-            p.tile_w = (int) (x.comp_bytes[c0] / ((uint64_t) (k / 16) * (nn / 16) * 2));
-            return p;
-        };
-        kernels::Exl3Expert desc;
-        desc.w1 = proj(0, kDim, kMoeInter);
-        desc.w3 = proj(4, kDim, kMoeInter);
-        desc.w2 = proj(8, kMoeInter, kDim);
+        const kernels::Exl3Expert desc = mtp_desc(x, dst);
         ck(cudaMemcpy(d.vdesc + slot, &desc, sizeof desc, cudaMemcpyHostToDevice), "dspark vram descriptor");
         changed = true;
     }
@@ -359,8 +391,8 @@ void Engine::Impl::enqueue_draft(int n_pend) {
         lin(d.sh_h, y.sh_w2, d.sh_out);
         ck(cudaMemsetAsync(d.routed, 0, B * kDim * sizeof(float), st), "dspark routed");
         if (d.vslots)
-            kernels::exl3_moe_decode((const __half*) d.half, B, d.sel, d.weights, dsk::kTopK, d.db->gpu_experts(),
-                                     d.routed, d.vws, VramExperts::kWorkspaceBytes, st);
+            routed_moe_decode(d.fmt, (const __half*) d.half, B, d.sel, d.weights, dsk::kTopK, d.db->gpu_experts(),
+                              d.routed, d.vws, VramExperts::kWorkspaceBytes, st);
         d.db->wait_add(d.routed, B, (uint32_t) (s + 1), st);
         ops::add_f32_bf16(d.routed, d.sh_out, d.ffn_out, B * kDim, st);
         ops::hc_post(d.ffn_out, d.h2, d.fpost, d.fcomb, d.h, B, st);
@@ -369,7 +401,7 @@ void Engine::Impl::enqueue_draft(int n_pend) {
     // forward_head: the collapse (its pre-norm rows feed the confidence head), norm, the backbone's head
     ops::hc_pre(d.h, d.mix, d.xfin, B, st);
     ops::rmsnorm(d.xfin, d.norm, d.xn, kDim, kNormEps, B, st);
-    ops::bf16_linear_rows(d.xn, B, head, kDim, kVocab, d.logits, st);
+    head_logits(d.xn, B, d.logits, st);
     for (int i = 0; i < B; ++i) {   // draft i: the Markov bias of the token before it, then the greedy pick
         dsk::markov_bias(i == 0 ? d.prm : d.out + i - 1, d.m_embed, d.m_head, kVocab, d.logits + (size_t) i * kVocab,
                          d.memb + i * dsk::kMarkovRank, st);
@@ -385,21 +417,15 @@ void Engine::Impl::enqueue_draft(int n_pend) {
 /// The decode worker's DSpark job: per stage, when the GPU publishes it, the block's routed experts from RAM.
 void Engine::Impl::run_dspark_job(ExpertDoorbell* d, int m) {
     try {
-        exl3_moe_cpu_pool_prime(cpu_threads);
+        cpu_pool_prime(ds->fmt, cpu_threads);
     } catch (...) {
     }
     for (int s = 0; s < dsk::kStages; ++s) {
         if (!d->wait_published((uint32_t) (s + 1), job_cancel)) return;
-        c10::Half wh[Dspark::B * dsk::kTopK];
-        for (int i = 0; i < m * dsk::kTopK; ++i) {
-            const __half hv = __float2half_rn(d->w()[i]);
-            wh[i] = c10::Half(__half_as_ushort(hv), c10::Half::from_bits());
-        }
         const double t0 = now_ms();
         try {
             if (fault("dspark")) throw std::runtime_error("ds41 test fault: DSpark experts");
-            exl3_moe_cpu_forward_raw(ds->moe[s], (const at::Half*) d->x(), d->ids(), wh, d->y(), m, dsk::kTopK,
-                                     cpu_threads);
+            cpu_forward(ds->fmt, ds->moe[s], d->x(), d->ids(), d->w(), d->y(), m, dsk::kTopK, cpu_threads);
         } catch (...) {
             std::fill_n(d->y(), (size_t) m * kDim, 0.0f);
             std::lock_guard<std::mutex> lk(mu);

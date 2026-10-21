@@ -141,6 +141,14 @@ public:
     /// position are still the ones fed when it was saved. Refused when the slot is empty or past position(). A pending
     /// verify window is dropped. The slot stays valid.
     int restore_snapshot(int slot);
+    /// The root checkpoint (ds41_serve: the end of a long system prompt, which new conversations share): the whole state
+    /// at position() - the snapshot's state and the attention caches up to there - copied aside, sized to the position.
+    /// It survives reset() and other conversations; a new save_root replaces it. Throws on a pending verify window.
+    /// tokens: the tokens fed so far (the caller's record, returned by root_tokens()).
+    void save_root(const std::vector<int>& tokens);
+    /// Back to the root: position() becomes its position and the tokens before it are root_tokens(). Throws without one.
+    int restore_root();
+    const std::vector<int>& root_tokens() const;
     int snapshot_slots() const;
 
     /// Concurrent requests. A request is read in the main session (prefill, step, verify), then copied into a slot.
@@ -174,6 +182,7 @@ public:
         /// the CPU's experts by tier: from the RAM copy, from the mapped file, and of those, the ones with pages
         /// missing from RAM when computed (read from the SSD)
         int ram_experts = 0, file_experts = 0, ssd_experts = 0;
+        int late_experts = 0;   ///< of the CPU's experts, the uses the GPU computed after the CPU read them (gpu_misses)
         int warmed = 0, warmed_useful = 0;   ///< lookahead: file-tier experts warmed, and of those, used next layer
         int prefetched = 0;   ///< misses the GPU computed from the prefetch buffer (DS41_PREFETCH), in zero_copy_experts()
         int skipped = 0;      ///< uses left out by the route tail skip (DS41_ROUTE_TAIL_SKIP), outside VRAM hits

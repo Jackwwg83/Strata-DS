@@ -9,6 +9,7 @@
 
 #include <algorithm>
 #include <cstdio>
+#include <cstdlib>
 #include <cstring>
 #include <fstream>
 #include <iterator>
@@ -34,6 +35,45 @@ void unmap_pack_pages(const Pack& pack) {
 }
 
 }  // namespace
+
+uint64_t uma_free_bytes(uint64_t cuda_free, uint64_t mem_available, uint64_t headroom) {
+    return mem_available > headroom && mem_available - headroom > cuda_free ? mem_available - headroom : cuda_free;
+}
+
+uint64_t uma_headroom_bytes() {
+    // STRATA_UMA_HEADROOM_GIB: a whole number of GiB, 0..1024; anything else keeps the default 6 (said once)
+    static const long gib = [] {
+        const char* h = std::getenv("STRATA_UMA_HEADROOM_GIB");
+        if (h == nullptr) return 6L;
+        char* end = nullptr;
+        const long v = std::strtol(h, &end, 10);
+        if (end != h && *end == '\0' && v >= 0 && v <= 1024) return v;
+        std::fprintf(stderr, "ds41: STRATA_UMA_HEADROOM_GIB=%s is not a whole number of GiB (0-1024): using 6\n", h);
+        return 6L;
+    }();
+    return (uint64_t) gib << 30;
+}
+
+uint64_t ram_tier_headroom(bool adaptive, bool unified, uint64_t uma_headroom) {
+    return (adaptive ? 8ull << 30 : 24ull << 30) + (unified ? uma_headroom : 0);
+}
+
+size_t device_free_bytes() {
+    size_t free_b = 0, total_b = 0;
+    ck(cudaMemGetInfo(&free_b, &total_b), "cudaMemGetInfo");
+    int dev = 0, integrated = 0;
+    if (cudaGetDevice(&dev) != cudaSuccess ||
+        cudaDeviceGetAttribute(&integrated, cudaDevAttrIntegrated, dev) != cudaSuccess || !integrated)
+        return free_b;
+    unsigned long long kb = 0;
+    if (std::FILE* m = std::fopen("/proc/meminfo", "r")) {
+        char line[256];
+        while (std::fgets(line, sizeof line, m))
+            if (std::sscanf(line, "MemAvailable: %llu kB", &kb) == 1) break;
+        std::fclose(m);
+    }
+    return (size_t) uma_free_bytes(free_b, (uint64_t) kb << 10, uma_headroom_bytes());
+}
 
 std::vector<std::pair<int, int>> read_expert_profile(const std::string& path, int n_layers, int n_experts) {
     std::ifstream f(path, std::ios::binary);
@@ -115,8 +155,7 @@ VramExperts::VramExperts(const Pack& pack, const std::string& profile_path, int6
         if (n_slots != 0 && !profile_path.empty()) {
             const auto ranked = read_expert_profile(profile_path, L, E);
             if (n_slots < 0) {   // by bytes, in rank order, up to the first that does not fit (upstream)
-                size_t free_b = 0, total_b = 0;
-                ck(cudaMemGetInfo(&free_b, &total_b), "cudaMemGetInfo");
+                const size_t free_b = device_free_bytes();
                 const size_t descs = (size_t) L * E * sizeof(kernels::Exl3Expert);
                 const size_t room = free_b > reserve_bytes + descs ? free_b - reserve_bytes - descs : 0;
                 size_t used = 0;

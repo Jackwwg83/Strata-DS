@@ -2,7 +2,9 @@
 
 This page is written for an AI coding assistant (Claude Code, Cursor, Codex, GitHub Copilot, ...) that a user asked to
 set up Strata on their PC. Strata runs the Qwen3.8-Flash-Next model locally on one NVIDIA or AMD graphics card plus
-system RAM. DeepSeek V4.1 Flash SAGE 1.59bpw also runs on Linux + NVIDIA. Strata serves an OpenAI- and
+system RAM. This fork (Strata-DS) also runs DeepSeek V4.1 Flash on Linux + NVIDIA, with two recipes: SAGE 1.59bpw on
+a PC or laptop ([DEEPSEEK_LAPTOP.md](DEEPSEEK_LAPTOP.md)) and the 1017 release with LibertAI's EXL3 2.9bpw on a DGX
+Spark ([DEEPSEEK_SPARK.md](DEEPSEEK_SPARK.md)). Strata serves an OpenAI- and
 Anthropic-compatible API on `http://127.0.0.1:8080`. The human-oriented version of everything below is [INSTALL.md](INSTALL.md).
 
 Work through the steps in order. Tell the user what you are doing in plain words; they may not be technical.
@@ -14,7 +16,8 @@ Work through the steps in order. Tell the user what you are doing in plain words
   user the key. Never put a tunnel or port forward in front of a server without a key.
 - Do not change the user's system beyond what setup does (setup installs Python for the user account if needed,
   and everything else inside the Strata folder and its `Strata-data` folder). Ask before installing drivers.
-- The model download is ~70 GB (94 GB for Unsloth's UD-IQ4_XS, 111 GB for UD-Q4_K_XL, 341.8 GB for DeepSeek).
+- The model download is ~70 GB (94 GB for Unsloth's UD-IQ4_XS, 111 GB for UD-Q4_K_XL, 341.8 GB for DeepSeek on a PC,
+  414.8 GB for DeepSeek on a DGX Spark).
   Confirm the user is fine with that before you start, especially on a metered connection.
 - Setup is long-running (an hour or more on a slow connection). Run it in the background or with a long timeout and
   poll its output; do not kill it because it is quiet for a while. It is resumable: running the same command again
@@ -52,9 +55,15 @@ Requirements (details: [INSTALL.md](INSTALL.md#what-you-need)):
 - **RAM:** 32 GB or more (see step 3). **Disk:** ~80 GB free, ideally on an NVMe SSD. **CPU:** x86-64 with AVX2. Without AVX2 (Xeon E5 v1/v2 and older) setup still installs, as an experimental and slow build it compiles on the PC (10-20 minutes): tell the user that before starting ([INSTALL.md](INSTALL.md#older-cpus-experimental)).
 - **OS:** Windows 10/11 or Linux (Ubuntu 22.04/24.04 are fully automatic).
 
-These are the Qwen requirements. DeepSeek needs Linux, one NVIDIA GPU with at least 16 GB VRAM and compute
-capability 8.6 or higher, and about 462 GB free disk space. A 128 GB PC is recommended. Below 120 GiB usable RAM,
-setup warns that the model is not tested and may be slow. `--family deepseek --yes` accepts that risk explicitly.
+These are the Qwen requirements. DeepSeek needs Linux and one NVIDIA GPU with compute capability 8.6 or higher:
+
+- **A PC or laptop:** at least 16 GB VRAM (24 GB tested) and about 462 GB free disk space. A 128 GB PC is
+  recommended; a 64 GB laptop with a 24 GB GPU is measured ([DEEPSEEK_LAPTOP.md](DEEPSEEK_LAPTOP.md)). Below 120 GiB
+  usable RAM, setup warns that the model is not tested and may be slow. `--family deepseek --yes` accepts that risk
+  explicitly.
+- **A DGX Spark** (GB10, 128 GB unified memory; nvidia-smi shows its memory as `[N/A]`): about 625 GB free disk
+  space. Setup picks the Spark recipe by itself ([DEEPSEEK_SPARK.md](DEEPSEEK_SPARK.md)).
+
 Windows, AMD and Mac are not supported for DeepSeek. Run `./setup.sh --family deepseek --check` first.
 
 If the PC does not meet the selected model's requirements, say which part is missing.
@@ -62,10 +71,11 @@ If the PC does not meet the selected model's requirements, say which part is mis
 ## 2. Get Strata
 
 ```
-git clone https://github.com/Niko1221/Strata.git
+git clone https://github.com/Jackwwg83/Strata-DS.git
 ```
 
-Without git: download https://github.com/Niko1221/Strata/archive/refs/heads/main.zip and unzip it. Pick a drive with
+DeepSeek is only in this fork. For Qwen alone, upstream works the same: `git clone https://github.com/Niko1221/Strata.git`.
+Without git: download https://github.com/Jackwwg83/Strata-DS/archive/refs/heads/main.zip and unzip it. Pick a drive with
 enough free space: the model files go to a `Strata-data` folder **next to** the Strata folder (or `--data-dir <path>`
 on another drive).
 
@@ -80,11 +90,12 @@ By the PC's RAM (ask the user whether they mainly want it for code - then the Co
 | 64 GB | `--family qwen --model IQ2_XS` (recommended) | `IQ3_XXS` / `IQ3_S` are slower and a bit better |
 | 96 GB+ | `--family qwen --model IQ3_S` | `--family unsloth --model UD-IQ4_XS` (~4-bit, 94 GB, part of the experts read from the SSD under ~80 GB of RAM); `--model UD-Q4_K_XL` is experimental: NVIDIA only, NVMe SSD, 7-8.5 tokens/s on 64 GB |
 
-DeepSeek is an explicit choice. Setup never selects it by default:
+DeepSeek is an explicit choice. Setup never selects it by default. `--family deepseek` picks the recipe by the GPU:
 
-| RAM | `--family` / `--model` | Notes |
+| Machine | `--family` / `--model` | Notes |
 | --- | --- | --- |
-| 128 GB recommended | `--family deepseek --model SAGE-1.59BPW` | Linux + NVIDIA only; 341.8 GB download plus about 120 GB pack; about 462 GB disk in total |
+| PC or laptop, NVIDIA 24 GB, 64-128 GB RAM | `--family deepseek` (= `--model SAGE-1.59BPW`) | 341.8 GB download plus about 120 GB pack; about 462 GB disk in total; 30-39 tokens/s on an RTX 5090 Laptop with 64 GB ([DEEPSEEK_LAPTOP.md](DEEPSEEK_LAPTOP.md)) |
+| DGX Spark (GB10) | `--family deepseek` (= `--model 1017-EXL3-2.9BPW`) | DeepSeek V4.1 Flash 1017; 414.8 GB download plus 210.2 GB pack; about 625 GB disk; 30.8 tokens/s over a coding-agent session, 256K context by default ([DEEPSEEK_SPARK.md](DEEPSEEK_SPARK.md)) |
 
 Measured on Linux with about 120 GiB of usable RAM (a 128 GB PC), 2026-10-07: an RTX 5090 (PCIe 5.0) writes 26-32
 tokens/s, an RTX 3090 (PCIe 4.0) 16-17 tokens/s; a 2000-token prompt took 13.4 s on the RTX 3090 PC, a short chat
@@ -110,12 +121,12 @@ The flags (all of them: `START-HERE.bat --help`):
 | --- | --- |
 | `--yes` | take the recommended answer to every question (no prompts) |
 | `--family qwen\|swift\|coder\|unsloth\|deepseek` | the model version |
-| `--model Q2_0\|IQ2_XS\|IQ3_XXS\|IQ3_S\|IQ1_M\|UD-IQ4_XS\|UD-Q4_K_XL\|SAGE-1.59BPW` | the size (the Coder is IQ1_M, Unsloth UD-IQ4_XS or UD-Q4_K_XL) |
-| `--context N` | context in tokens; default by VRAM: 32768 under 14 GB, 65536 under 20 GB, else 131072. DeepSeek: default 32768, maximum 262144; no RoPE extension |
+| `--model Q2_0\|IQ2_XS\|IQ3_XXS\|IQ3_S\|IQ1_M\|UD-IQ4_XS\|UD-Q4_K_XL\|SAGE-1.59BPW\|1017-EXL3-2.9BPW` | the size (the Coder is IQ1_M, Unsloth UD-IQ4_XS or UD-Q4_K_XL, DeepSeek SAGE-1.59BPW or, on a DGX Spark, 1017-EXL3-2.9BPW) |
+| `--context N` | context in tokens; default by VRAM: 32768 under 14 GB, 65536 under 20 GB, else 131072. DeepSeek: default 32768 (DGX Spark: 262144), maximum 262144; no RoPE extension |
 | `--vision yes\|no\|gpu\|cpu` | read pictures; `--yes` leaves images off. AMD cards: `cpu` |
 | `--gpu N` / `--gpus 0,1` / `--gpus all` | one card, or several sharing the model (default: the card with the most VRAM) |
 | `--backend cuda\|hip` | NVIDIA or AMD engine; chosen by itself on a PC with only one kind of card |
-| `--data-dir PATH` | where the model files and packs go (DeepSeek: about 462 GB total) |
+| `--data-dir PATH` | where the model files and packs go (DeepSeek: about 462 GB total, on a DGX Spark about 625 GB) |
 | `--models-dir PATH` | source files go in a model subfolder here; packs stay under `--data-dir` |
 | `--resident-budget-gib N` | DeepSeek: pass `--ram-budget-gib N` to the engine; omit it to use the engine default. Unsloth: limit resident experts |
 | `--port N` | the server port (default 8080) |
@@ -124,10 +135,11 @@ The flags (all of them: `START-HERE.bat --help`):
 | `--setup` | install another model or change settings of an installed one |
 | `--check` | only check the PC |
 
-DeepSeek example (the model flag is optional because SAGE is its only size):
+DeepSeek examples (the model flag is optional: setup picks the recipe by the GPU):
 
 ```sh
-./setup.sh --yes --family deepseek --context 32768 --vision no --no-browser --no-start
+./setup.sh --yes --family deepseek --context 32768 --vision no --no-browser --no-start   # a PC or laptop
+./setup.sh --setup --yes --family deepseek --no-start                                    # a DGX Spark (256K)
 ```
 
 DeepSeek skips Qwen's GGUF conversion, PLE, MTP draft layer, speed projection, low-RAM mode, KV precision and
@@ -155,7 +167,12 @@ Notes:
 
 ## 5. While it downloads, tell the user
 
-For DeepSeek, setup uses `vcruz305/DSV4.1-Flash-SAGE-EXL3-1.59bpw` at commit
+On a DGX Spark, setup downloads `LibertAIDAI/DeepSeek-V4.1-Flash-1017-EXL3-2.9bpw` (all 43 shards, 210.7 GB) and,
+of `deepseek-ai/DeepSeek-V4.1-Flash-1017`, the two Engram shards (203.1 GB) and 1.0 GB of single tensors by HTTP
+range, both at pinned revisions. It merges them into one index and packs them (210.2 GB). Keep the downloaded files:
+the engine reads the two Engram shards in place.
+
+On a PC, setup uses `vcruz305/DSV4.1-Flash-SAGE-EXL3-1.59bpw` at commit
 `eca94a388a70841858feed8f057a9862e897aba4`. It downloads root `*.json`, `tokenizer*` and the 17
 `model-*.safetensors` shards. It skips `README.md` and `exllamav3/`. It does not fall back to another revision.
 Downloads resume and keep `.done` marks.
@@ -178,7 +195,8 @@ The following download and startup sizes apply to Qwen:
 ## 6. Start the server
 
 Setup prints the start script it wrote (`start script: run-<model>.bat`). The name is the family tag plus the size,
-lower case: `run-iq2_xs`, `run-swift-iq2_xs`, `run-coder-iq1_m`, `run-unsloth-ud-iq4_xs`, `run-deepseek-sage-1.59bpw`.
+lower case: `run-iq2_xs`, `run-swift-iq2_xs`, `run-coder-iq1_m`, `run-unsloth-ud-iq4_xs`, `run-deepseek-sage-1.59bpw`,
+`run-deepseek-1017-exl3-2.9bpw` (DGX Spark).
 
 ```
 Windows (PowerShell):  Start-Process -FilePath ".\run-iq2_xs.bat"            (opens its own window)

@@ -1,0 +1,17 @@
+# sha256 of the pack a fresh setup wrote (2026-10-18, DGX Spark), and whether it is byte for byte the measured pack (pack-1017-exl3h). engram.txt and pack_info.txt hold absolute paths: only those differ.
+8be45ce0476004a3f529fd896115a4a2e800a129ad2d3ec05b16050f52e21879 same 3311 config.json
+7320c08ac95dc48f9f9835f31f941c6dcecbe3545efc538a46475354f07e08a7 same 7225067264 dense.bin
+a55179fea918e66a331ac4cc1bdf9a0b947117dd6478f74d470de2a7e42a5c49 same 1303 engram_hash.txt
+c60a86322ec17b4142bfef3c57a8d81fb428550cdf487f88a4320cb59fe46481 same 517120 engram_tokenmap.bin
+c7ede3abde52b29aff73beb00d68efe2f420e7ac5e45aadb82b39c0806fb90f2 DIFF 339 engram.txt
+fda074a7deb4a93667007c693f95e71da7e476a3e26d003ff7b6eb7c41f22b4f same 196104683520 experts.bin
+b7f7d0f209948948e1d5c813585278e8067fbb0be0cad85b6ac8dfc770fa8de5 same 4429976 experts.txt
+334e75e7ebe76c3285200abfa77d58eed3f80d9c340c799aedb06237b82bbc27 same 149179 index.txt
+542c647b3a8d656717cccc9a3ba6f87b71225d7bcc0572e89e8ccd703fe9b3d5 same 6813646848 mtp_experts.bin
+cc8b0ca99332b769e9098784b2a2cacaafb1975e6a12cf2a12f46566618b6cd9 same 111486 mtp_experts.txt
+79faff9ac1a0377e41cf1825164243440b17ee26f3a61bb52e88b504b8d48400 DIFF 268 pack_info.txt
+6ac8c8dc065ed118161d02dd532749ae3f52c243deac27872134fae2f50d8547 same 801 tokenizer_config.json
+c90dfa01249db1be4245780a052ede752e1361c612ac6d08e2bdada7d599476b same 6367257 tokenizer.json
+
+# the clone: 905516d setup: the DGX Spark DeepSeek recipe (--family deepseek on a GB10)
+# second run (after git pull to 6ac0a67 ): nothing downloaded or packed again, 0.7 s

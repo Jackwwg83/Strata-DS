@@ -127,6 +127,10 @@ void Engine::Impl::enqueue_verify(int m) {
         ck(cudaMemcpyAsync(dst, src, bytes, cudaMemcpyDeviceToDevice, st), "verify copy");
     };
     auto linear_on = [&](const bf16* x, const Fp8& w, bf16* out, float* act, cudaStream_t s) {
+        if (w.x3) {
+            w.x3->run(x, (int)w.k, out, (int)w.n, m, s);
+            return;
+        }
         fp8_quantize_activation_f32((const uint16_t*)x, m, w.k, act, s);
         fp8_block_gemv_q(act, m, w.k, w.w, w.s, w.n, (uint16_t*)out, s);
     };
@@ -266,10 +270,11 @@ void Engine::Impl::enqueue_verify(int m) {
                 kernels::sparse_attn_decode(qt, s.ring, nullptr, idx, 1, kWindow, y.sink,
                                             float(std::pow(kHeadDim,-0.5)), ot, st);
             ops::rope_device(ot, kHeads, kHeadDim, rope, p+1, 0, true, st);
-            if (!y.wo_a8.w) ops::wo_a_grouped(ot, y.wo_a, v.oa+t*kOGroups*kOLora, st);
+            if (!y.wo_a8.w && !y.wo_a3) ops::wo_a_grouped(ot, y.wo_a, v.oa+t*kOGroups*kOLora, st);
         }
         // every row at once, the weight read once (each row as wo_a_grouped_fp8 computes it)
         if (y.wo_a8.w) wo_a_grouped_fp8_rows(v.o, m, y.wo_a8.w, y.wo_a8.s, v.oa, st);
+        if (y.wo_a3) y.wo_a3->run(v.o, kHeads*kHeadDim, v.oa, kOGroups*kOLora, m, st);
         linear(v.oa, y.wo_b, v.attn_out);
         ops::hc_post(v.attn_out, v.h, v.apost, v.acomb, v.h2, m, st);
         kernels::hc_mixes_pre(v.h2, m, y.hc_ffn_fn, y.hc_ffn_scale, y.hc_ffn_base, v.apre,
@@ -305,9 +310,14 @@ void Engine::Impl::enqueue_verify(int m) {
         ck(cudaMemsetAsync(v.routed, 0, m*kDim*sizeof(float), st), "verify routed");
         if (pf && l > 0) prefetch->join(l, st);   // the GPU computes the prefetched experts below
         if (tier || ram)
-            kernels::exl3_moe_decode((const __half*)v.half, m, v.selected, w, kTopK, v.db->gpu_experts(), v.routed,
-                                    vram ? vram->workspace() : zc_workspace.get(), VramExperts::kWorkspaceBytes, st);
-        v.db->wait_add(v.routed, m, l+1, st);
+            routed_moe_decode(pack.expert_format(), (const __half*)v.half, m, v.selected, w, kTopK,
+                              v.db->gpu_experts(), v.routed, vram ? vram->workspace() : zc_workspace.get(),
+                              VramExperts::kWorkspaceBytes, st);
+        v.db->wait_add(v.routed, m, l+1, st, gpu_misses);
+        if (gpu_misses)   // the misses the CPU read into the RAM tier
+            routed_moe_decode(pack.expert_format(), (const __half*)v.half, m, v.db->late_sel_dev(), w, kTopK,
+                              v.db->late_desc_dev(), v.routed, vram ? vram->workspace() : zc_workspace.get(),
+                              VramExperts::kWorkspaceBytes, st);
         if (pf && l+1 < kLayers) prefetch->ready(l+1, st);   // the next layer overwrites v.xf, which the guesses read
         ck(cudaStreamWaitEvent(st, sh_done, 0), "verify shared join");
         ops::add_f32_bf16(v.routed, v.sh_out, v.ffn_out, m*kDim, st);
@@ -316,7 +326,7 @@ void Engine::Impl::enqueue_verify(int m) {
     }
     ops::hc_pre(v.h, v.mix, v.final_x, m, st);
     ops::rmsnorm(v.final_x, final_norm, v.final_x, kDim, kNormEps, m, st);
-    ops::bf16_linear_rows(v.final_x, m, head, kDim, kVocab, v.logits, st);   // the head read once (1.3 GB)
+    head_logits(v.final_x, m, v.logits, st);   // the head read once
     for (int t = 0; t < m; ++t) ops::argmax_logits(v.logits+t*kVocab, v.next+t, st);
     ck(cudaMemcpyAsync(v.next_host, v.next, m*sizeof(int), cudaMemcpyDeviceToHost, st), "verify next");
     ck(cudaMemcpyAsync(v.logits_host, v.logits, size_t(m)*kVocab*sizeof(float), cudaMemcpyDeviceToHost, st), "verify logits");

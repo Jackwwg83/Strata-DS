@@ -150,8 +150,138 @@ class PackTest(unittest.TestCase):
     def test_pack_is_marked_finished_last(self):
         info = open(os.path.join(self.out, "pack_info.txt")).read()
         self.assertIn("finished 1", info)
+        self.assertIn("expert_format exl3", info.splitlines())
         for f in ("tokenizer.json", "tokenizer_config.json", "config.json"):
             self.assertTrue(os.path.exists(os.path.join(self.out, f)))
+
+
+MXFP4_SHAPES = {"w1": ([2304, 2560], [2304, 160]), "w3": ([2304, 2560], [2304, 160]),
+                "w2": ([5120, 1152], [5120, 72])}
+
+
+def write_mxfp4_checkpoint(d, layers=(0, 1), n_exp=2, mtp_stages=0):
+    """The official layout (DeepSeek-V4.1-Flash-1017): each projection is an I8 weight [n, k/2] (two E2M1 codes per
+    byte, packed along k) and an F8_E8M0 scale [n, k/32]. Two shards; one expert's tensors are split across them."""
+    shards, index, truth = [{}, {}], {}, {}
+
+    def put(name, t, k):
+        shards[k][name] = t
+        index[name] = f"model-0000{k + 1}-of-00002.safetensors"
+        truth[name] = t
+
+    def experts(prefix, n_layers):
+        for L in range(n_layers) if isinstance(n_layers, int) else n_layers:
+            for e in range(n_exp):
+                for i, (w, (ws, ss)) in enumerate(MXFP4_SHAPES.items()):
+                    base = f"{prefix}.{L}.ffn.experts.{e}.{w}."
+                    put(base + "weight", torch.randint(-128, 127, ws, dtype=torch.int8), (e + i) % 2)
+                    put(base + "scale", (2.0 ** torch.randint(-8, 4, ss).float()).to(torch.float8_e8m0fnu), (e + L) % 2)
+
+    experts("layers", layers)
+    if mtp_stages:
+        experts("mtp", mtp_stages)
+    for L in layers:
+        put(f"layers.{L}.ffn.shared_experts.w1.weight", (torch.randn(64, 32)).to(torch.float8_e4m3fn), 0)
+        put(f"layers.{L}.ffn.shared_experts.w1.scale", (torch.ones(2, 1)).to(torch.float8_e8m0fnu), 0)
+        put(f"layers.{L}.ffn.gate.weight", torch.randn(384, 32).bfloat16(), 1)
+    put("embed.weight", torch.randn(100, 32).bfloat16(), 0)
+    for k in range(2):
+        save_file(shards[k], os.path.join(d, f"model-0000{k + 1}-of-00002.safetensors"))
+    json.dump({"weight_map": index}, open(os.path.join(d, "model.safetensors.index.json"), "w"))
+    for f in ("config.json", "tokenizer.json", "tokenizer_config.json"):
+        open(os.path.join(d, f), "w").write("{}")
+    return truth
+
+
+class Mxfp4PackTest(unittest.TestCase):
+    """The official FP4 experts are copied byte for byte: no requantization, no repacking."""
+
+    def setUp(self):
+        self.tmp = tempfile.TemporaryDirectory()
+        self.src = os.path.join(self.tmp.name, "src")
+        self.out = os.path.join(self.tmp.name, "pack")
+        os.makedirs(self.src)
+        self.truth = write_mxfp4_checkpoint(self.src, mtp_stages=2)
+        P.build_pack(self.src, self.out, n_layers=2, n_experts=2)
+
+    def tearDown(self):
+        self.tmp.cleanup()
+
+    def test_the_format_is_detected_and_recorded(self):
+        info = open(os.path.join(self.out, "pack_info.txt")).read().splitlines()
+        self.assertIn("expert_format mxfp4", info)
+        self.assertEqual(info[-1], "finished 1")
+
+    def test_every_expert_component_round_trips_and_is_aligned(self):
+        rows = P.read_experts_txt(os.path.join(self.out, "experts.txt"))
+        self.assertEqual(sorted(rows), [(L, e) for L in range(2) for e in range(2)])
+        blob = np.fromfile(os.path.join(self.out, "experts.bin"), dtype=np.uint8)
+        for (L, e), r in rows.items():
+            self.assertEqual(r["offset"] % P.EXPERT_ALIGN, 0)
+            self.assertEqual(r["bytes"] % P.EXPERT_ALIGN, 0)
+            self.assertEqual(r["bits"], {"w1": 4.25, "w3": 4.25, "w2": 4.25})
+            self.assertEqual(sorted(r["components"]), sorted(f"{w}.{p}" for w in P.PROJ for p in ("weight", "scale")))
+            for comp, (coff, cnb) in r["components"].items():
+                self.assertEqual(coff % P.COMPONENT_ALIGN, 0)
+                want = self.truth[f"layers.{L}.ffn.experts.{e}.{comp}"].contiguous().reshape(-1).view(torch.uint8)
+                a = r["offset"] + coff
+                np.testing.assert_array_equal(blob[a:a + cnb], want.numpy().reshape(-1), err_msg=f"{L}.{e}.{comp}")
+        # 2304 x 5120 x 2 + 5120 x 2304 codes at 4 bits and a byte of scale per 32: 18,800,640 bytes, which is already
+        # a whole number of 4 KiB pages (every component is a multiple of 256 bytes)
+        self.assertEqual(rows[(0, 0)]["bytes"], 18800640)
+
+    def test_dense_has_no_routed_expert(self):
+        idx = read_index(os.path.join(self.out, "index.txt"))
+        self.assertFalse(any(".ffn.experts." in n for n in idx))
+        self.assertIn("layers.0.ffn.shared_experts.w1.weight", idx)
+
+    def test_mtp_experts_come_from_the_same_checkpoint(self):
+        n = P.add_mtp_experts(self.src, self.out, n_stages=2, n_experts=2)
+        self.assertEqual(n, 4)
+        rows = P.read_experts_txt(os.path.join(self.out, "mtp_experts.txt"))
+        blob = np.fromfile(os.path.join(self.out, "mtp_experts.bin"), dtype=np.uint8)
+        for (S, e), r in rows.items():
+            for comp, (coff, cnb) in r["components"].items():
+                want = self.truth[f"mtp.{S}.ffn.experts.{e}.{comp}"].contiguous().reshape(-1).view(torch.uint8)
+                a = r["offset"] + coff
+                np.testing.assert_array_equal(blob[a:a + cnb], want.numpy().reshape(-1), err_msg=f"{S}.{e}.{comp}")
+        self.assertIn("finished 1", open(os.path.join(self.out, "pack_info.txt")).read())
+
+    def test_dense_only_keeps_the_mtp_experts(self):
+        # a dense-only rewrite (e.g. other dense tensors) keeps DSpark's experts and their pack_info lines
+        P.add_mtp_experts(self.src, self.out, n_stages=2, n_experts=2)
+        P.build_pack(self.src, self.out, n_layers=2, n_experts=2, dense_only=True)
+        info = open(os.path.join(self.out, "pack_info.txt")).read().splitlines()
+        self.assertIn("mtp_stages 2", info)
+        self.assertIn("mtp_experts 2", info)
+        self.assertTrue(any(l.startswith("mtp_expert_bytes ") for l in info))
+        self.assertEqual(info[-1], "finished 1")
+
+    def test_the_index_decides_which_tensors_exist(self):
+        # a merged checkpoint (official dense + another repo's experts) points its index at shards that also hold
+        # tensors it does not name: those are not part of the checkpoint
+        idx_path = os.path.join(self.src, "model.safetensors.index.json")
+        idx = json.load(open(idx_path))
+        gone = "layers.1.ffn.experts.1.w1.weight"
+        del idx["weight_map"][gone]
+        json.dump(idx, open(idx_path, "w"))
+        srcs = P.Source(self.src)
+        self.assertNotIn(gone, srcs.entries)
+        self.assertEqual(set(srcs.entries), set(idx["weight_map"]))
+
+    def test_a_mixed_checkpoint_is_refused(self):
+        # an EXL3 expert next to FP4 ones: one pack holds one expert format
+        bad = os.path.join(self.tmp.name, "bad")
+        os.makedirs(bad)
+        write_mxfp4_checkpoint(bad)
+        idx = json.load(open(os.path.join(bad, "model.safetensors.index.json")))
+        extra = {f"layers.1.ffn.experts.1.w1.{p}": t for p, t in (("trellis", torch.zeros(320, 144, 48, dtype=torch.int16)),
+                                                                   ("suh", torch.zeros(5120).half()))}
+        save_file(extra, os.path.join(bad, "extra.safetensors"))
+        idx["weight_map"].update({k: "extra.safetensors" for k in extra})
+        json.dump(idx, open(os.path.join(bad, "model.safetensors.index.json"), "w"))
+        with self.assertRaises(SystemExit):
+            P.build_pack(bad, os.path.join(self.tmp.name, "badpack"), n_layers=2, n_experts=2)
 
 
 class MtpExpertsTest(unittest.TestCase):

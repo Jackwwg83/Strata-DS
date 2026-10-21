@@ -1,0 +1,108 @@
+# ds41_serve runs on the DGX Spark, 2026-10-18, pack-1017-exl3h, DS41_SSD_TAIL_SKIP=1, --spec dspark --draft-always, --max-context 262144 (one run each)
+
+## ctxsweep: context sweep (code prompt, 200 or 300 tokens written)
+ds41_serve: root checkpoint at 8000 tokens
+ds41_serve: prompt 8021 (reused 0, read 8021) 16822 ms, 200 out 41.4 ms/token, VRAM hits 0 of 62640, length; DSpark windows 81, drafts 163, accepted 101
+ds41_serve: root checkpoint at 32000 tokens
+ds41_serve: prompt 32021 (reused 8000, read 24021) 43522 ms, 200 out 36.5 ms/token, VRAM hits 0 of 56640, length; DSpark windows 82, drafts 154, accepted 117
+ds41_serve: root checkpoint at 64000 tokens
+ds41_serve: prompt 64021 (reused 32000, read 32021) 63470 ms, 200 out 36.5 ms/token, VRAM hits 0 of 56160, length; DSpark windows 77, drafts 157, accepted 122
+ds41_serve: root checkpoint at 128000 tokens
+ds41_serve: prompt 128021 (reused 64000, read 64021) 131410 ms, 200 out 36.6 ms/token, VRAM hits 0 of 54480, length; DSpark windows 73, drafts 153, accepted 125
+ds41_serve: root checkpoint at 250000 tokens
+ds41_serve: prompt 250021 (reused 128000, read 122021) 1465571 ms, 200 out 43.7 ms/token, VRAM hits 0 of 55920, length; DSpark windows 92, drafts 140, accepted 106
+
+## ctx256: context sweep (code prompt, 200 or 300 tokens written)
+ds41_serve: root checkpoint at 250001 tokens
+ds41_serve: prompt 250017 (reused 0, read 250017) 498393 ms, 300 out 48.0 ms/token, VRAM hits 0 of 100560, length; DSpark windows 134, drafts 268, accepted 148
+ds41_serve: root checkpoint at 250301 tokens
+ds41_serve: prompt 250332 (reused 250001, read 331) 3154 ms, 120 out 41.0 ms/token, VRAM hits 0 of 36000, length; DSpark windows 50, drafts 100, accepted 69
+
+## long32: context sweep (code prompt, 200 or 300 tokens written)
+ds41_serve: root checkpoint at 32001 tokens
+ds41_serve: prompt 32016 (reused 0, read 32016) 53159 ms, 200 out 35.5 ms/token, VRAM hits 0 of 59520, length; DSpark windows 63, drafts 168, accepted 119
+
+## long64: context sweep (code prompt, 200 or 300 tokens written)
+ds41_serve: root checkpoint at 64001 tokens
+ds41_serve: prompt 64016 (reused 0, read 64016) 108679 ms, 1 out 0.0 ms/token, VRAM hits 0 of 0, stop; DSpark windows 0, drafts 0, accepted 0
+
+## ttft-4096: a 10,000-token context, then new parts (--window-prompt-max as named; ttft-4096: before K21)
+ds41_serve: prompt 10000 (reused 0, read 10000) 28193 ms, 8 out 48.3 ms/token, VRAM hits 0 of 1680, length; DSpark windows 0, drafts 0, accepted 0
+ds41_serve: prompt 10250 (reused 10007, read 243) 5528 ms, 8 out 45.6 ms/token, VRAM hits 0 of 1680, length; DSpark windows 0, drafts 0, accepted 0
+ds41_serve: prompt 11000 (reused 10257, read 743) 16870 ms, 8 out 46.1 ms/token, VRAM hits 0 of 1680, length; DSpark windows 1, drafts 2, accepted 2
+ds41_serve: prompt 14000 (reused 10999, read 3001) 68544 ms, 8 out 41.9 ms/token, VRAM hits 0 of 2160, length; DSpark windows 3, drafts 6, accepted 4
+
+## ttft-8: a 10,000-token context, then new parts (--window-prompt-max as named; ttft-4096: before K21)
+ds41_serve: prompt 10000 (reused 0, read 10000) 18517 ms, 8 out 48.4 ms/token, VRAM hits 0 of 1680, length; DSpark windows 0, drafts 0, accepted 0
+ds41_serve: prompt 10250 (reused 10007, read 243) 1475 ms, 8 out 45.2 ms/token, VRAM hits 0 of 1680, length; DSpark windows 0, drafts 0, accepted 0
+ds41_serve: prompt 11000 (reused 10257, read 743) 2795 ms, 8 out 43.4 ms/token, VRAM hits 0 of 1680, length; DSpark windows 1, drafts 2, accepted 2
+ds41_serve: prompt 14000 (reused 10999, read 3001) 7484 ms, 8 out 42.0 ms/token, VRAM hits 0 of 2160, length; DSpark windows 3, drafts 6, accepted 4
+
+## ttft2-8: a 10,000-token context, then new parts (--window-prompt-max as named; ttft-4096: before K21)
+ds41_serve: prompt 10000 (reused 0, read 10000) 18494 ms, 4 out 51.8 ms/token, VRAM hits 0 of 720, length; DSpark windows 0, drafts 0, accepted 0
+ds41_serve: prompt 10000 (reused 9999, read 1) 54 ms, 4 out 42.2 ms/token, VRAM hits 0 of 720, length; DSpark windows 0, drafts 0, accepted 0
+ds41_serve: prompt 10030 (reused 10003, read 27) 980 ms, 4 out 42.8 ms/token, VRAM hits 0 of 720, length; DSpark windows 0, drafts 0, accepted 0
+ds41_serve: prompt 10000 (reused 9999, read 1) 43 ms, 4 out 42.0 ms/token, VRAM hits 0 of 720, length; DSpark windows 0, drafts 0, accepted 0
+ds41_serve: prompt 10060 (reused 10003, read 57) 1084 ms, 4 out 42.6 ms/token, VRAM hits 0 of 720, length; DSpark windows 0, drafts 0, accepted 0
+ds41_serve: prompt 10000 (reused 9999, read 1) 43 ms, 4 out 42.3 ms/token, VRAM hits 0 of 720, length; DSpark windows 0, drafts 0, accepted 0
+ds41_serve: prompt 10120 (reused 10003, read 117) 1177 ms, 4 out 46.8 ms/token, VRAM hits 0 of 720, length; DSpark windows 0, drafts 0, accepted 0
+ds41_serve: prompt 10000 (reused 9999, read 1) 43 ms, 4 out 42.5 ms/token, VRAM hits 0 of 720, length; DSpark windows 0, drafts 0, accepted 0
+ds41_serve: prompt 10240 (reused 10003, read 237) 1433 ms, 4 out 34.4 ms/token, VRAM hits 0 of 720, length; DSpark windows 1, drafts 2, accepted 2
+
+## ttft2-128: a 10,000-token context, then new parts (--window-prompt-max as named; ttft-4096: before K21)
+ds41_serve: prompt 10000 (reused 0, read 10000) 18667 ms, 4 out 53.0 ms/token, VRAM hits 0 of 720, length; DSpark windows 0, drafts 0, accepted 0
+ds41_serve: prompt 10000 (reused 9999, read 1) 55 ms, 4 out 42.4 ms/token, VRAM hits 0 of 720, length; DSpark windows 0, drafts 0, accepted 0
+ds41_serve: prompt 10030 (reused 10003, read 27) 686 ms, 4 out 42.8 ms/token, VRAM hits 0 of 720, length; DSpark windows 0, drafts 0, accepted 0
+ds41_serve: prompt 10000 (reused 9999, read 1) 43 ms, 4 out 42.0 ms/token, VRAM hits 0 of 720, length; DSpark windows 0, drafts 0, accepted 0
+ds41_serve: prompt 10060 (reused 10003, read 57) 1304 ms, 4 out 42.3 ms/token, VRAM hits 0 of 720, length; DSpark windows 0, drafts 0, accepted 0
+ds41_serve: prompt 10000 (reused 9999, read 1) 44 ms, 4 out 42.3 ms/token, VRAM hits 0 of 720, length; DSpark windows 0, drafts 0, accepted 0
+ds41_serve: prompt 10120 (reused 10003, read 117) 2616 ms, 4 out 47.6 ms/token, VRAM hits 0 of 720, length; DSpark windows 0, drafts 0, accepted 0
+ds41_serve: prompt 10000 (reused 9999, read 1) 43 ms, 4 out 42.2 ms/token, VRAM hits 0 of 720, length; DSpark windows 0, drafts 0, accepted 0
+ds41_serve: prompt 10240 (reused 10003, read 237) 1601 ms, 4 out 34.7 ms/token, VRAM hits 0 of 720, length; DSpark windows 1, drafts 2, accepted 2
+
+## ttft2-512: a 10,000-token context, then new parts (--window-prompt-max as named; ttft-4096: before K21)
+ds41_serve: prompt 10000 (reused 0, read 10000) 20984 ms, 4 out 53.4 ms/token, VRAM hits 0 of 720, length; DSpark windows 0, drafts 0, accepted 0
+ds41_serve: prompt 10000 (reused 9999, read 1) 55 ms, 4 out 42.2 ms/token, VRAM hits 0 of 720, length; DSpark windows 0, drafts 0, accepted 0
+ds41_serve: prompt 10030 (reused 10003, read 27) 687 ms, 4 out 41.9 ms/token, VRAM hits 0 of 720, length; DSpark windows 0, drafts 0, accepted 0
+ds41_serve: prompt 10000 (reused 9999, read 1) 43 ms, 4 out 42.7 ms/token, VRAM hits 0 of 720, length; DSpark windows 0, drafts 0, accepted 0
+ds41_serve: prompt 10060 (reused 10003, read 57) 1295 ms, 4 out 42.3 ms/token, VRAM hits 0 of 720, length; DSpark windows 0, drafts 0, accepted 0
+ds41_serve: prompt 10000 (reused 9999, read 1) 44 ms, 4 out 42.1 ms/token, VRAM hits 0 of 720, length; DSpark windows 0, drafts 0, accepted 0
+ds41_serve: prompt 10120 (reused 10003, read 117) 2604 ms, 4 out 44.0 ms/token, VRAM hits 0 of 720, length; DSpark windows 0, drafts 0, accepted 0
+ds41_serve: prompt 10000 (reused 9999, read 1) 43 ms, 4 out 42.4 ms/token, VRAM hits 0 of 720, length; DSpark windows 0, drafts 0, accepted 0
+ds41_serve: prompt 10240 (reused 10003, read 237) 5285 ms, 4 out 38.3 ms/token, VRAM hits 0 of 720, length; DSpark windows 1, drafts 2, accepted 2
+
+## root1: root checkpoint, a new conversation with the same 10,000-token system prompt
+ds41_serve: root checkpoint at 10000 tokens
+ds41_serve: prompt 10012 (reused 0, read 10012) 19065 ms, 24 out 51.0 ms/token, VRAM hits 0 of 5520, length; DSpark windows 3, drafts 4, accepted 4
+ds41_serve: prompt 10 (reused 0, read 10) 430 ms, 20 out 57.3 ms/token, VRAM hits 0 of 6720, stop; DSpark windows 12, drafts 16, accepted 7
+ds41_serve: prompt 10009 (reused 10000, read 9) 245 ms, 24 out 60.7 ms/token, VRAM hits 0 of 9600, length; DSpark windows 15, drafts 24, accepted 7
+
+## root2: root checkpoint, a new conversation with the same 10,000-token system prompt
+ds41_serve: root checkpoint at 10000 tokens
+ds41_serve: prompt 10009 (reused 0, read 10009) 18887 ms, 24 out 45.4 ms/token, VRAM hits 0 of 5520, length; DSpark windows 2, drafts 4, accepted 4
+
+## root1x: root checkpoint, a new conversation with the same 10,000-token system prompt
+ds41_serve: root checkpoint at 10000 tokens
+ds41_serve: prompt 10012 (reused 0, read 10012) 21396 ms, 1 out 0.0 ms/token, VRAM hits 0 of 0, stop; DSpark windows 0, drafts 0, accepted 0
+ds41_serve: prompt 10 (reused 0, read 10) 653 ms, 8 out 105.4 ms/token, VRAM hits 0 of 1680, stop; DSpark windows 0, drafts 0, accepted 0
+ds41_serve: prompt 10009 (reused 10000, read 9) 357 ms, 24 out 81.8 ms/token, VRAM hits 0 of 5520, length; DSpark windows 0, drafts 0, accepted 0
+
+## root2x: root checkpoint, a new conversation with the same 10,000-token system prompt
+ds41_serve: root checkpoint at 10000 tokens
+ds41_serve: prompt 10009 (reused 0, read 10009) 21287 ms, 24 out 72.4 ms/token, VRAM hits 0 of 5520, length; DSpark windows 0, drafts 0, accepted 0
+
+## root3x: root checkpoint, a new conversation with the same 10,000-token system prompt
+ds41_serve: root checkpoint at 10000 tokens
+ds41_serve: prompt 10012 (reused 0, read 10012) 21266 ms, 1 out 0.0 ms/token, VRAM hits 0 of 0, stop; DSpark windows 0, drafts 0, accepted 0
+ds41_serve: prompt 10009 (reused 10000, read 9) 372 ms, 24 out 81.4 ms/token, VRAM hits 0 of 5520, length; DSpark windows 0, drafts 0, accepted 0
+
+## nll: teacher-forced prefill of 4,000 code tokens
+ds41: SSD tail skip ON: an expert read from the SSD that every token routes at rank 2 or lower is left out; DS41_SSD_TAIL_SKIP=0 turns it off
+ds41: RAM tier 7278 experts (86.3 GiB, locked, cuMem host NUMA), filled in 18.8 s
+ds41: adaptive RAM tier, 64 free slots per slot size (128 free)
+ds41: mapped RAM experts enabled, GPU quota 6 per token per layer, direct
+ds41: misses: the CPU reads them into the RAM tier, the GPU computes them
+ds41 prefill: pass 4000 tokens, sub-batch 4000; scratch 1.99 GiB cudaMalloc; ring 256 slots cudaMalloc; 0 tier slots lent
+ds41 prefill: 7.1 GiB available, 97.6 GiB of experts read from the pack: unbuffered (O_DIRECT): the file cache could not keep them
+prefill_tokens 4000 ms 9925.0 tok_s 403.0 chunks 1 chunk_tokens 4000 sub_batch 4000 engram_ms 0.0 stream_wait_ms 0.1 vram_experts 0 streamed 1207 (ram 0 cache 0 ssd 1207) engram_rows 192000 unique 123877
+teacher_forced_mean_nll 0.964207 ppl 2.6227 over 3999 tokens

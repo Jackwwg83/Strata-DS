@@ -11,6 +11,8 @@ add_library(strata_ds41_engine STATIC
   src/ds41/vram_experts.cu
   src/ds41/engram_rows.cpp
   src/ds41/host_experts.cpp
+  src/ds41/mxfp4_cpu.cpp
+  src/ds41/routed_experts.cpp
   src/ds41/lookahead.cpp
   src/ds41/expert_stream.cpp
   src/ds41/wo_a_fp8.cu
@@ -25,15 +27,22 @@ target_include_directories(strata_ds41_engine PUBLIC
 target_compile_features(strata_ds41_engine PUBLIC cxx_std_17)
 # moe_mul1 picks AVX2 / AVX-512 per function with target attributes and dispatches at run time
 set_source_files_properties(third_party/exllamav3_moe/moe_mul1.cpp PROPERTIES COMPILE_OPTIONS "-O3")
+set_source_files_properties(src/ds41/mxfp4_cpu.cpp PROPERTIES COMPILE_OPTIONS "-O3")
 find_package(Threads REQUIRED)
-target_link_libraries(strata_ds41_engine PUBLIC strata_ds41 CUDA::cudart CUDA::cublas Threads::Threads)
+target_link_libraries(strata_ds41_engine PUBLIC strata_ds41 CUDA::cudart CUDA::cuda_driver CUDA::cublas Threads::Threads)
 
 add_executable(ds41_generate src/ds41/ds41_generate.cpp)
 target_link_libraries(ds41_generate PRIVATE strata_ds41_engine strata_ds41_suffix)
 
+# Upstream's sampler alone. strata_kernels would pull in strata_core, whose x86-only CPU code does not build on
+# aarch64 (DGX Spark); the sampler needs only header-only parts of core.
+add_library(strata_ds41_sampler STATIC src/kernels/cuda/sampler.cu)
+target_include_directories(strata_ds41_sampler PUBLIC ${CMAKE_CURRENT_SOURCE_DIR}/include)
+target_link_libraries(strata_ds41_sampler PUBLIC CUDA::cudart)
+
 # the engine behind serve/server.py (upstream's --serve line protocol); samples with upstream's sampler
 add_executable(ds41_serve src/ds41/ds41_serve.cpp)
-target_link_libraries(ds41_serve PRIVATE strata_ds41_engine strata_kernels)
+target_link_libraries(ds41_serve PRIVATE strata_ds41_engine strata_ds41_sampler)
 
 if(STRATA_BUILD_TESTS)
   add_executable(ds41_test_validation src/ds41/tests/test_validation_test.cpp)
@@ -44,12 +53,22 @@ if(STRATA_BUILD_TESTS)
   target_include_directories(moe_revfix_test PRIVATE third_party/exllamav3_moe)
   target_compile_features(moe_revfix_test PRIVATE cxx_std_17)
   target_link_libraries(moe_revfix_test PRIVATE Threads::Threads)
-  foreach(case stage shape leak)
-    add_test(NAME moe_revfix_${case} COMMAND moe_revfix_test ${case})
-  endforeach()
-  foreach(n RANGE 0 11)
-    add_test(NAME moe_revfix_alloc_${n} COMMAND moe_revfix_test alloc ${n})
-  endforeach()
+  # moe_mul1 (the CPU's EXL3 experts) is x86 AVX2/AVX-512 only; on aarch64 it throws, and the DGX Spark computes
+  # every expert on its GPU instead
+  string(TOLOWER "${CMAKE_SYSTEM_PROCESSOR}" _ds41_cpu)
+  if(_ds41_cpu MATCHES "x86_64|amd64|i.86")
+    set(_ds41_x86 ON)
+  else()
+    set(_ds41_x86 OFF)
+  endif()
+  if(_ds41_x86)
+    foreach(case stage shape leak)
+      add_test(NAME moe_revfix_${case} COMMAND moe_revfix_test ${case})
+    endforeach()
+    foreach(n RANGE 0 11)
+      add_test(NAME moe_revfix_alloc_${n} COMMAND moe_revfix_test alloc ${n})
+    endforeach()
+  endif()
   foreach(test hybrid_decode hybrid_host_table expert_staging)
     add_executable(${test}_test src/ds41/tests/${test}_test.cu)
     target_link_libraries(${test}_test PRIVATE strata_ds41_engine)
@@ -66,6 +85,11 @@ if(STRATA_BUILD_TESTS)
   target_compile_features(parallel_test PRIVATE cxx_std_17)
   target_link_libraries(parallel_test PRIVATE Threads::Threads)
   add_test(NAME parallel_test COMMAND parallel_test)
+  # DSpark's policy (ds41_generate and ds41_serve) on the host
+  add_executable(draft_scheduler_test src/ds41/tests/draft_scheduler_test.cpp)
+  target_include_directories(draft_scheduler_test PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/include)
+  target_compile_features(draft_scheduler_test PRIVATE cxx_std_17)
+  add_test(NAME draft_scheduler_test COMMAND draft_scheduler_test)
   # ds41_serve's line protocol on the host
   add_executable(serve_request_test src/ds41/tests/serve_request_test.cpp)
   target_include_directories(serve_request_test PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/include)
@@ -105,7 +129,16 @@ if(STRATA_BUILD_TESTS)
   add_test(NAME host_experts_test COMMAND host_experts_test)
   add_executable(moe_set_expert_test src/ds41/tests/moe_set_expert_test.cpp)
   target_link_libraries(moe_set_expert_test PRIVATE strata_ds41_engine)
-  add_test(NAME moe_set_expert_test COMMAND moe_set_expert_test)
+  if(_ds41_x86)
+    add_test(NAME moe_set_expert_test COMMAND moe_set_expert_test)
+  endif()
+  add_executable(mxfp4_cpu_test src/ds41/tests/mxfp4_cpu_test.cpp)
+  target_link_libraries(mxfp4_cpu_test PRIVATE strata_ds41_engine)
+  add_test(NAME mxfp4_cpu_test COMMAND mxfp4_cpu_test)
+  set_tests_properties(mxfp4_cpu_test PROPERTIES TIMEOUT 900)
+  add_executable(pack_format_test src/ds41/tests/pack_format_test.cpp)
+  target_link_libraries(pack_format_test PRIVATE strata_ds41_engine)
+  add_test(NAME pack_format_test COMMAND pack_format_test)
   add_executable(engram_rows_test src/ds41/tests/engram_rows_test.cpp)
   target_link_libraries(engram_rows_test PRIVATE strata_ds41_engine)
   add_test(NAME engram_rows_test COMMAND engram_rows_test)

@@ -64,6 +64,8 @@ WIN = os.name == "nt"
 # day.  A revision the repository no longer has falls back to its current files, with a message (download()).
 HF_REVISIONS = {
     "vcruz305/DSV4.1-Flash-SAGE-EXL3-1.59bpw": "eca94a388a70841858feed8f057a9862e897aba4",
+    "LibertAIDAI/DeepSeek-V4.1-Flash-1017-EXL3-2.9bpw": "afc7aa0aab98ee735c0f54e0a122019af1ac08f1",  # 2026-10-17
+    "deepseek-ai/DeepSeek-V4.1-Flash-1017": "1bae0e1088993b9b82de08f59de5be5a34e42170",              # 2026-10-17
     "ISTA-DASLab/Qwen3.8-Flash-Next-GSQ-RCO-GGUF": "ed59f92082b1e93c0e96d60a8b11aab089b52f09",        # 2026-09-29
     "ukisai/Swift-1.5-Qwen3.8-Flash-Next-GSQ-RCO-GGUF": "b22d729eae29b5796f76fb70f91aef549b9fc52c",   # 2026-09-24
     "ISTA-DASLab/Qwen3.8-Flash-Next-GSQ-RCO-Coder-GGUF": "5348543e0147355ac9cbcb031184a3546350988e",  # 2026-09-29
@@ -235,6 +237,10 @@ MODELS = {
                   "vision": True},
     "SAGE-1.59BPW": {"about": "DeepSeek V4.1 Flash, SAGE EXL3 1.59bpw", "download_gb": 341.8,
                      "ram_gb": 128, "arena_gb": 108.9, "families": ("deepseek",), "nvidia_only": True},
+    # docs/DEEPSEEK_SPARK.md: the default on a GPU with unified memory (DGX Spark)
+    "1017-EXL3-2.9BPW": {"about": "DeepSeek V4.1 Flash 1017, LibertAI EXL3 2.9bpw (the DGX Spark recipe)",
+                         "download_gb": 414.8, "ram_gb": 120, "arena_gb": 196.1, "families": ("deepseek",),
+                         "nvidia_only": True},
 }
 # The experimental Unsloth file's four shards at the pinned revision: name -> (bytes, sha256), checked after the
 # download (setup trusts no other model file by name and size alone either: check_shards reads their directories).
@@ -302,8 +308,8 @@ FAMILIES = {
                 "mmproj": "mmproj-Qwen3.8-Flash-Next-BF16.gguf", "name": "qwen3.8-flash-next-unsloth",
                 "vision": False, "pack_args": ["--compat-bf16"],
                 "sha256": {**UNSLOTH_SHARDS, **UNSLOTH_IQ4_XS_SHARDS}},
-    "deepseek": {"title": "DeepSeek V4.1 Flash", "by": "SAGE EXL3 1.59bpw by vcruz305",
-                 "about": "Linux + NVIDIA only; 128 GB RAM recommended; 462 GB disk",
+    "deepseek": {"title": "DeepSeek V4.1 Flash", "by": "SAGE EXL3 1.59bpw by vcruz305 (DGX Spark: 1017, EXL3 2.9bpw)",
+                 "about": "Linux + NVIDIA only; 128 GB RAM recommended; 462 GB disk (DGX Spark: 625 GB)",
                  "hf": hf("vcruz305/DSV4.1-Flash-SAGE-EXL3-1.59bpw"), "tag": "deepseek-",
                  "file": "model-{i:05d}-of-00017.safetensors", "shards": 17,
                  "name": "deepseek-v4.1-flash", "vision": False, "nvidia_only": True},
@@ -743,8 +749,11 @@ def gpus():
     for line in s.strip().splitlines():
         try:
             idx, name, mem, cc, drv = [x.strip() for x in line.split(",")]
-            found.append({"index": int(idx), "name": name, "vram_gb": float(mem) / 1024.0, "arch": cc.replace(".", ""),
-                          "driver": drv})
+            # a GPU on unified memory (DGX Spark's GB10) has no VRAM of its own: nvidia-smi reports [N/A]
+            unified = mem == "[N/A]"
+            g = {"index": int(idx), "name": name, "vram_gb": 0.0 if unified else float(mem) / 1024.0,
+                 "arch": cc.replace(".", ""), "driver": drv}
+            found.append({**g, "unified": True} if unified else g)
         except ValueError:
             continue
     return found
@@ -4485,7 +4494,128 @@ DEEPSEEK_REPO = "vcruz305/DSV4.1-Flash-SAGE-EXL3-1.59bpw"
 DEEPSEEK_MODEL = "SAGE-1.59BPW"
 DEEPSEEK_TAG = "deepseek-sage-1.59bpw"
 DEEPSEEK_PACK_GB = 120.2
-DEEPSEEK_SOURCES = (*ENGINE_SOURCES, "cmake", "third_party/exllamav3_moe")
+DEEPSEEK_SOURCES = (*ENGINE_SOURCES, "cmake", "third_party/exllamav3_moe", "third_party/exl3_smoe")
+
+# The DGX Spark recipe (docs/DEEPSEEK_SPARK.md): DeepSeek V4.1 Flash 1017. From LibertAI's EXL3 2.9 bpw: the routed
+# experts (backbone and DSpark), the attention and shared-expert linears and the head. Everything else from
+# DeepSeek's checkpoint: the tensors LibertAI does not have or stores in another dtype (the routers in F16, Engram's
+# q/k in F32), the indexer and compressor weights, Engram and DSpark's dense layers. The rest is the same in both
+# (byte for byte) and comes from LibertAI's shards, which are downloaded anyway. Of DeepSeek's 48 shards only the two
+# with the Engram tables are downloaded whole; of the others, the tensors the merge takes (1.0 GB).
+SPARK_MODEL = "1017-EXL3-2.9BPW"
+SPARK_TAG = "deepseek-1017-exl3-2.9bpw"
+SPARK_EXL3_REPO = "LibertAIDAI/DeepSeek-V4.1-Flash-1017-EXL3-2.9bpw"
+SPARK_OFFICIAL_REPO = "deepseek-ai/DeepSeek-V4.1-Flash-1017"
+SPARK_PACK_GB = 210.2
+SPARK_EXL3 = re.compile(r"^(?:(?:layers|mtp)\.\d+\.ffn\.experts\.|layers\.\d+\.(?:attn\.(?:wq_a|wq_b|wkv|wo_a|wo_b)|"
+                        r"ffn\.shared_experts\.w[123])\.|head\.)")
+SPARK_OFFICIAL = re.compile(r"^(?:mtp\.|layers\.\d+\.engram\.|layers\.\d+\.ffn\.gate\.(?:weight|bias)$|"
+                            r"layers\.\d+\.attn\.(?:indexer\.(?:weights_proj|wk|wq_b)|compressor\.(?:wgate|wkv))\.)")
+DEEPSEEK_RECIPES = {
+    DEEPSEEK_MODEL: {"tag": DEEPSEEK_TAG, "title": "DeepSeek V4.1 Flash SAGE 1.59bpw", "name": "deepseek-v4.1-flash",
+                     "download_gb": 341.8, "pack_gb": DEEPSEEK_PACK_GB},
+    SPARK_MODEL: {"tag": SPARK_TAG, "title": "DeepSeek V4.1 Flash 1017 EXL3 2.9bpw (the DGX Spark recipe)",
+                  "name": "deepseek-v4.1-flash-1017", "download_gb": 414.8, "pack_gb": SPARK_PACK_GB},
+}
+
+
+def spark_merge(official, exl3):
+    """The Spark pack's source index from the two repositories' weight maps: {tensor: ("official" | "exl3", shard)}.
+    LibertAI's quantized tensors replace DeepSeek's (whose weight / scale are left out); a tensor in both repositories
+    comes from LibertAI unless SPARK_OFFICIAL names it."""
+    out = {}
+    for name, shard in official.items():
+        if SPARK_EXL3.match(name) or name.startswith(("vision.", "aligner.", "image_")):   # the pack has no vision
+            continue
+        out[name] = ("exl3", exl3[name]) if name in exl3 and not SPARK_OFFICIAL.match(name) else ("official", shard)
+    for name, shard in exl3.items():   # the linears as trellis, suh, svh (their mul1 is not used); experts whole
+        if SPARK_EXL3.match(name) and (".ffn.experts." in name or name.rsplit(".", 1)[1] in ("trellis", "suh", "svh")):
+            out[name] = ("exl3", shard)
+    return out
+
+
+def http_range(url, start, end):
+    """Bytes start..end (inclusive) of a file on the server, with retries."""
+    for attempt in range(10):
+        try:
+            req = urllib.request.Request(url, headers={"User-Agent": "strata-setup", "Range": f"bytes={start}-{end}"})
+            with urllib.request.urlopen(req, timeout=60) as r:
+                data = r.read()
+            if r.status == 206 and len(data) == end - start + 1:
+                return data
+            warn(f"{url.rsplit('/', 1)[1]}: the server sent {len(data)} bytes for a range of {end - start + 1}")
+        except OSError as e:
+            if attempt == 9:
+                fail(f"cannot reach {url.split('/')[2]} ({e})", "check your internet connection and run it again")
+        time.sleep(5)
+    fail(f"cannot read a part of {url.rsplit('/', 1)[1]}", "check your internet connection and run it again")
+
+
+def safetensors_header(url):
+    """A safetensors file's tensor directory on the server: ({name: entry}, data start, file size)."""
+    n = struct.unpack("<Q", http_range(url, 0, 7))[0]
+    hdr = json.loads(http_range(url, 8, 7 + n))
+    hdr.pop("__metadata__", None)
+    return hdr, 8 + n, 8 + n + max((v["data_offsets"][1] for v in hdr.values()), default=0)
+
+
+def download_tensors(url, dst, names):
+    """dst: a safetensors file with only `names` of the file at url, read by HTTP ranges. The finish mark holds a hash
+    of the names, so another list is fetched again."""
+    key = hashlib.sha256("\n".join(sorted(names)).encode()).hexdigest()
+    mark_file = dst.with_name(dst.name + ".done")
+    if dst.exists() and mark_file.exists() and mark_file.read_text(encoding="utf-8") == key:
+        return
+    hdr, start, _ = safetensors_header(url)
+    missing = [n for n in names if n not in hdr]
+    if missing:
+        fail(f"{dst.name} on the server has no {missing[0]} ({len(missing)} tensors missing)")
+    keep = sorted(names, key=lambda n: hdr[n]["data_offsets"][0])
+    new, off = {}, 0
+    for n in keep:
+        a, b = hdr[n]["data_offsets"]
+        new[n] = {"dtype": hdr[n]["dtype"], "shape": hdr[n]["shape"], "data_offsets": [off, off + b - a]}
+        off += b - a
+    h = json.dumps(new).encode()
+    h += b" " * (-len(h) % 8)                          # the data starts 8-byte aligned, as safetensors writes it
+    dst.parent.mkdir(parents=True, exist_ok=True)
+    part = dst.with_name(dst.name + ".part")
+    with open(part, "wb") as f:
+        f.write(struct.pack("<Q", len(h)) + h)
+        for n in keep:
+            a, b = hdr[n]["data_offsets"]
+            f.write(http_range(url, start + a, start + b - 1))
+    part.replace(dst)
+    mark(dst, key)
+    ok(f"{dst.name}: {len(keep)} tensors ({off / 1e9:.2f} GB) downloaded")
+
+
+def spark_sources(src):
+    """Download the Spark recipe's files into src and write its merged model.safetensors.index.json."""
+    off_url, exl3_url = hf(SPARK_OFFICIAL_REPO), hf(SPARK_EXL3_REPO)
+    download(off_url + "model.safetensors.index.json", src / "official.safetensors.index.json")
+    download(exl3_url + "model.safetensors.index.json", src / "exl3.safetensors.index.json")
+    for name in ("config.json", "tokenizer.json", "tokenizer_config.json"):
+        download(off_url + name, src / name)
+    maps = [json.loads((src / f"{r}.safetensors.index.json").read_text(encoding="utf-8"))["weight_map"]
+            for r in ("official", "exl3")]
+    merged = spark_merge(*maps)
+    (src / "model.safetensors.index.json").write_text(
+        json.dumps({"metadata": {}, "weight_map": {k: f for k, (r, f) in merged.items()}}), encoding="utf-8")
+    for shard in sorted({f for r, f in merged.values() if r == "exl3"}):
+        download(exl3_url + shard, src / shard)
+    wanted = {}
+    for name, (repo, shard) in merged.items():
+        if repo == "official":
+            wanted.setdefault(shard, []).append(name)
+    for shard, names in sorted(wanted.items()):
+        if done(src / shard):                          # finished on an earlier run, whole or in part
+            continue
+        hdr, start, size = safetensors_header(off_url + shard)
+        if 2 * sum(hdr[n]["data_offsets"][1] - hdr[n]["data_offsets"][0] for n in names) > size - start:
+            download(off_url + shard, src / shard)     # the Engram tables: most of the shard, read in place
+        else:
+            download_tensors(off_url + shard, src / shard, names)
 
 
 def deepseek_config(path):
@@ -4497,7 +4627,7 @@ def deepseek_problem(gpu):
         return "DeepSeek is available on Linux + NVIDIA only"
     if not str(gpu.get("arch", "")).isdigit() or int(gpu["arch"]) < 86:
         return "DeepSeek needs NVIDIA compute capability 8.6 or higher"
-    if gpu["vram_gb"] < 15.9:                           # nominal 16 GB cards report slightly less
+    if gpu["vram_gb"] < 15.9 and not gpu.get("unified"):   # nominal 16 GB cards report slightly less
         return "DeepSeek needs at least 16 GB VRAM (GPUs under 24 GB are not tested)"
     return None
 
@@ -4608,13 +4738,15 @@ def deepseek_files(folder):
     return files
 
 
-def deepseek_pack_ready(pack, src=None):
+def deepseek_pack_ready(pack, src=None, mtp=False):
+    """mtp: DSpark's routed experts too (the Spark recipe)."""
     try:
         info = dict(l.split(None, 1) for l in (pack / "pack_info.txt").read_text().splitlines() if l.strip())
         if info.get("finished") != "1" or (src is not None and info.get("source") != str(src.resolve())):
             return False
         return all((pack / n).is_file() for n in ("dense.bin", "experts.bin", "index.txt", "experts.txt",
-                   "engram.txt", "engram_hash.txt", "engram_tokenmap.bin", "tokenizer.json", "tokenizer_config.json"))
+                   "engram.txt", "engram_hash.txt", "engram_tokenmap.bin", "tokenizer.json", "tokenizer_config.json",
+                   *(("mtp_experts.bin", "mtp_experts.txt") if mtp else ())))
     except (OSError, ValueError):
         return False
 
@@ -4624,26 +4756,34 @@ def setup_deepseek(a, data, elsewhere, adopted=None):
         fail("DeepSeek is available on Linux + NVIDIA only")
     if a.gpus or a.layer_split:
         fail("DeepSeek supports one NVIDIA GPU only; use --gpu N")
-    if a.model not in (None, DEEPSEEK_MODEL):
-        fail(f"DeepSeek supports only --model {DEEPSEEK_MODEL}")
+    if a.model not in (None, *DEEPSEEK_RECIPES):
+        fail("DeepSeek supports only --model " + " or --model ".join(DEEPSEEK_RECIPES))
     if a.gguf_dir:
         fail("DeepSeek uses EXL3 safetensors, not --gguf-dir; use --models-dir")
     if a.rope_scaling not in (None, "none") or a.rope_scale is not None:
         fail("DeepSeek has no RoPE extension in setup; use --context 262144 or lower")
     if a.calibrate:
         fail("DeepSeek has no installer calibration yet")
-    previous = ROOT / f"strata-{DEEPSEEK_TAG}.json"
+    gpu = deepseek_gpu(a.gpu)
+    # a GPU on unified memory (DGX Spark) gets the Spark recipe, a PC the SAGE one; --model picks either
+    model = a.model or (SPARK_MODEL if gpu.get("unified") else DEEPSEEK_MODEL)
+    recipe = DEEPSEEK_RECIPES[model]
+    spark = model == SPARK_MODEL
+    tag = recipe["tag"]
+    previous = ROOT / f"strata-{tag}.json"
     network = json.loads(previous.read_text(encoding="utf-8-sig")) if previous.is_file() else \
         json.loads(adopted.read_text(encoding="utf-8-sig")) if adopted is not None else {}
     for key in ("host", "api_key"):
         if getattr(a, key) is not None:
             network[key] = getattr(a, key)
     deepseek_network(network)
-    gpu = deepseek_gpu(a.gpu)
     if driver_major(gpu) < (CUDA12_MIN_DRIVER if a.cuda == "12" else MIN_DRIVER):
         fail("the NVIDIA driver is too old for DeepSeek; update it or select --cuda 12")
     ram = ram_gb()
-    ok(f"DeepSeek V4.1 Flash SAGE 1.59bpw: {gpu_name(gpu)}; RAM {ram:.1f} GiB; 128 GB PC recommended")
+    ok(f"{recipe['title']}: {gpu_name(gpu)}; RAM {ram:.1f} GiB; " +
+       ("a DGX Spark (128 GB unified memory)" if spark else "128 GB PC recommended"))
+    if spark and not gpu.get("unified"):
+        warn("the DGX Spark recipe is tested on a DGX Spark only")
     note = "below 120 GiB usable RAM is not tested and may be slow or run out of RAM"
     if ram < 120:
         if a.check:
@@ -4651,16 +4791,20 @@ def setup_deepseek(a, data, elsewhere, adopted=None):
         else:
             confirm_risk(note, a.family == "deepseek", a.yes, "DeepSeek RAM risk was not accepted",
                          "choose --family deepseek --yes to continue on purpose")
-    if gpu["vram_gb"] < 23.5:                          # an RTX 4090 reports 23.99 GB
+    if gpu["vram_gb"] < 23.5 and not gpu.get("unified"):   # an RTX 4090 reports 23.99 GB
         warn("DeepSeek GPUs under 24 GB VRAM are not tested")
-    say("  Disk: about 462 GB total (341.8 GB download + 120.2 GB pack). Keep the source shards: Engram reads them in place.")
+    need_gb = recipe["download_gb"] + recipe["pack_gb"]
+    disk = f"about {need_gb:.0f} GB ({recipe['download_gb']} GB download + {recipe['pack_gb']} GB pack)"
+    say(f"  Disk: {disk}. Keep the source shards: Engram reads them in place.")
     if a.check:
         return 0
     contexts = [c for c in CONTEXTS if c <= 262144]
     if a.context is None:
+        best = 262144 if spark else 32768               # the Spark recipe was measured for coding agents at 256K
         for i, ctx in enumerate(contexts, 1):
-            say(f"  {i}) {ctx // 1024}K tokens" + (" (recommended)" if ctx == 32768 else ""))
-        ctx = contexts[int(ask("Context?", [str(i) for i in range(1, len(contexts) + 1)], "2", a.yes)) - 1]
+            say(f"  {i}) {ctx // 1024}K tokens" + (" (recommended)" if ctx == best else ""))
+        ctx = contexts[int(ask("Context?", [str(i) for i in range(1, len(contexts) + 1)],
+                               str(contexts.index(best) + 1), a.yes)) - 1]
     else:
         ctx = a.context
     if not 64 <= ctx <= 262144:                         # ds41_serve refuses a context under 64
@@ -4669,8 +4813,8 @@ def setup_deepseek(a, data, elsewhere, adopted=None):
             a.experimental_speed_projection not in (None, "off") or a.draft_vocab or \
             a.kv_streaming != "auto" or a.vram_reserve_mib is not None:
         warn("DeepSeek skips images, KV settings, low-RAM mode, speed projection and draft layers")
-    src = Path(a.models_dir).expanduser().resolve() / DEEPSEEK_TAG
-    pack = find_in([data, *elsewhere], f"packs/{DEEPSEEK_TAG}") or data / "packs" / DEEPSEEK_TAG
+    src = Path(a.models_dir).expanduser().resolve() / tag
+    pack = find_in([data, *elsewhere], f"packs/{tag}") or data / "packs" / tag
     if adopted is not None:
         old = json.loads(adopted.read_text(encoding="utf-8-sig"))
         old_pack = Path(old["tokenizer"])
@@ -4681,10 +4825,10 @@ def setup_deepseek(a, data, elsewhere, adopted=None):
         old_src = Path(info["source"])
     except (OSError, ValueError, KeyError):
         old_src = src
-    candidates = [src, old_src, *(r / "models" / DEEPSEEK_TAG for r in elsewhere)]
+    candidates = [src, old_src, *(r / "models" / tag for r in elsewhere)]
 
     def shards_done(folder):
-        return sum(1 for i in range(1, 18) if done(folder / f"model-{i:05d}-of-00017.safetensors"))
+        return sum(1 for p in folder.glob("model-*.safetensors") if done(p)) if folder.is_dir() else 0
 
     # the folder with the most finished shards (the first one on a tie); the download resumes there
     best = max(candidates, key=shards_done)
@@ -4694,29 +4838,40 @@ def setup_deepseek(a, data, elsewhere, adopted=None):
     ready = deepseek_pack_ready(pack, src)
     on_disk = sum(p.stat().st_size for p in src.glob("*") if p.is_file() and
                   (p.name.startswith("model-") or p.name.endswith(".json") or p.name.startswith("tokenizer"))) / 1e9
-    to_fetch = max(0, 341.8 - on_disk)
-    to_pack = 0 if ready else DEEPSEEK_PACK_GB
+    to_fetch = max(0, recipe["download_gb"] - on_disk)
+    to_pack = 0 if ready else recipe["pack_gb"]
     src_free, pack_free = free_gb(src), free_gb(pack)
     if same_drive(src, pack):
         enough = src_free >= to_fetch + to_pack
     else:
         enough = src_free >= to_fetch and pack_free >= to_pack
     if not enough:
-        fail(f"DeepSeek needs about 462 GB (341.8 GB download + 120.2 GB pack); still need "
+        fail(f"DeepSeek needs {disk}; still need "
              f"{to_fetch:.1f} GB in {src} and {to_pack:.1f} GB in {pack}",
              "use --data-dir and --models-dir on drives with enough free space")
-    files = deepseek_files(src)
+    files = [] if spark else deepseek_files(src)
     pip_install(requirement_lines() if REQUIREMENTS.exists() else PY_PACKAGES, "Strata Python packages (pack: numpy)")
     eng, dirs = build_deepseek_engine({**gpu, **({"toolkit": 12} if a.cuda == "12" else {})}, a.yes, force=a.build)
     for name in files:
         download(hf(DEEPSEEK_REPO) + name, src / name)
+    if spark:
+        spark_sources(src)
+    pack_py = [sys.executable, str(ROOT / "tools/ds41/pack.py"), "--src", str(src), "--out", str(pack)]
     if not ready:
-        run([sys.executable, str(ROOT / "tools/ds41/pack.py"), "--src", str(src), "--out", str(pack),
-             "--engram-from", str(ROOT / "ds41/data/engram")])
+        run([*pack_py, "--engram-from", str(ROOT / "ds41/data/engram")])
     if not deepseek_pack_ready(pack, src):
         fail("DeepSeek pack is incomplete; run setup again")
+    if spark and not deepseek_pack_ready(pack, src, mtp=True):   # DSpark's routed experts, added to the pack
+        run([*pack_py, "--mtp-experts"])
+        if not deepseek_pack_ready(pack, src, mtp=True):
+            fail("DeepSeek pack has no DSpark experts; run setup again")
+    # the Spark recipe as measured (docs/DEEPSEEK_SPARK.md): 16 threads, DSpark drafting every step, verify windows
+    # for prompts up to 32 tokens
+    threads = min(16, os.cpu_count() or 16) if spark else deepseek_threads()
     args = ["--pack", str(pack), "--max-context", str(ctx), "--expert-profile",
-            str(ROOT / "ds41/data/expert-profile.bin"), "--threads", str(deepseek_threads())]
+            str(ROOT / "ds41/data/expert-profile.bin"), "--threads", str(threads)]
+    if spark:
+        args += ["--window-prompt-max", "32", "--spec", "dspark", "--draft-always"]
     if a.resident_budget_gib is not None:
         args += ["--ram-budget-gib", f"{a.resident_budget_gib:g}"]
     # --parallel N: N requests decode together (ds41_serve --batch, at most 4 slots); a run without it keeps the last
@@ -4731,19 +4886,21 @@ def setup_deepseek(a, data, elsewhere, adopted=None):
         ok(f"parallel requests: up to {batch} decode together (each slot takes about 0.1 GB of VRAM at 32K context)")
     port = a.port or network.get("port") or 8080       # a run again keeps the saved port, host and key
     cfg = {"exe": str(eng / "ds41_serve"), "args": args, "cwd": str(ROOT), "tokenizer": str(pack),
-           "format": "deepseek_v41", "model_name": "deepseek-v4.1-flash",
-           "log": str(ROOT / f"strata-{DEEPSEEK_TAG}.log"), "lib_dirs": dirs, "port": port,
+           "format": "deepseek_v41", "model_name": recipe["name"],
+           "log": str(ROOT / f"strata-{tag}.log"), "lib_dirs": dirs, "port": port,
            "gpu": gpu["index"], "gpus_asked": True, "cuda": 12 if a.cuda == "12" else 13}
+    if spark:   # SSD tail skip at rank 2: KL 0.074 against the official MXFP4 weights, decode +25% (DEEPSEEK_SPARK.md)
+        cfg["env"] = {"DS41_SSD_TAIL_SKIP": "1"}
     for key, value in (("host", network.get("host")), ("api_key", network.get("api_key")), ("open_browser", a.browser)):
         if value is not None:
             cfg[key] = value
-    cfg_path = ROOT / f"strata-{DEEPSEEK_TAG}.json"
+    cfg_path = ROOT / f"strata-{tag}.json"
     if cfg_path.is_file() or adopted is not None:
         old = cfg_path if cfg_path.is_file() else adopted
         carry_over(json.loads(old.read_text(encoding="utf-8-sig")), cfg)
     deepseek_network(cfg)
     write_setup_config(cfg_path, cfg, adopted)
-    script = write_run_script(DEEPSEEK_TAG, cfg_path, port, cfg.get("open_browser") is not False)
+    script = write_run_script(tag, cfg_path, port, cfg.get("open_browser") is not False)
     ok(f"start script: {script.name}")
     ok(settings_summary(cfg))
     return 0 if a.no_start else start(cfg_path, port, yes=a.yes)
@@ -4816,7 +4973,8 @@ def sycl_setup(argv) -> int:
 
 def main() -> int:
     ap = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
-    ap.add_argument("--family", choices=list(FAMILIES), help="model family; deepseek = SAGE 1.59bpw, Linux + NVIDIA only")
+    ap.add_argument("--family", choices=list(FAMILIES), help="model family; deepseek = SAGE 1.59bpw (DGX Spark: 1017 "
+                    "EXL3 2.9bpw, docs/DEEPSEEK_SPARK.md), Linux + NVIDIA only")
     ap.add_argument("--model", choices=list(MODELS))
     ap.add_argument("--context", type=int)
     ap.add_argument("--rope-scaling", choices=["none", "linear", "yarn"],
@@ -5175,8 +5333,10 @@ def main() -> int:
         any_fits = False
         for m, d in MODELS.items():
             if "deepseek" in d.get("families", ()):
-                say("  DeepSeek: " + (deepseek_problem(gpu) or
-                    "Linux + NVIDIA; 128 GB RAM recommended; below 120 GiB not tested; 462 GB disk"))
+                if m == DEEPSEEK_MODEL:                # one line for both recipes
+                    say("  DeepSeek: " + (deepseek_problem(gpu) or (
+                        "the DGX Spark recipe (1017, EXL3 2.9bpw); 625 GB disk" if gpu and gpu.get("unified") else
+                        "Linux + NVIDIA; 128 GB RAM recommended; below 120 GiB not tested; 462 GB disk")))
                 continue
             verdict = "fits" if ram >= d["ram_gb"] else "tight" if ram >= d["ram_gb"] - 8 else "does not fit"
             if d.get("budget"):

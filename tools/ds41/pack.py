@@ -2,9 +2,12 @@
 
     python tools/ds41/pack.py --src /workspace/model --out /workspace/pack-3bpw
 
-Input: an EXL3 checkpoint in Hugging Face layout (coolbho3k 3bpw, SAGE mixed-bitrate, or ours): routed experts
-as EXL3 mul1 tensors (trellis, suh, svh, mul1), everything else as DeepSeek published it (FP8 E4M3 with E8M0
-32x32 block scales, BF16, F32), Engram tables under engrams/.
+Input: a checkpoint in Hugging Face layout whose routed experts are either
+  exl3   EXL3 mul1 tensors (trellis, suh, svh, mul1): coolbho3k 3bpw, SAGE mixed-bitrate, or ours; or
+  mxfp4  DeepSeek's own FP4 (weight: I8 [n, k/2], two E2M1 codes per byte packed along k, the low nibble first;
+         scale: F8_E8M0 [n, k/32]), as DeepSeek-V4.1-Flash-1017 ships them. They are copied byte for byte.
+Everything else as DeepSeek published it (FP8 E4M3 with E8M0 32x32 block scales, BF16, F32), Engram tables under
+engrams/ or in the index's shards. One pack holds one expert format; pack_info.txt records it (expert_format).
 
 Output (the engine reads only flat text indexes written here, as upstream Strata does: Python writes the layout
 once, the engine never re-derives it):
@@ -15,9 +18,10 @@ once, the engine never re-derives it):
   index.txt      one line per dense tensor: name dtype ndim dims... offset bytes
   experts.bin    one slot per routed expert, layer-major then expert-major. A slot starts on a 4 KiB boundary
                  and its length is a multiple of 4 KiB, so one O_DIRECT read fetches a whole expert.
-                 Inside a slot: w1, w3, w2, each as trellis, suh, svh, mul1; each component 256 B aligned.
-  experts.txt    one line per expert: layer expert offset bytes w1_bits w3_bits w2_bits, then 12 entries
-                 component:offset:bytes (offset inside the slot). Bitrates may differ per expert (SAGE).
+                 Inside a slot: w1, w3, w2, each as trellis, suh, svh, mul1 (exl3) or weight, scale (mxfp4); each
+                 component 256 B aligned.
+  experts.txt    one line per expert: layer expert offset bytes w1_bits w3_bits w2_bits, then one entry per component
+                 component:offset:bytes (offset inside the slot). Bitrates may differ per expert (SAGE); mxfp4: 4.25.
   mtp_experts.bin, mtp_experts.txt   DSpark's routed experts (--mtp-experts, added to a finished pack), laid out as
                  experts.bin; the layer field is the DSpark stage (0..2)
   engram.txt     one line per Engram layer: layer rows dim weight_offset scale_offset path (tables are not copied)
@@ -44,7 +48,8 @@ EXPERT_ALIGN = 4096
 DTYPE = {"F8_E4M3": "f8e4m3", "F8_E8M0": "e8m0", "BF16": "bf16", "F32": "f32", "F16": "f16",
          "I32": "i32", "I16": "i16", "I8": "i8", "U8": "u8"}
 PROJ = ("w1", "w3", "w2")
-PARTS = ("trellis", "suh", "svh", "mul1")
+PARTS = {"exl3": ("trellis", "suh", "svh", "mul1"), "mxfp4": ("weight", "scale")}
+MXFP4_BITS = 4.25   # 4-bit codes and one 8-bit scale per 32
 SKIP_PREFIX = ("vision.", "aligner.", "image_")
 
 
@@ -68,6 +73,8 @@ class Source:
             hdr.pop("__metadata__", None)
             self.fds[fname] = os.open(path, os.O_RDONLY)
             for k, v in hdr.items():
+                if files is None and k not in idx:   # the index names the checkpoint's tensors (a merged one
+                    continue                         # points at shards that hold others too)
                 a, b = v["data_offsets"]
                 self.entries[k] = (fname, v["dtype"], v["shape"], 8 + n + a, b - a)
         missing = set(idx) - set(self.entries)
@@ -124,28 +131,49 @@ def write_dense(srcs, out, wo_a_fp8=True):
     return len(names), off
 
 
-def expert_layout(srcs, L, e, prefix="layers"):
+def expert_format(srcs, prefix="layers"):
+    """exl3 or mxfp4, from the routed experts' tensor names under `prefix`. A checkpoint with both, or with neither,
+    is refused: the engine reads one expert format per pack."""
+    tag = f"{prefix}."
+    found = set()
+    for n, (_, dt, _, _, _) in srcs.entries.items():
+        if not n.startswith(tag) or ".ffn.experts." not in n:
+            continue
+        part = n.rsplit(".", 1)[1]
+        if part == "trellis":
+            found.add("exl3")
+        elif part == "weight":
+            if dt not in ("I8", "U8"):
+                raise SystemExit(f"{n}: routed expert weight of dtype {dt}, not FP4 (I8) or EXL3")
+            found.add("mxfp4")
+    if len(found) != 1:
+        raise SystemExit(f"routed experts under {prefix}: formats {sorted(found) or 'none'}; one pack holds one format")
+    return found.pop()
+
+
+def expert_layout(srcs, L, e, prefix="layers", fmt="exl3"):
     comps, off, bits = [], 0, {}
     for w in PROJ:
-        for p in PARTS:
+        for p in PARTS[fmt]:
             name = f"{prefix}.{L}.ffn.experts.{e}.{w}.{p}"
             nb = srcs.entries[name][4]
             comps.append((f"{w}.{p}", name, off, nb))
             off = align(off + nb, COMPONENT_ALIGN)
-        bits[w] = bits_of(srcs.entries[f"{prefix}.{L}.ffn.experts.{e}.{w}.trellis"][2])
+        bits[w] = (bits_of(srcs.entries[f"{prefix}.{L}.ffn.experts.{e}.{w}.trellis"][2]) if fmt == "exl3"
+                   else MXFP4_BITS)
     return comps, align(off, EXPERT_ALIGN), bits
 
 
-def write_experts(srcs, out, n_layers, n_experts, prefix="layers", name="experts"):
+def write_experts(srcs, out, n_layers, n_experts, prefix="layers", name="experts", fmt="exl3"):
     """name.bin and name.txt; prefix: layers (the backbone) or mtp (DSpark's stages, one per line's layer field)"""
     pos = 0
     t0 = time.time()
     with open(os.path.join(out, name + ".bin"), "wb") as fb, open(os.path.join(out, name + ".txt"), "w") as ft:
         ft.write("# ds41 experts index v1: layer expert offset bytes w1_bits w3_bits w2_bits "
-                 "then component:offset:bytes x12 (offset inside the slot)\n")
+                 "then component:offset:bytes per component (offset inside the slot)\n")
         for L in range(n_layers):
             for e in range(n_experts):
-                comps, slot, bits = expert_layout(srcs, L, e, prefix)
+                comps, slot, bits = expert_layout(srcs, L, e, prefix, fmt)
                 buf = bytearray(slot)
                 for _, name, coff, nb in comps:
                     buf[coff:coff + nb] = srcs.read(name)
@@ -315,11 +343,19 @@ def add_mtp_experts(src, out, n_stages=3, n_experts=128):
     if "finished 1" not in lines:
         raise SystemExit("--mtp-experts needs a finished pack")
     d = os.path.join(src, "exllamav3")
-    files = sorted(os.path.join("exllamav3", f) for f in os.listdir(d)
-                   if f.startswith("requant_mtp_part") and f.endswith(".safetensors"))
-    if not files:
-        raise SystemExit(f"no requant_mtp_part*.safetensors in {d}")
-    nbytes = write_experts(Source(src, files), out, n_stages, n_experts, prefix="mtp", name="mtp_experts")
+    if os.path.isdir(d):   # SAGE: requantized to EXL3 in files of their own
+        files = sorted(os.path.join("exllamav3", f) for f in os.listdir(d)
+                       if f.startswith("requant_mtp_part") and f.endswith(".safetensors"))
+        if not files:
+            raise SystemExit(f"no requant_mtp_part*.safetensors in {d}")
+        srcs = Source(src, files)
+    else:                  # the official checkpoint: in the index's shards, beside the backbone's
+        srcs = Source(src)
+    fmt = expert_format(srcs, "mtp")
+    pack_fmt = next((l.split()[1] for l in lines if l.split()[0] == "expert_format"), "exl3")
+    if fmt != pack_fmt:
+        raise SystemExit(f"DSpark's experts are {fmt}, the pack's are {pack_fmt}; one pack holds one format")
+    nbytes = write_experts(srcs, out, n_stages, n_experts, prefix="mtp", name="mtp_experts", fmt=fmt)
     keep = [l for l in lines if l.split()[0] not in ("finished", "mtp_stages", "mtp_experts", "mtp_expert_bytes")]
     with open(info + ".tmp", "w") as f:
         f.write("\n".join(keep + [f"mtp_stages {n_stages}", f"mtp_experts {n_experts}", f"mtp_expert_bytes {nbytes}",
@@ -347,9 +383,13 @@ def build_pack(src, out, n_layers=40, n_experts=384, wo_a_fp8=True, dense_only=F
         with open(info, "w") as f:
             f.write(f"source {os.path.abspath(src)}\nlayers {old['layers']}\nexperts {old['experts']}\n"
                     f"dense_tensors {n_dense}\ndense_bytes {dense_bytes}\nexpert_bytes {old['expert_bytes']}\n"
-                    f"engram_layers {old['engram_layers']}\nfinished 1\n")
+                    f"engram_layers {old['engram_layers']}\nexpert_format {old.get('expert_format', 'exl3').strip()}\n"
+                    + "".join(f"{k} {old[k].strip()}\n" for k in ("mtp_stages", "mtp_experts", "mtp_expert_bytes")
+                              if k in old)   # DSpark's experts stay
+                    + "finished 1\n")
         return
-    expert_bytes = write_experts(srcs, out, n_layers, n_experts)
+    fmt = expert_format(srcs)
+    expert_bytes = write_experts(srcs, out, n_layers, n_experts, fmt=fmt)
     n_engram = write_engram(src, out)
     cfg = json.load(open(os.path.join(src, "config.json")))
     if engram_from is not None:
@@ -362,7 +402,7 @@ def build_pack(src, out, n_layers=40, n_experts=384, wo_a_fp8=True, dense_only=F
     with open(info, "w") as f:
         f.write(f"source {os.path.abspath(src)}\nlayers {n_layers}\nexperts {n_experts}\n"
                 f"dense_tensors {n_dense}\ndense_bytes {dense_bytes}\nexpert_bytes {expert_bytes}\n"
-                f"engram_layers {n_engram}\nfinished 1\n")
+                f"engram_layers {n_engram}\nexpert_format {fmt}\nfinished 1\n")
 
 
 def main():

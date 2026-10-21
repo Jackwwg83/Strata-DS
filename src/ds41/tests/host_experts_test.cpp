@@ -6,6 +6,8 @@
 
 #include "fake_pack.hpp"
 
+#include <cuda_runtime.h>
+
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
@@ -14,6 +16,7 @@
 #include <unistd.h>
 #include <fstream>
 #include <string>
+#include <vector>
 
 using namespace strata::ds41;
 
@@ -76,6 +79,36 @@ int main() {
             check(same, std::string("DS41_FILL_DIRECT=") + direct + ": every slot holds its expert's bytes");
         }
         unsetenv("DS41_FILL_DIRECT");
+        // host_alloc (unified memory): the arena from cudaHostAlloc, which the DGX Spark's GPU reads at 210 GB/s
+        // against 166 GB/s for registered anonymous memory; the same bytes, mapped, read with O_DIRECT
+        {
+            int n_dev = 0;
+            if (cudaGetDeviceCount(&n_dev) == cudaSuccess && n_dev > 0) {
+                HostExperts h(pack, ranked, res, want, {}, 2, true);
+                bool same = h.slots() == 20 && h.host_allocated() && h.mapped() && h.locked();
+                for (int i = 0; i < h.slots(); ++i) {
+                    const ExpertSlot& x = pack.expert(ranked[i].first, ranked[i].second);
+                    same &= std::memcmp(h.slot_ptr(h.slot_of(ranked[i].first, ranked[i].second)),
+                                        pack.expert_base() + x.offset, x.bytes) == 0;
+                }
+                check(same, "host_alloc: a mapped host arena; every slot holds its expert's bytes");
+                // an integrated GPU (DGX Spark): cuMemCreate on the host NUMA node, which its GPU reads at 233 GB/s
+                // against 220 for cudaHostAlloc; the GPU reads the slots' bytes through the device address
+                int integrated = 0;
+                cudaDeviceGetAttribute(&integrated, cudaDevAttrIntegrated, 0);
+                if (integrated) {
+                    check(h.numa_allocated(), "host_alloc on unified memory: the arena from cuMemCreate (host NUMA)");
+                    const ExpertSlot& x = pack.expert(ranked[3].first, ranked[3].second);
+                    std::vector<uint8_t> back(x.bytes);
+                    const uint8_t* dev = h.device_address(h.slot_ptr(h.slot_of(ranked[3].first, ranked[3].second)));
+                    const bool copied = dev && cudaMemcpy(back.data(), dev, x.bytes, cudaMemcpyDefault) == cudaSuccess;
+                    check(copied && std::memcmp(back.data(), pack.expert_base() + x.offset, x.bytes) == 0,
+                          "host_alloc on unified memory: the GPU reads the slot's bytes");
+                }
+            } else {
+                cudaGetLastError();
+            }
+        }
         HostExperts host(pack, ranked, res, want, {}, 2);
         check(host.slots() == 20, "the budget of the first 20 experts' bytes holds 20 of them, got " +
                                       std::to_string(host.slots()));
@@ -273,7 +306,16 @@ int main() {
             const int layer = big[0].first;
             int32_t ids[3] = {big[0].second, big[1].second, big[2].second};
             bool ok[3] = {};
+            check(h.slot_bytes(layer, ids[0]) == nullptr, tag + "slot_bytes: null for an expert in no slot");
             const int n = h.admit(layer, ids, 3, ok);
+            // during the step, before end_step publishes them: the admitted experts' bytes are in their new slots
+            bool found = true;
+            for (int k = 0; k < 3; ++k) {
+                const uint8_t* b = h.slot_bytes(layer, ids[k]);
+                const ExpertSlot& x = pack.expert(layer, ids[k]);
+                found &= b != nullptr && std::memcmp(b, pack.expert_base() + x.offset, x.bytes) == 0;
+            }
+            check(found, tag + "slot_bytes: an expert admitted this step is found in its new slot");
             std::vector<int32_t> routes((size_t) ds41test::L * 6, -1);
             for (int k = 0; k < 3; ++k) routes[(size_t) layer * 6 + k] = ids[k];
             h.end_step(routes.data(), 6);

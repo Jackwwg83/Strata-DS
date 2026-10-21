@@ -2,15 +2,33 @@
 
 **English** · [简体中文](README.zh-CN.md) · [日本語](README.ja.md) · [Deutsch](README.de.md) · [Français](README.fr.md) · [Español](README.es.md) · [Português](README.pt-BR.md)
 
-<p align="center"><b>DeepSeek V4.1 Flash (763B MoE) on a 64 GB gaming laptop</b><br>
-30-32 tokens/s from a cold start, 33-39 on a running server · 24.4 tokens/s with a 256K-token prompt · RTX 5090 Laptop 24 GB · Linux</p>
+<p align="center"><b>DeepSeek V4.1 Flash (763B MoE) on a gaming laptop or a DGX Spark</b><br>
+Laptop: 30-39 tokens/s, 24.4 with a 256K-token prompt · DGX Spark: 30.8 tokens/s over a coding-agent session, 256K context · Linux + NVIDIA</p>
 
 <p align="center"><img src="docs/media/deepseek-laptop-context.svg" width="760" alt="DeepSeek V4.1 Flash decode and prefill speed by context length on an RTX 5090 Laptop with 64 GB of RAM"></p>
 
 This fork of [Strata](https://github.com/Niko1221/Strata) adds an engine for
 [DeepSeek V4.1 Flash](https://huggingface.co/deepseek-ai/DeepSeek-V4.1-Flash). It splits the model's 15,360 experts
-over GPU memory, RAM and the SSD, so the 763B model runs on a laptop with a 24 GB GPU and 64 GB of RAM. The recipe,
-every setting, what the settings cost in quality (measured), where the time goes, and the raw data: **[docs/DEEPSEEK_LAPTOP.md](docs/DEEPSEEK_LAPTOP.md)**.
+over GPU memory, RAM and the SSD, so the 763B model runs on one machine with a single GPU. Setup picks one of two
+recipes from the GPU:
+
+| Machine | Model and quantization | Measured | Recipe |
+| --- | --- | --- | --- |
+| RTX 5090 Laptop 24 GB, 64 GB RAM | V4.1 Flash, SAGE EXL3 1.59bpw (462 GB disk) | 30-32 tokens/s from a cold start, 33-39 on a running server; 24.4 with a 256K-token prompt | **[docs/DEEPSEEK_LAPTOP.md](docs/DEEPSEEK_LAPTOP.md)** |
+| DGX Spark (GB10, 128 GB unified memory) | V4.1 Flash 1017, LibertAI EXL3 2.9bpw (625 GB disk) | 30.8 tokens/s over a coding-agent session (23.6-36.4 per turn); 22.9 at 250K context | **[docs/DEEPSEEK_SPARK.md](docs/DEEPSEEK_SPARK.md)** |
+
+Both are the same 763B architecture and run on the same engine. The Spark recipe uses DeepSeek's 1017 release and a
+larger quantization (2.9 instead of 1.59 bits per expert weight), which 128 GB of unified memory holds better. Each
+recipe page has every setting, what it costs in quality (measured), where the time goes, and the raw data.
+
+```sh
+git clone https://github.com/Jackwwg83/Strata-DS.git && cd Strata-DS
+./setup.sh --setup --yes --family deepseek --no-start   # picks the recipe for this machine
+./run-deepseek-*.sh                                     # OpenAI and Anthropic API on 127.0.0.1:8080
+```
+
+To let an AI coding agent install it, give it this repository: [AGENTS.md](AGENTS.md) and
+[docs/AI_SETUP.md](docs/AI_SETUP.md) are written for it.
 
 ---
 

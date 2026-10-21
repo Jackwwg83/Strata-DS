@@ -2,15 +2,31 @@
 
 [English](README.md) · **简体中文** · [日本語](README.ja.md) · [Deutsch](README.de.md) · [Français](README.fr.md) · [Español](README.es.md) · [Português](README.pt-BR.md)
 
-<p align="center"><b>在 64 GB 内存的游戏本上运行 DeepSeek V4.1 Flash（7630 亿参数 MoE）</b><br>
-冷启动 30-32 token/s，服务运行后 33-39 token/s · 256K 上下文 24.4 token/s · RTX 5090 笔记本 24 GB · Linux</p>
+<p align="center"><b>在游戏本或 DGX Spark 上运行 DeepSeek V4.1 Flash（7630 亿参数 MoE）</b><br>
+笔记本：30-39 token/s，256K 提示 24.4 token/s · DGX Spark：一次真实编码 agent 会话平均 30.8 token/s，256K 上下文 · Linux + NVIDIA</p>
 
 <p align="center"><img src="docs/media/deepseek-laptop-context.svg" width="760" alt="DeepSeek V4.1 Flash 在 RTX 5090 笔记本、64 GB 内存上各上下文长度的生成和读入速度"></p>
 
 这个仓库是 [Strata](https://github.com/Niko1221/Strata) 的分支，加了一个
 [DeepSeek V4.1 Flash](https://huggingface.co/deepseek-ai/DeepSeek-V4.1-Flash) 引擎。它把模型的 15,360 个专家分放在
-显存、内存和 SSD 上，所以这个 7630 亿参数的模型能在 24 GB 显卡、64 GB 内存的笔记本上运行。完整配方、每项设置、
-设置对质量的实测影响、时间花在哪里和原始数据：**[docs/DEEPSEEK_LAPTOP.md](docs/DEEPSEEK_LAPTOP.md)**（英文）。
+显存、内存和 SSD 上，所以这个 7630 亿参数的模型只用一块 GPU 就能跑。安装程序按显卡自动选两个配方之一：
+
+| 机器 | 模型和量化 | 实测 | 配方 |
+| --- | --- | --- | --- |
+| RTX 5090 笔记本 24 GB，64 GB 内存 | V4.1 Flash，SAGE EXL3 1.59bpw（磁盘 462 GB） | 冷启动 30-32 token/s，服务运行后 33-39；256K 提示 24.4 | **[docs/DEEPSEEK_LAPTOP.md](docs/DEEPSEEK_LAPTOP.md)**（英文） |
+| DGX Spark（GB10，128 GB 统一内存） | V4.1 Flash 1017，LibertAI EXL3 2.9bpw（磁盘 625 GB） | 一次编码 agent 会话平均 30.8 token/s（每轮 23.6-36.4）；250K 上下文 22.9 | **[docs/DEEPSEEK_SPARK.md](docs/DEEPSEEK_SPARK.md)**（英文） |
+
+两个配方是同一个 7630 亿参数的架构，用同一个引擎。Spark 配方用 DeepSeek 的 1017 版本和更大的量化（每个专家权重
+2.9 bit，而不是 1.59 bit），128 GB 统一内存放得下更多。每个配方页都有全部设置、设置对质量的实测影响、时间花在哪里和原始数据。
+
+```sh
+git clone https://github.com/Jackwwg83/Strata-DS.git && cd Strata-DS
+./setup.sh --setup --yes --family deepseek --no-start   # 按这台机器选配方
+./run-deepseek-*.sh                                     # OpenAI 和 Anthropic 接口，127.0.0.1:8080
+```
+
+想让 AI 编码 agent 帮你装：把这个仓库交给它就行，[AGENTS.md](AGENTS.md) 和 [docs/AI_SETUP.md](docs/AI_SETUP.md)
+就是写给它看的。
 
 ---
 
