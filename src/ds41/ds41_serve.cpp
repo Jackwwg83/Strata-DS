@@ -272,7 +272,6 @@ Options parse_args(int argc, char** argv) {
     if (o.max_context < 64) usage("--max-context must be at least 64");
     o.eng.max_seq = o.max_context;
     if (o.draft_k > kVerifyMaxTokens - 1 || (o.draft_k >= 0 && !o.dspark)) usage("--draft-k 0..3 needs --spec dspark");
-    if (o.dspark && o.eng.batch_slots >= 2) usage("--spec dspark decodes the main session only: no --batch");
     o.eng.dspark = o.dspark;
     return o;
 }

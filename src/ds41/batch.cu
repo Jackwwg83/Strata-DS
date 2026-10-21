@@ -63,6 +63,7 @@ void Engine::Impl::slot_copy(int slot, bool to_slot) {
     ck(cudaStreamSynchronize(st), "slot copy");
     if (to_slot) s.history = history;
     else history = s.history;
+    if (!to_slot && ds) ds_set_pending(0, 0);   // DSpark's rings hold the main session's rows: stale (draft quality only)
 }
 
 void Engine::Impl::enqueue_slots(int m) {

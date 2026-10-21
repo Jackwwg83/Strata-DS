@@ -1,6 +1,8 @@
 // src/ds41/tests/batch_test.cpp - batch slots: three conversations decoded together give, row by row, the tokens each
 // gives decoded alone (static residency, so the same experts take the same path); a step of two of the slots in
 // another row order gives the same; a slot copied back to the main session continues there as it would have alone.
+// --dspark 1: the engine has DSpark too, and after the copy back the main session continues in DSpark's verify
+// windows with the tokens decoded alone (ds41_serve --spec dspark --batch: solo requests draft, slots do not).
 // Needs the model pack: --pack DIR [--expert-profile F] [--ids-dir D: real chats instead of random tokens] (without a
 // pack the test is skipped with code 77).
 #include "strata/ds41/config.hpp"
@@ -36,11 +38,13 @@ std::string show(const std::vector<int>& v) {
 
 int main(int argc, char** argv) {
     std::string pack, profile, ids_dir;
+    bool dspark = false;
     for (int i = 1; i + 1 < argc; i += 2) {
         const std::string a = argv[i];
         if (a == "--pack") pack = argv[i + 1];
         else if (a == "--expert-profile") profile = argv[i + 1];
         else if (a == "--ids-dir") ids_dir = argv[i + 1];   // tools/ds41/chat_ids.py: real chats (code, zh_chat, en_explain)
+        else if (a == "--dspark") dspark = std::string(argv[i + 1]) != "0";
     }
     if (pack.empty()) {
         std::printf("RESULT skip (no --pack)\n");
@@ -54,6 +58,7 @@ int main(int argc, char** argv) {
     opt.adapt_every = 0;   // static residency
     // (adapt_every 0 keeps the RAM tier static too: the engine's rule, not the test's)
     opt.batch_slots = 3;
+    opt.dspark = dspark;
     constexpr int kGen = 20, kBatched = 14;
     std::vector<std::vector<int>> prompts = {prompt(300, 1), prompt(41, 2), prompt(150, 3)};
     if (!ids_dir.empty()) {
@@ -118,6 +123,26 @@ int main(int argc, char** argv) {
         check(e.position() == (int) prompts[1].size() + n1 - 1, "the main session holds slot 1's tokens");
         int y = e.step(together[1].back(), e.position());
         check(n1 < kGen && y == alone[1][n1], "slot 1 continues in the main session as alone");
+        if (dspark) {   // DSpark windows from there: the drafts kept and the correction are the tokens decoded alone
+            check(e.has_dspark(), "the engine has DSpark and batch slots");
+            std::vector<int> got;
+            int tok = y;
+            for (int round = 0; round < 3 && n1 + 1 + (int) got.size() < kGen; ++round) {
+                const Engine::Draft dd = e.draft(tok);
+                std::vector<int> window{tok};
+                for (int j = 0; j < std::min(dd.n, 3); ++j) window.push_back(dd.tokens[(size_t) j]);
+                const VerifyResult v = e.verify(window, e.position());
+                int keep = 1;
+                while (keep < (int) window.size() && window[keep] == v.next[(size_t) keep - 1]) ++keep;
+                e.commit(keep);
+                for (int i = 0; i < keep; ++i) got.push_back(v.next[(size_t) i]);
+                tok = got.back();
+            }
+            const size_t n = std::min(got.size(), (size_t) (kGen - n1 - 1));
+            check(n > 0 && std::equal(got.begin(), got.begin() + (long) n, alone[1].begin() + n1 + 1),
+                  "after the copy back, DSpark's windows give the tokens decoded alone");
+            std::printf("  dspark after copy back: %s\n", show(got).c_str());
+        }
     } catch (const std::exception& ex) {
         std::printf("FAIL: unexpected exception: %s\n", ex.what());
         ++failures;
